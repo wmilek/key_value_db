@@ -9,6 +9,12 @@ find_package(Zephyr REQUIRED HINTS $ENV{ZEPHYR_BASE})
 
 project(app LANGUAGES C)
 
+# In-repo public headers and library sources. The repo is not registered
+# as a Zephyr module in the active west manifest, so we pull in the
+# pieces we need explicitly from here.
+zephyr_include_directories(${CMAKE_CURRENT_SOURCE_DIR}/../include)
+add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../lib lib)
+
 target_sources(app PRIVATE src/main.c)
 
 # The code below locates the git index file for this repository and adds it as a dependency for

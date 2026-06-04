@@ -10,6 +10,9 @@ menu "Zephyr"
 source "Kconfig.zephyr"
 endmenu
 
+# In-repo libraries (not registered via the active west manifest).
+rsource "../lib/Kconfig"
+
 module = APP
 module-str = APP
 source "subsys/logging/Kconfig.template.log_config"

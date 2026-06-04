@@ -4,5 +4,6 @@
 menu "Custom libraries"
 
 rsource "custom/Kconfig"
+rsource "blob_db/Kconfig"
 
 endmenu

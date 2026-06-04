@@ -123,7 +123,7 @@ A blob with id `i` lives in bucket `i mod N`. With sequential id assignment (1, 
 
 ## 5. On-flash format
 
-### 5.1 Master sector (16 B header, the rest of the 4 KB sector is unused / reserved)
+### 5.1 Master sector (24 B header, the rest of the 4 KB sector is unused / reserved)
 
 ```
 magic[4]        = 'B','D','M','S'           /* blob db master */
