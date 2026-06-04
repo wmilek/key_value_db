@@ -11,6 +11,8 @@
 
 #include <zephyr/logging/log.h>
 
+#include <app/lib/blob_db.h>
+
 #include "blob_db_internal.h"
 
 LOG_MODULE_REGISTER(blob_db, CONFIG_BLOB_DB_LOG_LEVEL);
