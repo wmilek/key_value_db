@@ -1,0 +1,12 @@
+# Copyright (c) 2026
+# SPDX-License-Identifier: Apache-2.0
+
+mainmenu "blob_db ztest"
+
+menu "Zephyr"
+source "Kconfig.zephyr"
+endmenu
+
+# The in-repo lib/ tree isn't loaded by the active west manifest, so source
+# it explicitly here. Mirrors the same approach used by app/Kconfig.
+rsource "../../../lib/Kconfig"

@@ -1,0 +1,5 @@
+common:
+  tags: storage blob_db
+  platform_allow: native_sim
+tests:
+  lib.blob_db: {}
