@@ -1020,21 +1020,151 @@ bool blob_db_exists(uint64_t id)
 	       !(w.target_flags & BLOB_DB_SLOT_F_TOMBSTONE);
 }
 
-/* Stage 6 stubs --------------------------------------------------------- */
+/* Stage 6 — format / count / iterate ------------------------------------ */
+
+/* Walk a bucket buffer, invoking `cb` for each *live* slot — the latest
+ * non-tombstoned slot for its id within this bucket. O(n²) over slots in
+ * the bucket; the per-bucket count is small in normal use. Returns 0 if
+ * walk completed, or the non-zero value the callback returned to abort. */
+typedef int (*live_slot_visit_t)(uint64_t id, const uint8_t *payload,
+				  uint16_t val_len, void *user);
+
+static int for_each_live_slot(const uint8_t *buf,
+			      live_slot_visit_t cb, void *user)
+{
+	off_t cursor = BLOB_DB_BUCKET_DATA_OFF;
+
+	for (;;) {
+		struct slot_view sv;
+
+		if (!slot_view_at(buf, cursor, &sv)) {
+			break;
+		}
+
+		bool superseded = false;
+		off_t scan = cursor + sv.total_size;
+
+		for (;;) {
+			struct slot_view future;
+
+			if (!slot_view_at(buf, scan, &future)) {
+				break;
+			}
+			if (future.id == sv.id) {
+				superseded = true;
+				break;
+			}
+			scan += future.total_size;
+		}
+
+		if (!superseded && !(sv.flags & BLOB_DB_SLOT_F_TOMBSTONE)) {
+			const uint8_t *payload = buf + cursor +
+						 sizeof(struct blob_db_slot_hdr) +
+						 sizeof(uint64_t);
+			int r = cb(sv.id, payload, sv.val_len, user);
+
+			if (r) {
+				return r;
+			}
+		}
+
+		cursor += sv.total_size;
+	}
+	return 0;
+}
+
+static int count_visitor(uint64_t id, const uint8_t *p, uint16_t l, void *user)
+{
+	ARG_UNUSED(id);
+	ARG_UNUSED(p);
+	ARG_UNUSED(l);
+	(*(size_t *)user)++;
+	return 0;
+}
 
 size_t blob_db_count(void)
 {
-	return 0;
+	if (!st.mounted) {
+		return 0;
+	}
+
+	size_t total = 0;
+	uint8_t bbuf[BLOB_DB_SECTOR_BUF_MAX];
+
+	for (uint16_t bid = 0; bid < st.n_buckets; bid++) {
+		if (read_bucket(bid, bbuf) < 0) {
+			continue;
+		}
+		if (!bucket_hdr_valid(bbuf, bid)) {
+			continue;
+		}
+		(void)for_each_live_slot(bbuf, count_visitor, &total);
+	}
+	return total;
+}
+
+struct iterate_trampoline {
+	blob_db_iter_cb_t user_cb;
+	void *user;
+};
+
+static int iterate_visitor(uint64_t id, const uint8_t *p, uint16_t l, void *u)
+{
+	struct iterate_trampoline *t = u;
+
+	return t->user_cb(id, p, l, t->user);
 }
 
 int blob_db_iterate(blob_db_iter_cb_t cb, void *user)
 {
-	ARG_UNUSED(cb);
-	ARG_UNUSED(user);
-	return -ENOSYS;
+	if (!st.mounted) {
+		return -ENODEV;
+	}
+	if (!cb) {
+		return -EINVAL;
+	}
+
+	uint8_t bbuf[BLOB_DB_SECTOR_BUF_MAX];
+	struct iterate_trampoline t = { .user_cb = cb, .user = user };
+
+	for (uint16_t bid = 0; bid < st.n_buckets; bid++) {
+		if (read_bucket(bid, bbuf) < 0) {
+			continue;
+		}
+		if (!bucket_hdr_valid(bbuf, bid)) {
+			continue;
+		}
+
+		int rc = for_each_live_slot(bbuf, iterate_visitor, &t);
+
+		if (rc) {
+			return rc;  /* user-requested early stop */
+		}
+	}
+	return 0;
 }
 
 int blob_db_format(void)
 {
-	return -ENOSYS;
+	if (!st.mounted) {
+		return -ENODEV;
+	}
+
+	int rc = flash_area_erase(st.fa, 0, st.fa_size);
+	if (rc < 0) {
+		LOG_ERR("format: erase: %d", rc);
+		return rc;
+	}
+
+	rc = write_master(BLOB_DB_MASTER_A_SECTOR, 1, BLOB_DB_STATE_CLEAN, 0, 1);
+	if (rc < 0) {
+		return rc;
+	}
+
+	st.active_master = BLOB_DB_MASTER_A_SECTOR;
+	st.master_gen    = 1;
+	st.next_id       = 1;
+
+	LOG_INF("format: complete; next_id=1");
+	return 0;
 }

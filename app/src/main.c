@@ -60,6 +60,14 @@ static void smoke(void)
 		blob_db_exists(9999) ? "true" : "false");
 }
 
+static int dump_cb(uint64_t id, const void *payload, size_t len, void *user)
+{
+	ARG_UNUSED(payload);
+	ARG_UNUSED(user);
+	LOG_INF("  id=%llu len=%zu", (unsigned long long)id, len);
+	return 0;
+}
+
 /* Pound id_hello with updates to force at least one bucket compaction
  * (slot size ~17 B at 3-byte payloads → ~240 fit in a 4 KB bucket). */
 static void compact_test(uint64_t id, int iters)
@@ -99,6 +107,13 @@ int main(void)
 
 	smoke();
 	compact_test(1, 500);
+
+	LOG_INF("count = %zu", blob_db_count());
+	LOG_INF("iterate:");
+	blob_db_iterate(dump_cb, NULL);
+
+	LOG_INF("format -> rc=%d", blob_db_format());
+	LOG_INF("count after format = %zu", blob_db_count());
 
 	blob_db_unmount();
 	LOG_INF("blob_db unmounted; bye");
