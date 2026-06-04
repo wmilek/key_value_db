@@ -10,6 +10,10 @@
 /build*
 /twister-out*
 
+# native_sim flash-simulator backing file (default name when running
+# zephyr.exe without --flash=<path>)
+flash.bin
+
 __pycache__/
 
 # docs
