@@ -17,6 +17,13 @@ add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../lib lib)
 
 target_sources(app PRIVATE src/main.c)
 
+# zephyr_library_named() registers the library but doesn't auto-link it
+# into zephyr.elf when add_subdirectory happens this late in app's
+# configuration. Link it explicitly here.
+if(CONFIG_BLOB_DB)
+  target_link_libraries(app PRIVATE blob_db)
+endif()
+
 # The code below locates the git index file for this repository and adds it as a dependency for
 # the application VERSION file so that if the repo has a new commit added, even if no files in
 # the build have changed, the application version file will be regenerated with the new git commit
