@@ -1,0 +1,19 @@
+/*
+ * Resize native_sim's simulated flash to 16 MB and carve out an 8 MB
+ * storage_partition for kv_db. Leaves the default mcuboot / slot partitions
+ * in the first 1 MB intact so existing tooling expectations still hold.
+ *
+ * See doc/design.md §1 "Capacity".
+ */
+
+&flashcontroller0 {
+	reg = <0x00000000 DT_SIZE_M(16)>;
+};
+
+&flash0 {
+	reg = <0x00000000 DT_SIZE_M(16)>;
+};
+
+&storage_partition {
+	reg = <0x00800000 DT_SIZE_M(8)>;
+};

@@ -12,7 +12,18 @@ This project delivers **one Zephyr library module**: a key-value database under 
 
 ### Target partition
 
-`storage_partition` (label `"storage"`) is already declared in `native_sim.dts`: 16 KB at 0xfc000 in `&flash0`, four 4 KB sectors, 1-byte write granularity, 0xff erase value. Accessible as `FIXED_PARTITION_ID(storage_partition)`. **No devicetree overlay required.**
+`storage_partition` (label `"storage"`) is the partition KV opens via `FIXED_PARTITION_ID(storage_partition)`. The library is partition-agnostic — sizing comes entirely from the device tree.
+
+### Capacity
+
+The target DB capacity is **8 MB**. With an estimated average entry footprint of ~80 B (6 B header + ~64 B avg key + ~8 B avg value + 2 B CRC), this comfortably accommodates the **100 000-entry structural target** from §1.4.
+
+`native_sim`'s stock storage partition is only 16 KB at 0xfc000 in a 2 MB simulated flash — insufficient for verifying at scale. The repo provides a device-tree overlay (`app/boards/native_sim.overlay`) that:
+
+- Extends the simulated flash to 16 MB.
+- Resizes `storage_partition` to 8 MB at offset 0x800000 (after the default mcuboot / slot partitions, which are left in place).
+
+On real hardware, the platform DT declares an 8 MB partition directly; no overlay needed.
 
 ### Goals
 
@@ -33,7 +44,7 @@ These constraints shape the algorithms and disqualify the obvious "RAM index" ap
 - **Minimum steady-state RAM.** Total RAM owned by `kv_db` between calls is a small handle: partition pointer, active-half index, current generation, write cursor — on the order of ~32 bytes. **No per-entry RAM.**
 - **No caching.** Keys, values, and offsets are not held in RAM between operations. Every `get` re-reads from flash. Every `count` rescans. No memoization, no Bloom filter, no hash table.
 - **Flash reads are fast.** Cost model: a flash read is cheap; a flash write/erase is expensive. Algorithms favor read-heavy designs over write-heavy ones.
-- **Structurally ready for 100 000 entries.** No fixed-size array sized to expected entry count. No O(n) RAM growth. The natural ceiling on entry count is the partition size, not a Kconfig limit.
+- **Structurally ready for 100 000 entries in 8 MB.** No fixed-size array sized to expected entry count. No O(n) RAM growth. The natural ceiling on entry count is partition size, not a Kconfig limit. 8 MB / ~80 B per entry ≈ 100 k entries.
 
 ### Cost summary (per operation)
 
@@ -384,8 +395,9 @@ tests/lib/kv_db/
   src/main.c               ztest
 
 app/
-  prj.conf                 CONFIG_KV_DB=y, CONFIG_FLASH=y, CONFIG_FLASH_MAP=y, CONFIG_CRC=y, CONFIG_LOG=y
-  src/main.c               demo: mount, RMW "boot_count" u32, log
+  boards/native_sim.overlay  extend sim-flash to 16 MB; resize storage_partition to 8 MB at 0x800000
+  prj.conf                   CONFIG_KV_DB=y, CONFIG_FLASH=y, CONFIG_FLASH_MAP=y, CONFIG_CRC=y, CONFIG_LOG=y
+  src/main.c                 demo: mount, RMW "boot_count" u32, log
 ```
 
 ---
@@ -430,7 +442,7 @@ Cases:
 11. `mount_picks_higher_generation` — manually seed both halves with different gens, verify selection
 12. `clear_resets_db` — populate, clear, mount → empty
 13. `iterate_visits_each_live_key_once` — callback count matches `count()`
-14. `scale_smoke` — fill the active half with as many entries as fit (~80 on native_sim's 8 KB half), exercise get/delete/compact. The 100k structural target cannot be verified on native_sim due to the 16 KB partition; this case verifies that no implementation detail (fixed array, static buffer) caps entry count below partition capacity.
+14. `scale_smoke` — fill the active half until the next set triggers compaction; verify get/delete/compact still work. With the 8 MB overlay in place, the suite can also exercise a heavier `scale_100k` variant (gated by a Kconfig flag) that inserts ~100 000 small entries and verifies a representative subset round-trips. Without the overlay, this case falls back to ~80 entries on the stock 16 KB partition.
 
 For cross-process persistence tests, `testcase.yaml` declares `extra_args: --flash=/tmp/kv_db_test.bin`. Most cases use in-process unmount/mount to exercise the same persistence paths without needing the flash file across runs.
 
@@ -438,10 +450,10 @@ For cross-process persistence tests, `testcase.yaml` declares `extra_args: --fla
 
 ## 12. Verification (end-to-end)
 
-1. `west build -b native_sim app -p` — clean build, no warnings.
-2. `./build/zephyr/zephyr.exe --flash=/tmp/kv.bin --stop_at=2` — first run prints `boot_count=1`, sets `hello → "world"`. Second run prints `boot_count=2`, reads `hello` back. Delete `/tmp/kv.bin` → resets.
+1. `west build -b native_sim app -p` — clean build, no warnings. The overlay at `app/boards/native_sim.overlay` is auto-applied by Zephyr's build system.
+2. `./build/zephyr/zephyr.exe --flash=/tmp/kv.bin --stop_at=2` — first run prints `boot_count=1`, sets `hello → "world"`. Second run prints `boot_count=2`, reads `hello` back. Delete `/tmp/kv.bin` → resets. The flash file should be ~16 MB on disk (matches the resized sim-flash).
 3. `west twister -p native_sim -T tests/lib/kv_db` — all cases green.
-4. `xxd /tmp/kv.bin | grep -c KVDH` — at least 1 sector-header match. `grep -c KV` — many entry-header matches.
+4. `ls -l /tmp/kv.bin` confirms 16 MB; `xxd /tmp/kv.bin | grep -c KVDH` ≥ 1; `grep -c KV` — many entry-header matches.
 
 ---
 
