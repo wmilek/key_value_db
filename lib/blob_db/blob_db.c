@@ -31,6 +31,10 @@ LOG_MODULE_REGISTER(blob_db, CONFIG_BLOB_DB_LOG_LEVEL);
 static const uint8_t MASTER_MAGIC[4] = { 'B', 'D', 'M', 'S' };
 static const uint8_t BUCKET_MAGIC[4] = { 'B', 'D', 'B', 'H' };
 
+/* Forward declarations (compaction helpers live below blob_db_mount). */
+static int recover_compaction(uint16_t bid);
+static int compact_bucket(uint16_t bid);
+
 /* Single global instance. v1 is single-threaded; caller serializes. */
 static struct {
 	bool      mounted;
@@ -294,10 +298,10 @@ int blob_db_mount(void)
 			st.master_gen, m->state, st.next_id);
 
 		if (m->state == BLOB_DB_STATE_COMPACTING) {
-			LOG_ERR("mid-compaction recovery not yet implemented "
-				"(stage 5); refusing mount");
-			rc = -EIO;
-			goto err_close;
+			rc = recover_compaction(m->compacting_bid);
+			if (rc < 0) {
+				goto err_close;
+			}
 		}
 	}
 
@@ -390,6 +394,55 @@ static bool bucket_hdr_valid(const uint8_t *buf, uint16_t bid)
 	return true;
 }
 
+/* Interpret a slot at buf[off] in a bucket buffer.
+ * Returns true iff structurally valid AND CRC verifies — i.e., a real
+ * committed slot. Returns false otherwise (end-of-log, torn write, etc.). */
+struct slot_view {
+	uint64_t id;
+	uint8_t  flags;
+	uint16_t val_len;
+	size_t   total_size;
+};
+
+static bool slot_view_at(const uint8_t *buf, off_t off, struct slot_view *out)
+{
+	if (off + BLOB_DB_SLOT_OVERHEAD > (off_t)st.peb_size) {
+		return false;
+	}
+	const struct blob_db_slot_hdr *shdr =
+		(const struct blob_db_slot_hdr *)(buf + off);
+
+	if (shdr->flags == 0xff) {
+		return false;
+	}
+	if (!(shdr->flags & BLOB_DB_SLOT_F_SEALED)) {
+		return false;
+	}
+	if (shdr->val_len > CONFIG_BLOB_DB_MAX_PAYLOAD_LEN) {
+		return false;
+	}
+	const size_t ssz = slot_size_for(shdr->val_len);
+
+	if (off + ssz > (off_t)st.peb_size) {
+		return false;
+	}
+
+	uint64_t id;
+	memcpy(&id, buf + off + sizeof(*shdr), sizeof(id));
+	const uint8_t *payload = buf + off + sizeof(*shdr) + sizeof(id);
+	uint16_t stored;
+	memcpy(&stored, buf + off + ssz - sizeof(stored), sizeof(stored));
+	if (slot_crc16(shdr, id, payload, shdr->val_len) != stored) {
+		return false;
+	}
+
+	out->id         = id;
+	out->flags      = shdr->flags;
+	out->val_len    = shdr->val_len;
+	out->total_size = ssz;
+	return true;
+}
+
 struct bucket_walk {
 	off_t    write_cursor;     /* end of valid slots in the bucket */
 	off_t    target_slot_off;  /* -1 if target_id not present */
@@ -397,59 +450,27 @@ struct bucket_walk {
 	uint16_t target_val_len;
 };
 
-/* Walk a bucket buffer, identifying the write cursor and (latest) slot for
- * target_id. Slot CRC validation is performed inline; on CRC failure the
- * walk truncates the bucket at that offset. */
 static void walk_bucket(const uint8_t *buf, uint64_t target_id,
 			struct bucket_walk *r)
 {
 	r->target_slot_off = -1;
-	r->target_flags = 0;
-	r->target_val_len = 0;
+	r->target_flags    = 0;
+	r->target_val_len  = 0;
 
 	off_t cursor = BLOB_DB_BUCKET_DATA_OFF;
-	const size_t min_slot = BLOB_DB_SLOT_OVERHEAD;
 
-	while (cursor + min_slot <= st.peb_size) {
-		const struct blob_db_slot_hdr *shdr =
-			(const struct blob_db_slot_hdr *)(buf + cursor);
+	for (;;) {
+		struct slot_view sv;
 
-		if (shdr->flags == 0xff) {
+		if (!slot_view_at(buf, cursor, &sv)) {
 			break;
 		}
-		if (!(shdr->flags & BLOB_DB_SLOT_F_SEALED)) {
-			break;
-		}
-		if (shdr->val_len > CONFIG_BLOB_DB_MAX_PAYLOAD_LEN) {
-			break;
-		}
-
-		const size_t ssz = slot_size_for(shdr->val_len);
-
-		if (cursor + ssz > st.peb_size) {
-			break;
-		}
-
-		uint64_t slot_id;
-		memcpy(&slot_id, buf + cursor + sizeof(*shdr), sizeof(slot_id));
-		const uint8_t *payload = buf + cursor + sizeof(*shdr) +
-					 sizeof(slot_id);
-		uint16_t stored_crc;
-		memcpy(&stored_crc, buf + cursor + ssz - sizeof(stored_crc),
-		       sizeof(stored_crc));
-
-		if (slot_crc16(shdr, slot_id, payload, shdr->val_len) !=
-		    stored_crc) {
-			break;
-		}
-
-		if (slot_id == target_id) {
+		if (sv.id == target_id) {
 			r->target_slot_off = cursor;
-			r->target_flags = shdr->flags;
-			r->target_val_len = shdr->val_len;
+			r->target_flags    = sv.flags;
+			r->target_val_len  = sv.val_len;
 		}
-
-		cursor += ssz;
+		cursor += sv.total_size;
 	}
 
 	r->write_cursor = cursor;
@@ -513,6 +534,212 @@ static int append_slot(uint16_t bid, off_t write_cursor, uint64_t id,
 				buf, total);
 }
 
+/* Per-bucket compaction & crash recovery (stage 5) ---------------------- */
+
+/* Build a compacted image of bucket `bid` in new_buf using old_buf as the
+ * source. Returns the number of bytes written into new_buf (≥ 16 for the
+ * bucket header). Skipped entries: tombstones, and any slot whose id has
+ * a later occurrence in the same bucket. */
+static size_t build_compacted_image(const uint8_t *old_buf, uint8_t *new_buf,
+				    uint16_t bid)
+{
+	const struct blob_db_bucket_hdr *old_bhdr =
+		(const struct blob_db_bucket_hdr *)old_buf;
+
+	struct blob_db_bucket_hdr *new_bhdr =
+		(struct blob_db_bucket_hdr *)new_buf;
+
+	memcpy(new_bhdr->magic, BUCKET_MAGIC, 4);
+	new_bhdr->bucket_id = bid;
+	new_bhdr->reserved  = 0;
+	new_bhdr->gen       = old_bhdr->gen + 1;
+	new_bhdr->hdr_crc32 = hdr_crc32(new_bhdr, sizeof(*new_bhdr));
+
+	off_t new_cursor = BLOB_DB_BUCKET_DATA_OFF;
+	off_t cursor     = BLOB_DB_BUCKET_DATA_OFF;
+
+	for (;;) {
+		struct slot_view sv;
+
+		if (!slot_view_at(old_buf, cursor, &sv)) {
+			break;
+		}
+
+		/* Is there a later slot with the same id? */
+		bool superseded = false;
+		off_t scan = cursor + sv.total_size;
+
+		for (;;) {
+			struct slot_view future;
+
+			if (!slot_view_at(old_buf, scan, &future)) {
+				break;
+			}
+			if (future.id == sv.id) {
+				superseded = true;
+				break;
+			}
+			scan += future.total_size;
+		}
+
+		if (!superseded && !(sv.flags & BLOB_DB_SLOT_F_TOMBSTONE)) {
+			memcpy(new_buf + new_cursor,
+			       old_buf + cursor, sv.total_size);
+			new_cursor += sv.total_size;
+		}
+
+		cursor += sv.total_size;
+	}
+
+	return (size_t)new_cursor;
+}
+
+/* Phase-2: persist the compacted image via master + scratch + bucket sequence.
+ *
+ *   1. write master inactive = COMPACTING(bid)                 ── enters atomic window
+ *   2. erase scratch; write scratch = new image
+ *   3. erase bucket; write bucket = new image
+ *   4. erase scratch
+ *   5. write master inactive = CLEAN                           ── leaves atomic window
+ *
+ * If we crash anywhere in 1..5, mount-time recover_compaction() restores a
+ * consistent state per the crash table in design §8.
+ */
+static int compact_commit(uint16_t bid, const uint8_t *new_buf, size_t new_len)
+{
+	const off_t scratch_off = peb_offset(BLOB_DB_SCRATCH_SECTOR);
+	const off_t bucket_off  = bucket_offset(bid);
+
+	/* Step 1: enter atomic window. */
+	uint8_t inactive = !st.active_master;
+	int rc = write_master(inactive, st.master_gen + 1,
+			      BLOB_DB_STATE_COMPACTING, bid, st.next_id);
+	if (rc < 0) {
+		return rc;
+	}
+	st.active_master = inactive;
+	st.master_gen++;
+
+	/* Step 2: scratch. */
+	rc = flash_area_erase(st.fa, scratch_off, st.peb_size);
+	if (rc < 0) {
+		return rc;
+	}
+	rc = flash_area_write(st.fa, scratch_off, new_buf, new_len);
+	if (rc < 0) {
+		return rc;
+	}
+
+	/* Step 3: bucket. */
+	rc = flash_area_erase(st.fa, bucket_off, st.peb_size);
+	if (rc < 0) {
+		return rc;
+	}
+	rc = flash_area_write(st.fa, bucket_off, new_buf, new_len);
+	if (rc < 0) {
+		return rc;
+	}
+
+	/* Step 4: erase scratch. */
+	rc = flash_area_erase(st.fa, scratch_off, st.peb_size);
+	if (rc < 0) {
+		return rc;
+	}
+
+	/* Step 5: leave atomic window. */
+	inactive = !st.active_master;
+	rc = write_master(inactive, st.master_gen + 1,
+			  BLOB_DB_STATE_CLEAN, 0, st.next_id);
+	if (rc < 0) {
+		return rc;
+	}
+	st.active_master = inactive;
+	st.master_gen++;
+
+	return 0;
+}
+
+static int compact_bucket(uint16_t bid)
+{
+	uint8_t old_buf[BLOB_DB_SECTOR_BUF_MAX];
+	uint8_t new_buf[BLOB_DB_SECTOR_BUF_MAX];
+
+	int rc = read_bucket(bid, old_buf);
+	if (rc < 0) {
+		return rc;
+	}
+	if (!bucket_hdr_valid(old_buf, bid)) {
+		LOG_WRN("compact: bucket %u not formatted; nothing to do", bid);
+		return -EINVAL;
+	}
+
+	const size_t new_len = build_compacted_image(old_buf, new_buf, bid);
+
+	LOG_INF("compact bid=%u: new bucket has %zu B (was up to %zu B)",
+		bid, new_len, st.peb_size);
+
+	return compact_commit(bid, new_buf, new_len);
+}
+
+/* Mount-time recovery for a partition we found in COMPACTING(bid) state.
+ *
+ * Decision rule: if the scratch sector contains a valid bucket header
+ * with the matching bid, treat scratch as authoritative — copy it back
+ * over the bucket. If scratch is invalid, the bucket is still the
+ * original (we crashed before scratch was sealed). Either way, finish
+ * by erasing scratch and writing a CLEAN master.
+ */
+static int recover_compaction(uint16_t bid)
+{
+	if (bid >= st.n_buckets) {
+		LOG_ERR("recover: compacting_bid %u out of range (n=%u)",
+			bid, st.n_buckets);
+		return -EIO;
+	}
+
+	uint8_t scratch[BLOB_DB_SECTOR_BUF_MAX];
+	const off_t scratch_off = peb_offset(BLOB_DB_SCRATCH_SECTOR);
+
+	int rc = flash_area_read(st.fa, scratch_off, scratch, st.peb_size);
+	if (rc < 0) {
+		return rc;
+	}
+
+	if (bucket_hdr_valid(scratch, bid)) {
+		LOG_WRN("recover: scratch is sealed for bid %u; "
+			"restoring bucket from scratch", bid);
+		rc = flash_area_erase(st.fa, bucket_offset(bid), st.peb_size);
+		if (rc < 0) {
+			return rc;
+		}
+		rc = flash_area_write(st.fa, bucket_offset(bid),
+				      scratch, st.peb_size);
+		if (rc < 0) {
+			return rc;
+		}
+	} else {
+		LOG_WRN("recover: scratch invalid; bucket %u left as-is", bid);
+	}
+
+	rc = flash_area_erase(st.fa, scratch_off, st.peb_size);
+	if (rc < 0) {
+		return rc;
+	}
+
+	const uint8_t inactive = !st.active_master;
+
+	rc = write_master(inactive, st.master_gen + 1,
+			  BLOB_DB_STATE_CLEAN, 0, st.next_id);
+	if (rc < 0) {
+		return rc;
+	}
+	st.active_master = inactive;
+	st.master_gen++;
+
+	LOG_INF("recover: complete; master gen=%u", st.master_gen);
+	return 0;
+}
+
 int blob_db_put(const void *payload, size_t len, uint64_t *out_id)
 {
 	if (!st.mounted) {
@@ -554,10 +781,21 @@ int blob_db_put(const void *payload, size_t len, uint64_t *out_id)
 	const size_t ssz = slot_size_for((uint16_t)len);
 
 	if (write_cursor + ssz > st.peb_size) {
-		LOG_WRN("bucket %u full (cursor 0x%lx + %zu > %zu); "
-			"compaction not yet implemented (stage 5)",
-			bid, (unsigned long)write_cursor, ssz, st.peb_size);
-		return -ENOSPC;
+		rc = compact_bucket(bid);
+		if (rc < 0) {
+			return rc;
+		}
+		rc = read_bucket(bid, bbuf);
+		if (rc < 0) {
+			return rc;
+		}
+		struct bucket_walk w;
+		walk_bucket(bbuf, 0, &w);
+		write_cursor = w.write_cursor;
+		if (write_cursor + ssz > st.peb_size) {
+			LOG_WRN("bucket %u still full after compaction", bid);
+			return -ENOSPC;
+		}
 	}
 
 	rc = append_slot(bid, write_cursor, id, 0, payload, (uint16_t)len);
@@ -659,13 +897,30 @@ int blob_db_update(uint64_t id, const void *payload, size_t len)
 	}
 
 	const size_t ssz = slot_size_for((uint16_t)len);
+	off_t write_cursor = w.write_cursor;
 
-	if (w.write_cursor + ssz > st.peb_size) {
-		LOG_WRN("bucket %u full; compaction not yet implemented", bid);
-		return -ENOSPC;
+	if (write_cursor + ssz > st.peb_size) {
+		rc = compact_bucket(bid);
+		if (rc < 0) {
+			return rc;
+		}
+		rc = read_bucket(bid, bbuf);
+		if (rc < 0) {
+			return rc;
+		}
+		walk_bucket(bbuf, id, &w);
+		if (w.target_slot_off < 0 ||
+		    (w.target_flags & BLOB_DB_SLOT_F_TOMBSTONE)) {
+			/* Shouldn't happen — we just confirmed it was live. */
+			return -EIO;
+		}
+		write_cursor = w.write_cursor;
+		if (write_cursor + ssz > st.peb_size) {
+			return -ENOSPC;
+		}
 	}
 
-	rc = append_slot(bid, w.write_cursor, id, 0, payload, (uint16_t)len);
+	rc = append_slot(bid, write_cursor, id, 0, payload, (uint16_t)len);
 	if (rc < 0) {
 		return rc;
 	}
@@ -707,13 +962,30 @@ int blob_db_delete(uint64_t id)
 	}
 
 	const size_t ssz = slot_size_for(0);
+	off_t write_cursor = w.write_cursor;
 
-	if (w.write_cursor + ssz > st.peb_size) {
-		LOG_WRN("bucket %u full; compaction not yet implemented", bid);
-		return -ENOSPC;
+	if (write_cursor + ssz > st.peb_size) {
+		rc = compact_bucket(bid);
+		if (rc < 0) {
+			return rc;
+		}
+		rc = read_bucket(bid, bbuf);
+		if (rc < 0) {
+			return rc;
+		}
+		walk_bucket(bbuf, id, &w);
+		if (w.target_slot_off < 0 ||
+		    (w.target_flags & BLOB_DB_SLOT_F_TOMBSTONE)) {
+			/* Compaction dropped this id — already deleted. */
+			return -ENOENT;
+		}
+		write_cursor = w.write_cursor;
+		if (write_cursor + ssz > st.peb_size) {
+			return -ENOSPC;
+		}
 	}
 
-	rc = append_slot(bid, w.write_cursor, id,
+	rc = append_slot(bid, write_cursor, id,
 			 BLOB_DB_SLOT_F_TOMBSTONE, NULL, 0);
 	if (rc < 0) {
 		return rc;

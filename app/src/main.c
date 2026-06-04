@@ -60,6 +60,32 @@ static void smoke(void)
 		blob_db_exists(9999) ? "true" : "false");
 }
 
+/* Pound id_hello with updates to force at least one bucket compaction
+ * (slot size ~17 B at 3-byte payloads → ~240 fit in a 4 KB bucket). */
+static void compact_test(uint64_t id, int iters)
+{
+	char buf[8];
+	size_t got;
+
+	LOG_INF("compact_test: %d updates to id=%llu",
+		iters, (unsigned long long)id);
+
+	for (int i = 0; i < iters; i++) {
+		char val[8];
+		int n = snprintk(val, sizeof(val), "v%04d", i);
+		int rc = blob_db_update(id, val, n);
+		if (rc < 0) {
+			LOG_ERR("update #%d failed: %d", i, rc);
+			return;
+		}
+	}
+
+	int rc = blob_db_get(id, buf, sizeof(buf), &got);
+	buf[got < sizeof(buf) ? got : sizeof(buf) - 1] = 0;
+	LOG_INF("after %d updates, get %llu -> '%s' rc=%d",
+		iters, (unsigned long long)id, buf, rc);
+}
+
 int main(void)
 {
 	printk("Zephyr Key-Value DB %s\n", APP_VERSION_STRING);
@@ -72,6 +98,7 @@ int main(void)
 	LOG_INF("blob_db mounted");
 
 	smoke();
+	compact_test(1, 500);
 
 	blob_db_unmount();
 	LOG_INF("blob_db unmounted; bye");
