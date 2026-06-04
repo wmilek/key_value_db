@@ -338,44 +338,417 @@ int blob_db_unmount(void)
 	return 0;
 }
 
-/* Stage 4 stubs --------------------------------------------------------- */
+/* Stage 4 — put / get / update / delete / exists ------------------------ */
+
+/* Maximum sector size we support. Bucket buffers are sized to this on the
+ * stack inside each op. */
+#define BLOB_DB_SECTOR_BUF_MAX 4096
+
+static inline size_t slot_size_for(uint16_t val_len)
+{
+	/* v1: no write-block padding (native_sim has W=1). */
+	return BLOB_DB_SLOT_OVERHEAD + val_len;
+}
+
+static inline off_t bucket_offset(uint16_t bid)
+{
+	return peb_offset(BLOB_DB_FIRST_BUCKET + bid);
+}
+
+static inline uint16_t id_to_bucket(uint64_t id)
+{
+	return (uint16_t)(id % st.n_buckets);
+}
+
+/* CRC16-CCITT(0xFFFF) over slot_hdr + id + payload. */
+static uint16_t slot_crc16(const struct blob_db_slot_hdr *hdr, uint64_t id,
+			    const void *payload, uint16_t val_len)
+{
+	uint16_t c = crc16_ccitt(0xffff, (const uint8_t *)hdr, sizeof(*hdr));
+
+	c = crc16_ccitt(c, (const uint8_t *)&id, sizeof(id));
+	if (val_len > 0) {
+		c = crc16_ccitt(c, (const uint8_t *)payload, val_len);
+	}
+	return c;
+}
+
+static bool bucket_hdr_valid(const uint8_t *buf, uint16_t bid)
+{
+	const struct blob_db_bucket_hdr *bhdr =
+		(const struct blob_db_bucket_hdr *)buf;
+
+	if (memcmp(bhdr->magic, BUCKET_MAGIC, 4) != 0) {
+		return false;
+	}
+	if (bhdr->hdr_crc32 != hdr_crc32(bhdr, sizeof(*bhdr))) {
+		return false;
+	}
+	if (bhdr->bucket_id != bid) {
+		return false;
+	}
+	return true;
+}
+
+struct bucket_walk {
+	off_t    write_cursor;     /* end of valid slots in the bucket */
+	off_t    target_slot_off;  /* -1 if target_id not present */
+	uint8_t  target_flags;
+	uint16_t target_val_len;
+};
+
+/* Walk a bucket buffer, identifying the write cursor and (latest) slot for
+ * target_id. Slot CRC validation is performed inline; on CRC failure the
+ * walk truncates the bucket at that offset. */
+static void walk_bucket(const uint8_t *buf, uint64_t target_id,
+			struct bucket_walk *r)
+{
+	r->target_slot_off = -1;
+	r->target_flags = 0;
+	r->target_val_len = 0;
+
+	off_t cursor = BLOB_DB_BUCKET_DATA_OFF;
+	const size_t min_slot = BLOB_DB_SLOT_OVERHEAD;
+
+	while (cursor + min_slot <= st.peb_size) {
+		const struct blob_db_slot_hdr *shdr =
+			(const struct blob_db_slot_hdr *)(buf + cursor);
+
+		if (shdr->flags == 0xff) {
+			break;
+		}
+		if (!(shdr->flags & BLOB_DB_SLOT_F_SEALED)) {
+			break;
+		}
+		if (shdr->val_len > CONFIG_BLOB_DB_MAX_PAYLOAD_LEN) {
+			break;
+		}
+
+		const size_t ssz = slot_size_for(shdr->val_len);
+
+		if (cursor + ssz > st.peb_size) {
+			break;
+		}
+
+		uint64_t slot_id;
+		memcpy(&slot_id, buf + cursor + sizeof(*shdr), sizeof(slot_id));
+		const uint8_t *payload = buf + cursor + sizeof(*shdr) +
+					 sizeof(slot_id);
+		uint16_t stored_crc;
+		memcpy(&stored_crc, buf + cursor + ssz - sizeof(stored_crc),
+		       sizeof(stored_crc));
+
+		if (slot_crc16(shdr, slot_id, payload, shdr->val_len) !=
+		    stored_crc) {
+			break;
+		}
+
+		if (slot_id == target_id) {
+			r->target_slot_off = cursor;
+			r->target_flags = shdr->flags;
+			r->target_val_len = shdr->val_len;
+		}
+
+		cursor += ssz;
+	}
+
+	r->write_cursor = cursor;
+}
+
+static int read_bucket(uint16_t bid, uint8_t *buf)
+{
+	return flash_area_read(st.fa, bucket_offset(bid), buf, st.peb_size);
+}
+
+static int format_bucket(uint16_t bid)
+{
+	int rc = flash_area_erase(st.fa, bucket_offset(bid), st.peb_size);
+
+	if (rc < 0) {
+		LOG_ERR("bucket %u erase: %d", bid, rc);
+		return rc;
+	}
+
+	struct blob_db_bucket_hdr bhdr = {
+		.bucket_id = bid,
+		.reserved  = 0,
+		.gen       = 1,
+	};
+	memcpy(bhdr.magic, BUCKET_MAGIC, 4);
+	bhdr.hdr_crc32 = hdr_crc32(&bhdr, sizeof(bhdr));
+
+	rc = flash_area_write(st.fa, bucket_offset(bid), &bhdr, sizeof(bhdr));
+	if (rc < 0) {
+		LOG_ERR("bucket %u header write: %d", bid, rc);
+	}
+	return rc;
+}
+
+/* Build and write a slot at bucket+write_cursor. */
+static int append_slot(uint16_t bid, off_t write_cursor, uint64_t id,
+		       uint8_t extra_flags, const void *payload,
+		       uint16_t val_len)
+{
+	uint8_t buf[BLOB_DB_SLOT_OVERHEAD + CONFIG_BLOB_DB_MAX_PAYLOAD_LEN];
+
+	struct blob_db_slot_hdr *shdr = (struct blob_db_slot_hdr *)buf;
+
+	shdr->flags    = BLOB_DB_SLOT_F_SEALED | extra_flags;
+	shdr->reserved = 0;
+	shdr->val_len  = val_len;
+
+	memcpy(buf + sizeof(*shdr), &id, sizeof(id));
+	if (val_len > 0) {
+		memcpy(buf + sizeof(*shdr) + sizeof(id), payload, val_len);
+	}
+
+	uint16_t crc = slot_crc16(shdr, id, payload, val_len);
+	const size_t crc_off = sizeof(*shdr) + sizeof(id) + val_len;
+
+	memcpy(buf + crc_off, &crc, sizeof(crc));
+
+	const size_t total = slot_size_for(val_len);
+
+	return flash_area_write(st.fa, bucket_offset(bid) + write_cursor,
+				buf, total);
+}
 
 int blob_db_put(const void *payload, size_t len, uint64_t *out_id)
 {
-	ARG_UNUSED(payload);
-	ARG_UNUSED(len);
-	ARG_UNUSED(out_id);
-	return -ENOSYS;
+	if (!st.mounted) {
+		return -ENODEV;
+	}
+	if (!out_id) {
+		return -EINVAL;
+	}
+	if (len > CONFIG_BLOB_DB_MAX_PAYLOAD_LEN) {
+		return -EINVAL;
+	}
+	if (len > 0 && !payload) {
+		return -EINVAL;
+	}
+
+	const uint64_t id = st.next_id;
+	const uint16_t bid = id_to_bucket(id);
+	uint8_t bbuf[BLOB_DB_SECTOR_BUF_MAX];
+
+	int rc = read_bucket(bid, bbuf);
+	if (rc < 0) {
+		return rc;
+	}
+
+	off_t write_cursor;
+
+	if (!bucket_hdr_valid(bbuf, bid)) {
+		rc = format_bucket(bid);
+		if (rc < 0) {
+			return rc;
+		}
+		write_cursor = BLOB_DB_BUCKET_DATA_OFF;
+	} else {
+		struct bucket_walk w;
+		walk_bucket(bbuf, 0 /* no target */, &w);
+		write_cursor = w.write_cursor;
+	}
+
+	const size_t ssz = slot_size_for((uint16_t)len);
+
+	if (write_cursor + ssz > st.peb_size) {
+		LOG_WRN("bucket %u full (cursor 0x%lx + %zu > %zu); "
+			"compaction not yet implemented (stage 5)",
+			bid, (unsigned long)write_cursor, ssz, st.peb_size);
+		return -ENOSPC;
+	}
+
+	rc = append_slot(bid, write_cursor, id, 0, payload, (uint16_t)len);
+	if (rc < 0) {
+		return rc;
+	}
+
+	st.next_id = id + 1;
+	*out_id = id;
+	LOG_DBG("put id=%llu bid=%u off=0x%lx len=%zu",
+		(unsigned long long)id, bid,
+		(unsigned long)write_cursor, len);
+	return 0;
 }
 
 int blob_db_get(uint64_t id, void *out, size_t out_sz, size_t *out_len)
 {
-	ARG_UNUSED(id);
-	ARG_UNUSED(out);
-	ARG_UNUSED(out_sz);
-	ARG_UNUSED(out_len);
-	return -ENOSYS;
+	if (!st.mounted) {
+		return -ENODEV;
+	}
+	if (out_sz > 0 && !out) {
+		return -EINVAL;
+	}
+	if (id == 0) {
+		return -ENOENT;
+	}
+
+	const uint16_t bid = id_to_bucket(id);
+	uint8_t bbuf[BLOB_DB_SECTOR_BUF_MAX];
+
+	int rc = read_bucket(bid, bbuf);
+	if (rc < 0) {
+		return rc;
+	}
+
+	if (!bucket_hdr_valid(bbuf, bid)) {
+		return -ENOENT;
+	}
+
+	struct bucket_walk w;
+	walk_bucket(bbuf, id, &w);
+
+	if (w.target_slot_off < 0) {
+		return -ENOENT;
+	}
+	if (w.target_flags & BLOB_DB_SLOT_F_TOMBSTONE) {
+		return -ENOENT;
+	}
+	if (out_sz < w.target_val_len) {
+		return -ENOMEM;
+	}
+
+	if (w.target_val_len > 0) {
+		const off_t payload_off = w.target_slot_off +
+					  sizeof(struct blob_db_slot_hdr) +
+					  sizeof(uint64_t);
+		memcpy(out, bbuf + payload_off, w.target_val_len);
+	}
+	if (out_len) {
+		*out_len = w.target_val_len;
+	}
+	return 0;
 }
 
 int blob_db_update(uint64_t id, const void *payload, size_t len)
 {
-	ARG_UNUSED(id);
-	ARG_UNUSED(payload);
-	ARG_UNUSED(len);
-	return -ENOSYS;
+	if (!st.mounted) {
+		return -ENODEV;
+	}
+	if (id == 0) {
+		return -ENOENT;
+	}
+	if (len > CONFIG_BLOB_DB_MAX_PAYLOAD_LEN) {
+		return -EINVAL;
+	}
+	if (len > 0 && !payload) {
+		return -EINVAL;
+	}
+
+	const uint16_t bid = id_to_bucket(id);
+	uint8_t bbuf[BLOB_DB_SECTOR_BUF_MAX];
+
+	int rc = read_bucket(bid, bbuf);
+	if (rc < 0) {
+		return rc;
+	}
+	if (!bucket_hdr_valid(bbuf, bid)) {
+		return -ENOENT;
+	}
+
+	struct bucket_walk w;
+	walk_bucket(bbuf, id, &w);
+
+	if (w.target_slot_off < 0) {
+		return -ENOENT;
+	}
+	if (w.target_flags & BLOB_DB_SLOT_F_TOMBSTONE) {
+		return -ENOENT;
+	}
+
+	const size_t ssz = slot_size_for((uint16_t)len);
+
+	if (w.write_cursor + ssz > st.peb_size) {
+		LOG_WRN("bucket %u full; compaction not yet implemented", bid);
+		return -ENOSPC;
+	}
+
+	rc = append_slot(bid, w.write_cursor, id, 0, payload, (uint16_t)len);
+	if (rc < 0) {
+		return rc;
+	}
+
+	LOG_DBG("update id=%llu bid=%u off=0x%lx len=%zu",
+		(unsigned long long)id, bid,
+		(unsigned long)w.write_cursor, len);
+	return 0;
 }
 
 int blob_db_delete(uint64_t id)
 {
-	ARG_UNUSED(id);
-	return -ENOSYS;
+	if (!st.mounted) {
+		return -ENODEV;
+	}
+	if (id == 0) {
+		return -ENOENT;
+	}
+
+	const uint16_t bid = id_to_bucket(id);
+	uint8_t bbuf[BLOB_DB_SECTOR_BUF_MAX];
+
+	int rc = read_bucket(bid, bbuf);
+	if (rc < 0) {
+		return rc;
+	}
+	if (!bucket_hdr_valid(bbuf, bid)) {
+		return -ENOENT;
+	}
+
+	struct bucket_walk w;
+	walk_bucket(bbuf, id, &w);
+
+	if (w.target_slot_off < 0) {
+		return -ENOENT;
+	}
+	if (w.target_flags & BLOB_DB_SLOT_F_TOMBSTONE) {
+		return -ENOENT;
+	}
+
+	const size_t ssz = slot_size_for(0);
+
+	if (w.write_cursor + ssz > st.peb_size) {
+		LOG_WRN("bucket %u full; compaction not yet implemented", bid);
+		return -ENOSPC;
+	}
+
+	rc = append_slot(bid, w.write_cursor, id,
+			 BLOB_DB_SLOT_F_TOMBSTONE, NULL, 0);
+	if (rc < 0) {
+		return rc;
+	}
+
+	LOG_DBG("delete id=%llu bid=%u off=0x%lx",
+		(unsigned long long)id, bid,
+		(unsigned long)w.write_cursor);
+	return 0;
 }
 
 bool blob_db_exists(uint64_t id)
 {
-	ARG_UNUSED(id);
-	return false;
+	if (!st.mounted || id == 0) {
+		return false;
+	}
+
+	const uint16_t bid = id_to_bucket(id);
+	uint8_t bbuf[BLOB_DB_SECTOR_BUF_MAX];
+
+	if (read_bucket(bid, bbuf) < 0) {
+		return false;
+	}
+	if (!bucket_hdr_valid(bbuf, bid)) {
+		return false;
+	}
+
+	struct bucket_walk w;
+	walk_bucket(bbuf, id, &w);
+
+	return w.target_slot_off >= 0 &&
+	       !(w.target_flags & BLOB_DB_SLOT_F_TOMBSTONE);
 }
+
+/* Stage 6 stubs --------------------------------------------------------- */
 
 size_t blob_db_count(void)
 {

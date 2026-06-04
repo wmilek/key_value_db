@@ -3,6 +3,8 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+#include <string.h>
+
 #include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
 
@@ -11,6 +13,52 @@
 #include <app_version.h>
 
 LOG_MODULE_REGISTER(main, CONFIG_APP_LOG_LEVEL);
+
+static void smoke(void)
+{
+	uint64_t id_hello = 0, id_world = 0, id_big = 0;
+	char buf[64];
+	size_t got;
+	int rc;
+
+	rc = blob_db_put("hello", 5, &id_hello);
+	LOG_INF("put 'hello' -> id=%llu rc=%d", (unsigned long long)id_hello, rc);
+
+	rc = blob_db_put("world", 5, &id_world);
+	LOG_INF("put 'world' -> id=%llu rc=%d", (unsigned long long)id_world, rc);
+
+	const char big[] = "the quick brown fox jumps over the lazy dog";
+	rc = blob_db_put(big, strlen(big), &id_big);
+	LOG_INF("put '<43B>' -> id=%llu rc=%d", (unsigned long long)id_big, rc);
+
+	rc = blob_db_get(id_hello, buf, sizeof(buf), &got);
+	buf[got < sizeof(buf) ? got : sizeof(buf) - 1] = 0;
+	LOG_INF("get %llu -> rc=%d '%s' (%zu)",
+		(unsigned long long)id_hello, rc, buf, got);
+
+	rc = blob_db_update(id_hello, "HELLO!", 6);
+	LOG_INF("update %llu rc=%d", (unsigned long long)id_hello, rc);
+
+	rc = blob_db_get(id_hello, buf, sizeof(buf), &got);
+	buf[got < sizeof(buf) ? got : sizeof(buf) - 1] = 0;
+	LOG_INF("get %llu (post-update) -> rc=%d '%s' (%zu)",
+		(unsigned long long)id_hello, rc, buf, got);
+
+	rc = blob_db_delete(id_world);
+	LOG_INF("delete %llu rc=%d", (unsigned long long)id_world, rc);
+
+	rc = blob_db_get(id_world, buf, sizeof(buf), &got);
+	LOG_INF("get %llu (post-delete) -> rc=%d", (unsigned long long)id_world, rc);
+
+	rc = blob_db_delete(id_world);
+	LOG_INF("delete %llu (already deleted) -> rc=%d",
+		(unsigned long long)id_world, rc);
+
+	LOG_INF("exists %llu = %s", (unsigned long long)id_big,
+		blob_db_exists(id_big) ? "true" : "false");
+	LOG_INF("exists 9999 = %s",
+		blob_db_exists(9999) ? "true" : "false");
+}
 
 int main(void)
 {
@@ -23,7 +71,7 @@ int main(void)
 	}
 	LOG_INF("blob_db mounted");
 
-	/* Stage 3: nothing else to do; subsequent stages will exercise the API. */
+	smoke();
 
 	blob_db_unmount();
 	LOG_INF("blob_db unmounted; bye");
