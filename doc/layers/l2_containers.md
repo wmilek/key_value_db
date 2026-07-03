@@ -41,7 +41,7 @@ traces, per-crash-point residue tables, and the recovery procedure — by the
 
 1. **Stage** — record the mutation in the container's intent blob
    (id watermark `W` + delete set);
-2. **Prepare** — N × `put` of every new object, still unreferenced;
+2. **Prepare** — N × (`alloc_id` + bind `update`) of every new object, still unreferenced;
 3. **Commit** — exactly **one** `update` of the i-node that makes them
    reachable: the single linearization point;
 4. **Cleanup** — M × `delete` of the superseded objects;
@@ -120,7 +120,7 @@ root { magic 'CKVL', count, (key_id, val_id)[count] }
 ```
 
 Every mutation rewrites the pair list and commits it with a **single `update`
-of the root**, with key/value `put`s before it and `delete`s after it as
+of the root**, with key/value alloc-and-bind `update`s before it and `delete`s after it as
 prepare/cleanup — exactly the traces in the model-container document §8 (and
 its §3.4 in-place fast path whenever the value blob is exclusively owned).
 
@@ -166,7 +166,7 @@ root { magic 'CKVT', height, top_id, count }
 node { nkeys, child_id[…], (klen,key,val_id|val)[…] }      one i-node per node
 ```
 
-Mutations rewrite the root→leaf path copy-on-write per §2.2 — depth+1 `put`s,
+Mutations rewrite the root→leaf path copy-on-write per §2.2 — depth+1 alloc-and-binds,
 one root `update` as the commit, then dead-path `delete`s. At fan-out 8, 100k
 keys ⇒ depth ≈ 6 ⇒ ~6 flash reads per lookup. Splits/merges follow standard
 B-tree rules, still committed by the single root write.

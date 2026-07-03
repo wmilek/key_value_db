@@ -50,30 +50,35 @@ the id = 1 root — P5). Everything is reachable from it.
 ### 3.1 Create — the container comes into existence
 
 ```
-blob_db_put(empty pair list) → list_id        ← one atomic operation
+list_id = blob_db_alloc_id()                  ← RAM only, nothing on flash
+blob_db_update(list_id, empty pair list)      ← one atomic write: binds the root
 ```
 
-The container exists from the moment this single `put` commits; the client
-persists `list_id` (as id = 1, or in the id = 1 root). Crash before it: no
-container, no residue. Crash after: an empty, fully valid container.
+The container exists from the moment the `update` commits; the client
+persists `list_id` (as id = 1, or in the id = 1 root). Crash before the bind:
+an allocated id and nothing on flash — no residue at all. Crash after: an
+empty, fully valid container.
 
 ### 3.2 First insert — `set("foo", "bar")`
 
 New data means new i-nodes, and the one ordering rule of the basic flow is:
-**create the referenced blobs first, make them reachable last** — the commit
-is the final, single `update`:
+**bind the referenced blobs first, make them reachable last** — the commit
+is the final `update` of the list:
 
 ```
-step 1  kid = blob_db_put("foo")                    new blob, unreferenced so far
-step 2  vid = blob_db_put("bar")                    new blob, unreferenced so far
-step 3  blob_db_update(list_id, …+(kid,vid))        COMMIT — atomic (spec §2)
+step 1  kid = blob_db_alloc_id()                    ┐ RAM only — a crash here
+        vid = blob_db_alloc_id()                    ┘ leaves nothing on flash
+step 2  blob_db_update(kid, "foo")                  new blob, unreferenced so far
+step 3  blob_db_update(vid, "bar")                  new blob, unreferenced so far
+step 4  blob_db_update(list_id, …+(kid,vid))        COMMIT — atomic (spec §2)
 ```
 
 | Crash after | Visible state on remount | Leftover on flash |
 |---|---|---|
-| step 1 | list unchanged, `get("foo")` → not found | `kid`, unreferenced |
-| step 2 | list unchanged, `get("foo")` → not found | `kid`, `vid`, unreferenced |
-| step 3 | `get("foo")` → "bar", mutation complete | none |
+| step 1 | list unchanged, `get("foo")` → not found | none (ids burned, free) |
+| step 2 | list unchanged, `get("foo")` → not found | `kid`, unreferenced |
+| step 3 | list unchanged, `get("foo")` → not found | `kid`, `vid`, unreferenced |
+| step 4 | `get("foo")` → "bar", mutation complete | none |
 
 Correctness is already perfect: at every crash point a reader or remount sees
 the complete old or the complete new mapping — never a torn list, never a
@@ -141,12 +146,13 @@ The intent blob is created once, together with the container; its id is
 stored in the root and never changes (id stability — the journal is only ever
 `update`d). It is empty whenever no mutation is in flight.
 
-Recovery is built on `blob_db_next_id()` (spec §9) — a pure-RAM accessor for
-the next id `put` would assign. Because ids are strictly monotonic and never
-reused across any crash (spec §2, §7.1/§7.6), the value `W` read before a
-mutation is a **watermark**: every blob the mutation creates has id ≥ W, and
-nothing else in the database does. Durability of `W` comes from writing it
-into the intent blob, not from the accessor.
+Recovery is built on `blob_db_alloc_id()` (spec §9). Because ids are strictly
+monotonic and never reused across any crash (spec §2, §7.1/§7.6), the
+mutation's **first allocation is its watermark**: `W = alloc_id()`, and every
+id the mutation allocates afterwards is > W — while nothing else in the
+database has an id ≥ W. (`W` itself is never bound; recovery's `delete(W)`
+hits `-ENOENT`, which it tolerates.) Durability of `W` comes from writing it
+into the intent blob, not from the allocation.
 
 ### 4.1 Crash-residue requirements (P7 applied)
 
@@ -164,10 +170,11 @@ Every reference-graph mutation follows one shape; each step is an
 individually atomic `blob_db` call:
 
 ```
-step 0  W = blob_db_next_id()                     (RAM read, no I/O)
+step 0  W = alloc_id()                    (RAM only — the watermark)
 step 1  update(intent_id, {W, del[]})     STAGE   declare the mutation durable:
                                                   "ids ≥ W are mine; del[] dies on commit"
-step 2  N × put(new objects)              PREPARE all get ids ≥ W, unreferenced so far
+step 2  N × (alloc_id + update)           PREPARE new blobs, all ids > W,
+                                                  unreferenced so far
 step 3  one update(list_id, new image)    COMMIT  the linearization point
 step 4  M × delete(del[])                 CLEANUP superseded blobs removed
 step 5  update(intent_id, {})             CLEAR   mutation sealed
@@ -233,14 +240,14 @@ carried:
 
 ### 8.1 Insert — `set("foo", "bar")`
 
-The first insert of §3.2, completed: the same three calls, wrapped in
+The first insert of §3.2, completed: the same calls, wrapped in
 stage/clear so the leftovers of its crash table become reclaimable.
 
 ```
-0  W = blob_db_next_id()
+0  W = blob_db_alloc_id()                             (RAM only)
 1  blob_db_update(intent_id, {W})                     STAGE
-2  kid = blob_db_put("foo")                           PREPARE
-3  vid = blob_db_put("bar")                           PREPARE
+2  kid = blob_db_alloc_id(); blob_db_update(kid, "foo")   PREPARE
+3  vid = blob_db_alloc_id(); blob_db_update(vid, "bar")   PREPARE
 4  blob_db_update(list_id, […, (kid,vid)])            COMMIT
 5  blob_db_update(intent_id, {})                      CLEAR
 ```
@@ -260,9 +267,9 @@ in-place change would leak to other referrers, or the store follows the
 immutable profile (spec Appendix C).
 
 ```
-0  W = blob_db_next_id()
+0  W = blob_db_alloc_id()                             (RAM only)
 1  blob_db_update(intent_id, {W, del:[vid]})          STAGE
-2  vid2 = blob_db_put("baz")                          PREPARE
+2  vid2 = blob_db_alloc_id(); blob_db_update(vid2, "baz")   PREPARE
 3  blob_db_update(list_id, […(kid,vid2)…])            COMMIT
 4  blob_db_delete(vid)                                CLEANUP
 5  blob_db_update(intent_id, {})                      CLEAR
@@ -279,7 +286,7 @@ immutable profile (spec Appendix C).
 ### 8.3 Delete — `del("foo")`
 
 ```
-0  W = blob_db_next_id()
+0  W = blob_db_alloc_id()                             (RAM only)
 1  blob_db_update(intent_id, {W, del:[kid,vid]})      STAGE
 2  blob_db_update(list_id, list without (kid,vid))    COMMIT
 3  blob_db_delete(kid)                                CLEANUP

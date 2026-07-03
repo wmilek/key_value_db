@@ -30,7 +30,7 @@ L2/L3 are specified, pre-implementation.
 │      data structures wired out of i-nodes                            │
 ├──────────────────────────────────────────────────────────────────────┤
 │  L1  i-node allocation      blob_db: stable u64 id → blob            │  the always-present core
-│      crash-atomic put/get/update/delete by id                        │
+│      crash-atomic alloc_id/update/get/delete by id                        │
 ├──────────────────────────────────────────────────────────────────────┤
 │  L0  Flash translation      flash_area today · UBI-like FTL later    │  swappable provider
 │      erase blocks, alignment, (wear/bad blocks in FTL form)          │

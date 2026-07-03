@@ -31,7 +31,7 @@ This project delivers a single Zephyr library module: **`lib/blob_db`** — an e
 │    e.g. list / tree / hash of (name → blob id), each node   │
 │    persisted as its own blob.                                │
 └─────────────────────────────────────────────────────────────┘
-                            │   put / get / update / delete  (by u64 id)
+                            │   alloc_id / update / get / delete  (by u64 id)
                             ▼
 ┌─────────────────────────────────────────────────────────────┐
 │  blob_db                       (lib/blob_db)                │
@@ -56,11 +56,12 @@ This is the load-bearing promise of the library — clients build on top of it.
 
 | Property | Guarantee |
 |---|---|
-| **Id assignment** | `put` returns a u64 id that is currently unused, never previously assigned in the lifetime of this DB, and ≥ the id returned by any prior `put`. |
-| **Id stability** | Once an id is returned, it refers to the same logical blob until that id is `delete`d. `update` keeps the id; only the payload changes. |
+| **Id allocation** | `alloc_id` returns a u64 id never returned before in the lifetime of this DB — across all crashes — and strictly greater than every previously returned id. Allocation itself is a RAM operation. |
+| **Id lifecycle** | *allocated* (fresh from `alloc_id`, nothing on flash) → *bound* (first `update` writes content) → rebound (further `update`s) → *dead* (`delete`). After `delete` the id **ceases to exist**: `get`/`exists`/`delete` on it are defined (`-ENOENT`/false), but `update` on it is **undefined behavior** — a debug build may assert. Likewise UB: `update` on an id never allocated. |
+| **Id stability** | A bound id refers to the same logical blob until `delete`d. `update` keeps the id; only the payload changes. |
 | **Compaction transparency** | Compaction may move slots within a bucket and may erase tombstones, but **ids never change**. A blob you can `get` today is reachable by the same id after any number of compactions. |
-| **No reuse** | After `delete(id)`, that id is never assigned to another blob. The next assigned id is strictly greater than every id ever seen. |
-| **Atomicity of single operations** | Each `put`/`update`/`delete` is atomic with respect to crash: either it takes effect fully or it doesn't (on next mount). Partial writes are detected and discarded. |
+| **No reuse** | A dead id is never returned by `alloc_id` again. The next allocated id is strictly greater than every id ever seen. |
+| **Atomicity of single operations** | Each `update`/`delete` is atomic with respect to crash: either it takes effect fully or it doesn't (on next mount). Partial writes are detected and discarded. |
 | **No partial reads** | `get` either returns the complete payload that was committed at some point, or returns `-ENOENT`/`-EIO`. It never returns partial bytes from an in-flight write. |
 
 These together make ids usable as **persistent references** — foreign keys for client-owned indexes, parent/child pointers in client trees, etc.
@@ -72,12 +73,13 @@ blobs — is demonstrated operation by operation in the companion document
 
 ### Root convention
 
-The very first successful `put` after a fresh format returns **id = 1**. Clients use id = 1 as their persistent root pointer:
+The very first `alloc_id` after a fresh format returns **id = 1**. Clients use id = 1 as their persistent root pointer:
 
 ```
-First boot:  blob_db_put(initial_root_blob, ..., &id)   →  id = 1
-Later:       blob_db_update(1, new_root_blob, ...)      ← keeps id = 1
-On mount:    blob_db_get(1, ...)                        ← always finds the latest root
+First boot:  id = blob_db_alloc_id()                     →  id = 1
+             blob_db_update(1, initial_root_blob, ...)   ← binds the root
+Later:       blob_db_update(1, new_root_blob, ...)       ← keeps id = 1
+On mount:    blob_db_get(1, ...)                         ← always finds the latest root
 ```
 
 Because `update` is id-stable, id = 1 always names "the latest version of the client's root". No extra library API needed; convention does it.
@@ -99,9 +101,9 @@ These constraints from earlier iterations still hold:
 | Op | Flash reads | Flash writes | RAM (transient) |
 |---|---|---|---|
 | `mount` | 2 (master A + B) + 2045 (bucket header scan)¹ | 0 (or formatting if first ever) | O(1) |
-| `put(payload, len)` | 0 | 1 (entry) + occasional bucket-compact | 4 KB stack only during compact |
+| `alloc_id()` | 0 | 0 (occasional id-hint persist) | O(1) |
 | `get(id)` | **1** (one bucket sector) | 0 | 4 KB stack |
-| `update(id, payload, len)` | 0 (or 1 to verify existence)² | 1 (new entry; old becomes garbage) + occasional compact | 4 KB stack |
+| `update(id, payload, len)` | 0² | 1 (entry; on rebind the old slot becomes garbage) + occasional compact | 4 KB stack |
 | `delete(id)` | 1 (verify presence) | 1 (tombstone) | 4 KB stack |
 | `exists(id)` | 1 | 0 | 4 KB stack |
 | `count` | 2045 (full bucket scan) | 0 | O(1) |
@@ -109,7 +111,7 @@ These constraints from earlier iterations still hold:
 | `compact_bucket` | 1 + master writes | 1 scratch + 1 bucket restore + 2 master | O(1) |
 
 ¹ Mount scans all buckets to recover per-bucket write cursors and the global max id. ~8 MB of reads; ≈100–200 ms on real flash.
-² `update` can skip the existence check at the cost of allowing "update a deleted id to undelete it" semantics; choose strict-by-default.
+² Release builds perform no existence check — `update` on a dead id is undefined behavior (§2). A debug build may spend one bucket read to verify the id is allocated-and-not-dead and assert otherwise.
 
 ---
 
@@ -238,7 +240,7 @@ if master_state == COMPACTING:
 max_id_seen = next_id_hint
 for bid in [0 .. N):
     open bucket bid
-    if bucket header invalid: bucket is "unformatted"; will format on first put
+    if bucket header invalid: bucket is "unformatted"; will format on first bind
     else:
         cursor = 0x10
         while cursor + sizeof(slot_hdr) <= sector_end:
@@ -256,30 +258,35 @@ next_id = max_id_seen + 1
 
 Total mount cost: ~2 master reads + 2045 sector reads ≈ 8 MB of reads. The bucket scans read full 4 KB sectors (not just headers) because each slot's `val_len` is needed to skip to the next slot. ≈100–200 ms on typical NOR.
 
-### 7.2 `put(payload, len) → id`
+### 7.2 `alloc_id() → id`, and the write path of `update` (first bind)
 
 ```
-id = next_id++
-bid = id % N
+alloc_id():
+    id = next_id++
+    # occasionally persist next_id (e.g. every 256 allocations) to bound
+    # the mount scan:
+    if (next_id & 0xff) == 0:
+        persist next_id_hint = next_id via master write
+    return id
 
-ensure bucket bid is formatted (write bucket header if first use)
-slot_sz = round_up(14 + len, W)
-if write_cursor[bid] + slot_sz > sector_end:
-    compact_bucket(bid)
-    if still no room: return -ENOSPC
+update(id, payload, len):            # first bind — id has no slot yet
+    bid = id % N
 
-build slot in stack buffer (slot_sz ≤ 14 + MAX_PAYLOAD_LEN + W bytes)
-flash_area_write(fa, bucket_offset(bid) + write_cursor[bid], buf, slot_sz)
-write_cursor[bid] += slot_sz
+    ensure bucket bid is formatted (write bucket header if first use)
+    slot_sz = round_up(14 + len, W)
+    if write_cursor[bid] + slot_sz > sector_end:
+        compact_bucket(bid)
+        if still no room: return -ENOSPC
 
-# occasionally persist next_id (e.g. every 256 inserts) to bound mount scan:
-if (next_id & 0xff) == 0:
-    persist next_id_hint = next_id via master write
-
-return id
+    build slot in stack buffer (slot_sz ≤ 14 + MAX_PAYLOAD_LEN + W bytes)
+    flash_area_write(fa, bucket_offset(bid) + write_cursor[bid], buf, slot_sz)
+    write_cursor[bid] += slot_sz
+    return 0
 ```
 
-No duplicate-id check is needed — `next_id` is monotonic.
+No duplicate-id check is needed — `next_id` is monotonic. A rebind (§7.4)
+uses the same append path; the two differ only in whether an older slot for
+the id exists and becomes garbage.
 
 ### 7.3 `get(id, out, out_sz, *out_len)`
 
@@ -300,10 +307,11 @@ return 0
 
 Single flash read; in-RAM scan of one sector. Independent of total entry count.
 
-### 7.4 `update(id, payload, len)`
+### 7.4 `update(id, payload, len)` — rebind
 
 ```
-verify id exists (use get-shaped scan; can be skipped if caller asserts)
+# debug builds: get-shaped scan, assert the id is bound (not dead/unallocated)
+# release builds: no check — update on a dead id is UB (§2)
 slot_sz = round_up(14 + len, W)
 bid = id % N
 
@@ -316,7 +324,8 @@ write_cursor[bid] += slot_sz
 return 0
 ```
 
-The previous slot for this id becomes garbage (an "overridden" slot, identical mechanism to a `put` followed by another `put` of the same id). Compaction reclaims it later.
+The previous slot for this id becomes garbage (an "overridden" slot).
+Compaction reclaims it later.
 
 ### 7.5 `delete(id)`
 
@@ -359,7 +368,7 @@ for each kept (id, off, val_len) in oldest-first order:
 #   next_id_hint = max(hint, 1 + highest id among the slots being DROPPED)
 # — compaction erases tombstones, and a tombstone may be the only on-flash
 # witness of a deleted maximum id (§7.1). Persisting the hint first keeps
-# next_id monotonic across a crash (no-reuse, §2; blob_db_next_id, §9).
+# next_id monotonic across a crash (no-reuse, §2; blob_db_alloc_id, §9).
 # Free of extra cost: it rides the master write that brackets the compact.
 write master B  (gen+1, state=COMPACTING, compacting_bid=bid, hint↑) ─┐
 flash_area_erase(scratch sector)                                      │
@@ -429,22 +438,25 @@ Either way, no committed slot is corrupted, and the bucket falls back to a self-
 int      blob_db_mount(void);
 int      blob_db_unmount(void);
 
-/* Returns -ENOSPC if no bucket has room even after compaction. */
-int      blob_db_put   (const void *payload, size_t len, uint64_t *out_id);
+/* Allocate a fresh id: never returned before, strictly greater than every
+ * previously returned id, across all remounts and crashes (§7.1, §7.6).
+ * Pure-RAM operation (occasional id-hint persist); returns 0 when not
+ * mounted (0 is never a valid id). Also the watermark client crash-recovery
+ * is built on (l1_model_container.md §4). */
+uint64_t blob_db_alloc_id(void);
 
-/* Strict: returns -ENOENT if id was never assigned or was deleted. */
-int      blob_db_get   (uint64_t id, void *out, size_t out_sz, size_t *out_len);
+/* Bind (first write) or rebind (rewrite) the payload of an allocated id.
+ * Returns -ENOSPC if no room even after compaction; -EINVAL if id is 0 or
+ * was never allocated. UNDEFINED BEHAVIOR if id is dead (deleted): the id
+ * no longer exists — a debug build may assert; release performs no check. */
 int      blob_db_update(uint64_t id, const void *payload, size_t len);
+
+/* Defined on any id, dead or alive: -ENOENT / false when not bound. */
+int      blob_db_get   (uint64_t id, void *out, size_t out_sz, size_t *out_len);
 int      blob_db_delete(uint64_t id);
 bool     blob_db_exists(uint64_t id);
 
 size_t   blob_db_count(void);
-
-/* Next id a put would assign. Pure-RAM accessor — no flash I/O; returns 0
- * when not mounted (0 is never a valid id). Strictly monotonic across
- * remounts and crashes (see §7.1, §7.6); this is the watermark that client
- * crash-recovery is built on (l1_model_container.md §4). */
-uint64_t blob_db_next_id(void);
 
 typedef int (*blob_db_iter_cb_t)(uint64_t id,
                                   const void *payload, size_t len,
@@ -596,14 +608,16 @@ struct root_blob {
 
 int my_set(const char *name, const void *val, size_t len) {
     uint64_t data_id, node_id;
-    blob_db_put(val, len, &data_id);
+    data_id = blob_db_alloc_id();
+    blob_db_update(data_id, val, len);
 
     struct root_blob r;
     size_t rl;
     blob_db_get(1, &r, sizeof(r), &rl);
 
     struct list_node *n = stack_build(r.head_id, data_id, name);
-    blob_db_put(n, n_total_size(n), &node_id);
+    node_id = blob_db_alloc_id();
+    blob_db_update(node_id, n, n_total_size(n));
 
     r.head_id = node_id;
     return blob_db_update(1, &r, sizeof(r));
