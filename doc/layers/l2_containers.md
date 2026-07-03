@@ -159,8 +159,8 @@ Every implementation must uphold (checklist for reviews and tests):
 2. **Typed root** — magic-tagged; wrong-type `open` fails cleanly.
 3. **One commit point per mutation** — §2.2; no observable intermediate state (P7).
 4. **O(1) steady-state RAM** — no per-element RAM, no caches (P3).
-5. **Bounded stack** — ≤ 4 KB transient, plus O(depth) ids for `kvtree`.
-6. **No heap** (P2).
+5. **Bounded stack** — ≤ 4 KB transient, plus O(depth) ids for `kvtree`;
+   stack buffers preferred over heap (P2).
 
 ## 6. Kconfig
 
