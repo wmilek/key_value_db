@@ -33,27 +33,75 @@ blob with its own stable id. Consequences, inherited from L1's contract:
   *detected* (`-ENOENT`), never *aliased* to unrelated data.
 - Each node mutation is individually crash-atomic.
 
-### 2.2 Mutation protocol: COW with a single commit point
+### 2.2 Mutation protocol: prepare / commit / cleanup
 
-A mutation touching several nodes must not be observable half-done (P7). The
-protocol, for any container:
+A mutation touching several i-nodes must not be observable half-done (P7).
+Every container mutation follows the same three-phase shape, built from plain
+`blob_db` calls (each individually atomic per L1 §2):
 
-1. Write **new** versions of changed nodes as fresh i-nodes (`put`) — these are
-   unreachable garbage until committed.
-2. Commit with **one** `blob_db_update` of the highest unchanged ancestor
-   (often the root). That single atomic write is the linearization point.
-3. Delete the superseded nodes (`delete`). A crash between 2 and 3 leaks
-   garbage i-nodes but never corrupts the structure.
+| Phase | blob_db calls | Crash here leaves |
+|---|---|---|
+| **1 Prepare** | N × `put` — write every *new* object (values, nodes) | the prepared i-nodes, **unreferenced** — invisible to readers |
+| **2 Commit** | exactly **one** `update` of the node that makes the new objects reachable (list blob, parent, root) | *before* the write lands: same as phase 1; *after*: mutation fully visible. Never a third state. |
+| **3 Cleanup** | M × `delete` of the objects the commit superseded | the superseded i-nodes, now unreferenced |
 
-Where a mutation is confined to one node (e.g. appending a key to one hash
-bucket), step 2 collapses into a single in-place `update` — the common fast path.
+The rules that follow from this, and that every container must obey:
 
-**Garbage after a crash:** i-nodes written in step 1 or not yet deleted in
-step 3 are unreachable but occupy space. v1 policy: accept the leak (bounded by
-one mutation's node count per crash); an optional mark-and-sweep walking from
-the root via `blob_db_iterate` can be added later behind its own Kconfig symbol.
+- **Only phase 1 and phase 3 can generate unreferenced objects.** The commit
+  itself cannot: L1 guarantees the single `update` either lands completely or
+  not at all, and it atomically swaps *which* set of i-nodes is referenced.
+- **A reader (or a remount after crash) always sees either the complete old
+  state or the complete new state** — never a torn structure, never a
+  reference to an i-node that doesn't exist.
+- **The leak per crash is bounded** by one mutation's object count: N prepared
+  + M not-yet-cleaned i-nodes. They waste space but are harmless — nothing
+  reachable points at them.
+- When the mutation fits one node (inline value, single-node change), phases
+  1 and 3 are empty and the whole mutation is one `update`: zero possible
+  garbage.
 
-### 2.3 Handles and RAM
+v1 policy on the leaked space: accept it. An optional mark-and-sweep
+(walk from id = 1, `blob_db_iterate` the rest, delete the difference) can be
+added later behind its own Kconfig symbol.
+
+### 2.3 Worked example: `set("foo", "bar")` on a simple k→v list
+
+The kvlist root is one i-node holding the whole pair array
+`[(k1, v1), (k2, v2), …]` (§4.2), with large values indirected to their own
+i-nodes. Inserting a new key whose value is indirected:
+
+```
+step 1  blob_db_put("bar") → vid          PREPARE   value blob on flash,
+                                                    referenced by nothing yet
+step 2  blob_db_update(list_id,           COMMIT    the array image is replaced
+          [(k1,v1), (k2,v2), ("foo",vid)])          atomically (L1 §2)
+```
+
+| Crash after | State on remount | Garbage |
+|---|---|---|
+| step 1 | list unchanged; `get("foo")` → not found | 1 i-node (`vid`) |
+| step 2 | `get("foo")` → "bar"; mutation complete | none |
+
+Overwriting an existing indirected key (`"foo"` → `"baz"`) adds cleanup:
+
+```
+step 1  blob_db_put("baz") → vid2                  PREPARE
+step 2  blob_db_update(list_id, […("foo",vid2)…])  COMMIT   old vid unreferenced from here
+step 3  blob_db_delete(vid)                        CLEANUP
+```
+
+| Crash after | State on remount | Garbage |
+|---|---|---|
+| step 1 | old mapping intact | `vid2` |
+| step 2 | new mapping intact | old `vid` (cleanup pending) |
+| step 3 | new mapping intact | none |
+
+With the value inline in the array (the small-value fast path), the entire
+mutation is step 2 alone. Deleting a key is the mirror image: commit first
+(`update` the array without the pair), then cleanup (`delete` the value
+i-node).
+
+### 2.4 Handles and RAM
 
 `open(root_id)` performs no scan — it reads at most the root i-node to validate
 magic/type. Handles (`seq_t`, `map_t`) hold the root id plus O(1) cursor state
@@ -104,18 +152,24 @@ logs, queues, file-data chunk chains — not random access at scale.
 
 ### 4.2 `kvlist` — simple k→v list
 
-The archetype from `l1_blob_db.md` Appendix A.1, promoted to a first-class
-module. A linked list of entry nodes:
+The whole pair array lives in **one i-node**:
 
 ```
-root  { magic 'CKVL', head_id, count }
-entry { next_id, klen, vlen, key…, val… }   val inline; or val_id when large
+root { magic 'CKVL', count, pair[count]… }
+pair { klen, vlen_or_ref, key…, (val… | val_id) }
 ```
 
-Values larger than `CONFIG_CONTAINER_KVLIST_INLINE_MAX` are stored as their own
-i-node and referenced by id — the same indirection pattern all containers reuse.
-O(n) everything; smallest code of the Map providers. Intended for ≲ tens of
-keys, and as `kvhash`'s per-bucket representation.
+Values up to `CONFIG_CONTAINER_KVLIST_INLINE_MAX` are inline; larger ones get
+their own i-node, referenced by `val_id` — the indirection pattern all
+containers reuse. Every mutation rewrites the array image and commits it with
+a **single `update` of the root** (§2.2; worked through step by step in §2.3),
+with value-i-node `put`/`delete` around it as prepare/cleanup.
+
+If the array outgrows one i-node payload, the node ends with a `next_id`
+chaining to an overflow node of the same layout; a mutation then rewrites only
+the affected node of the chain. O(n) everything; smallest code of the Map
+providers. Intended for ≲ tens of keys, and as `kvhash`'s per-bucket
+representation.
 
 ### 4.3 `kvhash` — k→v hash
 
@@ -124,7 +178,7 @@ Root holds a fixed array of bucket ids; each bucket is a `kvlist` chain
 
 ```
 root   { magic 'CKVH', nbuckets, bucket_id[nbuckets] }     nbuckets fixed at create
-bucket = kvlist entry chain (0 = empty bucket, created lazily)
+bucket = kvlist pair-array node (§4.2; 0 = empty bucket, created lazily)
 ```
 
 `nbuckets` defaults to `CONFIG_CONTAINER_KVHASH_BUCKETS` (default 64; root must
