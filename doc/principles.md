@@ -45,9 +45,22 @@ contract are swappable without source changes above.
 
 ## P7 — Crash-safe
 
-Every visible operation is atomic across power loss. Multi-node mutations use
-copy-on-write with a single commit write; torn writes are detected (CRC) and
-discarded; recovery is bounded and idempotent.
+Power can fail at any instruction. In order of strength:
+
+- **Never treat partial writes as data (must).** An operation interrupted by
+  power-off is detected (CRC) and discarded at L1; a reference that does not
+  resolve is treated as absent at L2/L3 — never returned as data.
+- **Atomic visible state (must).** Every externally visible operation either
+  fully happened or never happened; multi-node mutations use copy-on-write
+  with a single commit write.
+- **No permanent leak (must).** Crash residue is confined to unreachable
+  i-nodes of one interrupted mutation and is reclaimed by bounded, idempotent
+  recovery. Long-term accumulation of leaked space is not accepted.
+- **Self-healing (advisable).** On detecting residue that should be
+  impossible (e.g. a dangling reference), repair it — drop the entry — rather
+  than carry it.
+- **Avoidance first (advisable).** Order operations so the windows in which
+  residue can arise are as few and as small as possible.
 
 ## P8 — Test-proven
 

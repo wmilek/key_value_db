@@ -33,30 +33,32 @@ blob with its own stable id. Consequences, inherited from L1's contract:
   *detected* (`-ENOENT`), never *aliased* to unrelated data.
 - Each node mutation is individually crash-atomic.
 
-### 2.2 Mutation protocol: prepare / commit / cleanup
+### 2.2 Mutation protocol: stage / prepare / commit / cleanup / clear
 
 The protocol every container mutation must follow is defined — with full call
-traces and per-crash-point garbage tables — by the **model container**
-(`doc/layers/l1_model_container.md`). Summary:
+traces, per-crash-point residue tables, and the recovery procedure — by the
+**model container** (`doc/layers/l1_model_container.md`). Summary:
 
-1. **Prepare** — N × `put` of every new object, still unreferenced;
-2. **Commit** — exactly **one** `update` of the i-node that makes them
+1. **Stage** — record the mutation in the container's intent blob
+   (id watermark `W` + delete set);
+2. **Prepare** — N × `put` of every new object, still unreferenced;
+3. **Commit** — exactly **one** `update` of the i-node that makes them
    reachable: the single linearization point;
-3. **Cleanup** — M × `delete` of the superseded objects.
+4. **Cleanup** — M × `delete` of the superseded objects;
+5. **Clear** — empty the intent blob.
 
 Only prepare and cleanup can generate unreferenced i-nodes; the commit never
-can. A crash leaves the complete old or complete new state plus bounded
-garbage (one mutation's worth). When a mutation fits one node (inline value,
-single-node change) phases 1 and 3 are empty — one `update`, zero possible
-garbage.
+can. A crash leaves the complete old or complete new state, and any residue
+lies inside the staged window: `open` runs the model container's recovery
+(roll forward or back, then clear) — bounded, idempotent, **no permanent
+leak** (P7). A mutation that fits one node (inline value, single-node change)
+is the commit alone — no stage, no possible residue. Dangling references are
+impossible under this ordering; if one is ever observed, it is treated as
+absent and repaired, never returned as data.
 
 Every mutation a container defines must be reducible to this pattern; one that
 cannot (e.g. needing two commits) is outside the contract and requires its own
-crash analysis.
-
-v1 policy on leaked space: accept it. An optional mark-and-sweep (walk from
-id = 1, `blob_db_iterate` the rest, delete the difference) can be added later
-behind its own Kconfig symbol.
+crash analysis against P7.
 
 ### 2.3 Handles and RAM
 
@@ -221,8 +223,9 @@ provider), so backends stay behaviorally interchangeable:
 3. overwrite keeps external references valid (root id unchanged)
 4. iteration completeness; sort order for `kvtree`
 5. persistence across `blob_db` unmount/mount (single-integer recovery)
-6. crash injection: kill between COW steps (§2.2), remount, verify old state
-   intact and garbage bounded
+6. crash injection: kill between every step of §2.2, remount + `open`, verify
+   the visible state is complete-old or complete-new AND recovery reclaimed
+   all residue (no unreferenced i-nodes survive, intent blob cleared)
 7. capacity: fill to `-ENOSPC`, verify structure still consistent
 8. `kvhash`: distribution sanity; collision chains. `kvtree`: split/merge at
    fan-out boundaries; range scans.

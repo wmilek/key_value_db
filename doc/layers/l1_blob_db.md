@@ -444,6 +444,12 @@ int      blob_db_format(void);
 
 Errors: `-ENOENT`, `-ENOSPC`, `-ENOMEM`, `-EINVAL`, `-EIO`, `-ENODEV` (not mounted), `-EALREADY` (double mount).
 
+Planned extensions (specified, not yet implemented):
+`blob_db_size` / `blob_db_read` for partial access to spread payloads
+(Appendix B.4), and `blob_db_next_id(void)` — a no-I/O getter of the next id
+to be assigned, the watermark that client recovery is built on
+(`l1_model_container.md` §2).
+
 **Concurrency contract (v1):** single-threaded — caller serializes. Documented in the header. v2 may add a `k_mutex`.
 
 ---
