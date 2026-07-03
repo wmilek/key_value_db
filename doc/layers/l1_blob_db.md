@@ -624,3 +624,84 @@ A future UBI-style flash-translation layer will present a `flash_area`-shaped in
 - `app/prj.conf`, `app/src/main.c` — enable + demo
 - `app/boards/native_sim.overlay` — 16 MB sim-flash, 8 MB storage_partition
 - `tests/lib/blob_db/` — ztest suite
+
+---
+
+## 19. Appendix B — Allocation strategy: one interface, exchangeable allocators
+
+### B.1 The interface is the contract, the allocator is an implementation
+
+Everything in §4–§8 (bucket layout, slot format, compaction) describes **one**
+allocator — the **bucket-log** allocator, v1's choice. The layer boundary is
+only the public API (§9) plus the stability contract (§2). Alternative
+allocators may replace bucket-log behind the same API, selected at build time:
+
+```
+choice BLOB_DB_ALLOCATOR
+  config BLOB_DB_ALLOC_BUCKETLOG      # v1, this document
+  config BLOB_DB_ALLOC_FAT            # fixed-size chunks + bitmap/chain (future)
+  config BLOB_DB_ALLOC_EXTENT         # extent lists (future)
+endchoice
+```
+
+**Swap policy:** on-flash formats are mutually incompatible. Changing the
+allocator means a reformat — all stored data (and therefore every L2/L3
+structure) is lost. This is *accepted*: code above L1 needs no change, data is
+not migrated. Each allocator uses its own master magic so a mismatched mount
+fails cleanly with `-ENOTSUP` instead of misreading another format.
+
+### B.2 Candidate allocators compared
+
+| | **bucket-log (v1)** | **FAT-like** | **extent-based** |
+|---|---|---|---|
+| Allocation unit | variable-length slot | fixed-size chunk | variable extent (start, len) |
+| id → data | computed: `id mod N` → bucket, scan | i-node table → chunk chain | i-node table → extent list |
+| Free-space accounting | per-bucket append cursor | chunk bitmap | free-extent search |
+| Max payload | one sector (§5.4) | unbounded (chain) | unbounded (multi-extent) |
+| Fragmentation | none internal; garbage slots until compact | internal: ~½ chunk per blob | external: free-space splinters |
+| GC | per-bucket compaction | still needed (B.3) | compaction w/ extent moves |
+| Suits | many small blobs (L2 nodes) | mixed sizes, simple bookkeeping | few large blobs, streaming |
+
+### B.3 Are fixed-size slots worth it?
+
+What fixed chunks **buy**: O(1) bitmap accounting, uniform reads, no
+variable-slot scan. What they **don't** buy: in-place update. Flash erases at
+erase-block granularity, so a "freed" bitmap bit cannot be set back to free
+without erasing its whole block — updates stay out-of-place and erase-block GC
+remains necessary. A FAT-like allocator on flash ends up log-structured at
+block level anyway.
+
+What they **cost**: internal fragmentation. The dominant workload is small L2
+container nodes (tens–hundreds of bytes); with 64 B chunks, ~32 B average tail
+waste × 100 k blobs ≈ 3 MB of an 8 MB partition. Verdict: for v1's workload,
+variable-length slots waste strictly less; fixed chunks only pay off once
+blobs regularly exceed one sector — which v1 forbids anyway (§5.4).
+
+### B.4 Multi-chunk payloads and the read interface
+
+Chunking can live at two levels, and v1 deliberately puts it at L2: large data
+is chained from `seq` container chunk i-nodes (`l2_containers.md` §4.1, used by
+blobfs file bodies). L1 stays single-chunk.
+
+If a future allocator (FAT/extent) spreads payloads transparently, the
+whole-blob `get()` becomes inadequate — it forces the caller to buffer the
+entire blob. The agreed extension is **pread-style partial access**,
+implementable by every allocator (single-chunk included), so it can be added
+without ever changing again on an allocator swap:
+
+```c
+/* Total committed payload size, or -ENOENT. */
+int blob_db_size(uint64_t id, size_t *out_size);
+
+/* Read len bytes starting at offset; short read at end of blob.
+ * Reads only the chunks covering [offset, offset+len). */
+int blob_db_read(uint64_t id, size_t offset, void *out, size_t len,
+                 size_t *out_read);
+```
+
+`get()` remains as the `size` + `read(0, size)` convenience. The §2 contract is
+unchanged: a multi-chunk write commits by writing the id's index record
+**last** (single commit point), so `read` never observes a partially committed
+chain — "no partial reads" still holds. Writes stay whole-blob
+(`put`/`update` take the complete payload); a streaming write API would need
+handles/transactions and is out of scope until a concrete consumer appears.

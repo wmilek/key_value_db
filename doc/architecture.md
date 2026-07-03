@@ -63,8 +63,9 @@ bad-block remapping behind the *same* interface — a pointer swap via
 
 **L1 — i-node allocation (`blob_db`).** The always-present core: turns the
 partition into a pool of stably-identified, crash-atomically updatable blobs
-("i-nodes"). Hash-bucketed layout, O(1) lookup, O(1) steady-state RAM,
-per-bucket compaction, double-buffered master, full crash table.
+("i-nodes"). The public API is the contract; the allocator behind it
+(v1: hash-bucketed append-log) is exchangeable — FAT-like or extent-based
+variants can replace it at the cost of a reformat (`l1_blob_db.md` Appendix B).
 → `layers/l1_blob_db.md`
 
 **L2 — Containers.** Data structures whose nodes are i-nodes and whose edges
