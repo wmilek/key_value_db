@@ -42,16 +42,13 @@ the id = 1 root — P5). The intent blob is created together with the container;
 its id is recorded in the root and never changes. It is empty whenever no
 mutation is in flight.
 
-One small L1 API extension is required:
-
-```c
-/* The next id blob_db_put would assign (in-RAM counter; no flash I/O). */
-uint64_t blob_db_next_id(void);
-```
-
-Because ids are strictly monotonic and never reused (spec §2), the value `W`
-read before a mutation is a **watermark**: every blob the mutation creates has
-id ≥ W, and nothing else in the database does.
+Recovery is built on `blob_db_next_id()` (spec §9) — a pure-RAM accessor for
+the next id `put` would assign. Because ids are strictly monotonic and never
+reused across any crash (spec §2, with the scan and compaction rules of
+§7.1/§7.6 that enforce it), the value `W` read before a mutation is a
+**watermark**: every blob the mutation creates has id ≥ W, and nothing else in
+the database does. Durability of `W` comes from the intent write below, not
+from the accessor.
 
 ## 3. Crash-residue requirements (P7 applied)
 
@@ -115,6 +112,11 @@ Properties:
   commit state cannot change, deletes tolerate `-ENOENT`, and CLEAR is last.
 - **Complete**: every crash point in §4 lands in exactly one branch; the
   tables below show there is no window that leaks past recovery.
+- **Serialized**: assumes one mutation in flight per database — "unreferenced
+  ids ≥ W are mine" holds only if nothing else allocated ids inside the
+  staged window. Given by the v1 single-threaded contract; recovery itself
+  runs at `open`, before any other traffic. A concurrent v2 needs a global
+  mutation lock or per-mutation id ranges.
 
 ## 6. Self-healing (defense in depth)
 

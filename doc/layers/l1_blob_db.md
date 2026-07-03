@@ -245,8 +245,9 @@ for bid in [0 .. N):
             read slot_hdr at cursor
             if invalid: break               # end of log
             id = read 8 bytes at cursor+4
-            if not (flags & TOMBSTONE):
-                max_id_seen = max(max_id_seen, id)
+            max_id_seen = max(max_id_seen, id)   # tombstones count too: a
+                                                 # deleted max id must stay
+                                                 # reserved (no-reuse, §2)
             cursor += slot_size(val_len)
         write_cursor[bid] = cursor
 
@@ -353,7 +354,14 @@ for each kept (id, off, val_len) in oldest-first order:
     new_cursor += slot_size(val_len)
 
 # Phase 2: persist via master + scratch + erase + restore + master
-write master B  (gen+1, state=COMPACTING, compacting_bid=bid)        ─┐
+#
+# The COMPACTING master also persists
+#   next_id_hint = max(hint, 1 + highest id among the slots being DROPPED)
+# — compaction erases tombstones, and a tombstone may be the only on-flash
+# witness of a deleted maximum id (§7.1). Persisting the hint first keeps
+# next_id monotonic across a crash (no-reuse, §2; blob_db_next_id, §9).
+# Free of extra cost: it rides the master write that brackets the compact.
+write master B  (gen+1, state=COMPACTING, compacting_bid=bid, hint↑) ─┐
 flash_area_erase(scratch sector)                                      │
 flash_area_write(scratch sector, new_buf, new_cursor)                 │  ATOMIC
 flash_area_erase(bucket bid's sector)                                 │  WINDOW
@@ -432,6 +440,12 @@ bool     blob_db_exists(uint64_t id);
 
 size_t   blob_db_count(void);
 
+/* Next id a put would assign. Pure-RAM accessor — no flash I/O; returns 0
+ * when not mounted (0 is never a valid id). Strictly monotonic across
+ * remounts and crashes (see §7.1, §7.6); this is the watermark that client
+ * crash-recovery is built on (l1_model_container.md §2). */
+uint64_t blob_db_next_id(void);
+
 typedef int (*blob_db_iter_cb_t)(uint64_t id,
                                   const void *payload, size_t len,
                                   void *user);
@@ -446,9 +460,7 @@ Errors: `-ENOENT`, `-ENOSPC`, `-ENOMEM`, `-EINVAL`, `-EIO`, `-ENODEV` (not mount
 
 Planned extensions (specified, not yet implemented):
 `blob_db_size` / `blob_db_read` for partial access to spread payloads
-(Appendix B.4), and `blob_db_next_id(void)` — a no-I/O getter of the next id
-to be assigned, the watermark that client recovery is built on
-(`l1_model_container.md` §2).
+(Appendix B.4).
 
 **Concurrency contract (v1):** single-threaded — caller serializes. Documented in the header. v2 may add a `k_mutex`.
 
