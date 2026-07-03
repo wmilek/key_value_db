@@ -4,7 +4,7 @@
  *
  * blob_db — internal on-flash layout and constants.
  *
- * See doc/design.md §5 "On-flash format".
+ * See doc/layers/l1_blob_db.md §5 "On-flash format".
  */
 
 #ifndef LIB_BLOB_DB_INTERNAL_H_

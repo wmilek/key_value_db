@@ -8,7 +8,7 @@ config BLOB_DB
 	select CRC
 	help
 	  Enable the blob_db library: a stable-id blob store built on
-	  Zephyr's flash_area API. See doc/design.md for the on-flash
+	  Zephyr's flash_area API. See doc/layers/l1_blob_db.md for the on-flash
 	  format, atomicity model, and stability contract.
 
 if BLOB_DB

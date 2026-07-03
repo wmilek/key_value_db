@@ -8,7 +8,7 @@
  * Put/get/update/delete arrive in stage 4. Real compaction recovery in
  * stage 5.
  *
- * See doc/design.md for the on-flash format and algorithms.
+ * See doc/layers/l1_blob_db.md for the on-flash format and algorithms.
  */
 
 #include <errno.h>

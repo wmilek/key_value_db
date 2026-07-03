@@ -1,6 +1,8 @@
-# Design — `blob_db`: Stable-ID Blob Store on `flash_area`
+# L1 — `blob_db`: Stable-ID Blob Store on `flash_area` (i-node allocation)
 
 Status: v2 · Target board for v1: `native_sim`
+· Part of the stack in `doc/architecture.md` · Governed by `doc/principles.md`
+· Lower boundary: `doc/layers/l0_flash.md` · Consumed by: `doc/layers/l2_containers.md`
 
 ---
 
