@@ -35,99 +35,30 @@ blob with its own stable id. Consequences, inherited from L1's contract:
 
 ### 2.2 Mutation protocol: prepare / commit / cleanup
 
-A mutation touching several i-nodes must not be observable half-done (P7).
-Every container mutation follows the same three-phase shape, built from plain
-`blob_db` calls (each individually atomic per L1 §2):
+The protocol every container mutation must follow is defined — with full call
+traces and per-crash-point garbage tables — by the **model container**
+(`doc/layers/l1_model_container.md`). Summary:
 
-| Phase | blob_db calls | Crash here leaves |
-|---|---|---|
-| **1 Prepare** | N × `put` — write every *new* object (values, nodes) | the prepared i-nodes, **unreferenced** — invisible to readers |
-| **2 Commit** | exactly **one** `update` of the node that makes the new objects reachable (list blob, parent, root) | *before* the write lands: same as phase 1; *after*: mutation fully visible. Never a third state. |
-| **3 Cleanup** | M × `delete` of the objects the commit superseded | the superseded i-nodes, now unreferenced |
+1. **Prepare** — N × `put` of every new object, still unreferenced;
+2. **Commit** — exactly **one** `update` of the i-node that makes them
+   reachable: the single linearization point;
+3. **Cleanup** — M × `delete` of the superseded objects.
 
-The rules that follow from this, and that every container must obey:
+Only prepare and cleanup can generate unreferenced i-nodes; the commit never
+can. A crash leaves the complete old or complete new state plus bounded
+garbage (one mutation's worth). When a mutation fits one node (inline value,
+single-node change) phases 1 and 3 are empty — one `update`, zero possible
+garbage.
 
-- **Only phase 1 and phase 3 can generate unreferenced objects.** The commit
-  itself cannot: L1 guarantees the single `update` either lands completely or
-  not at all, and it atomically swaps *which* set of i-nodes is referenced.
-- **A reader (or a remount after crash) always sees either the complete old
-  state or the complete new state** — never a torn structure, never a
-  reference to an i-node that doesn't exist.
-- **The leak per crash is bounded** by one mutation's object count: N prepared
-  + M not-yet-cleaned i-nodes. They waste space but are harmless — nothing
-  reachable points at them.
-- When the mutation fits one node (inline value, single-node change), phases
-  1 and 3 are empty and the whole mutation is one `update`: zero possible
-  garbage.
+Every mutation a container defines must be reducible to this pattern; one that
+cannot (e.g. needing two commits) is outside the contract and requires its own
+crash analysis.
 
-v1 policy on the leaked space: accept it. An optional mark-and-sweep
-(walk from id = 1, `blob_db_iterate` the rest, delete the difference) can be
-added later behind its own Kconfig symbol.
+v1 policy on leaked space: accept it. An optional mark-and-sweep (walk from
+id = 1, `blob_db_iterate` the rest, delete the difference) can be added later
+behind its own Kconfig symbol.
 
-### 2.3 Worked example: `set("foo", "bar")` on a simple k→v list
-
-This is the **ground case** of the whole layer: every piece of data is its own
-i-node, every reference is explicit. Until the protocol is airtight here, no
-more complex structure can be built — the trees and hashes below are only ever
-compositions of this exact step pattern.
-
-Three kinds of i-node are involved:
-
-```
-key blob    "foo"                          own id: kid
-value blob  "bar"                          own id: vid
-list blob   [(kid1,vid1), (kid2,vid2), …]  own id: list_id   ← the container
-```
-
-**Insert** `set("foo","bar")` — two prepares, one commit:
-
-```
-step 1  kid = blob_db_put("foo")                    PREPARE
-step 2  vid = blob_db_put("bar")                    PREPARE
-step 3  blob_db_update(list_id,                     COMMIT   the pair list is
-          [(kid1,vid1), (kid2,vid2), (kid,vid)])             replaced atomically (L1 §2)
-```
-
-| Crash after | State on remount | Garbage (unreferenced i-nodes) |
-|---|---|---|
-| step 1 | list unchanged, `get("foo")` → not found | `kid` |
-| step 2 | list unchanged, `get("foo")` → not found | `kid`, `vid` |
-| step 3 | `get("foo")` → "bar", mutation complete | none |
-
-**Overwrite** `set("foo","baz")` — the key blob is reused, only the value is
-replaced:
-
-```
-step 1  vid2 = blob_db_put("baz")                   PREPARE
-step 2  blob_db_update(list_id, […(kid,vid2)…])     COMMIT   old vid unreferenced from here
-step 3  blob_db_delete(vid)                         CLEANUP
-```
-
-| Crash after | State on remount | Garbage |
-|---|---|---|
-| step 1 | old mapping intact | `vid2` |
-| step 2 | new mapping intact | old `vid` (cleanup pending) |
-| step 3 | new mapping intact | none |
-
-**Delete** `del("foo")` — the mirror image, commit first, cleanup after:
-
-```
-step 1  blob_db_update(list_id, list without (kid,vid))   COMMIT
-step 2  blob_db_delete(kid)                               CLEANUP
-step 3  blob_db_delete(vid)                               CLEANUP
-```
-
-A crash after step 1 or 2 leaves `kid` and/or `vid` as garbage; the mapping is
-already correctly gone.
-
-**Lookup** `get("foo")` reads the list blob, then reads key blobs
-`(kid1, kid2, …)` one by one to compare — O(n) flash reads. That cost is the
-price of the fully-indirected ground case; inlining short keys/values into the
-list blob (§4.2) is an *optimization of this model*, which collapses prepare
-and cleanup steps (fewer separate i-nodes → fewer leak windows and fewer
-reads) without changing the protocol or its guarantees.
-
-### 2.4 Handles and RAM
+### 2.3 Handles and RAM
 
 `open(root_id)` performs no scan — it reads at most the root i-node to validate
 magic/type. Handles (`seq_t`, `map_t`) hold the root id plus O(1) cursor state
@@ -178,8 +109,9 @@ logs, queues, file-data chunk chains — not random access at scale.
 
 ### 4.2 `kvlist` — simple k→v list
 
-The ground representation is full indirection (§2.3): the root i-node holds
-only **id pairs**; keys and values are each their own i-node.
+The ground representation is full indirection — this container *is* the model
+container of `l1_model_container.md`, promoted to a build-able module: the
+root i-node holds only **id pairs**; keys and values are each their own i-node.
 
 ```
 root { magic 'CKVL', count, (key_id, val_id)[count] }
@@ -187,7 +119,7 @@ root { magic 'CKVL', count, (key_id, val_id)[count] }
 
 Every mutation rewrites the pair list and commits it with a **single `update`
 of the root**, with key/value `put`s before it and `delete`s after it as
-prepare/cleanup — exactly the traces in §2.3.
+prepare/cleanup — exactly the traces in the model-container document §4.
 
 Two optimizations of the ground case, protocol unchanged:
 

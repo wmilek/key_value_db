@@ -65,6 +65,11 @@ This is the load-bearing promise of the library — clients build on top of it.
 
 These together make ids usable as **persistent references** — foreign keys for client-owned indexes, parent/child pointers in client trees, etc.
 
+What this contract means for a client — the exact call ordering that makes
+multi-blob structures crash-safe, and which steps can leave unreferenced
+blobs — is demonstrated operation by operation in the companion document
+`doc/layers/l1_model_container.md` (the *model container*).
+
 ### Root convention
 
 The very first successful `put` after a fresh format returns **id = 1**. Clients use id = 1 as their persistent root pointer:

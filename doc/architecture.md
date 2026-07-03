@@ -12,6 +12,7 @@ Status: v2 · Top-level document; per-layer detail lives in `doc/layers/`
 | `doc/principles.md` | Binding design principles (P1–P8) for every layer |
 | `doc/layers/l0_flash.md` | L0 — flash translation: `flash_area` contract, future UBI-like FTL |
 | `doc/layers/l1_blob_db.md` | L1 — i-node allocation (`blob_db`): full implementation-level spec |
+| `doc/layers/l1_model_container.md` | L1 — the model container: blob_db's client contract by example |
 | `doc/layers/l2_containers.md` | L2 — containers: seq, kvlist, kvhash, kvtree |
 | `doc/layers/l3_interfaces.md` | L3 — access interfaces: kvdb, blobfs, settings |
 
