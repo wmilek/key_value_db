@@ -151,7 +151,25 @@ carried:
 | 4 | **new mapping** | staged intent | committed (list refs ids ≥ W): forward; clear |
 | 5 | new mapping | none | — |
 
-### 7.2 Overwrite — `set("foo", "baz")` (key blob reused)
+### 7.2 Overwrite — `set("foo", "baz")`
+
+**Fast path — the normal case.** Ids are stable and payloads mutable
+(spec §2, Appendix C), so the pair `(kid, vid)` keeps referencing `vid` and
+only `vid`'s content changes:
+
+```
+blob_db_update(vid, "baz")                            ← the entire mutation
+```
+
+One atomic operation: a crash leaves complete "bar" or complete "baz", never
+a torn value. No new ids, no staging, no residue possible. This is the
+general principle: **a mutation that does not change the reference graph
+collapses to a single `update`; only mutations that change which ids are
+referenced need the full discipline.**
+
+**Full discipline — when the value blob must actually be replaced** (the blob
+is shared and an in-place change would leak to other referrers, or an
+immutable-profile store, spec Appendix C):
 
 ```
 0  W = blob_db_next_id()

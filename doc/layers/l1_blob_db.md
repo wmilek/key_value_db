@@ -728,3 +728,40 @@ unchanged: a multi-chunk write commits by writing the id's index record
 chain — "no partial reads" still holds. Writes stay whole-blob
 (`put`/`update` take the complete payload); a streaming write API would need
 handles/transactions and is out of scope until a concrete consumer appears.
+
+---
+
+## 20. Appendix C — Considered alternative: immutable payloads (rejected)
+
+**Decision: payloads are mutable.** `update(id)` replaces content under the
+same id; an id is the stable name of a *logical* blob. Mutations that do not
+change the reference graph therefore collapse to a single atomic `update` —
+the fast path clients are expected to use (`l1_model_container.md` §7.2).
+
+The alternative considered: drop `update`, make every blob immutable, and add
+a mutable **root register** in the master sector
+(`set_root(id)` / `get_root()`) as the single commit primitive — the
+git / ZFS / log-structured-FS model. It would buy real simplifications:
+
+- at most one live slot per id — the whole latest-wins machinery and the
+  "overridden slot" garbage class disappear;
+- create-only atomicity (a torn write = the blob never existed);
+- torn-free partial reads of multi-chunk payloads (chunks never change once
+  sealed) — relevant to the B.4 `read(offset, len)` extension;
+- coherence-free caching and lock-free readers (snapshot semantics for free).
+
+Why it was rejected:
+
+- **write amplification lands on the most common operations**: an in-place
+  value change becomes path-copy-to-root — O(depth) puts + register write +
+  O(depth) deletes — where the mutable profile pays one `update`;
+- **ids would name versions, not logical objects**, destroying the
+  foreign-key property (§2) that client structures are built on;
+  cross-references to mutable entities would need a mutable indirection
+  layer, reintroducing `update` by the back door;
+- more garbage per mutation → more reclamation pressure.
+
+Revisit if a multi-chunk allocator with partial reads lands, or a concurrent
+v2 wants lock-free readers; the two designs are coherent *profiles* of the
+same interface family, and the model container's discipline is valid under
+both.
