@@ -443,7 +443,7 @@ size_t   blob_db_count(void);
 /* Next id a put would assign. Pure-RAM accessor — no flash I/O; returns 0
  * when not mounted (0 is never a valid id). Strictly monotonic across
  * remounts and crashes (see §7.1, §7.6); this is the watermark that client
- * crash-recovery is built on (l1_model_container.md §2). */
+ * crash-recovery is built on (l1_model_container.md §4). */
 uint64_t blob_db_next_id(void);
 
 typedef int (*blob_db_iter_cb_t)(uint64_t id,
@@ -736,7 +736,7 @@ handles/transactions and is out of scope until a concrete consumer appears.
 **Decision: payloads are mutable.** `update(id)` replaces content under the
 same id; an id is the stable name of a *logical* blob. Mutations that do not
 change the reference graph therefore collapse to a single atomic `update` —
-the fast path clients are expected to use (`l1_model_container.md` §7.2).
+the fast path clients are expected to use (`l1_model_container.md` §3.2).
 
 The alternative considered: drop `update`, make every blob immutable, and add
 a mutable **root register** in the master sector

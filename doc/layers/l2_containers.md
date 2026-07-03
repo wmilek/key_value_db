@@ -121,7 +121,8 @@ root { magic 'CKVL', count, (key_id, val_id)[count] }
 
 Every mutation rewrites the pair list and commits it with a **single `update`
 of the root**, with key/value `put`s before it and `delete`s after it as
-prepare/cleanup — exactly the traces in the model-container document §4.
+prepare/cleanup — exactly the traces in the model-container document §8 (and
+its §3.2 in-place fast path whenever the value blob is exclusively owned).
 
 Two optimizations of the ground case, protocol unchanged:
 

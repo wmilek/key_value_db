@@ -1,6 +1,6 @@
 # L1 — Model Container: the `blob_db` Client Contract by Example
 
-Status: v2 · Companion to `doc/layers/l1_blob_db.md` (the blob_db spec)
+Status: v3 · Companion to `doc/layers/l1_blob_db.md` (the blob_db spec)
 · Governed by `doc/principles.md`
 
 ---
@@ -25,45 +25,117 @@ leak* — every crash residue is reclaimed by bounded, idempotent recovery.
   implementing it verbatim, with crash injection between every step,
   validates the contract independent of any real L2 code.
 
+The document builds up in two stages: the **basic flow** (§2–§3), where every
+mutation is a single atomic operation and no extra machinery exists at all —
+this covers the most common operations — and the **extension** (§4–§8) for
+mutations that a single operation cannot express, where the intent blob and
+the id watermark close every crash window.
+
 ## 2. The structure
 
-A key→value mapping built from four kinds of i-node, fully indirected —
+A key→value mapping built from three kinds of i-node, fully indirected —
 every piece of data is its own i-node, every reference an explicit id:
 
 ```
-key blob     "foo"                                  own id: kid
-value blob   "bar"                                  own id: vid
-list blob    { intent_id, [(kid1,vid1), …] }        own id: list_id   ← container root
-intent blob  {} or { W, del[] }                     own id: intent_id ← mutation journal
+key blob     "foo"                            own id: kid
+value blob   "bar"                            own id: vid
+list blob    [(kid1,vid1), (kid2,vid2), …]    own id: list_id   ← container root
 ```
 
 The client persists nothing but `list_id` (in practice id = 1, or a field of
-the id = 1 root — P5). The intent blob is created together with the container;
-its id is recorded in the root and never changes. It is empty whenever no
-mutation is in flight.
+the id = 1 root — P5). Everything is reachable from it.
+
+## 3. The basic flow — one operation is the whole mutation
+
+### 3.1 Lookup — `get("foo")`
+
+```
+blob_db_get(list_id) → the pair list
+for each (kid_i, vid_i):  blob_db_get(kid_i), compare with "foo"
+blob_db_get(vid_i of the match) → "bar"
+```
+
+O(n) flash reads — the honest price of full indirection. Read-only: no crash
+windows.
+
+### 3.2 Overwrite — `set("foo", "baz")` when "foo" already exists
+
+Ids are stable and payloads mutable (spec §2, Appendix C): the pair
+`(kid, vid)` keeps referencing `vid`, and only `vid`'s content changes.
+
+```
+blob_db_update(vid, "baz")                    ← the entire mutation
+```
+
+One atomic operation (spec §2/§8): after a crash the value is complete "bar"
+or complete "baz" — never torn, never absent. Nothing was created, nothing
+must die, there is no residue and nothing to recover.
+
+This is the load-bearing principle of the basic flow:
+
+> **A mutation that does not change the reference graph collapses to a single
+> atomic `update`. Only mutations that change *which ids are referenced*
+> need more.**
+
+In the basic flow the whole crash story is L1's single-operation atomicity.
+A well-designed container routes every mutation it can through this form.
+
+### 3.3 Where the basic flow ends
+
+Insert and delete *do* change the reference graph — new blobs must come into
+existence, or old ones must go — and no single `blob_db` call expresses that.
+A naive insert:
+
+```
+kid = blob_db_put("foo")            ← crash here: kid unreferenced, forever
+vid = blob_db_put("bar")            ← crash here: kid, vid unreferenced, forever
+blob_db_update(list_id, …+(kid,vid))
+```
+
+The *ordering* is already right — commit last, so a reader or remount never
+sees a torn list or a dangling reference (P7's must-tiers hold). What fails
+is the **no-permanent-leak** requirement: nothing records that `kid`/`vid`
+were created, so after a crash nothing can reclaim them. Each interrupted
+mutation leaks a few blobs; over a device's lifetime that is unbounded.
+
+Closing exactly this gap — reclamation, not correctness — is what the
+extension adds.
+
+## 4. Extension: the intent blob and the id watermark
+
+For reference-graph mutations the structure grows a fourth i-node, and the
+container uses one more API:
+
+```
+intent blob  {} or { W, del[] }               own id: intent_id ← mutation journal
+list blob    { intent_id, [(kid1,vid1), …] }  own id: list_id   ← root now records intent_id
+```
+
+The intent blob is created once, together with the container; its id is
+stored in the root and never changes (id stability — the journal is only ever
+`update`d). It is empty whenever no mutation is in flight.
 
 Recovery is built on `blob_db_next_id()` (spec §9) — a pure-RAM accessor for
 the next id `put` would assign. Because ids are strictly monotonic and never
-reused across any crash (spec §2, with the scan and compaction rules of
-§7.1/§7.6 that enforce it), the value `W` read before a mutation is a
-**watermark**: every blob the mutation creates has id ≥ W, and nothing else in
-the database does. Durability of `W` comes from the intent write below, not
-from the accessor.
+reused across any crash (spec §2, §7.1/§7.6), the value `W` read before a
+mutation is a **watermark**: every blob the mutation creates has id ≥ W, and
+nothing else in the database does. Durability of `W` comes from writing it
+into the intent blob, not from the accessor.
 
-## 3. Crash-residue requirements (P7 applied)
+### 4.1 Crash-residue requirements (P7 applied)
 
 | Tier | Requirement | Provided by |
 |---|---|---|
 | **must** | A partially written, power-interrupted operation is never data | L1: torn slot fails CRC → invisible (spec §8). Model: a reference that does not resolve is treated as *absent*, never surfaced as data |
-| **must** | Visible state flips atomically old → new | the single commit `update` (§4) |
-| **must** | No permanent leak — residue reclaimed | intent record + watermark recovery (§5) |
-| advisable | Self-healing of impossible residue | dangling pair → entry dropped (§6) |
-| advisable | Avoidance: ordering minimizes residue windows | prepare-before-commit, cleanup-after-commit (§4) |
+| **must** | Visible state flips atomically old → new | one commit per mutation: the single `update` of §3.2, or step COMMIT of §5 |
+| **must** | No permanent leak — residue reclaimed | intent record + watermark recovery (§6) |
+| advisable | Self-healing of impossible residue | dangling pair → entry dropped (§7) |
+| advisable | Avoidance: ordering minimizes residue windows | prepare-before-commit, cleanup-after-commit (§5) |
 
-## 4. The mutation discipline
+## 5. The extended mutation discipline
 
-Every mutation follows one shape; each step is an individually atomic
-`blob_db` call:
+Every reference-graph mutation follows one shape; each step is an
+individually atomic `blob_db` call:
 
 ```
 step 0  W = blob_db_next_id()                     (RAM read, no I/O)
@@ -76,21 +148,20 @@ step 5  update(intent_id, {})             CLEAR   mutation sealed
 ```
 
 - Only steps 2 and 4 can produce unreferenced i-nodes, and both lie inside
-  the staged window — recovery (§5) reclaims them. The commit itself can
+  the staged window — recovery (§6) reclaims them. The commit itself can
   never leak: it atomically swaps *which* set of i-nodes is referenced.
 - A reader, or a remount at any crash point, sees the complete old or the
   complete new mapping — never a torn list, never a dangling reference.
-- Fast path: a mutation that creates and deletes no blobs (e.g. an inline
-  change confined to the root) is step 3 alone — no stage, no residue
-  possible.
+- A basic-flow mutation (§3.2) is this shape with steps 0–2 and 4–5 empty:
+  the commit alone. No stage, no residue possible.
 
-Cost: two intent writes per residue-capable mutation. That is the price of
-zero leak; real containers may amortize it (§7) but the model pays it plainly.
+Cost: two intent writes per reference-graph mutation. That is the price of
+zero leak; real containers may amortize it (§9) but the model pays it plainly.
 
-## 5. Recovery — bounded and idempotent
+## 6. Recovery — bounded and idempotent
 
 On `open(list_id)` (and thus on every remount), read the intent blob. If it is
-empty, there is nothing to do — the fast path costs one read. Otherwise a
+empty, there is nothing to do — the normal case costs one read. Otherwise a
 mutation was interrupted, and `{W, del[]}` decides:
 
 ```
@@ -110,17 +181,17 @@ Properties:
   rollback branch runs only after a crash inside a staged window.
 - **Idempotent**: a crash during recovery re-enters the same branch — the
   commit state cannot change, deletes tolerate `-ENOENT`, and CLEAR is last.
-- **Complete**: every crash point in §4 lands in exactly one branch; the
-  tables below show there is no window that leaks past recovery.
+- **Complete**: every crash point in §8 lands in exactly one branch; the
+  tables show there is no window that leaks past recovery.
 - **Serialized**: assumes one mutation in flight per database — "unreferenced
   ids ≥ W are mine" holds only if nothing else allocated ids inside the
   staged window. Given by the v1 single-threaded contract; recovery itself
   runs at `open`, before any other traffic. A concurrent v2 needs a global
   mutation lock or per-mutation id ranges.
 
-## 6. Self-healing (defense in depth)
+## 7. Self-healing (defense in depth)
 
-Under the discipline of §4 a **dangling reference** — a pair whose `kid` or
+Under the discipline of §5 a **dangling reference** — a pair whose `kid` or
 `vid` no longer resolves — cannot occur. If one is observed anyway (software
 defect, external interference), it is *impossible residue* and must not be
 carried:
@@ -130,9 +201,9 @@ carried:
 - the next mutation of the list (or an explicit repair pass) drops the entry
   as part of its own commit.
 
-## 7. The operations, traced
+## 8. The extended operations, traced
 
-### 7.1 Insert — `set("foo", "bar")`
+### 8.1 Insert — `set("foo", "bar")`
 
 ```
 0  W = blob_db_next_id()
@@ -151,25 +222,11 @@ carried:
 | 4 | **new mapping** | staged intent | committed (list refs ids ≥ W): forward; clear |
 | 5 | new mapping | none | — |
 
-### 7.2 Overwrite — `set("foo", "baz")`
+### 8.2 Value replacement — when in-place `update` (§3.2) won't do
 
-**Fast path — the normal case.** Ids are stable and payloads mutable
-(spec §2, Appendix C), so the pair `(kid, vid)` keeps referencing `vid` and
-only `vid`'s content changes:
-
-```
-blob_db_update(vid, "baz")                            ← the entire mutation
-```
-
-One atomic operation: a crash leaves complete "bar" or complete "baz", never
-a torn value. No new ids, no staging, no residue possible. This is the
-general principle: **a mutation that does not change the reference graph
-collapses to a single `update`; only mutations that change which ids are
-referenced need the full discipline.**
-
-**Full discipline — when the value blob must actually be replaced** (the blob
-is shared and an in-place change would leak to other referrers, or an
-immutable-profile store, spec Appendix C):
+Applies when the value blob must genuinely be replaced: it is shared and an
+in-place change would leak to other referrers, or the store follows the
+immutable profile (spec Appendix C).
 
 ```
 0  W = blob_db_next_id()
@@ -188,7 +245,7 @@ immutable-profile store, spec Appendix C):
 | 4 | new mapping | staged intent | committed: delete `vid` → `-ENOENT`, fine; clear |
 | 5 | new mapping | none | — |
 
-### 7.3 Delete — `del("foo")`
+### 8.3 Delete — `del("foo")`
 
 ```
 0  W = blob_db_next_id()
@@ -207,24 +264,14 @@ immutable-profile store, spec Appendix C):
 | 4 | mapping gone | staged intent | committed: deletes → `-ENOENT`; clear |
 | 5 | mapping gone | none | — |
 
-### 7.4 Lookup — `get("foo")`
-
-```
-blob_db_get(list_id) → intent check (§5) → pair list
-for each (kid_i, vid_i):  blob_db_get(kid_i), compare
-blob_db_get(vid_i of the match) → "bar"
-```
-
-O(n) flash reads — the honest price of full indirection. No mutation, no
-residue windows.
-
-## 8. What real containers change — and what they must not
+## 9. What real containers change — and what they must not
 
 Real containers (`l2_containers.md`) optimize the model in three ways, none of
-which may weaken §3:
+which may weaken §4.1:
 
-- **Inlining** small keys/values into the referencing i-node — fewer blobs,
-  fewer staged steps, more mutations on the zero-residue fast path;
+- **Routing mutations through the basic flow** (§3.2) wherever possible —
+  in-place value updates, inlining small keys/values into the referencing
+  i-node — fewer blobs, fewer staged steps, more mutations with zero residue;
 - **Better reference-graph shapes** (hash buckets, tree nodes) — O(n) → O(1)
   / O(log n);
 - **Amortizing the intent cost** — one intent blob per container (as here)
@@ -232,9 +279,10 @@ which may weaken §3:
   stage/clear pair, at the price of a wider (still bounded, still recoverable)
   staged window.
 
-A mutation that cannot be expressed as *stage → prepare → one commit →
-cleanup → clear* (e.g. one needing two commits) is outside the contract and
-requires its own crash analysis against P7.
+A mutation that cannot be expressed as *one atomic update* (§3) or as
+*stage → prepare → one commit → cleanup → clear* (§5) — e.g. one needing two
+commits — is outside the contract and requires its own crash analysis against
+P7.
 
 A coarser alternative to the intent record is a **global sweep** (mark
 reachable from id = 1, `blob_db_iterate` everything, delete the difference).
