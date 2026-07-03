@@ -66,28 +66,41 @@ added later behind its own Kconfig symbol.
 
 ### 2.3 Worked example: `set("foo", "bar")` on a simple k→v list
 
-The kvlist root is one i-node holding the whole pair array
-`[(k1, v1), (k2, v2), …]` (§4.2), with large values indirected to their own
-i-nodes. Inserting a new key whose value is indirected:
+This is the **ground case** of the whole layer: every piece of data is its own
+i-node, every reference is explicit. Until the protocol is airtight here, no
+more complex structure can be built — the trees and hashes below are only ever
+compositions of this exact step pattern.
+
+Three kinds of i-node are involved:
 
 ```
-step 1  blob_db_put("bar") → vid          PREPARE   value blob on flash,
-                                                    referenced by nothing yet
-step 2  blob_db_update(list_id,           COMMIT    the array image is replaced
-          [(k1,v1), (k2,v2), ("foo",vid)])          atomically (L1 §2)
+key blob    "foo"                          own id: kid
+value blob  "bar"                          own id: vid
+list blob   [(kid1,vid1), (kid2,vid2), …]  own id: list_id   ← the container
 ```
 
-| Crash after | State on remount | Garbage |
+**Insert** `set("foo","bar")` — two prepares, one commit:
+
+```
+step 1  kid = blob_db_put("foo")                    PREPARE
+step 2  vid = blob_db_put("bar")                    PREPARE
+step 3  blob_db_update(list_id,                     COMMIT   the pair list is
+          [(kid1,vid1), (kid2,vid2), (kid,vid)])             replaced atomically (L1 §2)
+```
+
+| Crash after | State on remount | Garbage (unreferenced i-nodes) |
 |---|---|---|
-| step 1 | list unchanged; `get("foo")` → not found | 1 i-node (`vid`) |
-| step 2 | `get("foo")` → "bar"; mutation complete | none |
+| step 1 | list unchanged, `get("foo")` → not found | `kid` |
+| step 2 | list unchanged, `get("foo")` → not found | `kid`, `vid` |
+| step 3 | `get("foo")` → "bar", mutation complete | none |
 
-Overwriting an existing indirected key (`"foo"` → `"baz"`) adds cleanup:
+**Overwrite** `set("foo","baz")` — the key blob is reused, only the value is
+replaced:
 
 ```
-step 1  blob_db_put("baz") → vid2                  PREPARE
-step 2  blob_db_update(list_id, […("foo",vid2)…])  COMMIT   old vid unreferenced from here
-step 3  blob_db_delete(vid)                        CLEANUP
+step 1  vid2 = blob_db_put("baz")                   PREPARE
+step 2  blob_db_update(list_id, […(kid,vid2)…])     COMMIT   old vid unreferenced from here
+step 3  blob_db_delete(vid)                         CLEANUP
 ```
 
 | Crash after | State on remount | Garbage |
@@ -96,10 +109,23 @@ step 3  blob_db_delete(vid)                        CLEANUP
 | step 2 | new mapping intact | old `vid` (cleanup pending) |
 | step 3 | new mapping intact | none |
 
-With the value inline in the array (the small-value fast path), the entire
-mutation is step 2 alone. Deleting a key is the mirror image: commit first
-(`update` the array without the pair), then cleanup (`delete` the value
-i-node).
+**Delete** `del("foo")` — the mirror image, commit first, cleanup after:
+
+```
+step 1  blob_db_update(list_id, list without (kid,vid))   COMMIT
+step 2  blob_db_delete(kid)                               CLEANUP
+step 3  blob_db_delete(vid)                               CLEANUP
+```
+
+A crash after step 1 or 2 leaves `kid` and/or `vid` as garbage; the mapping is
+already correctly gone.
+
+**Lookup** `get("foo")` reads the list blob, then reads key blobs
+`(kid1, kid2, …)` one by one to compare — O(n) flash reads. That cost is the
+price of the fully-indirected ground case; inlining short keys/values into the
+list blob (§4.2) is an *optimization of this model*, which collapses prepare
+and cleanup steps (fewer separate i-nodes → fewer leak windows and fewer
+reads) without changing the protocol or its guarantees.
 
 ### 2.4 Handles and RAM
 
@@ -152,24 +178,29 @@ logs, queues, file-data chunk chains — not random access at scale.
 
 ### 4.2 `kvlist` — simple k→v list
 
-The whole pair array lives in **one i-node**:
+The ground representation is full indirection (§2.3): the root i-node holds
+only **id pairs**; keys and values are each their own i-node.
 
 ```
-root { magic 'CKVL', count, pair[count]… }
-pair { klen, vlen_or_ref, key…, (val… | val_id) }
+root { magic 'CKVL', count, (key_id, val_id)[count] }
 ```
 
-Values up to `CONFIG_CONTAINER_KVLIST_INLINE_MAX` are inline; larger ones get
-their own i-node, referenced by `val_id` — the indirection pattern all
-containers reuse. Every mutation rewrites the array image and commits it with
-a **single `update` of the root** (§2.2; worked through step by step in §2.3),
-with value-i-node `put`/`delete` around it as prepare/cleanup.
+Every mutation rewrites the pair list and commits it with a **single `update`
+of the root**, with key/value `put`s before it and `delete`s after it as
+prepare/cleanup — exactly the traces in §2.3.
 
-If the array outgrows one i-node payload, the node ends with a `next_id`
-chaining to an overflow node of the same layout; a mutation then rewrites only
-the affected node of the chain. O(n) everything; smallest code of the Map
-providers. Intended for ≲ tens of keys, and as `kvhash`'s per-bucket
-representation.
+Two optimizations of the ground case, protocol unchanged:
+
+- **Inlining.** Keys/values up to `CONFIG_CONTAINER_KVLIST_INLINE_MAX` are
+  stored in the root's pair entry instead of their own i-node — fewer flash
+  reads per lookup, fewer prepare/cleanup steps (and leak windows) per
+  mutation.
+- **Overflow chaining.** When the pair list outgrows one i-node payload, the
+  node ends with a `next_id` to an overflow node of the same layout; a
+  mutation rewrites only the affected node of the chain.
+
+O(n) everything; smallest code of the Map providers. Intended for ≲ tens of
+keys, and as `kvhash`'s per-bucket representation.
 
 ### 4.3 `kvhash` — k→v hash
 
