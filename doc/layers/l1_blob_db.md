@@ -736,7 +736,7 @@ handles/transactions and is out of scope until a concrete consumer appears.
 **Decision: payloads are mutable.** `update(id)` replaces content under the
 same id; an id is the stable name of a *logical* blob. Mutations that do not
 change the reference graph therefore collapse to a single atomic `update` —
-the fast path clients are expected to use (`l1_model_container.md` §3.2).
+the fast path clients are expected to use (`l1_model_container.md` §3.4).
 
 The alternative considered: drop `update`, make every blob immutable, and add
 a mutable **root register** in the master sector

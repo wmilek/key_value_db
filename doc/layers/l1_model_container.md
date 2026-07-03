@@ -45,9 +45,42 @@ list blob    [(kid1,vid1), (kid2,vid2), …]    own id: list_id   ← container 
 The client persists nothing but `list_id` (in practice id = 1, or a field of
 the id = 1 root — P5). Everything is reachable from it.
 
-## 3. The basic flow — one operation is the whole mutation
+## 3. The basic flow
 
-### 3.1 Lookup — `get("foo")`
+### 3.1 Create — the container comes into existence
+
+```
+blob_db_put(empty pair list) → list_id        ← one atomic operation
+```
+
+The container exists from the moment this single `put` commits; the client
+persists `list_id` (as id = 1, or in the id = 1 root). Crash before it: no
+container, no residue. Crash after: an empty, fully valid container.
+
+### 3.2 First insert — `set("foo", "bar")`
+
+New data means new i-nodes, and the one ordering rule of the basic flow is:
+**create the referenced blobs first, make them reachable last** — the commit
+is the final, single `update`:
+
+```
+step 1  kid = blob_db_put("foo")                    new blob, unreferenced so far
+step 2  vid = blob_db_put("bar")                    new blob, unreferenced so far
+step 3  blob_db_update(list_id, …+(kid,vid))        COMMIT — atomic (spec §2)
+```
+
+| Crash after | Visible state on remount | Leftover on flash |
+|---|---|---|
+| step 1 | list unchanged, `get("foo")` → not found | `kid`, unreferenced |
+| step 2 | list unchanged, `get("foo")` → not found | `kid`, `vid`, unreferenced |
+| step 3 | `get("foo")` → "bar", mutation complete | none |
+
+Correctness is already perfect: at every crash point a reader or remount sees
+the complete old or the complete new mapping — never a torn list, never a
+dangling reference. The commit-last ordering alone gives P7's must-tier
+atomicity. Note the leftover column, though — it returns in §3.5.
+
+### 3.3 Lookup — `get("foo")`
 
 ```
 blob_db_get(list_id) → the pair list
@@ -58,7 +91,7 @@ blob_db_get(vid_i of the match) → "bar"
 O(n) flash reads — the honest price of full indirection. Read-only: no crash
 windows.
 
-### 3.2 Overwrite — `set("foo", "baz")` when "foo" already exists
+### 3.4 Overwrite — `set("foo", "baz")` when "foo" already exists
 
 Ids are stable and payloads mutable (spec §2, Appendix C): the pair
 `(kid, vid)` keeps referencing `vid`, and only `vid`'s content changes.
@@ -75,28 +108,21 @@ This is the load-bearing principle of the basic flow:
 
 > **A mutation that does not change the reference graph collapses to a single
 > atomic `update`. Only mutations that change *which ids are referenced*
-> need more.**
+> need more (the ordering rule of §3.2 at minimum).**
 
-In the basic flow the whole crash story is L1's single-operation atomicity.
-A well-designed container routes every mutation it can through this form.
+In the basic flow the whole crash story is L1's single-operation atomicity
+plus the commit-last ordering. A well-designed container routes every
+mutation it can through the single-`update` form.
 
-### 3.3 Where the basic flow ends
+### 3.5 Where the basic flow ends
 
-Insert and delete *do* change the reference graph — new blobs must come into
-existence, or old ones must go — and no single `blob_db` call expresses that.
-A naive insert:
-
-```
-kid = blob_db_put("foo")            ← crash here: kid unreferenced, forever
-vid = blob_db_put("bar")            ← crash here: kid, vid unreferenced, forever
-blob_db_update(list_id, …+(kid,vid))
-```
-
-The *ordering* is already right — commit last, so a reader or remount never
-sees a torn list or a dangling reference (P7's must-tiers hold). What fails
-is the **no-permanent-leak** requirement: nothing records that `kid`/`vid`
-were created, so after a crash nothing can reclaim them. Each interrupted
-mutation leaks a few blobs; over a device's lifetime that is unbounded.
+Look back at the leftover column of §3.2 — and delete has the mirror problem:
+the pair's blobs can only be deleted *after* the commit that unlinks them,
+and a crash in between strands them. The visible state is always correct, but
+nothing records that `kid`/`vid` were created (or were scheduled to die), so
+after a crash nothing can ever reclaim them. Each interrupted mutation leaks
+a few blobs; over a device's lifetime that is unbounded, which violates P7's
+**no-permanent-leak** requirement.
 
 Closing exactly this gap — reclamation, not correctness — is what the
 extension adds.
@@ -127,7 +153,7 @@ into the intent blob, not from the accessor.
 | Tier | Requirement | Provided by |
 |---|---|---|
 | **must** | A partially written, power-interrupted operation is never data | L1: torn slot fails CRC → invisible (spec §8). Model: a reference that does not resolve is treated as *absent*, never surfaced as data |
-| **must** | Visible state flips atomically old → new | one commit per mutation: the single `update` of §3.2, or step COMMIT of §5 |
+| **must** | Visible state flips atomically old → new | one commit per mutation: the single `update` of §3.4, or step COMMIT of §5 |
 | **must** | No permanent leak — residue reclaimed | intent record + watermark recovery (§6) |
 | advisable | Self-healing of impossible residue | dangling pair → entry dropped (§7) |
 | advisable | Avoidance: ordering minimizes residue windows | prepare-before-commit, cleanup-after-commit (§5) |
@@ -152,8 +178,10 @@ step 5  update(intent_id, {})             CLEAR   mutation sealed
   never leak: it atomically swaps *which* set of i-nodes is referenced.
 - A reader, or a remount at any crash point, sees the complete old or the
   complete new mapping — never a torn list, never a dangling reference.
-- A basic-flow mutation (§3.2) is this shape with steps 0–2 and 4–5 empty:
-  the commit alone. No stage, no residue possible.
+- A single-`update` mutation (§3.4) is this shape with steps 0–2 and 4–5
+  empty: the commit alone. No stage, no residue possible. §3.2's first insert
+  is this shape with steps 0–1 and 4–5 missing — which is exactly why it
+  leaked.
 
 Cost: two intent writes per reference-graph mutation. That is the price of
 zero leak; real containers may amortize it (§9) but the model pays it plainly.
@@ -205,6 +233,9 @@ carried:
 
 ### 8.1 Insert — `set("foo", "bar")`
 
+The first insert of §3.2, completed: the same three calls, wrapped in
+stage/clear so the leftovers of its crash table become reclaimable.
+
 ```
 0  W = blob_db_next_id()
 1  blob_db_update(intent_id, {W})                     STAGE
@@ -222,7 +253,7 @@ carried:
 | 4 | **new mapping** | staged intent | committed (list refs ids ≥ W): forward; clear |
 | 5 | new mapping | none | — |
 
-### 8.2 Value replacement — when in-place `update` (§3.2) won't do
+### 8.2 Value replacement — when in-place `update` (§3.4) won't do
 
 Applies when the value blob must genuinely be replaced: it is shared and an
 in-place change would leak to other referrers, or the store follows the
@@ -269,7 +300,7 @@ immutable profile (spec Appendix C).
 Real containers (`l2_containers.md`) optimize the model in three ways, none of
 which may weaken §4.1:
 
-- **Routing mutations through the basic flow** (§3.2) wherever possible —
+- **Routing mutations through the basic flow** (§3.4) wherever possible —
   in-place value updates, inlining small keys/values into the referencing
   i-node — fewer blobs, fewer staged steps, more mutations with zero residue;
 - **Better reference-graph shapes** (hash buckets, tree nodes) — O(n) → O(1)
