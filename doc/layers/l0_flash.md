@@ -81,7 +81,7 @@ A translation layer inspired by Linux UBI, for flash that needs management
 
 Integration is a pointer swap, not a rewrite: `blob_db` gets aimed at the FTL's
 virtual partition via `CONFIG_BLOB_DB_PARTITION_LABEL`. No source change above
-L0 (see `doc/layers/l1_blob_db.md` §17).
+L0 (see `doc/architecture.md` §4 and the L1 contract, decision D1).
 
 The FTL's own design (PEB header format, atomic LEB move, erase-counter
 persistence) will be specified in a dedicated document when scheduled:

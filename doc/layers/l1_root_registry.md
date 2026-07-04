@@ -69,9 +69,12 @@ ROOTREG_KEY('KVDB', 1)      /* a second, independent kvdb instance      */
   build, not in the field.
 - Key 0 is invalid (reserved).
 
-## 4. On-flash format
+## 4. On-flash format (implementation sketch, non-normative)
 
-The registry is one i-node, **bound at id = 1**, containing:
+The contract-level requirements are: one i-node bound at id = 1, fixed-size
+entries, a frozen versioned format, capacity within one payload. The layout
+below is the intended realization — details may be fine-tuned during
+implementation:
 
 ```
 magic[4]      = 'R','R','E','G'

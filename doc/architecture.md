@@ -11,14 +11,19 @@ Status: v2 · Top-level document; per-layer detail lives in `doc/layers/`
 | **this file** | The stack: layers, boundaries, composition model |
 | `doc/principles.md` | Binding design principles (P1–P8) for every layer |
 | `doc/layers/l0_flash.md` | L0 — flash translation: `flash_area` contract, future UBI-like FTL |
-| `doc/layers/l1_blob_db.md` | L1 — i-node allocation (`blob_db`): full implementation-level spec |
+| `doc/layers/l1_blob_db.md` | L1 — `blob_db` **contract & requirements** (implementation-agnostic) |
 | `doc/layers/l1_model_container.md` | L1 — the model container: blob_db's client contract by example |
 | `doc/layers/l1_root_registry.md` | L1½ — root registry: owner of id = 1, key → structure-root map |
 | `doc/layers/l2_containers.md` | L2 — containers: seq, kvlist, kvhash, kvtree |
 | `doc/layers/l3_interfaces.md` | L3 — access interfaces: kvdb, blobfs, settings |
+| `doc/impl/l1_bucketlog.md` | **Implementation design** (non-normative): the v1 bucket-log allocator — formats, algorithms, costs, open items |
 
-L1 is implemented and tested; L0's interface is fixed (provider `a` in use);
-L2/L3 are specified, pre-implementation.
+`doc/layers/` holds **requirements & contracts** — everything an upper layer
+may rely on (P6). `doc/impl/` holds **implementation designs**: feasibility
+proofs of those contracts, fine-tuned during implementation, never depended
+on from above. Status: contracts for L0–L3 are specified; the bucket-log
+implementation design exists with tracked open items; production code is not
+yet written (existing `lib/` code is a draft predating the current contract).
 
 ## 2. The stack
 
@@ -30,8 +35,11 @@ L2/L3 are specified, pre-implementation.
 │  L2  Containers             seq · kvlist · kvhash · kvtree           │  choose backing container(s)
 │      data structures wired out of i-nodes                            │
 ├──────────────────────────────────────────────────────────────────────┤
+│  L1½ Root registry          owner of id = 1; key → structure root    │  tiny, always simple
+│      where clients persist "where is my structure"                   │
+├──────────────────────────────────────────────────────────────────────┤
 │  L1  i-node allocation      blob_db: stable u64 id → blob            │  the always-present core
-│      crash-atomic alloc_id/update/get/delete by id                        │
+│      crash-atomic alloc_id/update/get/delete by id                   │
 ├──────────────────────────────────────────────────────────────────────┤
 │  L0  Flash translation      flash_area today · UBI-like FTL later    │  swappable provider
 │      erase blocks, alignment, (wear/bad blocks in FTL form)          │
@@ -67,8 +75,14 @@ bad-block remapping behind the *same* interface — a pointer swap via
 partition into a pool of stably-identified, crash-atomically updatable blobs
 ("i-nodes"). The public API is the contract; the allocator behind it
 (v1: hash-bucketed append-log) is exchangeable — FAT-like or extent-based
-variants can replace it at the cost of a reformat (`l1_blob_db.md` Appendix B).
+variants can replace it at the cost of a reformat (L1 contract, decision D1).
 → `layers/l1_blob_db.md`
+
+**L1½ — Root registry.** A deliberately tiny module directly on L1: the sole
+owner of id = 1, mapping compile-time keys (`ROOTREG_KEY('KVDB',0)`) to
+structure-root ids. Single i-node, single-`update` mutations, no recovery
+machinery; `get_or_create` doubles as a leak-free creation intent for new
+structures. → `layers/l1_root_registry.md`
 
 **L2 — Containers.** Data structures whose nodes are i-nodes and whose edges
 are ids stored in payloads. Four providers behind two abstract shapes — **Map**
@@ -129,7 +143,8 @@ include/app/lib/      blob_db.h · rootreg.h · containers/{shape_map,shape_seq,
                       · kvdb.h · blobfs.h
 tests/lib/            blob_db/ (exists) · blob_db_contract/ (model container)
                       · rootreg/ · containers/* · kvdb/ · blobfs/
-doc/                  this file · principles.md · layers/*.md
+doc/                  this file · principles.md · layers/*.md (contracts)
+                      · impl/*.md (implementation designs)
 ```
 
 Each new module follows the `lib/blob_db/` pattern: own `Kconfig`,

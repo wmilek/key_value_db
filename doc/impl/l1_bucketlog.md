@@ -1,0 +1,343 @@
+# Implementation design — bucket-log allocator for `blob_db`
+
+Status: v2 · **Non-normative feasibility design.** This document proves the
+L1 contract (`doc/layers/l1_blob_db.md`) is implementable and guides the
+first implementation. Everything here — formats, algorithms, costs — may be
+fine-tuned during implementation as long as the contract holds. Upper layers
+must not depend on anything in this document (P6). Known deltas against the
+contract are tracked in §13 *Open implementation items*.
+
+Target board for bring-up: `native_sim`.
+
+---
+
+## 1. Approach & cost summary
+
+One erase sector = one **bucket**; a blob with id `i` lives in bucket
+`i mod N`. Buckets are append-only slot logs; per-bucket compaction reclaims
+garbage; a double-buffered master sector carries generation, compaction
+state, and the id hint.
+
+Costs achieved by this design (satisfying contract §3):
+
+| Op | Flash reads | Flash writes | RAM (transient) |
+|---|---|---|---|
+| `mount` | 2 (master A + B) + 2045 (bucket scan)¹ | 0 (or format if first ever) | O(1) |
+| `alloc_id()` | 0 | 0 (occasional id-hint persist) | O(1) |
+| `get(id)` | **1** (one bucket sector) | 0 | 4 KB stack |
+| `update(id, …)` | 0² | 1 (slot; on rebind the old slot becomes garbage) + occasional compact | 4 KB stack |
+| `delete(id)` | 1 (verify presence) | 1 (tombstone) | 4 KB stack |
+| `exists(id)` | 1 | 0 | 4 KB stack |
+| `count` / `iterate` | 2045 (full scan) | 0 | O(1) |
+| `compact_bucket` | 1 + master writes | 1 scratch + 1 bucket restore + 2 master | O(1) |
+
+¹ Mount scans all buckets to recover write cursors and the max id — ~8 MB of
+reads, ≈100–200 ms on typical NOR (full sectors are read because each slot's
+`val_len` is needed to skip to the next slot).
+² Release builds perform no existence check — `update` on a dead id is UB
+(contract §2). A debug build may spend one bucket read to verify and assert
+(§13.5).
+
+## 2. Storage layout
+
+Partition: 8 MB = 2048 × 4 KB sectors (`native_sim` overlay). One sector =
+one erase block ("PEB"); on other flash, geometry comes from
+`flash_area_get_sectors`.
+
+```
+sector  0       master A          ← metadata, gen counter, compaction state
+sector  1       master B          ← double-buffer of master
+sector  2       scratch           ← shared compaction scratch
+sectors 3..2047 bucket 0..2044    ← N = 2045 hash buckets, 4 KB each
+```
+
+Sequential id allocation round-robins ids across buckets — uniform fill.
+Per-bucket mean at 100 k blobs: 49 entries.
+
+## 3. On-flash format
+
+### 3.1 Master sector (24 B header; rest of the sector reserved)
+
+```
+magic[4]        = 'B','D','M','S'
+generation[4]   = monotonic LE              /* latest valid gen wins        */
+state[1]        = CLEAN | COMPACTING
+compacting_bid[2]
+reserved[1]
+next_id_hint[8] = id-counter persistence    /* see §5.1 and §13.1           */
+hdr_crc32[4]    = CRC32-IEEE over preceding 20 B
+```
+
+Double-buffered: writes alternate between sectors 0/1 with incrementing
+generation; a torn master write loses the new generation and the previous
+master still wins.
+
+### 3.2 Bucket layout (one sector)
+
+```
+offset 0x000   bucket header (16 B):  magic 'BDBH', bucket_id[2], reserved[2],
+                                      gen[4] (++ per compact), hdr_crc32[4]
+offset 0x010   entry slot stream (append-only)
+...            rest erased = 0xff
+```
+
+The header is written once per erase (first format or each compact); inserts
+append slots after it.
+
+### 3.3 Entry slot
+
+Variable length, write-block aligned (`W = flash_area_align()`):
+
+```
+struct blob_slot_hdr {           /* 4 B, __packed */
+    uint8_t  flags;              /* bit0 SEALED | bit1 TOMBSTONE */
+    uint8_t  reserved;
+    uint16_t val_len;            /* 0..MAX_PAYLOAD_LEN, LE */
+};
+/* uint64_t id (LE) · payload[val_len] (absent if TOMBSTONE) · crc16_ccitt */
+
+slot_size(val_len) = round_up(14 + val_len, W)
+```
+
+### 3.4 End-of-log detection
+
+The slot stream ends at the first offset where the slot would cross the
+sector end, `val_len > MAX_PAYLOAD_LEN`, `flags == 0xff` (erased), or the CRC
+fails. The bucket's write cursor is that offset.
+
+## 4. Slot semantics — latest wins
+
+A bucket is an append-only log of operations on the ids hashing to it.
+Multiple slots may exist for one id (rebinds, tombstone); `get` takes the
+**last** matching slot in append order; a trailing TOMBSTONE means dead
+(`-ENOENT`). Compaction (§5.6) leaves at most one live slot per id.
+
+## 5. Algorithms
+
+### 5.1 Mount
+
+```
+read master A, B → pick higher valid generation
+if state == COMPACTING: finish/abort per crash table (§6.1), write CLEAN master
+
+max_id_seen = next_id_hint
+for bid in [0..N):
+    walk slots: max_id_seen = max(max_id_seen, slot.id)   # tombstones count too
+    write_cursor[bid] = end of log
+next_id = max_id_seen + 1                                  # but see §13.1
+```
+
+### 5.2 `alloc_id`
+
+```
+id = next_id++
+if (next_id & 0xff) == 0: persist next_id_hint via master write   # see §13.1
+return id
+```
+
+### 5.3 `update` — first bind and rebind (same append path)
+
+```
+bid = id % N
+ensure bucket formatted (header write on first use)
+if write_cursor[bid] + slot_size(len) > sector_end:
+    compact_bucket(bid); if still no room: return -ENOSPC
+build slot in stack buffer; flash_area_write at write cursor
+```
+
+On rebind the previous slot for the id becomes garbage until compaction.
+Debug builds may precede this with a get-shaped scan asserting the id is
+bound or freshly allocated (§13.5).
+
+### 5.4 `get`
+
+Read the id's bucket sector into a 4 KB stack buffer (the only flash I/O),
+walk slots tracking the latest match, apply latest-wins (§4).
+
+### 5.5 `delete`
+
+Verify presence (1 read); append a TOMBSTONE slot (`val_len = 0`).
+
+### 5.6 `compact_bucket(bid)`
+
+Build the compacted image (live slots only) in RAM, then:
+
+```
+write master B  (gen+1, COMPACTING, bid, hint↑)  ─┐   hint↑: cover the highest
+erase scratch; write new image to scratch          │   id being dropped, so an
+erase bucket;  write new image to bucket           │   erased tombstone cannot
+erase scratch                                      │   unprotect its id
+write master A  (gen+2, CLEAN)                    ─┘   (subsumed by §13.1)
+```
+
+The window is bracketed by master writes; any crash inside is recovered at
+mount (§6.1).
+
+### 5.7 `iterate` / `count`
+
+Bucket-by-bucket full scan; callback runs against the resident sector buffer.
+Order is not id-sorted.
+
+## 6. Atomicity & crash recovery
+
+Two atomic-commit primitives: a **single slot append** (torn → CRC fails →
+treated as end-of-log) and a **master sector write** (torn → older master
+wins). Compaction composes them.
+
+### 6.1 Compaction crash table
+
+| Crash point | Mount sees | Recovery |
+|---|---|---|
+| before any write | both masters CLEAN | nothing |
+| during master-B write | B invalid, A CLEAN | not-yet-compacting |
+| during scratch erase/write | B = COMPACTING, scratch invalid | discard scratch; bucket untouched; write CLEAN |
+| during bucket erase/restore | B = COMPACTING, scratch valid | copy scratch → bucket; erase scratch; write CLEAN |
+| during final master-A write | B still COMPACTING | re-run recovery (idempotent); write CLEAN |
+
+### 6.2 Torn slot
+
+Torn slot write → `flags` still `0xff` or CRC fails → end-of-log at that
+offset; committed slots before it are intact; tail garbage is reclaimed by
+the next compaction.
+
+## 7. Kconfig
+
+```
+BLOB_DB                    bool, select FLASH, FLASH_MAP, CRC
+BLOB_DB_PARTITION_LABEL    string, default "storage"
+BLOB_DB_MAX_PAYLOAD_LEN    int, default 256, range 1 4096
+module = BLOB_DB (standard LOG pattern)
+```
+
+Partition geometry discovered at runtime (`flash_area_get_size/_get_sectors`).
+
+## 8. Repo integration
+
+```
+lib/blob_db/{blob_db.c, alloc_bucketlog.c, blob_db_internal.h, Kconfig, CMakeLists.txt}
+include/app/lib/blob_db.h
+tests/lib/blob_db/          unit suite (this doc §11)
+tests/lib/blob_db_contract/ model-container acceptance suite (crash injection)
+app/boards/native_sim.overlay   16 MB sim-flash; 8 MB storage_partition
+```
+
+## 9. Zephyr APIs used
+
+`<zephyr/storage/flash_map.h>` (open/close/read/write/erase/get_size/
+get_sectors/align), `<zephyr/sys/crc.h>` (crc16_ccitt for slots, crc32_ieee
+for headers), `<zephyr/logging/log.h>`.
+
+## 10. Failure-mode summary
+
+| Scenario | Outcome |
+|---|---|
+| Crash mid-slot write | CRC/erased-flags → end-of-log; committed slots intact |
+| Crash mid-compaction | master state machine + scratch (§6.1); ids unaffected |
+| Crash mid-master write | older valid master wins |
+| Bit corruption in a slot | CRC catches it; everything after it in that bucket is unreachable until next compaction |
+| Partition full | `update` returns `-ENOSPC` after attempting compaction of the target bucket |
+| One bucket overflows | as above, per-bucket; round-robin allocation keeps fill uniform, so buckets fill together |
+| Id space exhaustion | 2⁶⁴ allocations ≈ 5800 years at 100 M/s — not reachable |
+
+## 11. Unit-test plan (draft)
+
+`tests/lib/blob_db/`, `west twister -p native_sim`. This list tracks the
+draft implementation and will be reworked against the final API; the
+*contract-level* coverage lives in the model-container acceptance suite
+(`tests/lib/blob_db_contract/`, see `l1_model_container.md` §1).
+
+1. mount on erased partition formats; `count()==0`; first `alloc_id()==1`
+2. alloc+bind → get round-trip (payload with NUL bytes)
+3. ids strictly monotonic; survive remount
+4. get/delete on missing id → `-ENOENT`; exists → false
+5. rebind keeps id; old content replaced atomically
+6. delete → get `-ENOENT`; second delete `-ENOENT`
+7. debug-assert on update-after-delete (UB check, debug config only)
+8. persistence across remount (N blobs)
+9. payload length boundaries (0, 1, MAX, MAX+1 rejected)
+10. corrupted slot truncates its bucket cleanly on remount
+11. full bucket triggers compaction; bind succeeds after
+12. compaction drops tombstones/overrides; preserves all live ids
+13. simulated mid-compaction crash (forged COMPACTING master) recovers
+14. scale: 100 k blobs, random subset round-trips (Kconfig-gated)
+
+## 12. End-to-end verification
+
+1. `west build -b native_sim app -p` — clean build.
+2. Boot-count demo across two runs of `zephyr.exe --flash=…` (note: demo
+   currently binds id = 1 directly; to be migrated to a `ROOTREG_KEY('BOOT',0)`
+   root — §13.6).
+3. `west twister -p native_sim -T tests/lib/blob_db` green.
+4. `xxd` the flash file: master magic `BDMS` and bucket magic `BDBH` present.
+
+## 13. Open implementation items (to fine-tune before/during implementation)
+
+1. **Durable id allocation — adopt a leading ceiling (hi/lo).** As sketched
+   in §5.1/§5.2, `next_id` is recovered from the bucket scan plus a *lagging*
+   hint. That protects **bound** ids only; an allocated-but-unbound id leaves
+   no trace, so after a crash it could be returned again — violating contract
+   §2, and breaking root-registry `get_or_create` recovery and `update`'s
+   `-EINVAL` boundary. Fix: persist `next_id_hint` as a **ceiling ahead of
+   allocation** (e.g. +256) and have mount take `next_id = ceiling`, never
+   the scan max. This subsumes both monotonicity patches (tombstones counting
+   toward the scan max in §5.1, and the `hint↑` ride-along in §5.6). Cost
+   unchanged: one master write per block of allocations.
+2. **Steady-state RAM story.** §5 pseudocode keeps `write_cursor[N]`
+   (~4–8 KB), which violates contract R1. Either re-scan the target bucket on
+   each write operation (+1 read on `update`/`delete`; the current draft code
+   does this) or keep cursors and renegotiate R1. Decide with measurements;
+   the contract favors re-scan.
+3. **Sector-size portability.** 4 KB stack buffers assume ≤ 4 KB erase
+   sectors; parts with larger erase blocks need either a Kconfig'd buffer or
+   an explicit supported-geometry statement.
+4. **Master format version field** — add alongside the magic for bucket-log
+   format evolution.
+5. **Debug bound-check for UB `update`** — optional Kconfig
+   (`BLOB_DB_ASSERT_BOUND`): get-shaped scan + `__ASSERT` in debug builds,
+   nothing in release.
+6. **Migrate direct id = 1 users** — the app demo (and the Appendix A
+   sketches below) bind id = 1 directly; with the root registry they move to
+   `ROOTREG_KEY` roots.
+
+---
+
+## Appendix A — Client-side indexing patterns (historical)
+
+Superseded by the model container (`l1_model_container.md`) and the container
+layer (`l2_containers.md`); kept as informal illustrations of what clients
+build on the primitives. Note these sketches predate the root registry and
+bind id = 1 directly (§13.6); they also ignore the mutation discipline.
+
+- **A.1 Linked list of (name → blob id)** — each node its own blob; root
+  holds the head id; O(n) lookup, fine for tens of names.
+- **A.2 Balanced tree** — nodes hold child ids; O(log n) flash reads per
+  lookup; copy-on-write path updates.
+- **A.3 Hash table** — client bucket blobs; O(1) lookup; client-owned resize
+  policy.
+- **A.4 No index** — `iterate` + callback scan; effectively free below ~100
+  entries.
+
+## Appendix B — Alternative allocators (exploration)
+
+The contract fixes the API; these are candidate implementations behind it
+(contract §5.1). Comparison:
+
+| | **bucket-log (this doc)** | **FAT-like** | **extent-based** |
+|---|---|---|---|
+| Allocation unit | variable-length slot | fixed-size chunk | extent (start, len) |
+| id → data | computed (`id mod N`) + scan | i-node table → chunk chain | i-node table → extent list |
+| Free-space accounting | per-bucket append cursor | chunk bitmap | free-extent search |
+| Max payload | one sector | unbounded (chain) | unbounded (multi-extent) |
+| Fragmentation | garbage slots until compact | internal ~½ chunk/blob | external splinters |
+| GC | per-bucket compaction | still needed (below) | compaction with extent moves |
+| Suits | many small blobs (L2 nodes) | mixed sizes | few large blobs, streaming |
+
+**Why fixed-size chunks don't win for v1:** they buy O(1) bitmap accounting
+but *not* in-place update — flash erases at block granularity, so a freed
+bitmap bit can't be reused without erasing its whole block; a FAT-like
+allocator ends up log-structured at block level anyway. And they cost
+internal fragmentation: with 64 B chunks, ~32 B average tail waste × 100 k
+blobs ≈ 3 MB of an 8 MB partition. For the dominant workload (small L2
+nodes) variable slots waste strictly less; fixed chunks pay off only once
+blobs regularly exceed a sector — which v1 forbids. If such an allocator
+lands, the pread extension (contract §5.4) becomes the read path.

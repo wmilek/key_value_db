@@ -42,8 +42,9 @@ value blob   "bar"                            own id: vid
 list blob    [(kid1,vid1), (kid2,vid2), …]    own id: list_id   ← container root
 ```
 
-The client persists nothing but `list_id` (in practice id = 1, or a field of
-the id = 1 root — P5). Everything is reachable from it.
+The client persists nothing but `list_id` (P5) — in the full stack, as an
+entry in the root registry (`l1_root_registry.md`), which itself hangs off
+id = 1. Everything is reachable from it.
 
 ## 3. The basic flow
 
@@ -98,14 +99,14 @@ windows.
 
 ### 3.4 Overwrite — `set("foo", "baz")` when "foo" already exists
 
-Ids are stable and payloads mutable (spec §2, Appendix C): the pair
+Ids are stable and payloads mutable (spec §2, decision D2): the pair
 `(kid, vid)` keeps referencing `vid`, and only `vid`'s content changes.
 
 ```
 blob_db_update(vid, "baz")                    ← the entire mutation
 ```
 
-One atomic operation (spec §2/§8): after a crash the value is complete "bar"
+One atomic operation (spec §2): after a crash the value is complete "bar"
 or complete "baz" — never torn, never absent. Nothing was created, nothing
 must die, there is no residue and nothing to recover.
 
@@ -146,8 +147,8 @@ The intent blob is created once, together with the container; its id is
 stored in the root and never changes (id stability — the journal is only ever
 `update`d). It is empty whenever no mutation is in flight.
 
-Recovery is built on `blob_db_alloc_id()` (spec §9). Because ids are strictly
-monotonic and never reused across any crash (spec §2, §7.1/§7.6), the
+Recovery is built on `blob_db_alloc_id()` (spec §4). Because ids are strictly
+monotonic and never reused across any crash (spec §2), the
 mutation's **first allocation is its watermark**: `W = alloc_id()`, and every
 id the mutation allocates afterwards is > W — while nothing else in the
 database has an id ≥ W. (`W` itself is never bound; recovery's `delete(W)`
@@ -158,7 +159,7 @@ into the intent blob, not from the allocation.
 
 | Tier | Requirement | Provided by |
 |---|---|---|
-| **must** | A partially written, power-interrupted operation is never data | L1: torn slot fails CRC → invisible (spec §8). Model: a reference that does not resolve is treated as *absent*, never surfaced as data |
+| **must** | A partially written, power-interrupted operation is never data | L1: a torn write is detected and discarded (spec §2). Model: a reference that does not resolve is treated as *absent*, never surfaced as data |
 | **must** | Visible state flips atomically old → new | one commit per mutation: the single `update` of §3.4, or step COMMIT of §5 |
 | **must** | No permanent leak — residue reclaimed | intent record + watermark recovery (§6) |
 | advisable | Self-healing of impossible residue | dangling pair → entry dropped (§7) |
@@ -264,7 +265,7 @@ stage/clear so the leftovers of its crash table become reclaimable.
 
 Applies when the value blob must genuinely be replaced: it is shared and an
 in-place change would leak to other referrers, or the store follows the
-immutable profile (spec Appendix C).
+immutable profile (spec decision D2).
 
 ```
 0  W = blob_db_alloc_id()                             (RAM only)

@@ -95,6 +95,11 @@ cost beyond one indirection.
 | §4.3 `kvhash` — k→v hash | Map | O(1) avg | no | `CONTAINER_KVHASH` |
 | §4.4 `kvtree` — k→v tree | Map | O(log n) | by key | `CONTAINER_KVTREE` |
 
+The normative parts of each container are its shape, cost class, the §2.2
+discipline, and the §5 invariants. The node layouts sketched below are
+implementation designs — they show feasibility and may be fine-tuned when
+each container gets its own implementation document under `doc/impl/`.
+
 ### 4.1 `seq` — simple list
 
 Singly-linked chain of chunk nodes; the root holds head/tail ids and a count.

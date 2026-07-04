@@ -104,6 +104,7 @@ instead of NVS. Smallest of the three; may ship after `kvdb`/`blobfs`.
 
 ```
 config KVDB                        bool "Key/value DB interface"   depends on BLOB_CONTAINERS
+                                   select BLOB_ROOTREG
 choice KVDB_BACKEND                prompt "kvdb backing container" depends on KVDB
   config KVDB_BACKEND_KVLIST       select CONTAINER_KVLIST
   config KVDB_BACKEND_KVHASH       select CONTAINER_KVHASH
@@ -112,6 +113,7 @@ endchoice
 config KVDB_MAX_KEY_LEN            int "Max key length"            default 64
 
 config BLOBFS                      bool "Filesystem-like interface" depends on BLOB_CONTAINERS
+                                   select BLOB_ROOTREG
 choice BLOBFS_DIR_BACKEND          prompt "directory container"    depends on BLOBFS
   config BLOBFS_DIR_KVHASH         select CONTAINER_KVHASH
   config BLOBFS_DIR_KVTREE         select CONTAINER_KVTREE         # sorted readdir
