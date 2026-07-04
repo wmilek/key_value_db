@@ -64,6 +64,9 @@ Backend `choice` and resulting profile:
 | `KVDB_BACKEND_KVTREE` | O(log n), sorted `foreach`, prefix/range scans | ordered iteration matters |
 
 The API is identical across backends; only costs (and `foreach` order) change.
+`kvdb_foreach` and `blobfs_readdir` inherit the iterator rules from the L1
+contract §4: callback returns 0/non-zero (Zephyr convention), and mutating
+the store from inside the callback is undefined behavior.
 
 ## 4. `blobfs` — filesystem-like interface
 

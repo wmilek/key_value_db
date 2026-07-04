@@ -86,6 +86,12 @@ map_ops`/`seq_ops` instance; the L3 backend `choice` (P4) decides which instance
 an interface is compiled against — a compile-time binding, no runtime dispatch
 cost beyond one indirection.
 
+Both shapes' `iterate` follow the L1 iterator rules (contract §4): Zephyr
+convention (callback returns 0 = continue, non-zero = stop, value propagated
+to the caller), and **mutating the container from inside the callback is
+undefined behavior** — collect-then-mutate is the supported pattern.
+Iteration is a diagnostic/repair facility, not a data path.
+
 ## 4. The four containers
 
 | Container | Shape | Lookup | Ordered | Kconfig |

@@ -139,6 +139,13 @@ bool     blob_db_exists(uint64_t id);
 
 size_t   blob_db_count(void);
 
+/* Iterate all bound blobs; order unspecified. Intended for diagnostics and
+ * fsck-like repair, not as a data path. Zephyr iterator convention: the
+ * callback returns 0 to continue or non-zero to stop early — iterate
+ * returns that value (0 if it ran to the end). The callback MUST NOT
+ * mutate the store (alloc_id/update/delete): undefined behavior, a debug
+ * build may assert. Supported pattern: collect ids in the callback,
+ * mutate after iteration ends. */
 typedef int (*blob_db_iter_cb_t)(uint64_t id,
                                   const void *payload, size_t len,
                                   void *user);
