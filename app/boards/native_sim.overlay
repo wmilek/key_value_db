@@ -3,7 +3,7 @@
  * storage_partition for kv_db. Leaves the default mcuboot / slot partitions
  * in the first 1 MB intact so existing tooling expectations still hold.
  *
- * See doc/design.md §1 "Capacity".
+ * See doc/layers/l1_blob_db.md §1 "Capacity".
  */
 
 &flashcontroller0 {

@@ -58,7 +58,7 @@ extern "C" {
  * v1 is **single-threaded**: the caller must serialize all calls. The
  * library does no locking internally.
  *
- * See `doc/design.md` for the on-flash format, algorithms, and crash
+ * See `doc/layers/l1_blob_db.md` for the on-flash format, algorithms, and crash
  * recovery details.
  */
 
@@ -161,7 +161,7 @@ bool blob_db_exists(uint64_t id);
  * @brief Count the number of live blobs in the store.
  *
  * O(n²) in entry count — intended for diagnostics / fsck, not a hot
- * path. See `doc/design.md` §11 for cost details.
+ * path. See `doc/layers/l1_blob_db.md` §11 for cost details.
  *
  * @return number of live (non-tombstoned) blobs
  */
