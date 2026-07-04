@@ -13,6 +13,7 @@ Status: v2 · Top-level document; per-layer detail lives in `doc/layers/`
 | `doc/layers/l0_flash.md` | L0 — flash translation: `flash_area` contract, future UBI-like FTL |
 | `doc/layers/l1_blob_db.md` | L1 — i-node allocation (`blob_db`): full implementation-level spec |
 | `doc/layers/l1_model_container.md` | L1 — the model container: blob_db's client contract by example |
+| `doc/layers/l1_root_registry.md` | L1½ — root registry: owner of id = 1, key → structure-root map |
 | `doc/layers/l2_containers.md` | L2 — containers: seq, kvlist, kvhash, kvtree |
 | `doc/layers/l3_interfaces.md` | L3 — access interfaces: kvdb, blobfs, settings |
 
@@ -112,18 +113,22 @@ kvdb_set("wifi.ssid","home")                                  ── L3
        └─ blob_db_update(bucket_id[b], …)    upsert, COW node  ── L1  ← atomic commit
 ```
 
-Reboot recovery: `kvdb_open` → `blob_db_get(1)` → hash root → done. The only
-persisted "pointer" anyone remembered is the integer 1.
+Reboot recovery: `kvdb_open` → `rootreg_get(ROOTREG_KEY('KVDB',0))` (one read
+of id = 1) → hash root → done. The only persisted "pointer" anyone remembered
+is the integer 1.
 
 ## 7. Repository layout (target)
 
 ```
 lib/
   blob_db/            L1  (exists)
-  containers/         L2  seq/ kvlist/ kvhash/ kvtree/
+  rootreg/            L1½ root registry (owner of id = 1)
+  containers/         L2  seq/ kvlist/ kvhash/ kvtree/  (+ shared intent/)
   kvdb/  blobfs/      L3
-include/app/lib/      blob_db.h · containers/{map_ops,seq_ops,…}.h · kvdb.h · blobfs.h
-tests/lib/            blob_db/ (exists) · containers/* · kvdb/ · blobfs/
+include/app/lib/      blob_db.h · rootreg.h · containers/{shape_map,shape_seq,…}.h
+                      · kvdb.h · blobfs.h
+tests/lib/            blob_db/ (exists) · blob_db_contract/ (model container)
+                      · rootreg/ · containers/* · kvdb/ · blobfs/
 doc/                  this file · principles.md · layers/*.md
 ```
 

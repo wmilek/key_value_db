@@ -18,22 +18,27 @@ Each interface:
 
 - binds to a **shape** (Map, Sequence), never to a concrete container (P6);
 - gets its concrete backend from a Kconfig `choice` (P4);
-- anchors at the id = 1 root i-node, or at a field inside it (P5).
+- finds its root through the **root registry** (P5).
 
-## 2. Root ownership
+## 2. Root ownership — via the root registry
 
-Only one thing can *be* id = 1. When a single L3 interface is enabled, its
-container root is simply id = 1. When several are enabled, id = 1 holds a tiny
-**root directory blob** mapping each enabled interface to its container root id:
+Id = 1 is owned by the root registry (`doc/layers/l1_root_registry.md`);
+interfaces never touch it directly. Each interface holds a compile-time
+registry key and resolves its container root through it:
 
+```c
+#define KVDB_ROOT    ROOTREG_KEY('KVDB', 0)
+#define BLOBFS_ROOT  ROOTREG_KEY('BLFS', 0)
+
+/* in open(): */
+rootreg_get_or_create(KVDB_ROOT, &root_id);
+/* if blob_db_get(root_id) == -ENOENT: freshly allocated — bind the empty
+ * container now (defined, recoverable state; registry doc §7). */
 ```
-root (id=1) { magic 'ROOT', version,
-              kvdb_root_id, blobfs_root_id, … }     /* 0 = interface not initialized */
-```
 
-Fields are allocated per enabled interface at first mount; an interface's
-`open` reads id = 1, finds (or lazily creates) its own root, and proceeds. The
-single-integer principle is preserved: the whole system still hangs off id = 1.
+Each L3 interface `select`s `BLOB_ROOTREG`. Enabling a new interface later is
+just a new key — no root-format migration. The single-integer principle is
+preserved: the whole system still hangs off id = 1, through the registry.
 
 ## 3. `kvdb` — key/value database
 
