@@ -1,0 +1,26 @@
+# blob_db perf app — Kconfig entry point.
+
+menu "Zephyr"
+source "Kconfig.zephyr"
+endmenu
+
+module = APP_PERF
+module-str = APP_PERF
+source "subsys/logging/Kconfig.template.log_config"
+
+config APP_PERF_N_OPS
+	int "Number of add/read operations per run"
+	default 100
+	range 10 1000
+	help
+	  Size of the benchmark: this many nodes are added (then read back
+	  by traversal). Runtime grows roughly linearly.
+
+config APP_PERF_VAL_LEN
+	int "Per-node payload size in bytes"
+	default 24
+	range 0 240
+	help
+	  Payload bytes stored in each list node (in addition to the 8-byte
+	  next_id header). Keep the total node size under
+	  CONFIG_BLOB_DB_MAX_PAYLOAD_LEN.
