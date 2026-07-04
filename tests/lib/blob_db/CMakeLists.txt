@@ -5,9 +5,8 @@ cmake_minimum_required(VERSION 3.20.0)
 find_package(Zephyr REQUIRED HINTS $ENV{ZEPHYR_BASE})
 project(blob_db_test)
 
-# Pull in the library and its public header from the same in-repo paths
-# the app uses.
-zephyr_include_directories(${CMAKE_CURRENT_SOURCE_DIR}/../../../include)
-add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../../../lib lib)
+# The repository is a Zephyr module (see zephyr/module.yml): its top-level
+# CMakeLists already adds lib/ and exports include/, and the blob_db library
+# is built and linked automatically when CONFIG_BLOB_DB=y. Re-adding lib/
+# here would create a duplicate `blob_db` target, so we only add the test.
 target_sources(app PRIVATE src/main.c)
-target_link_libraries(app PRIVATE blob_db)

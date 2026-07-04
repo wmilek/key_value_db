@@ -7,6 +7,6 @@ menu "Zephyr"
 source "Kconfig.zephyr"
 endmenu
 
-# The in-repo lib/ tree isn't loaded by the active west manifest, so source
-# it explicitly here. Mirrors the same approach used by app/Kconfig.
-rsource "../../../lib/Kconfig"
+# The blob_db library's Kconfig (CONFIG_BLOB_DB and friends) is contributed by
+# the repository's module Kconfig entry point (zephyr/module.yml -> Kconfig ->
+# rsource lib/Kconfig), so it must not be sourced again here.

@@ -10,8 +10,9 @@ menu "Zephyr"
 source "Kconfig.zephyr"
 endmenu
 
-# In-repo libraries (not registered via the active west manifest).
-rsource "../lib/Kconfig"
+# The in-repo libraries' Kconfig (CONFIG_BLOB_DB and friends) is contributed
+# by the repository's module Kconfig entry point (zephyr/module.yml -> Kconfig
+# -> rsource lib/Kconfig), so it must not be sourced again here.
 
 module = APP
 module-str = APP
