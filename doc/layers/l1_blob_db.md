@@ -249,6 +249,35 @@ needs RAM ∝ visited items, against P3), or writes must be blocked/fixed-up
 while iterating (`-EBUSY` coupling), and the promise would bind every future
 allocator (D1) to iteration-stability. Same narrow-contract shape as D3.
 
+### 5.6 D6 — Batch operations: allowed as optimization, never as transaction
+
+Batch variants (`multi_get` / `multi_exists` / `multi_update` / `multi_delete`)
+**may** be added as pure optimizations. Their semantics are fixed now so the
+implementation room exists without contract growth:
+
+> A batch is an **unordered set of independent single operations**: each
+> element individually atomic per §2, per-element result codes, **no
+> atomicity across elements** — a crash may leave any subset applied.
+> Duplicate or conflicting ids within one batch: undefined behavior.
+
+What this buys the implementation: freedom to reorder for locality — sort
+ids by bucket and read each sector once, or switch to a single full pass when
+the batch is large (min(k, N) sector reads instead of k) — and, for future
+table-based allocators (D1), coalescing of shared index-sector reads. Primary
+consumers are the bulk workloads D5 creates: fsck-style verification of
+collected id lists and mark-and-sweep existence checks. The unordered-set
+semantics compose with the model container unchanged, because the prepare and
+cleanup phases are order-independent by construction; the commit remains a
+single `update` and is never batched.
+
+Rejected: an *atomic* multi-update (a transaction API). It would require an
+internal journal with mount-time redo — the intent mechanism moved into the
+library, made mandatory for all clients and binding every allocator (D1).
+Multi-op atomicity remains client discipline per the model container.
+
+Concrete signatures are added when the first consumer lands (likely
+`multi_exists` for the sweep); until then no batch entry points exist.
+
 ---
 
 ## 6. Companion documents
