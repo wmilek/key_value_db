@@ -1,29 +1,38 @@
-# L1 — Model Container: the `blob_db` Client Contract by Example
+# L1 — Model Container: Sufficiency Proof for the `blob_db` Contract
 
-Status: v3 · Companion to `doc/layers/l1_blob_db.md` (the blob_db spec)
+Status: v3 · Companion to `doc/layers/l1_blob_db.md` (the contract)
 · Governed by `doc/principles.md`
+
+This document is neither a contract nor an implementation design. It is a
+**proof by construction**: using nothing but the L1 contract, it builds the
+smallest complete crash-safe structure — demonstrating that `blob_db` as
+specified is *sufficient* to implement every layer above it, with no
+additional API or guarantee needed.
 
 ---
 
 ## 1. Purpose
 
-This document defines the **model container**: the smallest structure that
-exercises every element of the `blob_db` client contract — stable ids as
-persistent references, single-operation atomicity, and the discipline that
-makes multi-i-node mutations crash-safe.
+The **model container** is the smallest structure that exercises every
+element of the `blob_db` contract — stable ids as persistent references,
+single-operation atomicity, and the discipline that makes multi-i-node
+mutations crash-safe.
 
 It is deliberately **not a usable container** (O(n) flash reads per lookup, one
-i-node per key and per value). Its role is normative, and therefore it is
-**without compromises**: it satisfies P7 in full, including *no permanent
-leak* — every crash residue is reclaimed by bounded, idempotent recovery.
+i-node per key and per value), and it is **without compromises**: it satisfies
+P7 in full, including *no permanent leak* — every crash residue is reclaimed
+by bounded, idempotent recovery. Three roles follow:
 
-- it **defines the contract**: what a correct client may assume of `blob_db`
-  and the obligations it carries in return;
-- it is the **reference for every real container** (`l2_containers.md`) —
-  each is a composition of exactly these step patterns;
-- it is the natural shape of the **L1 acceptance test**: a ztest suite
-  implementing it verbatim, with crash injection between every step,
-  validates the contract independent of any real L2 code.
+- **Sufficiency proof.** If the model container works, the contract is
+  enough; conversely, any capability the model needs that the contract lacks
+  is a contract gap (this is how `alloc_id` earned its place in §4 of the
+  contract).
+- **Reference pattern for every real container** (`l2_containers.md`): a
+  container built by composing these step patterns inherits the proof; one
+  that deviates needs its own crash analysis against P7 (§9).
+- **Blueprint of the L1 acceptance test**: a ztest suite implementing it
+  verbatim, with crash injection between every step, validates any allocator
+  claiming to implement the contract — independent of real L2 code.
 
 The document builds up in two stages: the **basic flow** (§2–§3), where every
 mutation is a single atomic operation and no extra machinery exists at all —
