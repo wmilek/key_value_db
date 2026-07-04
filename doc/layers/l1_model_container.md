@@ -204,6 +204,13 @@ step 5  update(intent_id, {})             CLEAR   mutation sealed
 Cost: two intent writes per reference-graph mutation. That is the price of
 zero leak; real containers may amortize it (§9) but the model pays it plainly.
 
+**Failure without power loss (abort path).** If a step fails cleanly — e.g.
+`-ENOSPC` during PREPARE — the mutation aborts: delete the blobs prepared so
+far, then CLEAR the intent (the mirror of cleanup). The visible state was
+never touched. A crash *during* the abort is indistinguishable from a crash
+during the mutation itself, so recovery (§6) handles it with no special
+state — abort needs no new machinery.
+
 ## 6. Recovery — bounded and idempotent
 
 On `open(list_id)` (and thus on every remount), read the intent blob. If it is

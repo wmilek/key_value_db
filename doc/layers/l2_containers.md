@@ -206,6 +206,13 @@ included via `add_subdirectory_ifdef` — a disabled container costs zero flash
 and RAM (P4). Enabling several at once is legal; different L3 interfaces (or
 different roots) may use different containers side by side.
 
+Tunable compatibility is an **implementation detail**: every container node
+must fit one L1 payload (`BLOB_DB_MAX_PAYLOAD_LEN`), so each container's
+implementation enforces its sizing rule with a `BUILD_ASSERT` (e.g. hash
+root: header + 8 B × buckets; tree node: fan-out × max entry size) and its
+defaults must form a valid combination — specified per container in its
+implementation design under `doc/impl/`.
+
 ## 7. Repository layout
 
 ```

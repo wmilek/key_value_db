@@ -75,23 +75,35 @@ Hierarchical `path → file` storage. Composition:
 - **File body** = inline value for small files; a `seq` chunk chain
   (`BLOBFS_FILE_CHUNKED`) for large or streamed content.
 
+The API is **handle-free**: there is no open/close and no file-position
+state — reads and writes pass an explicit offset (pread/pwrite style):
+
 ```c
-int blobfs_mkdir  (const char *path);
-int blobfs_open   (const char *path, int flags, blobfs_file_t *f);   /* O_CREAT, O_TRUNC, O_APPEND */
-int blobfs_read   (blobfs_file_t *f, void *buf, size_t n, size_t *rd);
-int blobfs_write  (blobfs_file_t *f, const void *buf, size_t n);
-int blobfs_close  (blobfs_file_t *f);
-int blobfs_unlink (const char *path);
-int blobfs_rename (const char *from, const char *to);
-int blobfs_stat   (const char *path, blobfs_stat_t *st);
-int blobfs_readdir(const char *path, blobfs_dirent_cb_t cb, void *user);
+int blobfs_mkdir   (const char *path);
+int blobfs_create  (const char *path);                     /* empty file */
+int blobfs_read    (const char *path, size_t off,
+                    void *buf, size_t n, size_t *rd);      /* short read at EOF */
+int blobfs_write   (const char *path, size_t off,
+                    const void *buf, size_t n);            /* extends as needed */
+int blobfs_truncate(const char *path, size_t size);
+int blobfs_unlink  (const char *path);
+int blobfs_rename  (const char *from, const char *to);
+int blobfs_stat    (const char *path, blobfs_stat_t *st);
+int blobfs_readdir (const char *path, blobfs_dirent_cb_t cb, void *user);
 ```
 
-Path resolution walks one Map lookup per component (`/a/b/c` ⇒ 3 lookups).
-`rename` within a directory is one Map mutation; across directories it is
-insert-then-delete — the file's i-node id never changes, so open handles and
-the file body are untouched. Optionally registrable as a Zephyr `fs_file_system_t`
-backend (`BLOBFS_FS_INTEROP`) so `fs_open("/blob/…")` and friends work.
+No handles means no cursor ownership, no unlink-while-open semantics, and no
+`O_*` flag matrix — those questions do not exist in this API. The cost is
+path resolution on every call (one Map lookup per component: `/a/b/c` ⇒ 3);
+acceptable for embedded use, and a caching or handle layer can be added later
+without changing these semantics. The Zephyr `fs_file_system_t` interop shim
+(`BLOBFS_FS_INTEROP`) synthesizes handles on top of this API for
+`fs_open("/blob/…")` compatibility.
+
+`rename` within a directory is a single Map mutation (atomic, P7).
+Cross-directory rename crash-semantics are **deferred to the blobfs
+implementation design** (`doc/impl/`, when written); until specified, v1 may
+restrict `rename` to within one directory (`-ENOTSUP` otherwise).
 
 ## 5. `settings` registry (optional)
 
@@ -144,9 +156,9 @@ tests/lib/blobfs/ ztest
 - **`kvdb`**: one functional suite, executed as a twister scenario **per
   backend** (`extra_configs` swaps the `choice`), asserting identical observable
   behavior — the conformance guarantee that makes backends swappable.
-- **`blobfs`**: path walking, deep nesting, readdir, rename semantics
-  (id stability across rename), chunked read/write at chunk boundaries,
-  unlink-while-open policy.
+- **`blobfs`**: path walking, deep nesting, readdir, within-directory rename
+  (id stability), offset read/write at chunk boundaries, truncate grow/shrink,
+  short reads at EOF.
 - **Cross-interface**: enable `kvdb` + `blobfs` together; verify id = 1 root
   directory dispatch (§2) and mutual isolation.
 - **Persistence & crash**: remount and torn-write cases at this level are smoke
