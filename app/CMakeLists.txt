@@ -9,20 +9,11 @@ find_package(Zephyr REQUIRED HINTS $ENV{ZEPHYR_BASE})
 
 project(app LANGUAGES C)
 
-# In-repo public headers and library sources. The repo is not registered
-# as a Zephyr module in the active west manifest, so we pull in the
-# pieces we need explicitly from here.
-zephyr_include_directories(${CMAKE_CURRENT_SOURCE_DIR}/../include)
-add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../lib lib)
-
+# The repository is a Zephyr module (see zephyr/module.yml): its top-level
+# CMakeLists already exports include/ and adds lib/, and the blob_db library
+# is built and auto-linked when CONFIG_BLOB_DB=y. Re-adding lib/ here would
+# create a duplicate `blob_db` target, so the app only adds its own sources.
 target_sources(app PRIVATE src/main.c)
-
-# zephyr_library_named() registers the library but doesn't auto-link it
-# into zephyr.elf when add_subdirectory happens this late in app's
-# configuration. Link it explicitly here.
-if(CONFIG_BLOB_DB)
-  target_link_libraries(app PRIVATE blob_db)
-endif()
 
 # The code below locates the git index file for this repository and adds it as a dependency for
 # the application VERSION file so that if the repo has a new commit added, even if no files in
