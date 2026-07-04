@@ -13,7 +13,9 @@ client that *creates* a hash, tree, or any other container has nowhere good to
 keep that id. The root registry is the answer: a *global registry of
 structure roots*, mapping compile-time keys to root ids.
 
-It is the single **owner of id = 1**. Nothing else in the system may bind,
+The registry is a **helper, not a mandate**: a build that does not enable it
+may bind id = 1 directly (L1 contract, root convention). When it *is* enabled,
+it is the single **owner of id = 1** — nothing else in that system may bind,
 rebind, or assume anything about id = 1.
 
 Design posture, by requirement:
@@ -173,7 +175,10 @@ lazily binding the empty structure.
 - **Grow clever.** No caching, no hashing, no chaining, no in-place entry
   edits. One blob, linear scan, whole-image single-`update` commits. Its
   value is that it is too simple to fail.
-- **Share id = 1.** Any other binding of id = 1 is a system-integrity bug.
+- **Share id = 1.** In a build with the registry enabled, any other binding
+  of id = 1 is a system-integrity bug. (Registry-less builds own id = 1
+  themselves — but then the registry must never be enabled later against the
+  same store without a reformat; its `-ENOTSUP` magic check enforces this.)
 
 ## 9. Kconfig & placement
 

@@ -51,9 +51,10 @@ value blob   "bar"                            own id: vid
 list blob    [(kid1,vid1), (kid2,vid2), …]    own id: list_id   ← container root
 ```
 
-The client persists nothing but `list_id` (P5) — in the full stack, as an
-entry in the root registry (`l1_root_registry.md`), which itself hangs off
-id = 1. Everything is reachable from it.
+The client persists nothing but `list_id` (P5) — bound to id = 1 directly in
+a minimal build, or typically kept as an entry in the root registry helper
+(`l1_root_registry.md`), which itself hangs off id = 1. Everything is
+reachable from it.
 
 ## 3. The basic flow
 

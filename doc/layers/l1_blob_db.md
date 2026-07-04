@@ -77,10 +77,12 @@ First boot:  id = blob_db_alloc_id()                     →  id = 1
 On mount:    blob_db_get(1, ...)                         ← always finds the root
 ```
 
-One remembered integer bootstraps everything (P5). In the full stack, id = 1
-is owned exclusively by the **root registry**
-(`doc/layers/l1_root_registry.md`); other clients obtain their roots through
-registry keys rather than binding id = 1 themselves.
+One remembered integer bootstraps everything (P5). The only rule is that
+**exactly one component owns id = 1 in a given build**. A minimal system may
+bind id = 1 directly, as above. When the **root registry** helper
+(`doc/layers/l1_root_registry.md`) is enabled — the expected case in the full
+stack — the registry is that owner, and other clients keep their roots in it
+under registry keys instead of competing for id = 1.
 
 ---
 

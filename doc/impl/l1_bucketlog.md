@@ -295,8 +295,9 @@ draft implementation and will be reworked against the final API; the
 5. **Debug bound-check for UB `update`** — optional Kconfig
    (`BLOB_DB_ASSERT_BOUND`): get-shaped scan + `__ASSERT` in debug builds,
    nothing in release.
-6. **Migrate direct id = 1 users** — the app demo (and the Appendix A
-   sketches below) bind id = 1 directly; with the root registry they move to
+6. **Direct id = 1 users vs the registry** — the app demo (and the Appendix A
+   sketches below) bind id = 1 directly, which is legitimate in registry-less
+   builds; once the demo image enables the root registry, they move to
    `ROOTREG_KEY` roots.
 
 ---

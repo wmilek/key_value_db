@@ -13,7 +13,7 @@ Status: v2 · Top-level document; per-layer detail lives in `doc/layers/`
 | `doc/layers/l0_flash.md` | L0 — flash translation: `flash_area` contract, future UBI-like FTL |
 | `doc/layers/l1_blob_db.md` | L1 — `blob_db` **contract & requirements** (implementation-agnostic) |
 | `doc/layers/l1_model_container.md` | L1 — the model container: **sufficiency proof** that the blob_db contract can carry the layers above; reference pattern + acceptance-test blueprint |
-| `doc/layers/l1_root_registry.md` | L1½ — root registry: owner of id = 1, key → structure-root map |
+| `doc/layers/l1_root_registry.md` | L1½ — root registry (optional helper): key → structure-root map; owns id = 1 when enabled |
 | `doc/layers/l2_containers.md` | L2 — containers: seq, kvlist, kvhash, kvtree |
 | `doc/layers/l3_interfaces.md` | L3 — access interfaces: kvdb, blobfs, settings |
 | `doc/impl/l1_bucketlog.md` | **Implementation design** (non-normative): the v1 bucket-log allocator — formats, algorithms, costs, open items |
@@ -78,11 +78,12 @@ partition into a pool of stably-identified, crash-atomically updatable blobs
 variants can replace it at the cost of a reformat (L1 contract, decision D1).
 → `layers/l1_blob_db.md`
 
-**L1½ — Root registry.** A deliberately tiny module directly on L1: the sole
-owner of id = 1, mapping compile-time keys (`ROOTREG_KEY('KVDB',0)`) to
-structure-root ids. Single i-node, single-`update` mutations, no recovery
-machinery; `get_or_create` doubles as a leak-free creation intent for new
-structures. → `layers/l1_root_registry.md`
+**L1½ — Root registry.** An optional helper directly on L1: a deliberately
+tiny map of compile-time keys (`ROOTREG_KEY('KVDB',0)`) to structure-root
+ids, owning id = 1 when enabled. Single i-node, single-`update` mutations, no
+recovery machinery; `get_or_create` doubles as a leak-free creation intent
+for new structures. A minimal registry-less build may bind id = 1 directly
+instead. → `layers/l1_root_registry.md`
 
 **L2 — Containers.** Data structures whose nodes are i-nodes and whose edges
 are ids stored in payloads. Four providers behind two abstract shapes — **Map**
