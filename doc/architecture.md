@@ -132,6 +132,10 @@ Reboot recovery: `kvdb_open` → `rootreg_get(ROOTREG_KEY('KVDB',0))` (one read
 of id = 1) → hash root → done. The only persisted "pointer" anyone remembered
 is the integer 1.
 
+Boot ordering: the application (or a `SYS_INIT` hook it provides) calls
+`blob_db_mount()` once, then `rootreg_init()`; interfaces attach lazily on
+their first `open`. No other initialization order exists.
+
 ## 7. Repository layout (target)
 
 ```
@@ -144,6 +148,8 @@ include/app/lib/      blob_db.h · rootreg.h · containers/{shape_map,shape_seq,
                       · kvdb.h · blobfs.h
 tests/lib/            blob_db/ (exists) · blob_db_contract/ (model container)
                       · rootreg/ · containers/* · kvdb/ · blobfs/
+tests/support/        flash_fault/ — fail-after-N-writes flash_area shim,
+                      shared by all crash-injection suites
 doc/                  this file · principles.md · layers/*.md (contracts)
                       · impl/*.md (implementation designs)
 ```

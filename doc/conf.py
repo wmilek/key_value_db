@@ -14,10 +14,14 @@ release = '1.0.0'
 # -- General configuration ---------------------------------------------------
 # https://www.sphinx-doc.org/en/master/usage/configuration.html#general-configuration
 
-extensions = ['sphinx.ext.intersphinx']
+extensions = ['sphinx.ext.intersphinx', 'myst_parser']
+
+# Design documents are Markdown (MyST); allow lone § references etc.
+myst_enable_extensions = []
+suppress_warnings = ['myst.header', 'myst.xref_missing']
 
 templates_path = ['_templates']
-exclude_patterns = ['_build_sphinx', 'Thumbs.db', '.DS_Store']
+exclude_patterns = ['_build_sphinx', '_doxygen', 'Thumbs.db', '.DS_Store']
 
 # -- Options for HTML output -------------------------------------------------
 # https://www.sphinx-doc.org/en/master/usage/configuration.html#options-for-html-output

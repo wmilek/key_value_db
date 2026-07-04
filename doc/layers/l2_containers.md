@@ -17,8 +17,12 @@ pointers.
 The defining model (principle P5):
 
 > A container **is** a root i-node id plus a rule for interpreting the i-nodes
-> reachable from it. One `uint64_t` — canonically id = 1 — bootstraps the whole
-> structure after reboot. No side-band state, no mount-time rebuild.
+> reachable from it. One `uint64_t` — id = 1, or a root-registry entry hanging
+> off it — bootstraps the whole structure after reboot. No side-band state,
+> no mount-time rebuild.
+
+Concurrency: containers inherit L1's v1 contract — single-threaded, caller
+serializes, at most one mutation in flight per database.
 
 ## 2. Common mechanics
 

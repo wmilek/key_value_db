@@ -18,7 +18,8 @@ Each interface:
 
 - binds to a **shape** (Map, Sequence), never to a concrete container (P6);
 - gets its concrete backend from a Kconfig `choice` (P4);
-- finds its root through the **root registry** (P5).
+- finds its root through the **root registry** (P5);
+- inherits L1's v1 concurrency contract: single-threaded, caller serializes.
 
 ## 2. Root ownership — via the root registry
 
