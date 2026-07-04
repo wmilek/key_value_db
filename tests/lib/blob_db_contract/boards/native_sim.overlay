@@ -1,0 +1,16 @@
+/*
+ * 16 MB sim-flash with an 8 MB storage_partition at offset 0x800000 — matches
+ * the app and the L1 unit suite so blob_db sees the full multi-bucket layout.
+ */
+
+&flashcontroller0 {
+	reg = <0x00000000 DT_SIZE_M(16)>;
+};
+
+&flash0 {
+	reg = <0x00000000 DT_SIZE_M(16)>;
+};
+
+&storage_partition {
+	reg = <0x00800000 DT_SIZE_M(8)>;
+};
