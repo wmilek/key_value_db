@@ -233,6 +233,22 @@ A multi-chunk write must commit by writing the id's index record **last**, so
 "no partial reads" (§2) holds unchanged. Writes stay whole-blob until a
 concrete consumer needs streaming.
 
+### 5.5 D5 — Iteration is read-only: mutation from the callback is UB
+
+**Decision: mutating the store (`alloc_id`/`update`/`delete`) from inside a
+`blob_db_iterate` callback is not allowed — it is undefined behavior.** A
+debug build may assert; release performs no check. The supported pattern is
+collect-then-mutate: gather ids in the callback, mutate after iteration ends.
+
+Iteration is a diagnostics / fsck-like-repair facility, not a data path, and
+those callers run at startup where RAM for collected work-lists is plentiful.
+Rejected alternative — a mutation-tolerant iterator — was declined because it
+taxes the *common* write path to subsidize the rare diagnostic one: the
+iterator must survive compaction rewriting the sector under it (re-location
+needs RAM ∝ visited items, against P3), or writes must be blocked/fixed-up
+while iterating (`-EBUSY` coupling), and the promise would bind every future
+allocator (D1) to iteration-stability. Same narrow-contract shape as D3.
+
 ---
 
 ## 6. Companion documents
