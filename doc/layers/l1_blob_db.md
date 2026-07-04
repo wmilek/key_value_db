@@ -154,6 +154,37 @@ int      blob_db_iterate(blob_db_iter_cb_t cb, void *user);
 /* Format the partition (erase all blobs, reset the id counter to 1). For
  * factory reset / tests. */
 int      blob_db_format(void);
+
+/* ---- Batch operations (optional; CONFIG_BLOB_DB_MULTI, default off) -------
+ * A batch is an UNORDERED SET of independent single operations (decision D6):
+ * each element is individually atomic per §2 and carries its own result,
+ * with NO atomicity across elements — a crash may leave any subset applied.
+ * The caller's array is never reordered; result fields stay index-aligned.
+ * Duplicate or conflicting ids within one batch are undefined behavior.
+ * Each call returns the count of elements whose result is 0, or a negative
+ * errno if the batch could not be processed at all (-ENODEV, -EINVAL). */
+
+struct blob_db_read_req {
+    uint64_t id;        /* in                                              */
+    void    *out;       /* in: caller buffer                               */
+    size_t   out_sz;    /* in                                              */
+    size_t   out_len;   /* out: payload length (bytes written; or required */
+                        /*      size when result == -ENOMEM)               */
+    int      result;    /* out: 0 | -ENOENT | -ENOMEM | -EIO               */
+};
+int blob_db_multi_get   (struct blob_db_read_req *reqs, size_t n);
+
+struct blob_db_write_req {
+    uint64_t    id;      /* in                                             */
+    const void *payload; /* in                                             */
+    size_t      len;     /* in                                             */
+    int         result;  /* out: 0 | -ENOSPC | -EINVAL  (dead id: UB, D3)  */
+};
+int blob_db_multi_update(struct blob_db_write_req *reqs, size_t n);
+
+/* out_present[i] / results[i] correspond to ids[i]. */
+int blob_db_multi_exists(const uint64_t *ids, bool *out_present, size_t n);
+int blob_db_multi_delete(const uint64_t *ids, int  *results,     size_t n);
 ```
 
 Errors: `-ENOENT`, `-ENOSPC`, `-ENOMEM`, `-EINVAL`, `-EIO`, `-ENODEV` (not
@@ -260,23 +291,28 @@ implementation room exists without contract growth:
 > atomicity across elements** — a crash may leave any subset applied.
 > Duplicate or conflicting ids within one batch: undefined behavior.
 
-What this buys the implementation: freedom to reorder for locality — sort
-ids by bucket and read each sector once, or switch to a single full pass when
-the batch is large (min(k, N) sector reads instead of k) — and, for future
-table-based allocators (D1), coalescing of shared index-sector reads. Primary
-consumers are the bulk workloads D5 creates: fsck-style verification of
-collected id lists and mark-and-sweep existence checks. The unordered-set
-semantics compose with the model container unchanged, because the prepare and
-cleanup phases are order-independent by construction; the commit remains a
-single `update` and is never batched.
+What this buys the implementation: freedom to service the batch in any order
+for locality — visit each touched bucket once, or switch to a single full
+pass when the batch is large (min(k, N) sector reads instead of k) — and,
+for future table-based allocators (D1), coalescing of shared index-sector
+reads. Primary consumers are the bulk workloads D5 creates: fsck-style
+verification of collected id lists and mark-and-sweep existence checks. The
+unordered-set semantics compose with the model container unchanged, because
+the prepare and cleanup phases are order-independent by construction; the
+commit remains a single `update` and is never batched.
+
+The four entry points are defined in §4 (`multi_get` / `multi_update` /
+`multi_exists` / `multi_delete`), behind `CONFIG_BLOB_DB_MULTI` so they cost
+nothing when unused (P4). Their contract is fixed: unordered set, per-element
+result, no cross-element atomicity, no reorder of the caller's array,
+duplicate ids UB. Reads are the strongest beneficiary in the bucket-log
+allocator; writes coalesce only for the rare ids that share a bucket (impl
+notes: `doc/impl/l1_bucketlog.md`).
 
 Rejected: an *atomic* multi-update (a transaction API). It would require an
 internal journal with mount-time redo — the intent mechanism moved into the
 library, made mandatory for all clients and binding every allocator (D1).
 Multi-op atomicity remains client discipline per the model container.
-
-Concrete signatures are added when the first consumer lands (likely
-`multi_exists` for the sweep); until then no batch entry points exist.
 
 ---
 

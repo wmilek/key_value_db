@@ -178,6 +178,31 @@ mount (§6.1).
 Bucket-by-bucket full scan; callback runs against the resident sector buffer.
 Order is not id-sorted.
 
+### 5.8 Batch operations (optional, `CONFIG_BLOB_DB_MULTI`)
+
+Contract §4 / decision D6: unordered set, per-element result, no cross-element
+atomicity, the caller's array is never reordered, O(1) extra RAM (no sort
+buffer). The allocator picks its traversal for locality:
+
+```
+if n is small (n < THRESHOLD, ~N/8):
+    bucket-major — for each distinct bucket among reqs[].id, read the sector
+    once, then service every element hashing to it from the resident buffer
+else:                                  # k comparable to N
+    single full pass — walk buckets 0..N once (like iterate), matching each
+    resident sector against the request set
+```
+
+Both are O(1) extra RAM and touch each needed bucket exactly once — reads
+coalesce strongly (min(k, N) sector reads instead of k). `multi_get` /
+`multi_exists` are the strong wins. `multi_update` / `multi_delete` append or
+tombstone per element; the write count is unchanged, and the only saving is a
+shared sector read (and at most one compaction) when several ids fall in the
+same bucket — rare for a collected set (≈ k/N per bucket), so writes benefit
+far less than reads. No element ever crosses into another's atomicity: each
+slot append / master write is the same single-op commit as the scalar path,
+so a crash mid-batch leaves exactly the completed elements (contract §2).
+
 ## 6. Atomicity & crash recovery
 
 Two atomic-commit primitives: a **single slot append** (torn → CRC fails →
@@ -206,6 +231,7 @@ the next compaction.
 BLOB_DB                    bool, select FLASH, FLASH_MAP, CRC
 BLOB_DB_PARTITION_LABEL    string, default "storage"
 BLOB_DB_MAX_PAYLOAD_LEN    int, default 256, range 1 4096
+BLOB_DB_MULTI              bool, default n   # batch ops (§5.8, contract D6)
 module = BLOB_DB (standard LOG pattern)
 ```
 
@@ -260,6 +286,10 @@ draft implementation and will be reworked against the final API; the
 12. compaction drops tombstones/overrides; preserves all live ids
 13. simulated mid-compaction crash (forged COMPACTING master) recovers
 14. scale: 100 k blobs, random subset round-trips (Kconfig-gated)
+15. batch ops (`BLOB_DB_MULTI`): `multi_get`/`multi_exists`/`multi_delete`
+    over a mixed set (present, missing, dead ids) — per-element results
+    match the scalar path, array not reordered, and a large batch reads each
+    bucket at most once (assert read count ≤ N)
 
 ## 12. End-to-end verification
 
