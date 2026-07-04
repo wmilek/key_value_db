@@ -25,33 +25,38 @@ extern "C" {
  * @section blob_db_contract Stability contract
  *
  * `blob_db` does not know about strings, keys, schemas, or queries. It
- * promises only one thing: once you have an id, you can fetch the payload
- * that was stored under it. The full contract is:
+ * promises only one thing: once content is bound to an id, you can fetch it
+ * by that id. The full contract is:
  *
- * - **Id assignment.** `blob_db_put()` returns a u64 id that is currently
- *   unused, never previously assigned in the lifetime of this DB, and
- *   greater than or equal to every id returned by any prior `put`.
- * - **Id stability.** Once an id is returned, it refers to the same logical
- *   blob until that id is `delete`d. `update` keeps the id; only the
- *   payload changes.
+ * - **Id allocation.** `blob_db_alloc_id()` returns a u64 id never returned
+ *   before in the lifetime of this DB — across all crashes — and strictly
+ *   greater than every previously returned id. Allocation is a RAM
+ *   operation; the id is durable (a later mount never re-issues it) even if
+ *   it is never bound.
+ * - **Id lifecycle.** *allocated* (fresh from `alloc_id`, nothing on flash)
+ *   → *bound* (first `update` writes content) → rebound (further `update`s)
+ *   → *dead* (`delete`). After `delete` the id ceases to exist; `update` on
+ *   a dead id — or on one never allocated — is undefined behavior.
+ * - **Id stability.** A bound id refers to the same logical blob until
+ *   `delete`d. `update` keeps the id; only the payload changes.
  * - **Compaction transparency.** Internal compaction may move slots within
  *   the on-flash store and may erase tombstones, but ids never change. A
  *   blob you can `get` today is reachable by the same id after any number
  *   of compactions.
- * - **No reuse.** After `delete(id)`, that id is never assigned to another
- *   blob. The next assigned id is strictly greater than every id ever
- *   seen.
- * - **Atomicity.** Each `put` / `update` / `delete` is atomic with respect
- *   to crash: either it takes effect fully or it doesn't (on next mount).
+ * - **No reuse.** A dead — or merely allocated — id is never returned by
+ *   `alloc_id` again. The next allocated id is strictly greater than every
+ *   id ever seen.
+ * - **Atomicity.** Each `update` / `delete` is atomic with respect to
+ *   crash: either it takes effect fully or it doesn't (on next mount).
  *   Partial writes are detected and discarded.
  *
  * @section blob_db_root Root convention
  *
- * The first successful `put` after a fresh format returns **id = 1**.
- * Clients may use id = 1 as their persistent root pointer: because
- * `update` is id-stable, id = 1 always names "the latest version of the
- * client's root blob". No library API is needed for this — it's a
- * convention.
+ * The first `alloc_id()` after a fresh format returns **id = 1**; binding it
+ * with `update(1, ...)` gives one remembered integer that re-opens
+ * everything after reboot. Exactly one component owns id = 1 in a build
+ * (the root registry when enabled; otherwise a direct binder). No library
+ * API enforces this — it's a convention.
  *
  * @section blob_db_concurrency Concurrency
  *
@@ -85,24 +90,23 @@ int blob_db_mount(void);
 int blob_db_unmount(void);
 
 /**
- * @brief Store a new blob and return its assigned id.
+ * @brief Allocate a fresh, durable id (RAM operation; nothing on flash yet).
  *
- * @param payload   bytes to store (may be NULL only if @p len == 0)
- * @param len       payload length, in 0..CONFIG_BLOB_DB_MAX_PAYLOAD_LEN
- * @param out_id    (out) assigned id, valid for use with the other ops
+ * The returned id is never returned before in this DB's lifetime — across
+ * crashes — and strictly greater than every id previously returned. Bind it
+ * with `blob_db_update()`. An allocated-but-unbound id is durable: a later
+ * mount never re-issues it, which is the watermark client crash-recovery is
+ * built on.
  *
- * @retval 0        success
- * @retval -EINVAL  bad arguments (NULL out_id, len out of range, etc.)
- * @retval -ENOSPC  partition is full (compaction could not free space)
- * @retval -ENODEV  not mounted
- * @retval -EIO     flash I/O error
+ * @return a fresh id (>= 1), or 0 if not mounted (0 is never a valid id) or
+ *         the id ceiling could not be persisted.
  */
-int blob_db_put(const void *payload, size_t len, uint64_t *out_id);
+uint64_t blob_db_alloc_id(void);
 
 /**
  * @brief Fetch the payload for an id.
  *
- * @param id        id previously returned by `put`
+ * @param id        id previously returned by `alloc_id` and bound by `update`
  * @param out       (out) buffer to copy payload into
  * @param out_sz    capacity of @p out, in bytes
  * @param out_len   (out, optional) actual payload length written
@@ -117,17 +121,23 @@ int blob_db_put(const void *payload, size_t len, uint64_t *out_id);
 int blob_db_get(uint64_t id, void *out, size_t out_sz, size_t *out_len);
 
 /**
- * @brief Replace the payload for an existing id. The id is preserved.
+ * @brief Bind (first write) or rebind (rewrite) the payload of an id.
  *
- * The previous payload becomes garbage (reclaimed on next compaction).
+ * First `update` after `alloc_id` binds the blob; later `update`s replace
+ * the payload, keeping the id. The previous payload becomes garbage
+ * (reclaimed on next compaction).
  *
- * @param id        id previously returned by `put`
- * @param payload   new payload
- * @param len       new payload length
+ * `update` on a dead (deleted) id, or on an id never returned by `alloc_id`,
+ * is undefined behavior (decision D3). A best-effort bound check rejects an
+ * id of 0 or one not yet allocated with -EINVAL, but release builds owe no
+ * such check.
+ *
+ * @param id        id previously returned by `alloc_id`
+ * @param payload   payload bytes (may be NULL only if @p len == 0)
+ * @param len       payload length, in 0..CONFIG_BLOB_DB_MAX_PAYLOAD_LEN
  *
  * @retval 0        success
- * @retval -ENOENT  id was never assigned, or has been deleted
- * @retval -EINVAL  bad arguments
+ * @retval -EINVAL  bad arguments, or id was never allocated
  * @retval -ENOSPC  partition is full
  * @retval -ENODEV  not mounted
  * @retval -EIO     flash I/O error
@@ -139,7 +149,7 @@ int blob_db_update(uint64_t id, const void *payload, size_t len);
  *
  * After this call, `get(id)` returns -ENOENT and the id is never reused.
  *
- * @param id        id previously returned by `put`
+ * @param id        id previously returned by `alloc_id`
  *
  * @retval 0        success
  * @retval -ENOENT  id was never assigned, or has already been deleted

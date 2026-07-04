@@ -25,7 +25,7 @@ config BLOB_DB_MAX_PAYLOAD_LEN
 	default 256
 	range 1 4096
 	help
-	  Maximum payload size accepted by blob_db_put. Slot size on flash
+	  Maximum payload size accepted by blob_db_update. Slot size on flash
 	  is bounded by this plus a 14-byte header.
 
 module = BLOB_DB

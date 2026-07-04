@@ -40,17 +40,20 @@ int main(void)
 	rc = blob_db_get(BLOB_DB_ROOT_ID, &boot_count, sizeof(boot_count), &got);
 	if (rc == -ENOENT) {
 		boot_count = 1;
-		uint64_t assigned;
 
-		rc = blob_db_put(&boot_count, sizeof(boot_count), &assigned);
-		if (rc < 0) {
-			LOG_ERR("first-boot put failed: %d", rc);
+		/* Virgin store: the first alloc_id is the root convention's
+		 * id = 1. Allocate it, then bind the boot count. */
+		uint64_t assigned = blob_db_alloc_id();
+
+		if (assigned != BLOB_DB_ROOT_ID) {
+			LOG_ERR("root-convention broken: first alloc_id returned "
+				"id=%llu (expected %u)",
+				(unsigned long long)assigned, BLOB_DB_ROOT_ID);
 			goto out;
 		}
-		if (assigned != BLOB_DB_ROOT_ID) {
-			LOG_ERR("root-convention broken: first put returned id=%llu "
-				"(expected %u)",
-				(unsigned long long)assigned, BLOB_DB_ROOT_ID);
+		rc = blob_db_update(assigned, &boot_count, sizeof(boot_count));
+		if (rc < 0) {
+			LOG_ERR("first-boot bind failed: %d", rc);
 			goto out;
 		}
 		LOG_INF("first boot — wrote boot_count=1 at id=%u", BLOB_DB_ROOT_ID);

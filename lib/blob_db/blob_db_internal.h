@@ -29,6 +29,16 @@
 #define BLOB_DB_STATE_CLEAN       0x00
 #define BLOB_DB_STATE_COMPACTING  0x01
 
+/* Durable id allocation (contract §2 "no reuse", impl design §13.1).
+ *
+ * next_id_hint on the master is a LEADING ceiling: an exclusive upper bound
+ * on every id ever returned by alloc_id — i.e. no id >= next_id_hint has been
+ * (or ever will be, until the hint is raised) handed out. Mount takes
+ * next_id = next_id_hint, so an allocated-but-unbound id is never re-issued
+ * after a crash. alloc_id persists a fresh ceiling this many ids ahead
+ * whenever the current one is reached, amortizing the master write. */
+#define BLOB_DB_ID_HINT_STEP      256
+
 /* Slot flags. After erase the flags byte is 0xff, which trivially fails
  * the "is sealed" check. A slot is considered valid when it has the
  * SEALED bit set AND its CRC verifies.

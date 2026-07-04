@@ -34,6 +34,7 @@ static const uint8_t BUCKET_MAGIC[4] = { 'B', 'D', 'B', 'H' };
 /* Forward declarations (compaction helpers live below blob_db_mount). */
 static int recover_compaction(uint16_t bid);
 static int compact_bucket(uint16_t bid);
+static int persist_next_id_hint(uint64_t new_hint);
 
 /* Single global instance. v1 is single-threaded; caller serializes. */
 static struct {
@@ -45,7 +46,8 @@ static struct {
 	uint16_t  n_buckets;
 	uint8_t   active_master;   /* 0 or 1 */
 	uint32_t  master_gen;
-	uint64_t  next_id;
+	uint64_t  next_id;         /* RAM: next id alloc_id will hand out */
+	uint64_t  next_id_hint;    /* durable leading ceiling (see internal.h) */
 } st;
 
 static inline off_t peb_offset(uint16_t peb)
@@ -109,6 +111,29 @@ static int write_master(uint8_t slot, uint32_t gen, uint8_t state,
 		LOG_ERR("master %u write failed: %d", slot, rc);
 		return rc;
 	}
+	return 0;
+}
+
+/* Persist a raised leading id ceiling by committing a fresh CLEAN master on
+ * the inactive slot (double-buffered: a torn write leaves the old ceiling,
+ * which is still a safe — if lower — bound; mount re-raises it from the
+ * scan). On success the new master is active. */
+static int persist_next_id_hint(uint64_t new_hint)
+{
+	const uint8_t inactive = !st.active_master;
+
+	int rc = write_master(inactive, st.master_gen + 1, BLOB_DB_STATE_CLEAN,
+			      0, new_hint);
+	if (rc < 0) {
+		LOG_ERR("persist next_id_hint=%llu failed: %d",
+			(unsigned long long)new_hint, rc);
+		return rc;
+	}
+	st.active_master = inactive;
+	st.master_gen++;
+	st.next_id_hint = new_hint;
+	LOG_DBG("id ceiling raised to %llu (master gen=%u)",
+		(unsigned long long)new_hint, st.master_gen);
 	return 0;
 }
 
@@ -201,6 +226,7 @@ static int format_masters_fresh(void)
 	st.active_master = BLOB_DB_MASTER_A_SECTOR;
 	st.master_gen = 1;
 	st.next_id = 1;
+	st.next_id_hint = 1;   /* nothing handed out yet: ceiling == next_id */
 	return 0;
 }
 
@@ -292,7 +318,8 @@ int blob_db_mount(void)
 		st.active_master = pick_a ? BLOB_DB_MASTER_A_SECTOR
 					  : BLOB_DB_MASTER_B_SECTOR;
 		st.master_gen = m->generation;
-		st.next_id = m->next_id_hint;
+		st.next_id_hint = m->next_id_hint;
+		st.next_id = m->next_id_hint;   /* ceiling is authoritative (§13.1) */
 		LOG_INF("master %c gen=%u state=%u next_id_hint=%llu",
 			pick_a ? 'A' : 'B',
 			st.master_gen, m->state, st.next_id);
@@ -305,7 +332,11 @@ int blob_db_mount(void)
 		}
 	}
 
-	/* Scan every bucket to refine next_id. */
+	/* Defensive: the leading ceiling should already exceed every bound id,
+	 * but scan anyway so a store written by an older (lagging-hint) format,
+	 * or one with a corrupt/rolled-back master, cannot re-issue a live id.
+	 * If the scan out-runs the ceiling, raise it AND persist the new ceiling
+	 * before any allocation can hand the id back out. */
 	uint64_t max_id = (st.next_id == 0) ? 0 : (st.next_id - 1);
 	for (uint16_t bid = 0; bid < st.n_buckets; bid++) {
 		rc = scan_bucket(bid, &max_id);
@@ -314,10 +345,14 @@ int blob_db_mount(void)
 			goto err_close;
 		}
 	}
-	if (max_id + 1 > st.next_id) {
-		LOG_INF("bucket scan raised next_id %llu -> %llu",
-			st.next_id, max_id + 1);
+	if (max_id + 1 > st.next_id_hint) {
+		LOG_WRN("bucket scan out-ran ceiling (%llu >= %llu); raising",
+			(unsigned long long)max_id, st.next_id_hint);
 		st.next_id = max_id + 1;
+		rc = persist_next_id_hint(max_id + 1 + BLOB_DB_ID_HINT_STEP);
+		if (rc < 0) {
+			goto err_close;
+		}
 	}
 
 	st.mounted = true;
@@ -740,75 +775,30 @@ static int recover_compaction(uint16_t bid)
 	return 0;
 }
 
-int blob_db_put(const void *payload, size_t len, uint64_t *out_id)
+uint64_t blob_db_alloc_id(void)
 {
 	if (!st.mounted) {
-		return -ENODEV;
+		return 0;   /* 0 is never a valid id */
 	}
-	if (!out_id) {
-		return -EINVAL;
-	}
-	if (len > CONFIG_BLOB_DB_MAX_PAYLOAD_LEN) {
-		return -EINVAL;
-	}
-	if (len > 0 && !payload) {
-		return -EINVAL;
+
+	/* Guarantee durability before returning: the id we hand out must be
+	 * strictly below a persisted ceiling, so a crash before it is ever
+	 * bound cannot let a later mount re-issue it (contract §2, §13.1). */
+	if (st.next_id >= st.next_id_hint) {
+		int rc = persist_next_id_hint(st.next_id + 1 +
+					      BLOB_DB_ID_HINT_STEP);
+		if (rc < 0) {
+			LOG_ERR("alloc_id: cannot persist ceiling: %d", rc);
+			return 0;
+		}
 	}
 
 	const uint64_t id = st.next_id;
-	const uint16_t bid = id_to_bucket(id);
-	uint8_t bbuf[BLOB_DB_SECTOR_BUF_MAX];
-
-	int rc = read_bucket(bid, bbuf);
-	if (rc < 0) {
-		return rc;
-	}
-
-	off_t write_cursor;
-
-	if (!bucket_hdr_valid(bbuf, bid)) {
-		rc = format_bucket(bid);
-		if (rc < 0) {
-			return rc;
-		}
-		write_cursor = BLOB_DB_BUCKET_DATA_OFF;
-	} else {
-		struct bucket_walk w;
-		walk_bucket(bbuf, 0 /* no target */, &w);
-		write_cursor = w.write_cursor;
-	}
-
-	const size_t ssz = slot_size_for((uint16_t)len);
-
-	if (write_cursor + ssz > st.peb_size) {
-		rc = compact_bucket(bid);
-		if (rc < 0) {
-			return rc;
-		}
-		rc = read_bucket(bid, bbuf);
-		if (rc < 0) {
-			return rc;
-		}
-		struct bucket_walk w;
-		walk_bucket(bbuf, 0, &w);
-		write_cursor = w.write_cursor;
-		if (write_cursor + ssz > st.peb_size) {
-			LOG_WRN("bucket %u still full after compaction", bid);
-			return -ENOSPC;
-		}
-	}
-
-	rc = append_slot(bid, write_cursor, id, 0, payload, (uint16_t)len);
-	if (rc < 0) {
-		return rc;
-	}
 
 	st.next_id = id + 1;
-	*out_id = id;
-	LOG_DBG("put id=%llu bid=%u off=0x%lx len=%zu",
-		(unsigned long long)id, bid,
-		(unsigned long)write_cursor, len);
-	return 0;
+	LOG_DBG("alloc_id -> %llu (ceiling %llu)",
+		(unsigned long long)id, (unsigned long long)st.next_id_hint);
+	return id;
 }
 
 int blob_db_get(uint64_t id, void *out, size_t out_sz, size_t *out_len)
@@ -865,8 +855,11 @@ int blob_db_update(uint64_t id, const void *payload, size_t len)
 	if (!st.mounted) {
 		return -ENODEV;
 	}
-	if (id == 0) {
-		return -ENOENT;
+	/* An id is valid iff alloc_id has handed it out (0 < id < next_id).
+	 * Anything else was never allocated — contract §2 makes this UB, and
+	 * this cheap bound is the fail-fast the narrow contract permits. */
+	if (id == 0 || id >= st.next_id) {
+		return -EINVAL;
 	}
 	if (len > CONFIG_BLOB_DB_MAX_PAYLOAD_LEN) {
 		return -EINVAL;
@@ -875,6 +868,10 @@ int blob_db_update(uint64_t id, const void *payload, size_t len)
 		return -EINVAL;
 	}
 
+	/* Bind (first write) and rebind (rewrite) are the same append path:
+	 * write the new slot; latest-wins (§4) makes it the live one. We do
+	 * NOT verify prior state — a first bind has no prior slot, and writing
+	 * to a dead id is UB (decision D3), not our job to catch here. */
 	const uint16_t bid = id_to_bucket(id);
 	uint8_t bbuf[BLOB_DB_SECTOR_BUF_MAX];
 
@@ -882,22 +879,23 @@ int blob_db_update(uint64_t id, const void *payload, size_t len)
 	if (rc < 0) {
 		return rc;
 	}
+
+	off_t write_cursor;
+
 	if (!bucket_hdr_valid(bbuf, bid)) {
-		return -ENOENT;
-	}
+		rc = format_bucket(bid);
+		if (rc < 0) {
+			return rc;
+		}
+		write_cursor = BLOB_DB_BUCKET_DATA_OFF;
+	} else {
+		struct bucket_walk w;
 
-	struct bucket_walk w;
-	walk_bucket(bbuf, id, &w);
-
-	if (w.target_slot_off < 0) {
-		return -ENOENT;
-	}
-	if (w.target_flags & BLOB_DB_SLOT_F_TOMBSTONE) {
-		return -ENOENT;
+		walk_bucket(bbuf, id, &w);
+		write_cursor = w.write_cursor;
 	}
 
 	const size_t ssz = slot_size_for((uint16_t)len);
-	off_t write_cursor = w.write_cursor;
 
 	if (write_cursor + ssz > st.peb_size) {
 		rc = compact_bucket(bid);
@@ -908,12 +906,9 @@ int blob_db_update(uint64_t id, const void *payload, size_t len)
 		if (rc < 0) {
 			return rc;
 		}
+		struct bucket_walk w;
+
 		walk_bucket(bbuf, id, &w);
-		if (w.target_slot_off < 0 ||
-		    (w.target_flags & BLOB_DB_SLOT_F_TOMBSTONE)) {
-			/* Shouldn't happen — we just confirmed it was live. */
-			return -EIO;
-		}
 		write_cursor = w.write_cursor;
 		if (write_cursor + ssz > st.peb_size) {
 			return -ENOSPC;
@@ -927,7 +922,7 @@ int blob_db_update(uint64_t id, const void *payload, size_t len)
 
 	LOG_DBG("update id=%llu bid=%u off=0x%lx len=%zu",
 		(unsigned long long)id, bid,
-		(unsigned long)w.write_cursor, len);
+		(unsigned long)write_cursor, len);
 	return 0;
 }
 
@@ -1164,6 +1159,7 @@ int blob_db_format(void)
 	st.active_master = BLOB_DB_MASTER_A_SECTOR;
 	st.master_gen    = 1;
 	st.next_id       = 1;
+	st.next_id_hint  = 1;
 
 	LOG_INF("format: complete; next_id=1");
 	return 0;
