@@ -50,13 +50,26 @@ extern "C" {
  *   crash: either it takes effect fully or it doesn't (on next mount).
  *   Partial writes are detected and discarded.
  *
- * @section blob_db_root Root convention
+ * @section blob_db_root Root id
  *
- * The first `alloc_id()` after a fresh format returns **id = 1**; binding it
- * with `update(1, ...)` gives one remembered integer that re-opens
- * everything after reboot. Exactly one component owns id = 1 in a build
- * (the root registry when enabled; otherwise a direct binder). No library
- * API enforces this — it's a convention.
+ * **`BLOB_DB_ROOT_ID` (= 1) is guaranteed to exist after every successful
+ * `blob_db_mount()`.** Callers may unconditionally `get(1)` / `exists(1)` /
+ * `update(1, ...)` without a pre-check: on a virgin (or freshly formatted)
+ * store, mount allocates id 1 and binds it with an empty payload; on a
+ * previously mounted store, mount inherits whatever the last `update(1, ...)`
+ * wrote.
+ *
+ * Consequences:
+ * - `blob_db_exists(1)` is always `true` between mount and unmount.
+ * - `blob_db_get(1, ...)` never returns `-ENOENT`.
+ * - `blob_db_alloc_id()` never returns 1; the first user-visible allocation
+ *   is id = 2. (The library consumes id 1 internally at format time.)
+ * - `blob_db_delete(1)` is undefined behavior — the root id must not be
+ *   deleted.
+ *
+ * Exactly one component owns id = 1 in a build (the root registry when
+ * enabled; otherwise a direct binder). The library reserves the id but does
+ * not police what the caller writes there.
  *
  * @section blob_db_concurrency Concurrency
  *
@@ -68,12 +81,23 @@ extern "C" {
  */
 
 /**
+ * @brief The reserved root id — see @ref blob_db_root.
+ *
+ * Always live between mount and unmount. Callers should reference this
+ * macro rather than the literal 1.
+ */
+#define BLOB_DB_ROOT_ID  ((uint64_t)1)
+
+/**
  * @brief Open the DB and recover state from flash.
  *
  * Discovers the partition geometry, validates the master sector,
  * recovers from any mid-compaction crash, scans each bucket to recover
  * its write cursor, and determines the next id to assign. If the
- * partition is unformatted, formats it.
+ * partition is unformatted, formats it. In either case, on return
+ * `BLOB_DB_ROOT_ID` is guaranteed to identify a live blob
+ * (see @ref blob_db_root); on a virgin store it is bound to an empty
+ * payload.
  *
  * @retval 0       success
  * @retval -EALREADY already mounted
@@ -98,7 +122,11 @@ int blob_db_unmount(void);
  * mount never re-issues it, which is the watermark client crash-recovery is
  * built on.
  *
- * @return a fresh id (>= 1), or 0 if not mounted (0 is never a valid id) or
+ * Never returns `BLOB_DB_ROOT_ID` (= 1); that id is reserved and consumed at
+ * format time (see @ref blob_db_root). The first user-visible allocation on a
+ * fresh store is id = 2.
+ *
+ * @return a fresh id (>= 2), or 0 if not mounted (0 is never a valid id) or
  *         the id ceiling could not be persisted.
  */
 uint64_t blob_db_alloc_id(void);
@@ -148,6 +176,9 @@ int blob_db_update(uint64_t id, const void *payload, size_t len);
  * @brief Delete the blob with the given id.
  *
  * After this call, `get(id)` returns -ENOENT and the id is never reused.
+ *
+ * Calling `delete(BLOB_DB_ROOT_ID)` is undefined behavior — the root id
+ * must remain live for the lifetime of the mount (see @ref blob_db_root).
  *
  * @param id        id previously returned by `alloc_id`
  *
@@ -213,13 +244,43 @@ int blob_db_iterate(blob_db_iter_cb_t cb, void *user);
  * @brief Erase the entire DB and reset to a fresh state.
  *
  * All blobs are destroyed, all sectors are erased, masters are
- * re-initialized, and the next id will be 1 again.
+ * re-initialized, and `BLOB_DB_ROOT_ID` is bound to an empty payload
+ * (see @ref blob_db_root). The next user-visible `alloc_id` returns 2.
  *
  * @retval 0        success
  * @retval -ENODEV  not mounted
  * @retval -EIO     flash I/O error
  */
 int blob_db_format(void);
+
+/**
+ * @brief Logically drop every blob and reset the id space, without erasing
+ *        flash.
+ *
+ * Fast counterpart to `blob_db_format()`: the DB is left in the same visible
+ * state as after a fresh format (no live blobs except an empty
+ * `BLOB_DB_ROOT_ID`, next user-visible `alloc_id` = 2), but the underlying
+ * sectors are not erased and no compaction runs. Prior on-flash records
+ * become unreachable garbage that a later compaction — or the next
+ * `blob_db_format()` — will reclaim.
+ *
+ * Typical use: cheap "wipe" between test scenarios, or a factory-reset path
+ * where the caller does not want to pay the multi-second cost of erasing a
+ * large partition (an 8 MB QSPI NOR can take tens of seconds to erase; this
+ * call is O(one master write)).
+ *
+ * Postconditions, identical to `blob_db_format()`:
+ * - `blob_db_exists(BLOB_DB_ROOT_ID)` is `true`, payload is empty.
+ * - `blob_db_count()` is 1.
+ * - The next `blob_db_alloc_id()` returns 2.
+ *
+ * @retval 0        success
+ * @retval -ENOSPC  no room to write a new master record; caller must
+ *                  fall back to `blob_db_format()`
+ * @retval -ENODEV  not mounted
+ * @retval -EIO     flash I/O error
+ */
+int blob_db_erase_all(void);
 
 /** @} */ /* end of lib_blob_db */
 

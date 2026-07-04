@@ -284,14 +284,9 @@ static int mc_recover(struct mc_list *l)
 
 static int mc_create(void)
 {
-	uint64_t root_id = blob_db_alloc_id();
-
-	if (root_id != MC_ROOT_ID) {
-		LOG_ERR("virgin create: first alloc_id=%llu, want %u",
-			(unsigned long long)root_id, MC_ROOT_ID);
-		return -EIO;
-	}
-
+	/* Root (id = 1) is pre-bound with an empty payload by blob_db_format()
+	 * — see @blob_db_root in blob_db.h. Allocate the intent blob, then
+	 * rebind the root with the initial list image. */
 	uint64_t intent_id = blob_db_alloc_id();
 	struct mc_intent empty = { 0 };
 	int rc = intent_store(intent_id, &empty);   /* bind intent blob */
@@ -313,7 +308,9 @@ int mc_open(void)
 	size_t got;
 	int rc = blob_db_get(MC_ROOT_ID, probe, sizeof(probe), &got);
 
-	if (rc == -ENOENT) {
+	/* Virgin detection: root always exists after format, but with an
+	 * empty payload — that is the "no container yet" signal. */
+	if (rc == 0 && got == 0) {
 		rc = mc_create();
 		if (rc < 0) {
 			return rc;

@@ -47,10 +47,19 @@ static void blob_db_after(void *fixture)
 
 ZTEST_SUITE(blob_db, NULL, NULL, blob_db_before, blob_db_after, NULL);
 
-/* 1. Fresh erase, mount OK, count == 0. */
+/* 1. Fresh format: only the reserved root blob is live (empty payload). */
 ZTEST(blob_db, test_mount_empty_formats_partition)
 {
-	zassert_equal(blob_db_count(), 0);
+	zassert_equal(blob_db_count(), 1,
+		      "want count=1 (root only), got %zu", blob_db_count());
+	zassert_true(blob_db_exists(BLOB_DB_ROOT_ID),
+		     "root must be live after format");
+
+	uint8_t buf[16];
+	size_t got = 42;
+
+	zassert_ok(blob_db_get(BLOB_DB_ROOT_ID, buf, sizeof(buf), &got));
+	zassert_equal(got, 0, "root payload must be empty after format, got %zu", got);
 }
 
 /* 2. Single blob round-trip with NUL and 0xff bytes inside. */
@@ -67,19 +76,19 @@ ZTEST(blob_db, test_bind_get_roundtrip)
 	zassert_mem_equal(buf, pl, sizeof(pl));
 }
 
-/* 3. First alloc_id returns id=1; ids are strictly monotonic. */
-ZTEST(blob_db, test_alloc_id_1_first_then_monotonic)
+/* 3. First user alloc_id returns 2 (root consumed id=1), then monotonic. */
+ZTEST(blob_db, test_alloc_id_skips_root_then_monotonic)
 {
 	uint64_t a = blob_db_alloc_id();
 
-	zassert_equal(a, 1, "first alloc_id returned %llu, want 1",
+	zassert_equal(a, 2, "first user alloc_id returned %llu, want 2",
 		      (unsigned long long)a);
 
 	uint64_t b = blob_db_alloc_id();
 	uint64_t c = blob_db_alloc_id();
 
-	zassert_equal(b, 2);
-	zassert_equal(c, 3);
+	zassert_equal(b, 3);
+	zassert_equal(c, 4);
 }
 
 /* 4. Get on a never-issued id returns -ENOENT. */
@@ -126,14 +135,15 @@ ZTEST(blob_db, test_delete_lifecycle)
 }
 
 /* 7. update on a never-allocated id returns -EINVAL (the defined boundary;
- *    update on a *dead* id is UB per decision D3 and is not asserted here). */
+ *    update on a *dead* id is UB per decision D3 and is not asserted here).
+ *    Root (id=1) is not a "never-allocated" id — it is consumed at format
+ *    time — so update(1, ...) succeeds; test_root_rebind covers that path. */
 ZTEST(blob_db, test_update_never_allocated_returns_einval)
 {
-	/* Nothing allocated yet: id 1 was never handed out. */
-	zassert_equal(blob_db_update(1, "x", 1), -EINVAL);
+	/* id=0 is never valid. */
 	zassert_equal(blob_db_update(0, "x", 1), -EINVAL);
 
-	uint64_t id = blob_db_alloc_id();   /* == 1 */
+	uint64_t id = blob_db_alloc_id();   /* == 2 */
 
 	/* id+1 was never allocated. */
 	zassert_equal(blob_db_update(id + 1, "x", 1), -EINVAL);
@@ -162,7 +172,8 @@ ZTEST(blob_db, test_persistence_across_remount)
 	zassert_ok(blob_db_get(c, buf, sizeof(buf), &got));
 	zassert_mem_equal(buf, "cc", 2);
 
-	zassert_equal(blob_db_count(), 2);
+	zassert_equal(blob_db_count(), 3, "want 3 (a, c, root), got %zu",
+		      blob_db_count());
 }
 
 /* 9. Payload length boundaries: 0 (allowed), MAX (allowed), MAX+1 (rejected). */
@@ -271,8 +282,8 @@ ZTEST(blob_db, test_compaction_drops_tombstones_and_overrides)
 	zassert_ok(blob_db_delete(id));
 
 	/* count() does latest-wins dedup, so the tombstoned id is already
-	 * invisible — even pre-compaction. */
-	zassert_equal(blob_db_count(), 0);
+	 * invisible — even pre-compaction. Only the reserved root remains. */
+	zassert_equal(blob_db_count(), 1);
 
 	/* Force a compaction in this id's bucket via many updates to an id
 	 * that lives in the same bucket. With sequential ids and round-robin
@@ -430,7 +441,9 @@ ZTEST(blob_db, test_iterate_visits_each_live_blob_once)
 	struct iter_ctx c = { 0 };
 
 	zassert_ok(blob_db_iterate(iter_cb, &c));
-	zassert_equal(c.hits, 4, "expected 4 live blobs, got %d", c.hits);
+	/* 4 user blobs (ids[1] deleted) + the reserved root = 5. */
+	zassert_equal(c.hits, 5, "expected 5 live blobs (4 + root), got %d",
+		      c.hits);
 
 	for (int i = 0; i < c.hits; i++) {
 		zassert_not_equal(c.saw[i], ids[1],
@@ -472,4 +485,114 @@ ZTEST(blob_db, test_allocated_unbound_id_survives_remount)
 
 	zassert_ok(blob_db_get(bound, buf, sizeof(buf), &got));
 	zassert_mem_equal(buf, "keep", 4);
+}
+
+/* Root invariant — id=1 is live between mount and unmount (see @blob_db_root
+ * in blob_db.h). */
+ZTEST(blob_db, test_root_present_after_mount)
+{
+	zassert_true(blob_db_exists(BLOB_DB_ROOT_ID));
+
+	uint8_t buf[16];
+	size_t got = 42;
+
+	zassert_ok(blob_db_get(BLOB_DB_ROOT_ID, buf, sizeof(buf), &got));
+	zassert_equal(got, 0);
+}
+
+/* Callers may `update(root, ...)` directly. The root convention says exactly
+ * one component owns id=1; the library does not enforce that, but it must
+ * accept the write and persist it across a remount. */
+ZTEST(blob_db, test_root_rebind_persists_across_remount)
+{
+	zassert_ok(blob_db_update(BLOB_DB_ROOT_ID, "hi", 2));
+
+	zassert_ok(blob_db_unmount());
+	zassert_ok(blob_db_mount());
+
+	uint8_t buf[8];
+	size_t got;
+
+	zassert_ok(blob_db_get(BLOB_DB_ROOT_ID, buf, sizeof(buf), &got));
+	zassert_equal(got, 2);
+	zassert_mem_equal(buf, "hi", 2);
+}
+
+/* erase_all — postconditions match a fresh format(). */
+ZTEST(blob_db, test_erase_all_leaves_only_root)
+{
+	/* Populate the store across several buckets. */
+	uint64_t a = put_blob("alpha", 5);
+	uint64_t b = put_blob("beta",  4);
+	uint64_t c = put_blob("gamma", 5);
+
+	zassert_ok(blob_db_update(BLOB_DB_ROOT_ID, "OLD", 3));
+	zassert_equal(blob_db_count(), 4);   /* a, b, c, root */
+
+	zassert_ok(blob_db_erase_all());
+
+	/* Only root survives, and its payload is empty. */
+	zassert_equal(blob_db_count(), 1);
+	zassert_true(blob_db_exists(BLOB_DB_ROOT_ID));
+	zassert_false(blob_db_exists(a));
+	zassert_false(blob_db_exists(b));
+	zassert_false(blob_db_exists(c));
+
+	uint8_t buf[16];
+	size_t got = 42;
+
+	zassert_ok(blob_db_get(BLOB_DB_ROOT_ID, buf, sizeof(buf), &got));
+	zassert_equal(got, 0, "root payload must be empty after erase_all");
+	zassert_equal(blob_db_get(a, buf, sizeof(buf), &got), -ENOENT);
+	zassert_equal(blob_db_get(b, buf, sizeof(buf), &got), -ENOENT);
+	zassert_equal(blob_db_get(c, buf, sizeof(buf), &got), -ENOENT);
+}
+
+/* erase_all resets the id space: the next allocation is 2 (root=1 consumed). */
+ZTEST(blob_db, test_erase_all_resets_id_space)
+{
+	/* Burn a few ids first. */
+	(void)blob_db_alloc_id();   /* 2 */
+	(void)blob_db_alloc_id();   /* 3 */
+	(void)blob_db_alloc_id();   /* 4 */
+
+	zassert_ok(blob_db_erase_all());
+
+	zassert_equal(blob_db_alloc_id(), 2,
+		      "erase_all should reset next alloc to 2");
+	zassert_equal(blob_db_alloc_id(), 3);
+}
+
+/* erase_all survives a remount: the new master beats the old, and the wiped
+ * buckets stay wiped. */
+ZTEST(blob_db, test_erase_all_survives_remount)
+{
+	(void)put_blob("x", 1);
+	(void)put_blob("y", 1);
+	uint64_t stale = put_blob("z", 1);
+
+	zassert_ok(blob_db_erase_all());
+	zassert_ok(blob_db_unmount());
+	zassert_ok(blob_db_mount());
+
+	zassert_equal(blob_db_count(), 1);
+	zassert_true(blob_db_exists(BLOB_DB_ROOT_ID));
+	zassert_false(blob_db_exists(stale));
+
+	/* And the id space is still reset. */
+	zassert_equal(blob_db_alloc_id(), 2);
+}
+
+/* erase_all is idempotent. */
+ZTEST(blob_db, test_erase_all_idempotent)
+{
+	(void)put_blob("x", 1);
+
+	zassert_ok(blob_db_erase_all());
+	zassert_ok(blob_db_erase_all());   /* second call must not fail */
+	zassert_ok(blob_db_erase_all());
+
+	zassert_equal(blob_db_count(), 1);
+	zassert_true(blob_db_exists(BLOB_DB_ROOT_ID));
+	zassert_equal(blob_db_alloc_id(), 2);
 }
