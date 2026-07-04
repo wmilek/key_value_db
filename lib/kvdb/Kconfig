@@ -1,0 +1,10 @@
+# Copyright (c) 2026
+# SPDX-License-Identifier: Apache-2.0
+
+config BLOBDB_KVDB
+	bool "kvdb (L3)"
+	depends on BLOB_DB
+	select BLOB_ROOTREG
+	help
+	  kvdb — string key -> value interface over any Map container.
+	  NOT YET IMPLEMENTED — skeleton only.

@@ -22,8 +22,14 @@ Status: v2 · Top-level document; per-layer detail lives in `doc/layers/`
 may rely on (P6). `doc/impl/` holds **implementation designs**: feasibility
 proofs of those contracts, fine-tuned during implementation, never depended
 on from above. Status: contracts for L0–L3 are specified; the bucket-log
-implementation design exists with tracked open items; production code is not
-yet written (existing `lib/` code is a draft predating the current contract).
+implementation design exists with tracked open items. **L1 (`blob_db`) is
+implemented** against the current contract — `alloc_id` + bind/rebind
+`update`, durable leading id ceiling (impl §13.1) — and validated on
+`native_sim` by a unit suite (`tests/lib/blob_db`) and the model-container
+acceptance suite (`tests/lib/blob_db_contract`, the sufficiency proof of
+`l1_model_container.md` with crash injection at every mutation step). The
+module tree above L1 (rootreg, containers, interfaces) is **scaffolded**
+(build-wired, Kconfig-gated `default n`) but not yet implemented.
 
 ## 2. The stack
 

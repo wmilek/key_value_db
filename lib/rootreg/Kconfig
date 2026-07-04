@@ -1,0 +1,24 @@
+# Copyright (c) 2026
+# SPDX-License-Identifier: Apache-2.0
+
+config BLOB_ROOTREG
+	bool "Root registry (L1.5)"
+	depends on BLOB_DB
+	help
+	  Enable the root registry: a tiny, always-simple map of compile-time
+	  keys (ROOTREG_KEY) to structure-root ids, owning id = 1 when enabled.
+	  Every mutation is a single atomic blob_db_update — no intent, no
+	  recovery machinery. See doc/layers/l1_root_registry.md.
+
+	  NOT YET IMPLEMENTED — skeleton only.
+
+if BLOB_ROOTREG
+
+config ROOTREG_MAX_ROOTS
+	int "Max registered roots"
+	default 8
+	help
+	  Upper bound on registered structure roots. A BUILD_ASSERT keeps
+	  8 + 16 * ROOTREG_MAX_ROOTS within BLOB_DB_MAX_PAYLOAD_LEN.
+
+endif # BLOB_ROOTREG
