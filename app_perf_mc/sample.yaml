@@ -1,0 +1,7 @@
+sample:
+  description: model-container (L1 contract) performance benchmark
+  name: model-container-perf
+common:
+  build_only: true
+tests:
+  perf_mc.default: {}

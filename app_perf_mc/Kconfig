@@ -1,0 +1,36 @@
+# model-container perf app — Kconfig entry point.
+
+menu "Zephyr"
+source "Kconfig.zephyr"
+endmenu
+
+module = APP_PERF_MC
+module-str = APP_PERF_MC
+source "subsys/logging/Kconfig.template.log_config"
+
+config APP_PERF_MC_N_KEYS
+	int "Number of distinct keys"
+	default 10
+	range 1 15
+	help
+	  Keys inserted by the set phase and cycled by the get/overwrite
+	  phases. Hard-capped by the model container's MC_MAX_ENTRIES (15).
+
+config APP_PERF_MC_N_GET
+	int "Number of lookups in the get phase"
+	default 100
+	range 1 10000
+
+config APP_PERF_MC_N_OVW
+	int "Number of overwrites in the overwrite phase"
+	default 50
+	range 1 10000
+
+config APP_PERF_MC_PREPARE
+	int "Buckets to erase-ahead before the timed phases"
+	default 150
+	range 0 4096
+	help
+	  Passed to blob_db_prepare() once after the initial erase_all so the
+	  timed loops measure the warm append-only path. Sized to cover the id
+	  consumption of all phases; capped internally at the bucket count.
