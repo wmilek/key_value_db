@@ -12,6 +12,22 @@ config BLOB_CONTAINERS_INTENT
 
 	  NOT YET IMPLEMENTED — skeleton only.
 
+config BLOB_CONTAINER_LOGRING
+	bool "logring — bounded circular log container"
+	help
+	  A log-specialized container: a single-i-node ring of sequence-stamped
+	  records that auto-evicts its oldest entries so appends never fail for
+	  space. Every mutation is one atomic blob_db_update (the rootreg
+	  pattern — no intent, no recovery machinery, no residue). Ideal for
+	  boot reasons, fault codes, and last-lines-before-crash flight
+	  recorders. See doc/layers/l2_containers.md §4.5.
+
+if BLOB_CONTAINER_LOGRING
+module = BLOB_CONTAINER_LOGRING
+module-str = BLOB_CONTAINER_LOGRING
+source "subsys/logging/Kconfig.template.log_config"
+endif
+
 config BLOB_CONTAINER_SEQ
 	bool "seq — append/index sequence container"
 	help
