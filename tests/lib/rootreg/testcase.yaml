@@ -1,0 +1,5 @@
+common:
+  tags: storage blob_db rootreg
+  platform_allow: native_sim
+tests:
+  lib.rootreg: {}

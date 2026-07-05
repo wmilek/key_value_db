@@ -10,8 +10,12 @@
  * correct visible state AND zero permanent leak, the L1 contract is enough to
  * carry every layer above it.
  *
- * The whole structure is reachable from the single integer id = 1 (P5): the
- * client (this test) persists nothing else.
+ * The container itself knows nothing about how its root id is persisted —
+ * the CLIENT owns that (l1_root_registry.md §2: containers don't use the
+ * registry; their clients do). The client resolves a root id — typically
+ * via rootreg_get_or_create() — and passes it to mc_open(). Everything is
+ * still reachable from the single integer id = 1 (P5), through whatever
+ * the client persisted there.
  */
 
 #ifndef MODEL_CONTAINER_H_
@@ -20,10 +24,6 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <stdbool.h>
-
-/* Root convention: the list root lives at id = 1 (this build has no root
- * registry, so the model binds id = 1 directly — l1_model_container.md §2). */
-#define MC_ROOT_ID  1u
 
 /* Crash-injection points for the extended mutation discipline
  * (l1_model_container.md §5). A mutation runs up to and INCLUDING the named
@@ -42,10 +42,12 @@ enum mc_crash_point {
 /* Signals a mutation stopped early at its injected crash point. */
 #define MC_STOPPED  1
 
-/* Open (and, on a virgin store, create) the container rooted at id = 1,
- * running intent recovery (§6) if a mutation was interrupted. Idempotent —
- * safe to call on every mount. */
-int mc_open(void);
+/* Open the container rooted at `root_id`, creating it if the id is
+ * allocated-but-unbound (the registry-§7 "creation in progress" state), and
+ * running intent recovery (§6) if a mutation was interrupted. The caller
+ * owns the id's persistence (root registry, direct id-1 binding, ...).
+ * Idempotent — safe to call on every mount. */
+int mc_open(uint64_t root_id);
 
 /* Look up a key. Returns 0 and fills out/out_len on hit, -ENOENT on miss. */
 int mc_get(const char *key, void *out, size_t out_sz, size_t *out_len);
@@ -58,6 +60,18 @@ int mc_set(const char *key, const void *val, size_t vlen,
 
 /* Remove a key (and its blobs). `crash_at` as in mc_set. */
 int mc_del(const char *key, enum mc_crash_point crash_at);
+
+/* Tear the container down entirely: delete every key/value blob, the intent
+ * blob, and finally the list root. After this the container does not exist —
+ * the root id is dead (never reused) and every mc_* call fails with -ENODEV
+ * until a fresh mc_open(). The client completes the cleanup by dropping its
+ * record of the root id (rootreg_unregister) AFTER this returns — teardown
+ * before unregistration, per l1_root_registry.md §8.
+ *
+ * Not crash-atomic: a crash mid-destroy leaves the root bound with dangling
+ * entry references (harmless — lookups treat them as absent); rerunning
+ * destroy after mc_open() finishes the job (deletes tolerate -ENOENT). */
+int mc_destroy(void);
 
 /* Diagnostics for tests: number of entries in the list, and the total live
  * blob count in the whole store (root + intent + all key/value blobs). The

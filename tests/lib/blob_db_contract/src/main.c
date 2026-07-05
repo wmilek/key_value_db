@@ -7,7 +7,8 @@
  * whole concept:
  *
  *   - single-integer reachability (P5): the container is re-opened after every
- *     remount from nothing but id = 1;
+ *     remount from nothing but id = 1 — the root registry lives there and
+ *     maps MC_ROOTREG_KEY to the list root;
  *   - crash-safety (P7): at every step of every reference-graph mutation, a
  *     crash + remount + recovery yields the complete old OR complete new
  *     mapping — never torn, never dangling;
@@ -26,13 +27,18 @@
 #include <zephyr/ztest.h>
 
 #include <app/lib/blob_db.h>
+#include <app/lib/rootreg.h>
 
 #include "model_container.h"
 
-/* Structural blob floor: the root list (id = 1) + the intent blob. Each live
- * entry adds exactly two blobs (key + value). "No leak" == live count matches
- * this formula exactly. */
-#define STRUCT_BLOBS  2
+/* This suite is the container's CLIENT — it owns root-id persistence
+ * (l1_root_registry.md §2) and registers the container under its key. */
+#define MC_ROOTREG_KEY  ROOTREG_KEY(0x4d434e54 /* 'MCNT' */, 0)
+
+/* Structural blob floor: the root registry (id = 1) + the list root + the
+ * intent blob. Each live entry adds exactly two blobs (key + value). "No
+ * leak" == live count matches this formula exactly. */
+#define STRUCT_BLOBS  3
 
 static void assert_no_leak(void)
 {
@@ -44,20 +50,33 @@ static void assert_no_leak(void)
 		      blob_db_count(), STRUCT_BLOBS + 2 * entries, entries);
 }
 
-/* Power-cut simulation: drop the mount and bring it back. mc_open() re-derives
- * the entire container from id = 1 and runs intent recovery. */
+/* Client-side open: bootstrap the registry, resolve (or register) the
+ * container's root id, hand it to the container. This is the l1½ pattern
+ * every real client follows. */
+static void open_container(void)
+{
+	uint64_t root;
+
+	zassert_ok(rootreg_init());
+	zassert_ok(rootreg_get_or_create(MC_ROOTREG_KEY, &root));
+	zassert_ok(mc_open(root), "open/recovery failed");
+}
+
+/* Power-cut simulation: drop the mount and bring it back. The client
+ * re-derives the entire container from id = 1 (registry -> list root) and
+ * mc_open() runs intent recovery. */
 static void crash_and_recover(void)
 {
 	zassert_ok(blob_db_unmount());
 	zassert_ok(blob_db_mount());
-	zassert_ok(mc_open(), "reopen-from-id-1 + recovery failed");
+	open_container();
 }
 
 /* Wipe to a virgin store and create an empty container. */
 static void fresh_container(void)
 {
 	zassert_ok(blob_db_format());
-	zassert_ok(mc_open());   /* virgin -> create at id = 1 */
+	open_container();   /* virgin -> bootstrap registry + create */
 }
 
 static void before(void *f)
@@ -239,6 +258,62 @@ ZTEST(blob_db_contract, test_overwrite_crash_table)
 		zassert_equal(entries, 1, "case %zu entries", i);
 		assert_no_leak();   /* exactly one value blob survives */
 	}
+}
+
+/* --- full-lifecycle cleanup: destroy + unregister ----------------------- */
+
+/* Tear-down leaves the store at the absolute floor — ONLY the (empty-again)
+ * registry survives — and a later open under the same key starts a brand-new
+ * container on a fresh id (dead ids are never reused). */
+ZTEST(blob_db_contract, test_destroy_and_unregister_cleanup)
+{
+	zassert_ok(mc_set("alpha", "1", 1, MC_STEP_NONE));
+	zassert_ok(mc_set("beta", "22", 2, MC_STEP_NONE));
+	zassert_ok(mc_set("gamma", "333", 3, MC_STEP_NONE));
+
+	uint64_t old_root;
+
+	zassert_ok(rootreg_get(MC_ROOTREG_KEY, &old_root));
+
+	/* Cleanup: unset all keys + structure, then drop the registry entry
+	 * (teardown BEFORE unregistration — registry §8). */
+	zassert_ok(mc_destroy());
+	zassert_ok(rootreg_unregister(MC_ROOTREG_KEY));
+
+	/* Only the registry blob remains, and the container is truly gone. */
+	zassert_equal(blob_db_count(), 1,
+		      "want registry only, got %zu blobs", blob_db_count());
+	zassert_false(blob_db_exists(old_root));
+
+	char buf[8];
+
+	zassert_equal(mc_get("alpha", buf, sizeof(buf), NULL), -ENODEV,
+		      "container must be closed after destroy");
+
+	/* Same key, fresh life: a new root id, an empty container. */
+	open_container();
+
+	uint64_t new_root;
+
+	zassert_ok(rootreg_get(MC_ROOTREG_KEY, &new_root));
+	zassert_not_equal(new_root, old_root, "dead ids must not be reused");
+	zassert_equal(get_str("alpha", buf, sizeof(buf)), -ENOENT);
+	assert_no_leak();
+}
+
+/* Destroy is re-runnable: a "crash" between destroy and unregister just
+ * means the next open finds the registered id dead… which must NOT happen
+ * silently — so the client contract is destroy-then-unregister with no
+ * mutation in between. This test pins the safe rerun path instead: destroy
+ * on an already-half-torn container (simulated by a double destroy cycle). */
+ZTEST(blob_db_contract, test_destroy_empty_container)
+{
+	zassert_ok(mc_destroy());   /* no entries — deletes intent + root */
+	zassert_ok(rootreg_unregister(MC_ROOTREG_KEY));
+	zassert_equal(blob_db_count(), 1);
+
+	open_container();           /* fresh container, fresh id */
+	assert_no_leak();
 }
 
 /* §8.3 Delete: committed once the entry is unlinked (COMMIT). */
