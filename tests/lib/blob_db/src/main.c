@@ -596,3 +596,95 @@ ZTEST(blob_db, test_erase_all_idempotent)
 	zassert_true(blob_db_exists(BLOB_DB_ROOT_ID));
 	zassert_equal(blob_db_alloc_id(), 2);
 }
+
+/* prepare — erase-ahead: pre-format the buckets the allocator will hit next
+ * so subsequent updates never pay a sector-erase on their first write. */
+ZTEST(blob_db, test_prepare_zero_is_noop)
+{
+	zassert_equal(blob_db_prepare(0), 0);
+}
+
+/* After a fresh format the cursor is at id=2 and the four upcoming buckets
+ * (2..5) are all unformatted, so prepare(4) formats exactly four. A repeat
+ * call over the same window finds them already prepared and returns 0. */
+ZTEST(blob_db, test_prepare_is_idempotent_on_same_cursor)
+{
+	zassert_equal(blob_db_prepare(4), 4,
+		      "expected 4 formats on virgin buckets");
+
+	zassert_equal(blob_db_prepare(4), 0,
+		      "second call over same window must be a no-op");
+}
+
+/* The ready window slides with the alloc cursor: after some ids are burned,
+ * a fresh prepare(N) formats only the new tail. */
+ZTEST(blob_db, test_prepare_extends_window_after_alloc)
+{
+	zassert_equal(blob_db_prepare(4), 4);
+
+	/* Move the cursor forward by 3. */
+	for (int i = 0; i < 3; i++) {
+		(void)put_blob("x", 1);
+	}
+
+	/* Window is now buckets [cursor .. cursor+3]. One was already
+	 * inside the previous prepare(4) window; the other three are fresh. */
+	zassert_equal(blob_db_prepare(4), 3);
+}
+
+/* A prepared bucket must accept its intended write on the append-only path
+ * (proof-by-round-trip; timing is measured separately in app_perf). */
+ZTEST(blob_db, test_prepare_then_update_roundtrips)
+{
+	int rc = blob_db_prepare(3);
+
+	zassert_true(rc >= 0, "prepare returned %d", rc);
+
+	uint64_t a = put_blob("A", 1);
+	uint64_t b = put_blob("BB", 2);
+	uint64_t c = put_blob("CCC", 3);
+
+	uint8_t buf[4];
+	size_t got;
+
+	zassert_ok(blob_db_get(a, buf, sizeof(buf), &got));
+	zassert_equal(got, 1);
+	zassert_equal(buf[0], 'A');
+	zassert_ok(blob_db_get(b, buf, sizeof(buf), &got));
+	zassert_equal(got, 2);
+	zassert_ok(blob_db_get(c, buf, sizeof(buf), &got));
+	zassert_equal(got, 3);
+}
+
+/* An n larger than the partition's bucket count is capped; the root bucket
+ * must never be re-formatted (that would drop the reserved root slot). */
+ZTEST(blob_db, test_prepare_caps_and_preserves_root)
+{
+	zassert_ok(blob_db_update(BLOB_DB_ROOT_ID, "R", 1));
+
+	/* Ask for far more than the partition can offer — a well-behaved
+	 * prepare caps internally and returns without error. */
+	int rc = blob_db_prepare(SIZE_MAX / 2);
+
+	zassert_true(rc >= 0, "prepare failed: %d", rc);
+
+	/* Root's payload must have survived. */
+	uint8_t buf[4];
+	size_t got;
+
+	zassert_ok(blob_db_get(BLOB_DB_ROOT_ID, buf, sizeof(buf), &got));
+	zassert_equal(got, 1);
+	zassert_equal(buf[0], 'R');
+}
+
+/* Prepared bucket headers live on flash, so they survive a remount. */
+ZTEST(blob_db, test_prepare_survives_remount)
+{
+	zassert_equal(blob_db_prepare(4), 4);
+
+	zassert_ok(blob_db_unmount());
+	zassert_ok(blob_db_mount());
+
+	/* Same cursor, same window — everything should already be prepared. */
+	zassert_equal(blob_db_prepare(4), 0);
+}

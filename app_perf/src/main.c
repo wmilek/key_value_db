@@ -8,15 +8,18 @@
  *   - each node is one blob: { uint64_t next_id; uint8_t val[VAL_LEN]; }
  *   - the head id is stored at BLOB_DB_ROOT_ID (empty root == empty list)
  *
- * Four workloads are measured (each preceded by an erase_all so the
- * numbers are reproducible):
+ * Four workloads are measured. Each phase runs erase_all() followed by
+ * blob_db_prepare(N_OPS), so the timed loop measures the append-only write
+ * path — the one-time sector-erase cost is paid up-front by prepare() and
+ * reported separately.
+ *   prepare — pre-format N_OPS buckets ahead of the alloc cursor (one 64 KB
+ *             sector erase per bucket on mx25r64; the append/prepend loops
+ *             below never trigger a bucket format because of this)
  *   prepend — alloc_id + bind(new, next=head) + update(root=new_id)
  *   append  — alloc_id + bind(new, next=0) + update(prev_tail, next=new_id)
- *             (both cold: each new id lands in a "not yet formatted"
- *             bucket, so the sector erase on 64 KB QSPI NOR dominates)
+ *             (O(1) via a caller-side tail cache)
  *   read    — traverse from head, get() every node
- *   update  — rewrite the payload of every existing node (warm: buckets
- *             are already formatted, so the write path is append-only)
+ *   update  — rewrite the payload of every existing node in place
  *
  * Wall-clock is via k_uptime_delta(); ops/sec is derived at millisecond
  * resolution — for flash operations that costs less than 1 % vs a raw
@@ -254,6 +257,15 @@ int main(void)
 		goto out;
 	}
 
+	int64_t tp = k_uptime_get();
+	int prepared = blob_db_prepare(N_OPS);
+
+	if (prepared < 0) {
+		LOG_ERR("prepare: %d", prepared);
+		goto out;
+	}
+	bench_line("prepare", prepared, k_uptime_delta(&tp));
+
 	int64_t t0 = k_uptime_get();
 
 	for (int i = 0; i < N_OPS; i++) {
@@ -286,6 +298,14 @@ int main(void)
 		LOG_ERR("erase_all: %d", rc);
 		goto out;
 	}
+
+	tp = k_uptime_get();
+	prepared = blob_db_prepare(N_OPS);
+	if (prepared < 0) {
+		LOG_ERR("prepare: %d", prepared);
+		goto out;
+	}
+	bench_line("prepare", prepared, k_uptime_delta(&tp));
 
 	int64_t t1 = k_uptime_get();
 	uint64_t tail = 0;   /* caller-side tail cache; O(1) append */

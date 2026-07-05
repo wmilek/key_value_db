@@ -282,6 +282,40 @@ int blob_db_format(void);
  */
 int blob_db_erase_all(void);
 
+/**
+ * @brief Pre-format the next @p n buckets the allocator will use.
+ *
+ * `blob_db_update()` on an id whose bucket has never been written to must
+ * first erase-and-header that sector — on 64 KB QSPI NOR this dominates the
+ * cost of a cold first write (roughly one second per bucket at 8 MHz Quad-SPI
+ * on mx25r64). This call amortizes that cost off the hot path: it walks the
+ * @p n buckets ahead of the current allocation cursor (`bid = id % n_buckets`
+ * for ids `next_id … next_id + n − 1`) and formats any that don't already
+ * have a valid header.
+ *
+ * Idempotent: buckets already prepared (or already holding live data) are
+ * skipped. Safe to call repeatedly from an idle context to keep a rolling
+ * "N-ahead" ready window; the return value tells the caller how many
+ * sectors were actually erased this call, so progress is observable.
+ *
+ * @p n is capped at the total bucket count — beyond that the loop would
+ * revisit buckets already covered on this call. The root bucket
+ * (`BLOB_DB_ROOT_ID % n_buckets`) is always skipped: it stays formatted for
+ * the lifetime of the mount, and `alloc_id` never returns the root id, so
+ * it never appears in the "next N" window anyway.
+ *
+ * Prepared sectors persist across a remount — the bucket header is on
+ * flash, not in RAM. Prior on-flash bytes in a prepared sector are
+ * discarded (this is a real erase, not a logical drop).
+ *
+ * @param n  desired number of ready-to-write buckets ahead of the cursor
+ *
+ * @retval >=0     number of buckets actually formatted this call
+ * @retval -ENODEV not mounted
+ * @retval -EIO    flash I/O error
+ */
+int blob_db_prepare(size_t n);
+
 /** @} */ /* end of lib_blob_db */
 
 #ifdef __cplusplus

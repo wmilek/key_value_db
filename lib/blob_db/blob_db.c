@@ -1336,3 +1336,51 @@ int blob_db_erase_all(void)
 		(unsigned long long)st.next_id, st.master_gen);
 	return 0;
 }
+
+int blob_db_prepare(size_t n)
+{
+	if (!st.mounted) {
+		return -ENODEV;
+	}
+	if (n == 0) {
+		return 0;
+	}
+	if (n > st.n_buckets) {
+		n = st.n_buckets;
+	}
+
+	const uint16_t root_bid = (uint16_t)(BLOB_DB_ROOT_ID % st.n_buckets);
+	size_t prepared = 0;
+
+	for (size_t i = 0; i < n; i++) {
+		const uint16_t bid =
+			(uint16_t)((st.next_id + i) % st.n_buckets);
+
+		if (bid == root_bid) {
+			continue;
+		}
+
+		/* Peek only the header — no need to pull a full sector into
+		 * g_bbuf just to decide whether formatting is needed. */
+		struct blob_db_bucket_hdr peek;
+		int rc = flash_area_read(st.fa, bucket_offset(bid),
+					 &peek, sizeof(peek));
+		if (rc < 0) {
+			LOG_ERR("prepare: read bid %u: %d", bid, rc);
+			return rc;
+		}
+		if (bucket_hdr_valid((const uint8_t *)&peek, bid)) {
+			continue;
+		}
+
+		rc = format_bucket(bid);
+		if (rc < 0) {
+			return rc;
+		}
+		prepared++;
+	}
+
+	LOG_DBG("prepare(%zu): formatted %zu (cursor=%llu)",
+		n, prepared, (unsigned long long)st.next_id);
+	return (int)prepared;
+}
