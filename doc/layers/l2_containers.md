@@ -96,7 +96,7 @@ to the caller), and **mutating the container from inside the callback is
 undefined behavior** — collect-then-mutate is the supported pattern.
 Iteration is a diagnostic/repair facility, not a data path.
 
-## 4. The four containers
+## 4. The containers
 
 | Container | Shape | Lookup | Ordered | Kconfig |
 |---|---|---|---|---|
@@ -104,6 +104,7 @@ Iteration is a diagnostic/repair facility, not a data path.
 | §4.2 `kvlist` — simple k→v list | Map | O(n) | insertion | `CONTAINER_KVLIST` |
 | §4.3 `kvhash` — k→v hash | Map | O(1) avg | no | `CONTAINER_KVHASH` |
 | §4.4 `kvtree` — k→v tree | Map | O(log n) | by key | `CONTAINER_KVTREE` |
+| §4.5 `logring` — bounded log | *(own API)* | append/scan | insertion | `CONTAINER_LOGRING` |
 
 The normative parts of each container are its shape, cost class, the §2.2
 discipline, and the §5 invariants. The node layouts sketched below are
@@ -122,7 +123,9 @@ chunk { next_id, nelems, elem[]… }          each elem: { len, bytes… }
 Chunking (several elements per i-node, up to the payload limit) keeps read
 amplification low; a chunk splits when an insert doesn't fit. `append` is O(1)
 (tail id known from the root); `get(index)` is O(n/chunk_factor). Intended use:
-logs, queues, file-data chunk chains — not random access at scale.
+queues, file-data chunk chains — not random access at scale. For *bounded*
+logging with automatic eviction of old records, use `logring` (§4.5) instead
+of an ever-growing `seq`.
 
 ### 4.2 `kvlist` — simple k→v list
 
@@ -186,6 +189,42 @@ one root `update` as the commit, then dead-path `delete`s. At fan-out 8, 100k
 keys ⇒ depth ≈ 6 ⇒ ~6 flash reads per lookup. Splits/merges follow standard
 B-tree rules, still committed by the single root write.
 
+### 4.5 `logring` — bounded circular log
+
+Where `seq` (§4.1) is an *unbounded, index-addressed* sequence — the right
+shape for file bodies and chunk chains — `logring` is its opposite trade,
+purpose-built for **logging**: a *bounded* store that keeps the most recent
+records and silently drops the oldest. It is the embedded "flight recorder" —
+boot reasons, fault codes, the last lines before a crash — and so it does not
+implement the generic `seq_ops`; it exports its own small append/scan API
+(`logring.h`). **Implemented**, not scaffolded.
+
+```
+root { magic 'CLOG', version, count, used, next_seq, rec[]… }
+rec  { seq (u64), len (u16), bytes… }         packed, oldest → newest
+```
+
+The entire ring lives inline in the **one** root i-node, exactly like
+`rootreg` (`l1_root_registry.md`): every mutation — `append`, `reset`,
+`create` — is a single atomic `blob_db_update(root, …)`, the sole
+linearization point (§2.2). There is no prepare/cleanup phase, hence **no
+residue and no recovery pass** — `open` only validates the magic. `append`
+evicts whole records from the head until the newcomer fits, so it returns
+`-ENOSPC` only when a *single* record exceeds the ring's capacity
+(`BLOB_DB_MAX_PAYLOAD_LEN` − header), never merely because the ring is full.
+
+Each record carries a strictly-increasing, never-reused `uint64_t` **sequence
+number** — durable across eviction, `reset`, and remount (it lives in
+`next_seq`, written atomically with the ring). A consumer that remembers the
+last sequence number it processed can therefore detect exactly how many
+records were dropped while it was away (oldest surviving seq − last seen − 1):
+the same single-integer "where was I" idea L1 applies to ids (P5), applied to
+the log cursor. Capacity is one i-node payload; for larger retention, run
+several rings (e.g. per subsystem) side by side — each is one `uint64_t` root.
+
+Cost: `append` = 1 read + 1 write, O(payload) transient RAM; `iterate` walks
+the inline run oldest→newest. Design detail: `doc/impl/l2_logring.md`.
+
 ## 5. Container invariants
 
 Every implementation must uphold (checklist for reviews and tests):
@@ -209,7 +248,12 @@ config CONTAINER_KVHASH            bool "Key→value hash"        select CONTAIN
 config CONTAINER_KVHASH_BUCKETS    int  "Default bucket count"  default 64
 config CONTAINER_KVTREE            bool "Key→value tree"
 config CONTAINER_KVTREE_FANOUT     int  "B-tree fan-out"        default 8
+config CONTAINER_LOGRING           bool "Bounded circular log"
 ```
+
+`logring` needs no capacity tunable of its own: its ring is one i-node payload,
+so `CONFIG_BLOB_DB_MAX_PAYLOAD_LEN` alone bounds it (a `BUILD_ASSERT` keeps the
+20-byte header + a one-byte record within the payload).
 
 Each container is its own translation unit under `lib/containers/<name>/`,
 included via `add_subdirectory_ifdef` — a disabled container costs zero flash
@@ -229,10 +273,12 @@ implementation design under `doc/impl/`.
 lib/containers/
   CMakeLists.txt   Kconfig
   seq/  kvlist/  kvhash/  kvtree/        each { <name>.c, Kconfig, CMakeLists.txt }
+  logring/                              logring.c (implemented)
 include/app/lib/containers/
-  seq_ops.h  map_ops.h  seq.h  kvlist.h  kvhash.h  kvtree.h
+  seq_ops.h  map_ops.h  seq.h  kvlist.h  kvhash.h  kvtree.h  logring.h
 tests/lib/containers/
   seq/  kvlist/  kvhash/  kvtree/        ztest per container
+  logring/                              ztest (implemented)
 ```
 
 ## 8. Testing strategy (per container)
@@ -252,3 +298,9 @@ provider), so backends stay behaviorally interchangeable:
 7. capacity: fill to `-ENOSPC`, verify structure still consistent
 8. `kvhash`: distribution sanity; collision chains. `kvtree`: split/merge at
    fan-out boundaries; range scans.
+9. `logring`: append/iterate order; oldest-first eviction past capacity;
+   sequence numbers monotonic, contiguous, and durable across eviction /
+   `reset` / remount; over-capacity record rejected with `-ENOSPC`;
+   wrong-type `open` → `-ENOTSUP`. (`logring` uses its own append/scan API,
+   not `seq_ops`/`map_ops`, so it is exercised by its own suite rather than
+   the shared shape-conformance suite.)

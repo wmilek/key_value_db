@@ -14,9 +14,10 @@ Status: v2 · Top-level document; per-layer detail lives in `doc/layers/`
 | `doc/layers/l1_blob_db.md` | L1 — `blob_db` **contract & requirements** (implementation-agnostic) |
 | `doc/layers/l1_model_container.md` | L1 — the model container: **sufficiency proof** that the blob_db contract can carry the layers above; reference pattern + acceptance-test blueprint |
 | `doc/layers/l1_root_registry.md` | L1½ — root registry (optional helper): key → structure-root map; owns id = 1 when enabled |
-| `doc/layers/l2_containers.md` | L2 — containers: seq, kvlist, kvhash, kvtree |
+| `doc/layers/l2_containers.md` | L2 — containers: seq, kvlist, kvhash, kvtree, logring |
 | `doc/layers/l3_interfaces.md` | L3 — access interfaces: kvdb, blobfs, settings |
 | `doc/impl/l1_bucketlog.md` | **Implementation design** (non-normative): the v1 bucket-log allocator — formats, algorithms, costs, open items |
+| `doc/impl/l2_logring.md` | **Implementation design**: the `logring` bounded circular log — format, algorithms, crash model |
 
 `doc/layers/` holds **requirements & contracts** — everything an upper layer
 may rely on (P6). `doc/impl/` holds **implementation designs**: feasibility
@@ -27,9 +28,13 @@ implemented** against the current contract — `alloc_id` + bind/rebind
 `update`, durable leading id ceiling (impl §13.1) — and validated on
 `native_sim` by a unit suite (`tests/lib/blob_db`) and the model-container
 acceptance suite (`tests/lib/blob_db_contract`, the sufficiency proof of
-`l1_model_container.md` with crash injection at every mutation step). The
-module tree above L1 (rootreg, containers, interfaces) is **scaffolded**
-(build-wired, Kconfig-gated `default n`) but not yet implemented.
+`l1_model_container.md` with crash injection at every mutation step). Above
+L1, the **root registry** (`lib/rootreg`) and the L2 **`logring`** container
+(`lib/containers/logring`) are **implemented** and unit-tested on `native_sim`
+— both are single-i-node structures whose every mutation is one atomic
+`blob_db_update` (no intent, no residue). The rest of the module tree
+(`seq`/`kvlist`/`kvhash`/`kvtree`, interfaces) is **scaffolded** (build-wired,
+Kconfig-gated `default n`) but not yet implemented.
 
 ## 2. The stack
 

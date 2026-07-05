@@ -21,6 +21,7 @@ This is a simple Sphinx documentation setup for ``example-application``.
    :caption: Design — implementation
 
    impl/l1_bucketlog
+   impl/l2_logring
 
 .. toctree::
    :maxdepth: 2
