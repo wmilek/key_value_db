@@ -61,6 +61,18 @@ int mc_set(const char *key, const void *val, size_t vlen,
 /* Remove a key (and its blobs). `crash_at` as in mc_set. */
 int mc_del(const char *key, enum mc_crash_point crash_at);
 
+/* Tear the container down entirely: delete every key/value blob, the intent
+ * blob, and finally the list root. After this the container does not exist —
+ * the root id is dead (never reused) and every mc_* call fails with -ENODEV
+ * until a fresh mc_open(). The client completes the cleanup by dropping its
+ * record of the root id (rootreg_unregister) AFTER this returns — teardown
+ * before unregistration, per l1_root_registry.md §8.
+ *
+ * Not crash-atomic: a crash mid-destroy leaves the root bound with dangling
+ * entry references (harmless — lookups treat them as absent); rerunning
+ * destroy after mc_open() finishes the job (deletes tolerate -ENOENT). */
+int mc_destroy(void);
+
 /* Diagnostics for tests: number of entries in the list, and the total live
  * blob count in the whole store (root + intent + all key/value blobs). The
  * latter is how the tests prove "no permanent leak". */

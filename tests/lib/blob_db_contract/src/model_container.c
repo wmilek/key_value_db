@@ -472,6 +472,46 @@ int mc_set(const char *key, const void *val, size_t vlen,
 	return intent_clear(l.intent_id);
 }
 
+int mc_destroy(void)
+{
+	if (!mc_ready) {
+		return -ENODEV;
+	}
+
+	struct mc_list l;
+	int rc = list_load(&l);
+
+	if (rc < 0) {
+		return rc;
+	}
+
+	/* Delete leaves first, the root last, so a crash anywhere leaves a
+	 * re-runnable state: the root still loads, dangling entry refs read
+	 * as absent, and every delete below tolerates -ENOENT on rerun. */
+	for (uint32_t i = 0; i < l.count; i++) {
+		rc = blob_db_delete(l.e[i].kid);
+		if (rc < 0 && rc != -ENOENT) {
+			return rc;
+		}
+		rc = blob_db_delete(l.e[i].vid);
+		if (rc < 0 && rc != -ENOENT) {
+			return rc;
+		}
+	}
+	rc = blob_db_delete(l.intent_id);
+	if (rc < 0 && rc != -ENOENT) {
+		return rc;
+	}
+	rc = blob_db_delete(mc_root);
+	if (rc < 0 && rc != -ENOENT) {
+		return rc;
+	}
+
+	mc_ready = false;
+	mc_root = 0;
+	return 0;
+}
+
 int mc_del(const char *key, enum mc_crash_point crash_at)
 {
 	if (!mc_ready) {

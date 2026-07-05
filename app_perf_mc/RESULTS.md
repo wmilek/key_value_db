@@ -19,10 +19,11 @@ benchmark shape changes or when regenerating on new hardware.
 
 | workload  | ops/s | ms/op | blob_db ops per mc op (approx) |
 | --------- | ----: | ----: | ------------------------------ |
-| set       | 4.251 |   235 | ~2 reads + 4 updates + 0–1 del |
-| get       | 6.087 |   164 | ~7 reads (list + key scan + value) |
-| overwrite | 3.803 |   263 | ~2 reads + 4 updates + 1 delete |
-| delete    | 4.746 |   211 | ~2 reads + 2 updates + 2 deletes |
+| set       | 4.248 |   235 | ~2 reads + 4 updates + 0–1 del |
+| get       | 6.084 |   164 | ~7 reads (list + key scan + value) |
+| overwrite | 3.801 |   263 | ~2 reads + 4 updates + 1 delete |
+| delete    | 4.743 |   211 | ~2 reads + 2 updates + 2 deletes |
+| cleanup   |     — |   119 | mc_destroy (2 deletes on an emptied container) + rootreg_unregister |
 
 For scale: raw blob_db on the same setup does ~59 reads/s (17 ms) and
 ~29 updates/s (34 ms) — see `app_perf/RESULTS.md`. The model container's
@@ -45,26 +46,29 @@ app) reads it once at open to resolve the root id it hands to `mc_open()`;
 the container never touches it (`mc_get`/`mc_set` operate on the resolved
 root id).
 
-Leak check on hardware: after set + overwrite + delete of everything, the
-store holds exactly 3 blobs — registry + list + intent, the structural
-floor. The crash-discipline bookkeeping reclaims everything else.
+Cleanup check on hardware: after the delete phase the store holds the
+structural floor (registry + list + intent); the final cleanup phase —
+`mc_destroy()` then `rootreg_unregister()` (teardown before unregistration,
+registry §8) — takes it all the way down to **1 blob: the empty registry**.
+Nothing leaks anywhere in the lifecycle.
 
 ## Raw UART capture
 
 ```
 *** Booting Zephyr OS build 34bd8ff000cc ***
 model-container perf 1.0.0  (N_KEYS=10  N_GET=100  N_OVW=50  VAL_LEN=24)
-bench prepare  :  124 ops in  137726 ms  ->    0.900 ops/s  (  1110693 us/op)
-bench set      :   10 ops in    2352 ms  ->    4.251 ops/s  (   235200 us/op)
-bench get      :  100 ops in   16427 ms  ->    6.087 ops/s  (   164270 us/op)
-bench overwrite:   50 ops in   13145 ms  ->    3.803 ops/s  (   262900 us/op)
-bench delete   :   10 ops in    2107 ms  ->    4.746 ops/s  (   210700 us/op)
+bench prepare  :  124 ops in  137312 ms  ->    0.903 ops/s  (  1107354 us/op)
+bench set      :   10 ops in    2354 ms  ->    4.248 ops/s  (   235400 us/op)
+bench get      :  100 ops in   16436 ms  ->    6.084 ops/s  (   164360 us/op)
+bench overwrite:   50 ops in   13153 ms  ->    3.801 ops/s  (   263060 us/op)
+bench delete   :   10 ops in    2108 ms  ->    4.743 ops/s  (   210800 us/op)
+bench cleanup  :    1 ops in     119 ms  ->    8.403 ops/s  (   119000 us/op)
 get checksum: 0xac6a5f02
-live blobs at end: 3 (structural floor: registry + list + intent)
+live blobs at end: 1 (expect 1 — the empty registry alone)
 ```
 
 native_sim run (timing-free, correctness reference): same checksum
-`0xac6a5f02`, same end state of 3 live blobs.
+`0xac6a5f02`, same end state of 1 live blob.
 
 ## Reproducing
 

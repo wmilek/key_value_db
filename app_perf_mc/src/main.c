@@ -19,6 +19,8 @@
  *   get       — N_GET lookups cycling over the keys (read-only)
  *   overwrite — N_OVW value replacements cycling over the keys
  *   delete    — remove all N_KEYS keys
+ *   cleanup   — full teardown: mc_destroy() + rootreg_unregister(), leaving
+ *               the store at the absolute floor (the empty registry alone)
  */
 
 #include <errno.h>
@@ -185,15 +187,30 @@ int main(void)
 	}
 	bench_line("delete", N_KEYS, k_uptime_delta(&t));
 
-	printk("get checksum: 0x%08x\n", sum);
-
 	size_t entries;
 
 	rc = mc_entry_count(&entries);
 	if (rc == 0 && entries != 0) {
-		LOG_ERR("expected empty container at end, got %zu", entries);
+		LOG_ERR("expected empty container after delete, got %zu",
+			entries);
 	}
-	printk("live blobs at end: %zu (structural floor: registry + list + intent)\n",
+
+	/* ============ cleanup (unset everything) ======================= */
+	t = k_uptime_get();
+	rc = mc_destroy();   /* unsets all keys + structure blobs */
+	if (rc < 0) {
+		LOG_ERR("mc_destroy: %d", rc);
+		goto out;
+	}
+	rc = rootreg_unregister(MC_ROOTREG_KEY);
+	if (rc < 0) {
+		LOG_ERR("unregister: %d", rc);
+		goto out;
+	}
+	bench_line("cleanup", 1, k_uptime_delta(&t));
+
+	printk("get checksum: 0x%08x\n", sum);
+	printk("live blobs at end: %zu (expect 1 — the empty registry alone)\n",
 	       blob_db_count());
 
 out:

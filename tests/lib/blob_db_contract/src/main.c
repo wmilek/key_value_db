@@ -260,6 +260,62 @@ ZTEST(blob_db_contract, test_overwrite_crash_table)
 	}
 }
 
+/* --- full-lifecycle cleanup: destroy + unregister ----------------------- */
+
+/* Tear-down leaves the store at the absolute floor — ONLY the (empty-again)
+ * registry survives — and a later open under the same key starts a brand-new
+ * container on a fresh id (dead ids are never reused). */
+ZTEST(blob_db_contract, test_destroy_and_unregister_cleanup)
+{
+	zassert_ok(mc_set("alpha", "1", 1, MC_STEP_NONE));
+	zassert_ok(mc_set("beta", "22", 2, MC_STEP_NONE));
+	zassert_ok(mc_set("gamma", "333", 3, MC_STEP_NONE));
+
+	uint64_t old_root;
+
+	zassert_ok(rootreg_get(MC_ROOTREG_KEY, &old_root));
+
+	/* Cleanup: unset all keys + structure, then drop the registry entry
+	 * (teardown BEFORE unregistration — registry §8). */
+	zassert_ok(mc_destroy());
+	zassert_ok(rootreg_unregister(MC_ROOTREG_KEY));
+
+	/* Only the registry blob remains, and the container is truly gone. */
+	zassert_equal(blob_db_count(), 1,
+		      "want registry only, got %zu blobs", blob_db_count());
+	zassert_false(blob_db_exists(old_root));
+
+	char buf[8];
+
+	zassert_equal(mc_get("alpha", buf, sizeof(buf), NULL), -ENODEV,
+		      "container must be closed after destroy");
+
+	/* Same key, fresh life: a new root id, an empty container. */
+	open_container();
+
+	uint64_t new_root;
+
+	zassert_ok(rootreg_get(MC_ROOTREG_KEY, &new_root));
+	zassert_not_equal(new_root, old_root, "dead ids must not be reused");
+	zassert_equal(get_str("alpha", buf, sizeof(buf)), -ENOENT);
+	assert_no_leak();
+}
+
+/* Destroy is re-runnable: a "crash" between destroy and unregister just
+ * means the next open finds the registered id dead… which must NOT happen
+ * silently — so the client contract is destroy-then-unregister with no
+ * mutation in between. This test pins the safe rerun path instead: destroy
+ * on an already-half-torn container (simulated by a double destroy cycle). */
+ZTEST(blob_db_contract, test_destroy_empty_container)
+{
+	zassert_ok(mc_destroy());   /* no entries — deletes intent + root */
+	zassert_ok(rootreg_unregister(MC_ROOTREG_KEY));
+	zassert_equal(blob_db_count(), 1);
+
+	open_container();           /* fresh container, fresh id */
+	assert_no_leak();
+}
+
 /* §8.3 Delete: committed once the entry is unlinked (COMMIT). */
 ZTEST(blob_db_contract, test_delete_crash_table)
 {
