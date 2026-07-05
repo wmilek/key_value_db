@@ -46,6 +46,13 @@ about 63 ms/op with two writes per prepend/append.
 (both walk buckets whose headers are already valid), so they were
 already on the warm path — the numbers match to three decimals.
 
+One caveat on the prepend/append figures: the first `alloc_id` after
+an `erase_all` re-persists the id ceiling, which rotates the master —
+one 64 KB sector erase (~1.1 s) inside the timed loop. Amortized over
+100 ops that inflates the per-op cost by ~11 ms; steady-state
+prepend/append is closer to ~52 ms/op (≈19 ops/s) than the ~63 ms/op
+the table shows.
+
 ## Raw UART capture (warm run)
 
 ```

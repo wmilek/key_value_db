@@ -1279,13 +1279,20 @@ int blob_db_erase_all(void)
 	}
 
 	const uint16_t root_bid = (uint16_t)(BLOB_DB_ROOT_ID % st.n_buckets);
-	const uint8_t zeros[4] = { 0, 0, 0, 0 };
+	uint8_t zeros[BLOB_DB_MAX_WRITE_ALIGN];
+	const size_t zlen = MAX(sizeof(uint32_t),
+				MIN(st.write_align, sizeof(zeros)));
+
+	memset(zeros, 0, sizeof(zeros));
 
 	/* Invalidate every non-root bucket's magic in place (BUCKET_MAGIC is
 	 * 'B'/'D'/'B'/'H' = 0x42/0x44/0x42/0x48; overwriting with 0x00 only
 	 * flips 1→0 bits — no erase needed, and every scan afterwards treats
-	 * the sector as unformatted). Skip buckets that already look
-	 * unformatted so we do not touch fresh sectors. */
+	 * the sector as unformatted). The write covers at least the 4 magic
+	 * bytes, rounded up to the device's write-block-size; the extra bytes
+	 * land inside the bucket header and programming them to 0x00 is
+	 * equally legal. Skip buckets that already look unformatted so we do
+	 * not touch fresh sectors. */
 	for (uint16_t bid = 0; bid < st.n_buckets; bid++) {
 		if (bid == root_bid) {
 			continue;
@@ -1303,7 +1310,7 @@ int blob_db_erase_all(void)
 		}
 		rc = flash_area_write(st.fa,
 				      peb_offset(BLOB_DB_FIRST_BUCKET + bid),
-				      zeros, sizeof(zeros));
+				      zeros, zlen);
 		if (rc < 0) {
 			LOG_ERR("erase_all: invalidate bid %u: %d", bid, rc);
 			return rc;
@@ -1317,9 +1324,14 @@ int blob_db_erase_all(void)
 		return rc;
 	}
 
-	/* Reset the id space and commit atomically via a new master on the
-	 * inactive slot. A crash before this write leaves the old master
-	 * authoritative — mount will still see the old contents. */
+	/* Reset the id space via a new master on the inactive slot. Note that
+	 * erase_all as a whole is NOT crash-atomic: a crash after some magics
+	 * were zeroed leaves those buckets gone while the rest survive under
+	 * the old master. That partial state is still consistent — the old
+	 * (higher) next_id_hint stays authoritative so no id is ever reused,
+	 * and a torn root rebind is repaired by mount's root-invariant
+	 * check. The caller asked for destruction; how much of it lands
+	 * before a crash is not part of the contract. */
 	const uint8_t inactive = !st.active_master;
 
 	rc = write_master(inactive, st.master_gen + 1,

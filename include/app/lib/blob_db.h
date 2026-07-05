@@ -274,6 +274,11 @@ int blob_db_format(void);
  * - `blob_db_count()` is 1.
  * - The next `blob_db_alloc_id()` returns 2.
  *
+ * Unlike `update`/`delete`, this call is NOT crash-atomic: a crash mid-call
+ * can leave some blobs destroyed and others still live. The store stays
+ * consistent (ids are never reused, and the root invariant is repaired on
+ * the next mount); rerun `erase_all` after the remount to finish the wipe.
+ *
  * @retval 0        success
  * @retval -ENOSPC  no room to write a new master record; caller must
  *                  fall back to `blob_db_format()`
