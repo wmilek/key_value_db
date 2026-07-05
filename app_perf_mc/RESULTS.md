@@ -20,9 +20,9 @@ benchmark shape changes or when regenerating on new hardware.
 | workload  | ops/s | ms/op | blob_db ops per mc op (approx) |
 | --------- | ----: | ----: | ------------------------------ |
 | set       | 4.251 |   235 | ~2 reads + 4 updates + 0–1 del |
-| get       | 6.089 |   164 | ~7 reads (list + key scan + value) |
-| overwrite | 3.804 |   263 | ~2 reads + 4 updates + 1 delete |
-| delete    | 4.748 |   211 | ~2 reads + 2 updates + 2 deletes |
+| get       | 6.087 |   164 | ~7 reads (list + key scan + value) |
+| overwrite | 3.803 |   263 | ~2 reads + 4 updates + 1 delete |
+| delete    | 4.746 |   211 | ~2 reads + 2 updates + 2 deletes |
 
 For scale: raw blob_db on the same setup does ~59 reads/s (17 ms) and
 ~29 updates/s (34 ms) — see `app_perf/RESULTS.md`. The model container's
@@ -40,9 +40,10 @@ multiples follow directly from its design:
   (`l1_model_container.md` §1), and the real L2 containers reduce both
   the O(n) key scan and the per-mutation write count.
 
-The registry itself adds nothing measurable to the phases: it is read once
-in `mc_open()` and never touched again (`mc_get`/`mc_set` operate on the
-resolved root id).
+The registry itself adds nothing measurable to the phases: the CLIENT (this
+app) reads it once at open to resolve the root id it hands to `mc_open()`;
+the container never touches it (`mc_get`/`mc_set` operate on the resolved
+root id).
 
 Leak check on hardware: after set + overwrite + delete of everything, the
 store holds exactly 3 blobs — registry + list + intent, the structural
@@ -53,11 +54,11 @@ floor. The crash-discipline bookkeeping reclaims everything else.
 ```
 *** Booting Zephyr OS build 34bd8ff000cc ***
 model-container perf 1.0.0  (N_KEYS=10  N_GET=100  N_OVW=50  VAL_LEN=24)
-bench prepare  :  124 ops in  137958 ms  ->    0.898 ops/s  (  1112564 us/op)
+bench prepare  :  124 ops in  137726 ms  ->    0.900 ops/s  (  1110693 us/op)
 bench set      :   10 ops in    2352 ms  ->    4.251 ops/s  (   235200 us/op)
-bench get      :  100 ops in   16423 ms  ->    6.089 ops/s  (   164230 us/op)
-bench overwrite:   50 ops in   13141 ms  ->    3.804 ops/s  (   262820 us/op)
-bench delete   :   10 ops in    2106 ms  ->    4.748 ops/s  (   210600 us/op)
+bench get      :  100 ops in   16427 ms  ->    6.087 ops/s  (   164270 us/op)
+bench overwrite:   50 ops in   13145 ms  ->    3.803 ops/s  (   262900 us/op)
+bench delete   :   10 ops in    2107 ms  ->    4.746 ops/s  (   210700 us/op)
 get checksum: 0xac6a5f02
 live blobs at end: 3 (structural floor: registry + list + intent)
 ```

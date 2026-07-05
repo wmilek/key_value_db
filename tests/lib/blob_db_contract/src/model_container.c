@@ -12,7 +12,6 @@
 #include <zephyr/logging/log.h>
 
 #include <app/lib/blob_db.h>
-#include <app/lib/rootreg.h>
 
 #include "model_container.h"
 
@@ -23,8 +22,8 @@ LOG_MODULE_REGISTER(model_container, LOG_LEVEL_INF);
 #define MC_MAX_KEY      32
 #define MC_MAX_VAL      64
 
-/* The list root id, resolved from the root registry on every mc_open().
- * Everything is reachable from id 1 (registry) -> mc_root (list). */
+/* The list root id, handed in by the client on mc_open(). How it is
+ * persisted (root registry, direct id-1 binding) is the client's business. */
 static uint64_t mc_root;
 
 /* ---- RAM shapes (parsed from flash payloads) -------------------------- */
@@ -289,8 +288,8 @@ static int mc_recover(struct mc_list *l)
 
 static int mc_create(void)
 {
-	/* mc_root came from rootreg_get_or_create() — registered but not yet
-	 * bound (the registry entry is the durable creation intent). Allocate
+	/* mc_root is allocated but not yet bound (the client's durable record
+	 * of it — e.g. a registry entry — is the creation intent). Allocate
 	 * and bind the intent blob, then bind the initial list image; the
 	 * final update is the commit that makes the container exist. */
 	uint64_t intent_id = blob_db_alloc_id();
@@ -308,27 +307,19 @@ static int mc_create(void)
 
 /* ---- public API ------------------------------------------------------- */
 
-int mc_open(void)
+int mc_open(uint64_t root_id)
 {
-	/* Bootstrap the registry (idempotent) and resolve — or register —
-	 * the container's root id. The only thing the client persists is
-	 * the compile-time key. */
-	int rc = rootreg_init();
-
-	if (rc < 0) {
-		return rc;
+	if (root_id == 0) {
+		return -EINVAL;
 	}
-	rc = rootreg_get_or_create(MC_ROOTREG_KEY, &mc_root);
-	if (rc < 0) {
-		return rc;
-	}
+	mc_root = root_id;
 
 	uint8_t probe[4];
 	size_t got;
+	int rc = blob_db_get(mc_root, probe, sizeof(probe), &got);
 
-	rc = blob_db_get(mc_root, probe, sizeof(probe), &got);
-
-	/* Registered-but-unbound (registry §7): creation is ours to finish. */
+	/* Allocated-but-unbound root (the client's record exists, the blob
+	 * doesn't — registry §7 "creation in progress"): finish it now. */
 	if (rc == -ENOENT) {
 		rc = mc_create();
 		if (rc < 0) {

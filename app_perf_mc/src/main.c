@@ -32,12 +32,17 @@
 #include <zephyr/sys/printk.h>
 
 #include <app/lib/blob_db.h>
+#include <app/lib/rootreg.h>
 
 #include <zephyr/app_version.h>
 
 #include "model_container.h"
 
 LOG_MODULE_REGISTER(app_perf_mc, CONFIG_APP_PERF_MC_LOG_LEVEL);
+
+/* This app is the container's CLIENT — it owns root-id persistence and
+ * registers the container's root under its own key. */
+#define MC_ROOTREG_KEY  ROOTREG_KEY(0x4d434e54 /* 'MCNT' */, 0)
 
 #define N_KEYS  CONFIG_APP_PERF_MC_N_KEYS
 #define N_GET   CONFIG_APP_PERF_MC_N_GET
@@ -95,7 +100,22 @@ int main(void)
 	}
 	bench_line("prepare", prepared, k_uptime_delta(&t));
 
-	rc = mc_open();   /* bootstraps registry + creates the container */
+	/* Client-side open: bootstrap the registry, resolve (or register)
+	 * the container's root, hand the id to the container. */
+	rc = rootreg_init();
+	if (rc < 0) {
+		LOG_ERR("rootreg_init: %d", rc);
+		goto out;
+	}
+
+	uint64_t root;
+
+	rc = rootreg_get_or_create(MC_ROOTREG_KEY, &root);
+	if (rc < 0) {
+		LOG_ERR("get_or_create: %d", rc);
+		goto out;
+	}
+	rc = mc_open(root);
 	if (rc < 0) {
 		LOG_ERR("mc_open: %d", rc);
 		goto out;

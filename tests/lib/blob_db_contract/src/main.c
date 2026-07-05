@@ -27,8 +27,13 @@
 #include <zephyr/ztest.h>
 
 #include <app/lib/blob_db.h>
+#include <app/lib/rootreg.h>
 
 #include "model_container.h"
+
+/* This suite is the container's CLIENT — it owns root-id persistence
+ * (l1_root_registry.md §2) and registers the container under its key. */
+#define MC_ROOTREG_KEY  ROOTREG_KEY(0x4d434e54 /* 'MCNT' */, 0)
 
 /* Structural blob floor: the root registry (id = 1) + the list root + the
  * intent blob. Each live entry adds exactly two blobs (key + value). "No
@@ -45,21 +50,33 @@ static void assert_no_leak(void)
 		      blob_db_count(), STRUCT_BLOBS + 2 * entries, entries);
 }
 
-/* Power-cut simulation: drop the mount and bring it back. mc_open() re-derives
- * the entire container from id = 1 (registry -> list root) and runs intent
- * recovery. */
+/* Client-side open: bootstrap the registry, resolve (or register) the
+ * container's root id, hand it to the container. This is the l1½ pattern
+ * every real client follows. */
+static void open_container(void)
+{
+	uint64_t root;
+
+	zassert_ok(rootreg_init());
+	zassert_ok(rootreg_get_or_create(MC_ROOTREG_KEY, &root));
+	zassert_ok(mc_open(root), "open/recovery failed");
+}
+
+/* Power-cut simulation: drop the mount and bring it back. The client
+ * re-derives the entire container from id = 1 (registry -> list root) and
+ * mc_open() runs intent recovery. */
 static void crash_and_recover(void)
 {
 	zassert_ok(blob_db_unmount());
 	zassert_ok(blob_db_mount());
-	zassert_ok(mc_open(), "reopen-from-id-1 + recovery failed");
+	open_container();
 }
 
 /* Wipe to a virgin store and create an empty container. */
 static void fresh_container(void)
 {
 	zassert_ok(blob_db_format());
-	zassert_ok(mc_open());   /* virgin -> bootstrap registry + create */
+	open_container();   /* virgin -> bootstrap registry + create */
 }
 
 static void before(void *f)

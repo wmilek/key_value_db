@@ -10,10 +10,12 @@
  * correct visible state AND zero permanent leak, the L1 contract is enough to
  * carry every layer above it.
  *
- * The whole structure is reachable from the single integer id = 1 (P5): the
- * client (this test) persists nothing else. Id 1 is owned by the root
- * registry (CONFIG_BLOB_ROOTREG); the model registers its list root under
- * MC_ROOTREG_KEY and re-derives it on every open — l1_model_container.md §2.
+ * The container itself knows nothing about how its root id is persisted —
+ * the CLIENT owns that (l1_root_registry.md §2: containers don't use the
+ * registry; their clients do). The client resolves a root id — typically
+ * via rootreg_get_or_create() — and passes it to mc_open(). Everything is
+ * still reachable from the single integer id = 1 (P5), through whatever
+ * the client persisted there.
  */
 
 #ifndef MODEL_CONTAINER_H_
@@ -22,11 +24,6 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <stdbool.h>
-
-#include <app/lib/rootreg.h>
-
-/* The model container's root-registry key ('MCNT', instance 0). */
-#define MC_ROOTREG_KEY  ROOTREG_KEY(0x4d434e54, 0)
 
 /* Crash-injection points for the extended mutation discipline
  * (l1_model_container.md §5). A mutation runs up to and INCLUDING the named
@@ -45,11 +42,12 @@ enum mc_crash_point {
 /* Signals a mutation stopped early at its injected crash point. */
 #define MC_STOPPED  1
 
-/* Open (and, on a virgin store, create) the container whose root id is
- * registered under MC_ROOTREG_KEY, bootstrapping the registry itself if
- * needed and running intent recovery (§6) if a mutation was interrupted.
+/* Open the container rooted at `root_id`, creating it if the id is
+ * allocated-but-unbound (the registry-§7 "creation in progress" state), and
+ * running intent recovery (§6) if a mutation was interrupted. The caller
+ * owns the id's persistence (root registry, direct id-1 binding, ...).
  * Idempotent — safe to call on every mount. */
-int mc_open(void);
+int mc_open(uint64_t root_id);
 
 /* Look up a key. Returns 0 and fills out/out_len on hit, -ENOENT on miss. */
 int mc_get(const char *key, void *out, size_t out_sz, size_t *out_len);
