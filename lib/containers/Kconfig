@@ -1,0 +1,39 @@
+# Copyright (c) 2026
+# SPDX-License-Identifier: Apache-2.0
+
+menu "Containers (L2)"
+	depends on BLOB_DB
+
+config BLOB_CONTAINERS_INTENT
+	bool "Shared intent/watermark helper"
+	help
+	  Reusable stage->commit->clear intent mechanism (model container §4/§5)
+	  shared by the reference-graph mutations of the real containers.
+
+	  NOT YET IMPLEMENTED — skeleton only.
+
+config BLOB_CONTAINER_SEQ
+	bool "seq — append/index sequence container"
+	help
+	  Sequence shape (seq_ops): file bodies and chunked payloads.
+	  NOT YET IMPLEMENTED — skeleton only.
+
+config BLOB_CONTAINER_KVLIST
+	bool "kvlist — O(n) map container"
+	help
+	  Map shape (map_ops) backed by a linear pair list. Smallest map.
+	  NOT YET IMPLEMENTED — skeleton only.
+
+config BLOB_CONTAINER_KVHASH
+	bool "kvhash — O(1) map container"
+	help
+	  Map shape (map_ops) backed by hash buckets.
+	  NOT YET IMPLEMENTED — skeleton only.
+
+config BLOB_CONTAINER_KVTREE
+	bool "kvtree — O(log n) ordered map container"
+	help
+	  Map shape (map_ops) backed by a balanced tree; ordered / range queries.
+	  NOT YET IMPLEMENTED — skeleton only.
+
+endmenu

@@ -34,6 +34,28 @@ static const uint8_t BUCKET_MAGIC[4] = { 'B', 'D', 'B', 'H' };
 /* Forward declarations (compaction helpers live below blob_db_mount). */
 static int recover_compaction(uint16_t bid);
 static int compact_bucket(uint16_t bid);
+static int persist_next_id_hint(uint64_t new_hint);
+static int bind_root_empty(void);
+struct bucket_walk {
+	off_t    write_cursor;
+	off_t    target_slot_off;
+	uint8_t  target_flags;
+	uint16_t target_val_len;
+};
+static bool bucket_hdr_valid(const uint8_t *buf, uint16_t bid);
+static void walk_bucket(const uint8_t *buf, uint64_t target_id,
+			struct bucket_walk *r);
+
+/* Upper bound on the sector size we can hold in RAM. mount refuses larger
+ * partitions. Two full-sector buffers live in .bss (below); the library is
+ * single-threaded per contract §5 so sharing them across calls is safe. */
+#define BLOB_DB_SECTOR_BUF_MAX CONFIG_BLOB_DB_SECTOR_BUF_SIZE
+
+/* Sector-sized scratch buffers. g_bbuf is used by every read-a-bucket op
+ * (mount, get, update, delete, exists, count, iterate) and by compaction
+ * as the "old" image; g_bbuf_new is used by compaction as the "new" image. */
+static uint8_t g_bbuf[BLOB_DB_SECTOR_BUF_MAX];
+static uint8_t g_bbuf_new[BLOB_DB_SECTOR_BUF_MAX];
 
 /* Single global instance. v1 is single-threaded; caller serializes. */
 static struct {
@@ -41,11 +63,13 @@ static struct {
 	const struct flash_area *fa;
 	size_t    fa_size;
 	size_t    peb_size;
+	size_t    write_align;     /* backing flash write-block-size */
 	uint16_t  n_pebs;
 	uint16_t  n_buckets;
 	uint8_t   active_master;   /* 0 or 1 */
 	uint32_t  master_gen;
-	uint64_t  next_id;
+	uint64_t  next_id;         /* RAM: next id alloc_id will hand out */
+	uint64_t  next_id_hint;    /* durable leading ceiling (see internal.h) */
 } st;
 
 static inline off_t peb_offset(uint16_t peb)
@@ -112,6 +136,29 @@ static int write_master(uint8_t slot, uint32_t gen, uint8_t state,
 	return 0;
 }
 
+/* Persist a raised leading id ceiling by committing a fresh CLEAN master on
+ * the inactive slot (double-buffered: a torn write leaves the old ceiling,
+ * which is still a safe — if lower — bound; mount re-raises it from the
+ * scan). On success the new master is active. */
+static int persist_next_id_hint(uint64_t new_hint)
+{
+	const uint8_t inactive = !st.active_master;
+
+	int rc = write_master(inactive, st.master_gen + 1, BLOB_DB_STATE_CLEAN,
+			      0, new_hint);
+	if (rc < 0) {
+		LOG_ERR("persist next_id_hint=%llu failed: %d",
+			(unsigned long long)new_hint, rc);
+		return rc;
+	}
+	st.active_master = inactive;
+	st.master_gen++;
+	st.next_id_hint = new_hint;
+	LOG_DBG("id ceiling raised to %llu (master gen=%u)",
+		(unsigned long long)new_hint, st.master_gen);
+	return 0;
+}
+
 /* Bucket scan ----------------------------------------------------------- */
 
 static int scan_bucket(uint16_t bid, uint64_t *max_id_inout)
@@ -159,8 +206,10 @@ static int scan_bucket(uint16_t bid, uint64_t *max_id_inout)
 				bid, shdr.val_len, (unsigned long)cursor);
 			break;
 		}
-		const size_t slot_sz = sizeof(shdr) + sizeof(uint64_t) +
+		const size_t base_sz = sizeof(shdr) + sizeof(uint64_t) +
 				       shdr.val_len + sizeof(uint16_t);
+		const size_t a = st.write_align ? st.write_align : 1;
+		const size_t slot_sz = (base_sz + a - 1) & ~(a - 1);
 		if (cursor + slot_sz > st.peb_size) {
 			break;
 		}
@@ -188,8 +237,10 @@ static int scan_bucket(uint16_t bid, uint64_t *max_id_inout)
 
 static int format_masters_fresh(void)
 {
+	/* Root id (=1) is consumed at format time (see @blob_db_root in
+	 * blob_db.h), so the leading ceiling starts at 2. */
 	int rc = write_master(BLOB_DB_MASTER_A_SECTOR, 1,
-			      BLOB_DB_STATE_CLEAN, 0, 1);
+			      BLOB_DB_STATE_CLEAN, 0, 2);
 	if (rc < 0) {
 		return rc;
 	}
@@ -200,8 +251,9 @@ static int format_masters_fresh(void)
 	}
 	st.active_master = BLOB_DB_MASTER_A_SECTOR;
 	st.master_gen = 1;
-	st.next_id = 1;
-	return 0;
+	st.next_id = 2;
+	st.next_id_hint = 2;
+	return bind_root_empty();
 }
 
 int blob_db_mount(void)
@@ -232,6 +284,10 @@ int blob_db_mount(void)
 		rc = -EIO;
 		goto err_close;
 	}
+	st.write_align = flash_area_align(st.fa);
+	if (st.write_align == 0) {
+		st.write_align = 1;
+	}
 	st.peb_size = sectors[0].fs_size;
 	for (uint32_t i = 1; i < scount; i++) {
 		if (sectors[i].fs_size != st.peb_size) {
@@ -239,6 +295,12 @@ int blob_db_mount(void)
 			rc = -ENOTSUP;
 			goto err_close;
 		}
+	}
+	if (st.peb_size > BLOB_DB_SECTOR_BUF_MAX) {
+		LOG_ERR("sector size %zu exceeds CONFIG_BLOB_DB_SECTOR_BUF_SIZE=%u",
+			st.peb_size, BLOB_DB_SECTOR_BUF_MAX);
+		rc = -ENOTSUP;
+		goto err_close;
 	}
 
 	if (st.fa_size % st.peb_size != 0) {
@@ -292,7 +354,8 @@ int blob_db_mount(void)
 		st.active_master = pick_a ? BLOB_DB_MASTER_A_SECTOR
 					  : BLOB_DB_MASTER_B_SECTOR;
 		st.master_gen = m->generation;
-		st.next_id = m->next_id_hint;
+		st.next_id_hint = m->next_id_hint;
+		st.next_id = m->next_id_hint;   /* ceiling is authoritative (§13.1) */
 		LOG_INF("master %c gen=%u state=%u next_id_hint=%llu",
 			pick_a ? 'A' : 'B',
 			st.master_gen, m->state, st.next_id);
@@ -305,7 +368,11 @@ int blob_db_mount(void)
 		}
 	}
 
-	/* Scan every bucket to refine next_id. */
+	/* Defensive: the leading ceiling should already exceed every bound id,
+	 * but scan anyway so a store written by an older (lagging-hint) format,
+	 * or one with a corrupt/rolled-back master, cannot re-issue a live id.
+	 * If the scan out-runs the ceiling, raise it AND persist the new ceiling
+	 * before any allocation can hand the id back out. */
 	uint64_t max_id = (st.next_id == 0) ? 0 : (st.next_id - 1);
 	for (uint16_t bid = 0; bid < st.n_buckets; bid++) {
 		rc = scan_bucket(bid, &max_id);
@@ -314,10 +381,55 @@ int blob_db_mount(void)
 			goto err_close;
 		}
 	}
-	if (max_id + 1 > st.next_id) {
-		LOG_INF("bucket scan raised next_id %llu -> %llu",
-			st.next_id, max_id + 1);
+	if (max_id + 1 > st.next_id_hint) {
+		LOG_WRN("bucket scan out-ran ceiling (%llu >= %llu); raising",
+			(unsigned long long)max_id, st.next_id_hint);
 		st.next_id = max_id + 1;
+		rc = persist_next_id_hint(max_id + 1 + BLOB_DB_ID_HINT_STEP);
+		if (rc < 0) {
+			goto err_close;
+		}
+	}
+
+	/* Root-always-exists invariant (see @blob_db_root in blob_db.h): if the
+	 * store predates this invariant — an older format where nobody bound
+	 * id=1, or a virgin store whose master survived a partial format — bind
+	 * an empty root now so callers can unconditionally get(root) / exists(root)
+	 * / update(root). */
+	{
+		const uint16_t root_bid =
+			(uint16_t)(BLOB_DB_ROOT_ID % st.n_buckets);
+		rc = flash_area_read(st.fa, peb_offset(BLOB_DB_FIRST_BUCKET + root_bid),
+				     g_bbuf, st.peb_size);
+		if (rc < 0) {
+			goto err_close;
+		}
+		bool root_live = false;
+		if (bucket_hdr_valid(g_bbuf, root_bid)) {
+			struct bucket_walk w;
+
+			walk_bucket(g_bbuf, BLOB_DB_ROOT_ID, &w);
+			root_live = (w.target_slot_off >= 0) &&
+				    !(w.target_flags & BLOB_DB_SLOT_F_TOMBSTONE);
+		}
+		if (!root_live) {
+			LOG_WRN("root not bound; binding empty root");
+			/* Consume id=1 for the root and raise the ceiling if
+			 * we came in with next_id < 2. */
+			if (st.next_id < 2) {
+				st.next_id = 2;
+			}
+			if (st.next_id_hint < 2) {
+				rc = persist_next_id_hint(2 + BLOB_DB_ID_HINT_STEP);
+				if (rc < 0) {
+					goto err_close;
+				}
+			}
+			rc = bind_root_empty();
+			if (rc < 0) {
+				goto err_close;
+			}
+		}
 	}
 
 	st.mounted = true;
@@ -344,14 +456,17 @@ int blob_db_unmount(void)
 
 /* Stage 4 — put / get / update / delete / exists ------------------------ */
 
-/* Maximum sector size we support. Bucket buffers are sized to this on the
- * stack inside each op. */
-#define BLOB_DB_SECTOR_BUF_MAX 4096
-
 static inline size_t slot_size_for(uint16_t val_len)
 {
-	/* v1: no write-block padding (native_sim has W=1). */
-	return BLOB_DB_SLOT_OVERHEAD + val_len;
+	/* Round the on-flash slot size up to the backing device's
+	 * write-block-size so writes always land on aligned boundaries. Any
+	 * padding bytes read back as the erased value (0xff) and don't
+	 * affect the CRC (which is stored at slot_size_for()-2, before the
+	 * padding is added — see append_slot / slot_view_at). */
+	const size_t base = BLOB_DB_SLOT_OVERHEAD + val_len;
+	const size_t a = st.write_align ? st.write_align : 1;
+
+	return (base + a - 1) & ~(a - 1);
 }
 
 static inline off_t bucket_offset(uint16_t bid)
@@ -431,7 +546,9 @@ static bool slot_view_at(const uint8_t *buf, off_t off, struct slot_view *out)
 	memcpy(&id, buf + off + sizeof(*shdr), sizeof(id));
 	const uint8_t *payload = buf + off + sizeof(*shdr) + sizeof(id);
 	uint16_t stored;
-	memcpy(&stored, buf + off + ssz - sizeof(stored), sizeof(stored));
+	const size_t crc_off = sizeof(*shdr) + sizeof(id) + shdr->val_len;
+
+	memcpy(&stored, buf + off + crc_off, sizeof(stored));
 	if (slot_crc16(shdr, id, payload, shdr->val_len) != stored) {
 		return false;
 	}
@@ -442,13 +559,6 @@ static bool slot_view_at(const uint8_t *buf, off_t off, struct slot_view *out)
 	out->total_size = ssz;
 	return true;
 }
-
-struct bucket_walk {
-	off_t    write_cursor;     /* end of valid slots in the bucket */
-	off_t    target_slot_off;  /* -1 if target_id not present */
-	uint8_t  target_flags;
-	uint16_t target_val_len;
-};
 
 static void walk_bucket(const uint8_t *buf, uint64_t target_id,
 			struct bucket_walk *r)
@@ -505,12 +615,17 @@ static int format_bucket(uint16_t bid)
 	return rc;
 }
 
-/* Build and write a slot at bucket+write_cursor. */
+/* Build and write a slot at bucket+write_cursor. Slot size on flash is
+ * padded to write_block_size; padding bytes are 0xff so any truncated
+ * write still reads as erased in the padding region. */
+#define BLOB_DB_MAX_WRITE_ALIGN 32
+
 static int append_slot(uint16_t bid, off_t write_cursor, uint64_t id,
 		       uint8_t extra_flags, const void *payload,
 		       uint16_t val_len)
 {
-	uint8_t buf[BLOB_DB_SLOT_OVERHEAD + CONFIG_BLOB_DB_MAX_PAYLOAD_LEN];
+	uint8_t buf[BLOB_DB_SLOT_OVERHEAD + CONFIG_BLOB_DB_MAX_PAYLOAD_LEN +
+		    BLOB_DB_MAX_WRITE_ALIGN];
 
 	struct blob_db_slot_hdr *shdr = (struct blob_db_slot_hdr *)buf;
 
@@ -529,6 +644,16 @@ static int append_slot(uint16_t bid, off_t write_cursor, uint64_t id,
 	memcpy(buf + crc_off, &crc, sizeof(crc));
 
 	const size_t total = slot_size_for(val_len);
+	const size_t base = BLOB_DB_SLOT_OVERHEAD + val_len;
+
+	if (total > base) {
+		memset(buf + base, 0xff, total - base);
+	}
+	if (st.write_align > BLOB_DB_MAX_WRITE_ALIGN) {
+		LOG_ERR("write_align %zu exceeds BLOB_DB_MAX_WRITE_ALIGN=%u",
+			st.write_align, BLOB_DB_MAX_WRITE_ALIGN);
+		return -ENOTSUP;
+	}
 
 	return flash_area_write(st.fa, bucket_offset(bid) + write_cursor,
 				buf, total);
@@ -661,24 +786,21 @@ static int compact_commit(uint16_t bid, const uint8_t *new_buf, size_t new_len)
 
 static int compact_bucket(uint16_t bid)
 {
-	uint8_t old_buf[BLOB_DB_SECTOR_BUF_MAX];
-	uint8_t new_buf[BLOB_DB_SECTOR_BUF_MAX];
-
-	int rc = read_bucket(bid, old_buf);
+	int rc = read_bucket(bid, g_bbuf);
 	if (rc < 0) {
 		return rc;
 	}
-	if (!bucket_hdr_valid(old_buf, bid)) {
+	if (!bucket_hdr_valid(g_bbuf, bid)) {
 		LOG_WRN("compact: bucket %u not formatted; nothing to do", bid);
 		return -EINVAL;
 	}
 
-	const size_t new_len = build_compacted_image(old_buf, new_buf, bid);
+	const size_t new_len = build_compacted_image(g_bbuf, g_bbuf_new, bid);
 
 	LOG_INF("compact bid=%u: new bucket has %zu B (was up to %zu B)",
 		bid, new_len, st.peb_size);
 
-	return compact_commit(bid, new_buf, new_len);
+	return compact_commit(bid, g_bbuf_new, new_len);
 }
 
 /* Mount-time recovery for a partition we found in COMPACTING(bid) state.
@@ -697,15 +819,14 @@ static int recover_compaction(uint16_t bid)
 		return -EIO;
 	}
 
-	uint8_t scratch[BLOB_DB_SECTOR_BUF_MAX];
 	const off_t scratch_off = peb_offset(BLOB_DB_SCRATCH_SECTOR);
 
-	int rc = flash_area_read(st.fa, scratch_off, scratch, st.peb_size);
+	int rc = flash_area_read(st.fa, scratch_off, g_bbuf, st.peb_size);
 	if (rc < 0) {
 		return rc;
 	}
 
-	if (bucket_hdr_valid(scratch, bid)) {
+	if (bucket_hdr_valid(g_bbuf, bid)) {
 		LOG_WRN("recover: scratch is sealed for bid %u; "
 			"restoring bucket from scratch", bid);
 		rc = flash_area_erase(st.fa, bucket_offset(bid), st.peb_size);
@@ -713,7 +834,7 @@ static int recover_compaction(uint16_t bid)
 			return rc;
 		}
 		rc = flash_area_write(st.fa, bucket_offset(bid),
-				      scratch, st.peb_size);
+				      g_bbuf, st.peb_size);
 		if (rc < 0) {
 			return rc;
 		}
@@ -740,75 +861,30 @@ static int recover_compaction(uint16_t bid)
 	return 0;
 }
 
-int blob_db_put(const void *payload, size_t len, uint64_t *out_id)
+uint64_t blob_db_alloc_id(void)
 {
 	if (!st.mounted) {
-		return -ENODEV;
+		return 0;   /* 0 is never a valid id */
 	}
-	if (!out_id) {
-		return -EINVAL;
-	}
-	if (len > CONFIG_BLOB_DB_MAX_PAYLOAD_LEN) {
-		return -EINVAL;
-	}
-	if (len > 0 && !payload) {
-		return -EINVAL;
+
+	/* Guarantee durability before returning: the id we hand out must be
+	 * strictly below a persisted ceiling, so a crash before it is ever
+	 * bound cannot let a later mount re-issue it (contract §2, §13.1). */
+	if (st.next_id >= st.next_id_hint) {
+		int rc = persist_next_id_hint(st.next_id + 1 +
+					      BLOB_DB_ID_HINT_STEP);
+		if (rc < 0) {
+			LOG_ERR("alloc_id: cannot persist ceiling: %d", rc);
+			return 0;
+		}
 	}
 
 	const uint64_t id = st.next_id;
-	const uint16_t bid = id_to_bucket(id);
-	uint8_t bbuf[BLOB_DB_SECTOR_BUF_MAX];
-
-	int rc = read_bucket(bid, bbuf);
-	if (rc < 0) {
-		return rc;
-	}
-
-	off_t write_cursor;
-
-	if (!bucket_hdr_valid(bbuf, bid)) {
-		rc = format_bucket(bid);
-		if (rc < 0) {
-			return rc;
-		}
-		write_cursor = BLOB_DB_BUCKET_DATA_OFF;
-	} else {
-		struct bucket_walk w;
-		walk_bucket(bbuf, 0 /* no target */, &w);
-		write_cursor = w.write_cursor;
-	}
-
-	const size_t ssz = slot_size_for((uint16_t)len);
-
-	if (write_cursor + ssz > st.peb_size) {
-		rc = compact_bucket(bid);
-		if (rc < 0) {
-			return rc;
-		}
-		rc = read_bucket(bid, bbuf);
-		if (rc < 0) {
-			return rc;
-		}
-		struct bucket_walk w;
-		walk_bucket(bbuf, 0, &w);
-		write_cursor = w.write_cursor;
-		if (write_cursor + ssz > st.peb_size) {
-			LOG_WRN("bucket %u still full after compaction", bid);
-			return -ENOSPC;
-		}
-	}
-
-	rc = append_slot(bid, write_cursor, id, 0, payload, (uint16_t)len);
-	if (rc < 0) {
-		return rc;
-	}
 
 	st.next_id = id + 1;
-	*out_id = id;
-	LOG_DBG("put id=%llu bid=%u off=0x%lx len=%zu",
-		(unsigned long long)id, bid,
-		(unsigned long)write_cursor, len);
-	return 0;
+	LOG_DBG("alloc_id -> %llu (ceiling %llu)",
+		(unsigned long long)id, (unsigned long long)st.next_id_hint);
+	return id;
 }
 
 int blob_db_get(uint64_t id, void *out, size_t out_sz, size_t *out_len)
@@ -824,19 +900,18 @@ int blob_db_get(uint64_t id, void *out, size_t out_sz, size_t *out_len)
 	}
 
 	const uint16_t bid = id_to_bucket(id);
-	uint8_t bbuf[BLOB_DB_SECTOR_BUF_MAX];
 
-	int rc = read_bucket(bid, bbuf);
+	int rc = read_bucket(bid, g_bbuf);
 	if (rc < 0) {
 		return rc;
 	}
 
-	if (!bucket_hdr_valid(bbuf, bid)) {
+	if (!bucket_hdr_valid(g_bbuf, bid)) {
 		return -ENOENT;
 	}
 
 	struct bucket_walk w;
-	walk_bucket(bbuf, id, &w);
+	walk_bucket(g_bbuf, id, &w);
 
 	if (w.target_slot_off < 0) {
 		return -ENOENT;
@@ -852,7 +927,7 @@ int blob_db_get(uint64_t id, void *out, size_t out_sz, size_t *out_len)
 		const off_t payload_off = w.target_slot_off +
 					  sizeof(struct blob_db_slot_hdr) +
 					  sizeof(uint64_t);
-		memcpy(out, bbuf + payload_off, w.target_val_len);
+		memcpy(out, g_bbuf + payload_off, w.target_val_len);
 	}
 	if (out_len) {
 		*out_len = w.target_val_len;
@@ -865,8 +940,11 @@ int blob_db_update(uint64_t id, const void *payload, size_t len)
 	if (!st.mounted) {
 		return -ENODEV;
 	}
-	if (id == 0) {
-		return -ENOENT;
+	/* An id is valid iff alloc_id has handed it out (0 < id < next_id).
+	 * Anything else was never allocated — contract §2 makes this UB, and
+	 * this cheap bound is the fail-fast the narrow contract permits. */
+	if (id == 0 || id >= st.next_id) {
+		return -EINVAL;
 	}
 	if (len > CONFIG_BLOB_DB_MAX_PAYLOAD_LEN) {
 		return -EINVAL;
@@ -875,45 +953,46 @@ int blob_db_update(uint64_t id, const void *payload, size_t len)
 		return -EINVAL;
 	}
 
+	/* Bind (first write) and rebind (rewrite) are the same append path:
+	 * write the new slot; latest-wins (§4) makes it the live one. We do
+	 * NOT verify prior state — a first bind has no prior slot, and writing
+	 * to a dead id is UB (decision D3), not our job to catch here. */
 	const uint16_t bid = id_to_bucket(id);
-	uint8_t bbuf[BLOB_DB_SECTOR_BUF_MAX];
 
-	int rc = read_bucket(bid, bbuf);
+	int rc = read_bucket(bid, g_bbuf);
 	if (rc < 0) {
 		return rc;
 	}
-	if (!bucket_hdr_valid(bbuf, bid)) {
-		return -ENOENT;
-	}
 
-	struct bucket_walk w;
-	walk_bucket(bbuf, id, &w);
+	off_t write_cursor;
 
-	if (w.target_slot_off < 0) {
-		return -ENOENT;
-	}
-	if (w.target_flags & BLOB_DB_SLOT_F_TOMBSTONE) {
-		return -ENOENT;
+	if (!bucket_hdr_valid(g_bbuf, bid)) {
+		rc = format_bucket(bid);
+		if (rc < 0) {
+			return rc;
+		}
+		write_cursor = BLOB_DB_BUCKET_DATA_OFF;
+	} else {
+		struct bucket_walk w;
+
+		walk_bucket(g_bbuf, id, &w);
+		write_cursor = w.write_cursor;
 	}
 
 	const size_t ssz = slot_size_for((uint16_t)len);
-	off_t write_cursor = w.write_cursor;
 
 	if (write_cursor + ssz > st.peb_size) {
 		rc = compact_bucket(bid);
 		if (rc < 0) {
 			return rc;
 		}
-		rc = read_bucket(bid, bbuf);
+		rc = read_bucket(bid, g_bbuf);
 		if (rc < 0) {
 			return rc;
 		}
-		walk_bucket(bbuf, id, &w);
-		if (w.target_slot_off < 0 ||
-		    (w.target_flags & BLOB_DB_SLOT_F_TOMBSTONE)) {
-			/* Shouldn't happen — we just confirmed it was live. */
-			return -EIO;
-		}
+		struct bucket_walk w;
+
+		walk_bucket(g_bbuf, id, &w);
 		write_cursor = w.write_cursor;
 		if (write_cursor + ssz > st.peb_size) {
 			return -ENOSPC;
@@ -927,7 +1006,7 @@ int blob_db_update(uint64_t id, const void *payload, size_t len)
 
 	LOG_DBG("update id=%llu bid=%u off=0x%lx len=%zu",
 		(unsigned long long)id, bid,
-		(unsigned long)w.write_cursor, len);
+		(unsigned long)write_cursor, len);
 	return 0;
 }
 
@@ -941,18 +1020,17 @@ int blob_db_delete(uint64_t id)
 	}
 
 	const uint16_t bid = id_to_bucket(id);
-	uint8_t bbuf[BLOB_DB_SECTOR_BUF_MAX];
 
-	int rc = read_bucket(bid, bbuf);
+	int rc = read_bucket(bid, g_bbuf);
 	if (rc < 0) {
 		return rc;
 	}
-	if (!bucket_hdr_valid(bbuf, bid)) {
+	if (!bucket_hdr_valid(g_bbuf, bid)) {
 		return -ENOENT;
 	}
 
 	struct bucket_walk w;
-	walk_bucket(bbuf, id, &w);
+	walk_bucket(g_bbuf, id, &w);
 
 	if (w.target_slot_off < 0) {
 		return -ENOENT;
@@ -969,11 +1047,11 @@ int blob_db_delete(uint64_t id)
 		if (rc < 0) {
 			return rc;
 		}
-		rc = read_bucket(bid, bbuf);
+		rc = read_bucket(bid, g_bbuf);
 		if (rc < 0) {
 			return rc;
 		}
-		walk_bucket(bbuf, id, &w);
+		walk_bucket(g_bbuf, id, &w);
 		if (w.target_slot_off < 0 ||
 		    (w.target_flags & BLOB_DB_SLOT_F_TOMBSTONE)) {
 			/* Compaction dropped this id — already deleted. */
@@ -1004,17 +1082,16 @@ bool blob_db_exists(uint64_t id)
 	}
 
 	const uint16_t bid = id_to_bucket(id);
-	uint8_t bbuf[BLOB_DB_SECTOR_BUF_MAX];
 
-	if (read_bucket(bid, bbuf) < 0) {
+	if (read_bucket(bid, g_bbuf) < 0) {
 		return false;
 	}
-	if (!bucket_hdr_valid(bbuf, bid)) {
+	if (!bucket_hdr_valid(g_bbuf, bid)) {
 		return false;
 	}
 
 	struct bucket_walk w;
-	walk_bucket(bbuf, id, &w);
+	walk_bucket(g_bbuf, id, &w);
 
 	return w.target_slot_off >= 0 &&
 	       !(w.target_flags & BLOB_DB_SLOT_F_TOMBSTONE);
@@ -1089,16 +1166,15 @@ size_t blob_db_count(void)
 	}
 
 	size_t total = 0;
-	uint8_t bbuf[BLOB_DB_SECTOR_BUF_MAX];
 
 	for (uint16_t bid = 0; bid < st.n_buckets; bid++) {
-		if (read_bucket(bid, bbuf) < 0) {
+		if (read_bucket(bid, g_bbuf) < 0) {
 			continue;
 		}
-		if (!bucket_hdr_valid(bbuf, bid)) {
+		if (!bucket_hdr_valid(g_bbuf, bid)) {
 			continue;
 		}
-		(void)for_each_live_slot(bbuf, count_visitor, &total);
+		(void)for_each_live_slot(g_bbuf, count_visitor, &total);
 	}
 	return total;
 }
@@ -1124,18 +1200,17 @@ int blob_db_iterate(blob_db_iter_cb_t cb, void *user)
 		return -EINVAL;
 	}
 
-	uint8_t bbuf[BLOB_DB_SECTOR_BUF_MAX];
 	struct iterate_trampoline t = { .user_cb = cb, .user = user };
 
 	for (uint16_t bid = 0; bid < st.n_buckets; bid++) {
-		if (read_bucket(bid, bbuf) < 0) {
+		if (read_bucket(bid, g_bbuf) < 0) {
 			continue;
 		}
-		if (!bucket_hdr_valid(bbuf, bid)) {
+		if (!bucket_hdr_valid(g_bbuf, bid)) {
 			continue;
 		}
 
-		int rc = for_each_live_slot(bbuf, iterate_visitor, &t);
+		int rc = for_each_live_slot(g_bbuf, iterate_visitor, &t);
 
 		if (rc) {
 			return rc;  /* user-requested early stop */
@@ -1156,15 +1231,168 @@ int blob_db_format(void)
 		return rc;
 	}
 
-	rc = write_master(BLOB_DB_MASTER_A_SECTOR, 1, BLOB_DB_STATE_CLEAN, 0, 1);
+	/* Root id (=1) is consumed at format time — see bind_root_empty(). */
+	rc = write_master(BLOB_DB_MASTER_A_SECTOR, 1, BLOB_DB_STATE_CLEAN, 0, 2);
 	if (rc < 0) {
 		return rc;
 	}
 
 	st.active_master = BLOB_DB_MASTER_A_SECTOR;
 	st.master_gen    = 1;
-	st.next_id       = 1;
+	st.next_id       = 2;
+	st.next_id_hint  = 2;
 
-	LOG_INF("format: complete; next_id=1");
+	rc = bind_root_empty();
+	if (rc < 0) {
+		return rc;
+	}
+
+	LOG_INF("format: complete; next_id=%llu",
+		(unsigned long long)st.next_id);
 	return 0;
+}
+
+/* Format the root bucket (erase + write header) and append an empty slot
+ * for BLOB_DB_ROOT_ID. See @blob_db_root in blob_db.h. Callers must have
+ * already set up st.fa / st.peb_size / st.n_buckets. */
+static int bind_root_empty(void)
+{
+	const uint16_t root_bid = (uint16_t)(BLOB_DB_ROOT_ID % st.n_buckets);
+
+	int rc = format_bucket(root_bid);
+	if (rc < 0) {
+		LOG_ERR("bind_root: format bucket %u: %d", root_bid, rc);
+		return rc;
+	}
+	rc = append_slot(root_bid, BLOB_DB_BUCKET_DATA_OFF,
+			 BLOB_DB_ROOT_ID, 0, NULL, 0);
+	if (rc < 0) {
+		LOG_ERR("bind_root: append: %d", rc);
+	}
+	return rc;
+}
+
+int blob_db_erase_all(void)
+{
+	if (!st.mounted) {
+		return -ENODEV;
+	}
+
+	const uint16_t root_bid = (uint16_t)(BLOB_DB_ROOT_ID % st.n_buckets);
+	uint8_t zeros[BLOB_DB_MAX_WRITE_ALIGN];
+	const size_t zlen = MAX(sizeof(uint32_t),
+				MIN(st.write_align, sizeof(zeros)));
+
+	memset(zeros, 0, sizeof(zeros));
+
+	/* Invalidate every non-root bucket's magic in place (BUCKET_MAGIC is
+	 * 'B'/'D'/'B'/'H' = 0x42/0x44/0x42/0x48; overwriting with 0x00 only
+	 * flips 1→0 bits — no erase needed, and every scan afterwards treats
+	 * the sector as unformatted). The write covers at least the 4 magic
+	 * bytes, rounded up to the device's write-block-size; the extra bytes
+	 * land inside the bucket header and programming them to 0x00 is
+	 * equally legal. Skip buckets that already look unformatted so we do
+	 * not touch fresh sectors. */
+	for (uint16_t bid = 0; bid < st.n_buckets; bid++) {
+		if (bid == root_bid) {
+			continue;
+		}
+		uint8_t peek[4];
+		int rc = flash_area_read(st.fa,
+					 peb_offset(BLOB_DB_FIRST_BUCKET + bid),
+					 peek, sizeof(peek));
+		if (rc < 0) {
+			LOG_ERR("erase_all: peek bid %u: %d", bid, rc);
+			return rc;
+		}
+		if (memcmp(peek, BUCKET_MAGIC, 4) != 0) {
+			continue;
+		}
+		rc = flash_area_write(st.fa,
+				      peb_offset(BLOB_DB_FIRST_BUCKET + bid),
+				      zeros, zlen);
+		if (rc < 0) {
+			LOG_ERR("erase_all: invalidate bid %u: %d", bid, rc);
+			return rc;
+		}
+	}
+
+	/* Reformat the root bucket (single sector erase) and bind an empty
+	 * root slot so BLOB_DB_ROOT_ID is live before this call returns. */
+	int rc = bind_root_empty();
+	if (rc < 0) {
+		return rc;
+	}
+
+	/* Reset the id space via a new master on the inactive slot. Note that
+	 * erase_all as a whole is NOT crash-atomic: a crash after some magics
+	 * were zeroed leaves those buckets gone while the rest survive under
+	 * the old master. That partial state is still consistent — the old
+	 * (higher) next_id_hint stays authoritative so no id is ever reused,
+	 * and a torn root rebind is repaired by mount's root-invariant
+	 * check. The caller asked for destruction; how much of it lands
+	 * before a crash is not part of the contract. */
+	const uint8_t inactive = !st.active_master;
+
+	rc = write_master(inactive, st.master_gen + 1,
+			  BLOB_DB_STATE_CLEAN, 0, 2);
+	if (rc < 0) {
+		return rc;
+	}
+	st.active_master = inactive;
+	st.master_gen++;
+	st.next_id = 2;
+	st.next_id_hint = 2;
+
+	LOG_INF("erase_all: complete; next_id=%llu (master gen=%u)",
+		(unsigned long long)st.next_id, st.master_gen);
+	return 0;
+}
+
+int blob_db_prepare(size_t n)
+{
+	if (!st.mounted) {
+		return -ENODEV;
+	}
+	if (n == 0) {
+		return 0;
+	}
+	if (n > st.n_buckets) {
+		n = st.n_buckets;
+	}
+
+	const uint16_t root_bid = (uint16_t)(BLOB_DB_ROOT_ID % st.n_buckets);
+	size_t prepared = 0;
+
+	for (size_t i = 0; i < n; i++) {
+		const uint16_t bid =
+			(uint16_t)((st.next_id + i) % st.n_buckets);
+
+		if (bid == root_bid) {
+			continue;
+		}
+
+		/* Peek only the header — no need to pull a full sector into
+		 * g_bbuf just to decide whether formatting is needed. */
+		struct blob_db_bucket_hdr peek;
+		int rc = flash_area_read(st.fa, bucket_offset(bid),
+					 &peek, sizeof(peek));
+		if (rc < 0) {
+			LOG_ERR("prepare: read bid %u: %d", bid, rc);
+			return rc;
+		}
+		if (bucket_hdr_valid((const uint8_t *)&peek, bid)) {
+			continue;
+		}
+
+		rc = format_bucket(bid);
+		if (rc < 0) {
+			return rc;
+		}
+		prepared++;
+	}
+
+	LOG_DBG("prepare(%zu): formatted %zu (cursor=%llu)",
+		n, prepared, (unsigned long long)st.next_id);
+	return (int)prepared;
 }

@@ -1,0 +1,10 @@
+# Copyright (c) 2026
+# SPDX-License-Identifier: Apache-2.0
+
+config BLOBDB_BLOBFS
+	bool "blobfs (L3)"
+	depends on BLOB_DB
+	select BLOB_ROOTREG
+	help
+	  blobfs — path/file interface: Map directories + Sequence file bodies.
+	  NOT YET IMPLEMENTED — skeleton only.

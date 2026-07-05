@@ -1,0 +1,7 @@
+sample:
+  description: blob_db performance benchmark
+  name: blob-db-perf
+common:
+  build_only: true
+tests:
+  perf.default: {}

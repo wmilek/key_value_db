@@ -302,21 +302,24 @@ draft implementation and will be reworked against the final API; the
 
 ## 13. Open implementation items (to fine-tune before/during implementation)
 
-1. **Durable id allocation — adopt a leading ceiling (hi/lo).** As sketched
-   in §5.1/§5.2, `next_id` is recovered from the bucket scan plus a *lagging*
-   hint. That protects **bound** ids only; an allocated-but-unbound id leaves
-   no trace, so after a crash it could be returned again — violating contract
-   §2, and breaking root-registry `get_or_create` recovery and `update`'s
-   `-EINVAL` boundary. Fix: persist `next_id_hint` as a **ceiling ahead of
-   allocation** (e.g. +256) and have mount take `next_id = ceiling`, never
-   the scan max. This subsumes both monotonicity patches (tombstones counting
-   toward the scan max in §5.1, and the `hint↑` ride-along in §5.6). Cost
-   unchanged: one master write per block of allocations.
-2. **Steady-state RAM story.** §5 pseudocode keeps `write_cursor[N]`
-   (~4–8 KB), which violates contract R1. Either re-scan the target bucket on
-   each write operation (+1 read on `update`/`delete`; the current draft code
-   does this) or keep cursors and renegotiate R1. Decide with measurements;
-   the contract favors re-scan.
+1. **Durable id allocation — adopt a leading ceiling.** *(Implemented.)*
+   `next_id_hint` on the master is now a **leading ceiling**: an exclusive
+   upper bound on every id ever returned by `alloc_id`. `alloc_id` persists a
+   fresh ceiling `BLOB_DB_ID_HINT_STEP` (256) ids ahead whenever the current
+   one is reached, and mount takes `next_id = next_id_hint` (the bucket scan
+   only ever *raises* it defensively, never lowers it). This protects
+   allocated-but-unbound ids across a crash — the property the model
+   container's watermark recovery and (future) root-registry `get_or_create`
+   depend on. It subsumes both earlier monotonicity patches (tombstones toward
+   the scan max, the `hint↑` compaction ride-along). Cost: one master write
+   per block of 256 allocations. Note: this means a crash that returns id = 1
+   but never binds it does **not** recover `next_id` to 1 — the root
+   convention holds on a *fresh format*, and a registry-enabled build that
+   needs virgin re-bootstrap resolves this at the rootreg layer, not here.
+2. **Steady-state RAM story.** *(Resolved: re-scan.)* The implementation
+   keeps **no** `write_cursor[N]` array; each write re-walks the target
+   bucket (`walk_bucket`) to find the append cursor (+1 read on
+   `update`/`delete`), honoring contract R1 (O(1) steady-state RAM).
 3. **Sector-size portability.** 4 KB stack buffers assume ≤ 4 KB erase
    sectors; parts with larger erase blocks need either a Kconfig'd buffer or
    an explicit supported-geometry statement.
