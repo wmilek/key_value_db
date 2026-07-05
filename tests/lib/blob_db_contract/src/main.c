@@ -7,7 +7,8 @@
  * whole concept:
  *
  *   - single-integer reachability (P5): the container is re-opened after every
- *     remount from nothing but id = 1;
+ *     remount from nothing but id = 1 — the root registry lives there and
+ *     maps MC_ROOTREG_KEY to the list root;
  *   - crash-safety (P7): at every step of every reference-graph mutation, a
  *     crash + remount + recovery yields the complete old OR complete new
  *     mapping — never torn, never dangling;
@@ -29,10 +30,10 @@
 
 #include "model_container.h"
 
-/* Structural blob floor: the root list (id = 1) + the intent blob. Each live
- * entry adds exactly two blobs (key + value). "No leak" == live count matches
- * this formula exactly. */
-#define STRUCT_BLOBS  2
+/* Structural blob floor: the root registry (id = 1) + the list root + the
+ * intent blob. Each live entry adds exactly two blobs (key + value). "No
+ * leak" == live count matches this formula exactly. */
+#define STRUCT_BLOBS  3
 
 static void assert_no_leak(void)
 {
@@ -45,7 +46,8 @@ static void assert_no_leak(void)
 }
 
 /* Power-cut simulation: drop the mount and bring it back. mc_open() re-derives
- * the entire container from id = 1 and runs intent recovery. */
+ * the entire container from id = 1 (registry -> list root) and runs intent
+ * recovery. */
 static void crash_and_recover(void)
 {
 	zassert_ok(blob_db_unmount());
@@ -57,7 +59,7 @@ static void crash_and_recover(void)
 static void fresh_container(void)
 {
 	zassert_ok(blob_db_format());
-	zassert_ok(mc_open());   /* virgin -> create at id = 1 */
+	zassert_ok(mc_open());   /* virgin -> bootstrap registry + create */
 }
 
 static void before(void *f)

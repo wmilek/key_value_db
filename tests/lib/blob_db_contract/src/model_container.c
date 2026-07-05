@@ -12,6 +12,7 @@
 #include <zephyr/logging/log.h>
 
 #include <app/lib/blob_db.h>
+#include <app/lib/rootreg.h>
 
 #include "model_container.h"
 
@@ -21,6 +22,10 @@ LOG_MODULE_REGISTER(model_container, LOG_LEVEL_INF);
 #define MC_MAX_DEL       4
 #define MC_MAX_KEY      32
 #define MC_MAX_VAL      64
+
+/* The list root id, resolved from the root registry on every mc_open().
+ * Everything is reachable from id 1 (registry) -> mc_root (list). */
+static uint64_t mc_root;
 
 /* ---- RAM shapes (parsed from flash payloads) -------------------------- */
 
@@ -64,7 +69,7 @@ static int list_load(struct mc_list *l)
 {
 	uint8_t buf[CONFIG_BLOB_DB_MAX_PAYLOAD_LEN];
 	size_t got;
-	int rc = blob_db_get(MC_ROOT_ID, buf, sizeof(buf), &got);
+	int rc = blob_db_get(mc_root, buf, sizeof(buf), &got);
 
 	if (rc < 0) {
 		return rc;
@@ -93,7 +98,7 @@ static int list_store(const struct mc_list *l)
 	uint8_t buf[CONFIG_BLOB_DB_MAX_PAYLOAD_LEN];
 	size_t len = list_serialize(l, buf);
 
-	return blob_db_update(MC_ROOT_ID, buf, len);
+	return blob_db_update(mc_root, buf, len);
 }
 
 static int intent_load(uint64_t intent_id, struct mc_intent *in)
@@ -206,7 +211,7 @@ static int rollback_collect(uint64_t id, const void *p, size_t len, void *user)
 	if (id < c->w) {
 		return 0;   /* below watermark — not this mutation's */
 	}
-	if (id == MC_ROOT_ID || id == c->intent_id) {
+	if (id == mc_root || id == c->intent_id) {
 		return 0;   /* structural */
 	}
 	if (list_refs_id(c->l, id)) {
@@ -280,13 +285,14 @@ static int mc_recover(struct mc_list *l)
 	return intent_clear(l->intent_id);   /* CLEAR — last, idempotent */
 }
 
-/* ---- create (virgin store, basic flow §3.1) --------------------------- */
+/* ---- create (virgin store, basic flow §3.1 + registry §7) ------------- */
 
 static int mc_create(void)
 {
-	/* Root (id = 1) is pre-bound with an empty payload by blob_db_format()
-	 * — see @blob_db_root in blob_db.h. Allocate the intent blob, then
-	 * rebind the root with the initial list image. */
+	/* mc_root came from rootreg_get_or_create() — registered but not yet
+	 * bound (the registry entry is the durable creation intent). Allocate
+	 * and bind the intent blob, then bind the initial list image; the
+	 * final update is the commit that makes the container exist. */
 	uint64_t intent_id = blob_db_alloc_id();
 	struct mc_intent empty = { 0 };
 	int rc = intent_store(intent_id, &empty);   /* bind intent blob */
@@ -297,20 +303,33 @@ static int mc_create(void)
 
 	struct mc_list l = { .intent_id = intent_id, .count = 0 };
 
-	return list_store(&l);   /* COMMIT — container exists at id = 1 */
+	return list_store(&l);   /* COMMIT — container exists at mc_root */
 }
 
 /* ---- public API ------------------------------------------------------- */
 
 int mc_open(void)
 {
+	/* Bootstrap the registry (idempotent) and resolve — or register —
+	 * the container's root id. The only thing the client persists is
+	 * the compile-time key. */
+	int rc = rootreg_init();
+
+	if (rc < 0) {
+		return rc;
+	}
+	rc = rootreg_get_or_create(MC_ROOTREG_KEY, &mc_root);
+	if (rc < 0) {
+		return rc;
+	}
+
 	uint8_t probe[4];
 	size_t got;
-	int rc = blob_db_get(MC_ROOT_ID, probe, sizeof(probe), &got);
 
-	/* Virgin detection: root always exists after format, but with an
-	 * empty payload — that is the "no container yet" signal. */
-	if (rc == 0 && got == 0) {
+	rc = blob_db_get(mc_root, probe, sizeof(probe), &got);
+
+	/* Registered-but-unbound (registry §7): creation is ours to finish. */
+	if (rc == -ENOENT) {
 		rc = mc_create();
 		if (rc < 0) {
 			return rc;
@@ -318,7 +337,7 @@ int mc_open(void)
 		mc_ready = true;
 		return 0;
 	}
-	/* -ENOMEM just means the root is bigger than the probe buffer —
+	/* -ENOMEM just means the list is bigger than the probe buffer —
 	 * that's fine, it exists. Any other negative is a real error. */
 	if (rc < 0 && rc != -ENOMEM) {
 		return rc;
