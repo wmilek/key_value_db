@@ -193,6 +193,18 @@ downward slice via Kconfig `select`, and invalid combinations are unrepresentabl
 - The model container's ~1/6th throughput is the *measured price* of the full 5-step
   crash-safe, zero-leak mutation discipline — by design, not overhead to optimize.
 
+**Footprint** (architectural guarantees from P2/P3/P4):
+
+| Resource | Cost | Why |
+|---|---|---|
+| **Steady-state RAM** | **O(1) per module** — no per-blob/key/node RAM, no caches, no mount-time index | P3: state is re-read from flash on demand |
+| **Transient RAM** | a single **≤ 4 KB stack buffer** (one sector) per operation; handles are O(1) (root id + cursor), `kvtree` adds O(depth) ids | P2: stack over heap, bounded worst case |
+| **Code (source)** | L1 `blob_db` **~1400 LoC**, L1½ `rootreg` **~300 LoC**; every module above the core is Kconfig-gated | P4: disabled module = **zero flash & RAM** |
+| **Flash data overhead** | per blob: one append-log slot = header + payload + CRC; partition = N × sector-sized buckets | append-only, compaction reclaims garbage |
+
+*Binary ROM/RAM sizes are not yet measured on target — the numbers above are the
+design footprint; a per-config `west build` size report is the next step.*
+
 **Bottom line:** the always-present crash-safe core (**L1 + L1½**) is built, tested,
 and benchmarked on real hardware; the à-la-carte layers above (**L2/L3**) are
 specified and scaffolded, awaiting implementation.
