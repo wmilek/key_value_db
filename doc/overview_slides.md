@@ -193,17 +193,29 @@ downward slice via Kconfig `select`, and invalid combinations are unrepresentabl
 - The model container's ~1/6th throughput is the *measured price* of the full 5-step
   crash-safe, zero-leak mutation discipline — by design, not overhead to optimize.
 
-**Footprint** (architectural guarantees from P2/P3/P4):
+**Footprint** — concrete design numbers (P2/P3/P4):
 
-| Resource | Cost | Why |
+*RAM:*
+
+| Resource | Cost | Detail |
 |---|---|---|
-| **Steady-state RAM** | **O(1) per module** — no per-blob/key/node RAM, no caches, no mount-time index | P3: state is re-read from flash on demand |
-| **Transient RAM** | a single **≤ 4 KB stack buffer** (one sector) per operation; handles are O(1) (root id + cursor), `kvtree` adds O(depth) ids | P2: stack over heap, bounded worst case |
-| **Code (source)** | L1 `blob_db` **~1400 LoC**, L1½ `rootreg` **~300 LoC**; every module above the core is Kconfig-gated | P4: disabled module = **zero flash & RAM** |
-| **Flash data overhead** | per blob: one append-log slot = header + payload + CRC; partition = N × sector-sized buckets | append-only, compaction reclaims garbage |
+| **Steady-state RAM** | **~32 B fixed handle per module** — *no* per-blob/key/node RAM, no caches, no mount-time index rebuild | `blob_db` handle: partition ptr, master generation/state, id ceiling, compaction state (P3); state re-read from flash on demand |
+| **Transient RAM** | a single **≤ 4 KB stack buffer** (one sector) per operation | container handles add O(1) cursor state; `kvtree` adds O(depth) ids — stack over heap (P2) |
 
-*Binary ROM/RAM sizes are not yet measured on target — the numbers above are the
-design footprint; a per-config `west build` size report is the next step.*
+*Flash (on-disk overhead, from the v1 bucket-log design):*
+
+| Item | Size | Note |
+|---|---|---|
+| Per-blob slot overhead | **14 B** (4 B slot hdr + 8 B id + 2 B CRC-16) + payload, aligned to write block | append-only; a rebind supersedes the old slot, reclaimed at compaction |
+| Bucket header | **16 B** | written once per erase/compact |
+| Master sector header | **24 B** | double-buffered across two sectors |
+| Capacity | ~80 B avg entry ⇒ **~100 k entries in 8 MB** | bounded by partition size, not by any Kconfig limit |
+
+*Code:* L1 `blob_db` **~1400 LoC**, L1½ `rootreg` **~300 LoC**; every module above the
+core is Kconfig-gated so a **disabled module costs zero flash & RAM** (P4).
+
+*Compiled binary ROM/RAM on target is not yet measured — a per-config `west build`
+size report is the next step; the numbers above are the design footprint.*
 
 **Bottom line:** the always-present crash-safe core (**L1 + L1½**) is built, tested,
 and benchmarked on real hardware; the à-la-carte layers above (**L2/L3**) are
