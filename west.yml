@@ -10,6 +10,8 @@ manifest:
       url-base: https://github.com/zephyrproject-rtos
     - name: kamil-kielbasa
       url-base: https://github.com/kamil-kielbasa
+    - name: wmilek
+      url-base: https://github.com/wmilek
 
   projects:
     - name: zephyr
@@ -23,9 +25,12 @@ manifest:
           - hal_nordic # required by the custom_plank board (Nordic based)
           - hal_stm32  # required by the nucleo_f302r8 board (STM32 based)
     # UBI flash-virtualization layer — provides the wear-leveled volume
-    # substrate that the key-value store builds on. Pinned to the stable
-    # v1.0.0 release (public API + on-flash format frozen).
+    # substrate that the key-value store builds on. The UBI backend needs the
+    # in-place partial-update API (ubi_leb_write_at) and the "compile only when
+    # enabled" build guard, which live on this branch pending the upstream PR
+    # (kamil-kielbasa/ubi). Flip back to a kamil-kielbasa release tag once it
+    # lands.
     - name: ubi
-      remote: kamil-kielbasa
-      revision: v1.0.0
+      remote: wmilek
+      revision: feature/leb-partial-update
       path: ubi
