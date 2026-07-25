@@ -8,6 +8,8 @@ manifest:
   remotes:
     - name: zephyrproject-rtos
       url-base: https://github.com/zephyrproject-rtos
+    - name: kamil-kielbasa
+      url-base: https://github.com/kamil-kielbasa
 
   projects:
     - name: zephyr
@@ -20,3 +22,10 @@ manifest:
           - cmsis_6    # required by the ARM port for Cortex-M
           - hal_nordic # required by the custom_plank board (Nordic based)
           - hal_stm32  # required by the nucleo_f302r8 board (STM32 based)
+    # UBI flash-virtualization layer — provides the wear-leveled volume
+    # substrate that the key-value store builds on. Pinned to the stable
+    # v1.0.0 release (public API + on-flash format frozen).
+    - name: ubi
+      remote: kamil-kielbasa
+      revision: v1.0.0
+      path: ubi
