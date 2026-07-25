@@ -16,16 +16,14 @@
 
 #include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
-#include <zephyr/storage/flash_map.h>
 #include <zephyr/sys/crc.h>
 
 #include <app/lib/blob_db.h>
 
 #include "blob_db_internal.h"
+#include "blob_db_store.h"
 
 LOG_MODULE_REGISTER(blob_db, CONFIG_BLOB_DB_LOG_LEVEL);
-
-#define BLOB_DB_PARTITION_ID  PARTITION_ID(storage_partition)
 
 /* On-flash magic strings, 4 bytes each (no NUL terminator). */
 static const uint8_t MASTER_MAGIC[4] = { 'B', 'D', 'M', 'S' };
@@ -60,8 +58,7 @@ static uint8_t g_bbuf_new[BLOB_DB_SECTOR_BUF_MAX];
 /* Single global instance. v1 is single-threaded; caller serializes. */
 static struct {
 	bool      mounted;
-	const struct flash_area *fa;
-	size_t    fa_size;
+	size_t    fa_size;         /* total addressable bytes (n_pebs * peb_size) */
 	size_t    peb_size;
 	size_t    write_align;     /* backing flash write-block-size */
 	uint16_t  n_pebs;
@@ -90,7 +87,7 @@ static int read_master(uint8_t slot, struct blob_db_master_hdr *out, bool *valid
 {
 	*valid = false;
 
-	int rc = flash_area_read(st.fa, peb_offset(slot), out, sizeof(*out));
+	int rc = blob_db_store_read(peb_offset(slot), out, sizeof(*out));
 	if (rc < 0) {
 		LOG_ERR("master %u read failed: %d", slot, rc);
 		return rc;
@@ -112,7 +109,7 @@ static int read_master(uint8_t slot, struct blob_db_master_hdr *out, bool *valid
 static int write_master(uint8_t slot, uint32_t gen, uint8_t state,
 			uint16_t compacting_bid, uint64_t next_id_hint)
 {
-	int rc = flash_area_erase(st.fa, peb_offset(slot), st.peb_size);
+	int rc = blob_db_store_erase(peb_offset(slot), st.peb_size);
 	if (rc < 0) {
 		LOG_ERR("master %u erase failed: %d", slot, rc);
 		return rc;
@@ -128,7 +125,7 @@ static int write_master(uint8_t slot, uint32_t gen, uint8_t state,
 	memcpy(hdr.magic, MASTER_MAGIC, 4);
 	hdr.hdr_crc32 = hdr_crc32(&hdr, sizeof(hdr));
 
-	rc = flash_area_write(st.fa, peb_offset(slot), &hdr, sizeof(hdr));
+	rc = blob_db_store_write(peb_offset(slot), &hdr, sizeof(hdr));
 	if (rc < 0) {
 		LOG_ERR("master %u write failed: %d", slot, rc);
 		return rc;
@@ -166,7 +163,7 @@ static int scan_bucket(uint16_t bid, uint64_t *max_id_inout)
 	const off_t base = peb_offset(BLOB_DB_FIRST_BUCKET + bid);
 
 	struct blob_db_bucket_hdr bhdr;
-	int rc = flash_area_read(st.fa, base, &bhdr, sizeof(bhdr));
+	int rc = blob_db_store_read(base, &bhdr, sizeof(bhdr));
 	if (rc < 0) {
 		return rc;
 	}
@@ -189,7 +186,7 @@ static int scan_bucket(uint16_t bid, uint64_t *max_id_inout)
 
 	while (cursor + min_slot <= st.peb_size) {
 		struct blob_db_slot_hdr shdr;
-		rc = flash_area_read(st.fa, base + cursor, &shdr, sizeof(shdr));
+		rc = blob_db_store_read(base + cursor, &shdr, sizeof(shdr));
 		if (rc < 0) {
 			return rc;
 		}
@@ -215,7 +212,7 @@ static int scan_bucket(uint16_t bid, uint64_t *max_id_inout)
 		}
 
 		uint64_t id;
-		rc = flash_area_read(st.fa, base + cursor + sizeof(shdr),
+		rc = blob_db_store_read(base + cursor + sizeof(shdr),
 				     &id, sizeof(id));
 		if (rc < 0) {
 			return rc;
@@ -244,7 +241,7 @@ static int format_masters_fresh(void)
 	if (rc < 0) {
 		return rc;
 	}
-	rc = flash_area_erase(st.fa, peb_offset(BLOB_DB_MASTER_B_SECTOR),
+	rc = blob_db_store_erase(peb_offset(BLOB_DB_MASTER_B_SECTOR),
 			      st.peb_size);
 	if (rc < 0) {
 		return rc;
@@ -262,40 +259,18 @@ int blob_db_mount(void)
 		return -EALREADY;
 	}
 
-	int rc = flash_area_open(BLOB_DB_PARTITION_ID, &st.fa);
+	struct blob_db_store_geom geom;
+	int rc = blob_db_store_open(&geom);
 	if (rc < 0) {
-		LOG_ERR("flash_area_open: %d", rc);
+		LOG_ERR("store open: %d", rc);
 		return rc;
 	}
 
-	st.fa_size = st.fa->fa_size;
+	st.peb_size = geom.peb_size;
+	st.write_align = geom.write_align ? geom.write_align : 1;
+	st.n_pebs = geom.n_pebs;
+	st.fa_size = (size_t)geom.n_pebs * geom.peb_size;
 
-	/* Derive sector size: get the first sector, assume uniform. */
-	struct flash_sector sectors[4];
-	uint32_t scount = ARRAY_SIZE(sectors);
-
-	rc = flash_area_sectors(st.fa, &scount, sectors);
-	if (rc < 0 && rc != -ENOMEM) {
-		LOG_ERR("flash_area_get_sectors: %d", rc);
-		goto err_close;
-	}
-	if (scount == 0) {
-		LOG_ERR("partition reports zero sectors");
-		rc = -EIO;
-		goto err_close;
-	}
-	st.write_align = flash_area_align(st.fa);
-	if (st.write_align == 0) {
-		st.write_align = 1;
-	}
-	st.peb_size = sectors[0].fs_size;
-	for (uint32_t i = 1; i < scount; i++) {
-		if (sectors[i].fs_size != st.peb_size) {
-			LOG_ERR("non-uniform sectors not supported");
-			rc = -ENOTSUP;
-			goto err_close;
-		}
-	}
 	if (st.peb_size > BLOB_DB_SECTOR_BUF_MAX) {
 		LOG_ERR("sector size %zu exceeds CONFIG_BLOB_DB_SECTOR_BUF_SIZE=%u",
 			st.peb_size, BLOB_DB_SECTOR_BUF_MAX);
@@ -303,13 +278,6 @@ int blob_db_mount(void)
 		goto err_close;
 	}
 
-	if (st.fa_size % st.peb_size != 0) {
-		LOG_ERR("partition size %zu not a multiple of sector %zu",
-			st.fa_size, st.peb_size);
-		rc = -EINVAL;
-		goto err_close;
-	}
-	st.n_pebs = st.fa_size / st.peb_size;
 	if (st.n_pebs < BLOB_DB_FIRST_BUCKET + 1) {
 		LOG_ERR("partition too small: %u sectors (need ≥ %u)",
 			st.n_pebs, BLOB_DB_FIRST_BUCKET + 1);
@@ -399,7 +367,7 @@ int blob_db_mount(void)
 	{
 		const uint16_t root_bid =
 			(uint16_t)(BLOB_DB_ROOT_ID % st.n_buckets);
-		rc = flash_area_read(st.fa, peb_offset(BLOB_DB_FIRST_BUCKET + root_bid),
+		rc = blob_db_store_read(peb_offset(BLOB_DB_FIRST_BUCKET + root_bid),
 				     g_bbuf, st.peb_size);
 		if (rc < 0) {
 			goto err_close;
@@ -437,8 +405,7 @@ int blob_db_mount(void)
 	return 0;
 
 err_close:
-	flash_area_close(st.fa);
-	st.fa = NULL;
+	blob_db_store_close();
 	return rc;
 }
 
@@ -447,8 +414,7 @@ int blob_db_unmount(void)
 	if (!st.mounted) {
 		return 0;
 	}
-	flash_area_close(st.fa);
-	st.fa = NULL;
+	blob_db_store_close();
 	st.mounted = false;
 	LOG_INF("unmounted");
 	return 0;
@@ -588,12 +554,12 @@ static void walk_bucket(const uint8_t *buf, uint64_t target_id,
 
 static int read_bucket(uint16_t bid, uint8_t *buf)
 {
-	return flash_area_read(st.fa, bucket_offset(bid), buf, st.peb_size);
+	return blob_db_store_read(bucket_offset(bid), buf, st.peb_size);
 }
 
 static int format_bucket(uint16_t bid)
 {
-	int rc = flash_area_erase(st.fa, bucket_offset(bid), st.peb_size);
+	int rc = blob_db_store_erase(bucket_offset(bid), st.peb_size);
 
 	if (rc < 0) {
 		LOG_ERR("bucket %u erase: %d", bid, rc);
@@ -608,7 +574,7 @@ static int format_bucket(uint16_t bid)
 	memcpy(bhdr.magic, BUCKET_MAGIC, 4);
 	bhdr.hdr_crc32 = hdr_crc32(&bhdr, sizeof(bhdr));
 
-	rc = flash_area_write(st.fa, bucket_offset(bid), &bhdr, sizeof(bhdr));
+	rc = blob_db_store_write(bucket_offset(bid), &bhdr, sizeof(bhdr));
 	if (rc < 0) {
 		LOG_ERR("bucket %u header write: %d", bid, rc);
 	}
@@ -655,7 +621,7 @@ static int append_slot(uint16_t bid, off_t write_cursor, uint64_t id,
 		return -ENOTSUP;
 	}
 
-	return flash_area_write(st.fa, bucket_offset(bid) + write_cursor,
+	return blob_db_store_write(bucket_offset(bid) + write_cursor,
 				buf, total);
 }
 
@@ -746,27 +712,27 @@ static int compact_commit(uint16_t bid, const uint8_t *new_buf, size_t new_len)
 	st.master_gen++;
 
 	/* Step 2: scratch. */
-	rc = flash_area_erase(st.fa, scratch_off, st.peb_size);
+	rc = blob_db_store_erase(scratch_off, st.peb_size);
 	if (rc < 0) {
 		return rc;
 	}
-	rc = flash_area_write(st.fa, scratch_off, new_buf, new_len);
+	rc = blob_db_store_write(scratch_off, new_buf, new_len);
 	if (rc < 0) {
 		return rc;
 	}
 
 	/* Step 3: bucket. */
-	rc = flash_area_erase(st.fa, bucket_off, st.peb_size);
+	rc = blob_db_store_erase(bucket_off, st.peb_size);
 	if (rc < 0) {
 		return rc;
 	}
-	rc = flash_area_write(st.fa, bucket_off, new_buf, new_len);
+	rc = blob_db_store_write(bucket_off, new_buf, new_len);
 	if (rc < 0) {
 		return rc;
 	}
 
 	/* Step 4: erase scratch. */
-	rc = flash_area_erase(st.fa, scratch_off, st.peb_size);
+	rc = blob_db_store_erase(scratch_off, st.peb_size);
 	if (rc < 0) {
 		return rc;
 	}
@@ -821,7 +787,7 @@ static int recover_compaction(uint16_t bid)
 
 	const off_t scratch_off = peb_offset(BLOB_DB_SCRATCH_SECTOR);
 
-	int rc = flash_area_read(st.fa, scratch_off, g_bbuf, st.peb_size);
+	int rc = blob_db_store_read(scratch_off, g_bbuf, st.peb_size);
 	if (rc < 0) {
 		return rc;
 	}
@@ -829,11 +795,11 @@ static int recover_compaction(uint16_t bid)
 	if (bucket_hdr_valid(g_bbuf, bid)) {
 		LOG_WRN("recover: scratch is sealed for bid %u; "
 			"restoring bucket from scratch", bid);
-		rc = flash_area_erase(st.fa, bucket_offset(bid), st.peb_size);
+		rc = blob_db_store_erase(bucket_offset(bid), st.peb_size);
 		if (rc < 0) {
 			return rc;
 		}
-		rc = flash_area_write(st.fa, bucket_offset(bid),
+		rc = blob_db_store_write(bucket_offset(bid),
 				      g_bbuf, st.peb_size);
 		if (rc < 0) {
 			return rc;
@@ -842,7 +808,7 @@ static int recover_compaction(uint16_t bid)
 		LOG_WRN("recover: scratch invalid; bucket %u left as-is", bid);
 	}
 
-	rc = flash_area_erase(st.fa, scratch_off, st.peb_size);
+	rc = blob_db_store_erase(scratch_off, st.peb_size);
 	if (rc < 0) {
 		return rc;
 	}
@@ -1225,7 +1191,7 @@ int blob_db_format(void)
 		return -ENODEV;
 	}
 
-	int rc = flash_area_erase(st.fa, 0, st.fa_size);
+	int rc = blob_db_store_erase(0, st.fa_size);
 	if (rc < 0) {
 		LOG_ERR("format: erase: %d", rc);
 		return rc;
@@ -1254,7 +1220,7 @@ int blob_db_format(void)
 
 /* Format the root bucket (erase + write header) and append an empty slot
  * for BLOB_DB_ROOT_ID. See @blob_db_root in blob_db.h. Callers must have
- * already set up st.fa / st.peb_size / st.n_buckets. */
+ * already set up the store / st.peb_size / st.n_buckets. */
 static int bind_root_empty(void)
 {
 	const uint16_t root_bid = (uint16_t)(BLOB_DB_ROOT_ID % st.n_buckets);
@@ -1298,7 +1264,7 @@ int blob_db_erase_all(void)
 			continue;
 		}
 		uint8_t peek[4];
-		int rc = flash_area_read(st.fa,
+		int rc = blob_db_store_read(
 					 peb_offset(BLOB_DB_FIRST_BUCKET + bid),
 					 peek, sizeof(peek));
 		if (rc < 0) {
@@ -1308,7 +1274,7 @@ int blob_db_erase_all(void)
 		if (memcmp(peek, BUCKET_MAGIC, 4) != 0) {
 			continue;
 		}
-		rc = flash_area_write(st.fa,
+		rc = blob_db_store_write(
 				      peb_offset(BLOB_DB_FIRST_BUCKET + bid),
 				      zeros, zlen);
 		if (rc < 0) {
@@ -1375,7 +1341,7 @@ int blob_db_prepare(size_t n)
 		/* Peek only the header — no need to pull a full sector into
 		 * g_bbuf just to decide whether formatting is needed. */
 		struct blob_db_bucket_hdr peek;
-		int rc = flash_area_read(st.fa, bucket_offset(bid),
+		int rc = blob_db_store_read(bucket_offset(bid),
 					 &peek, sizeof(peek));
 		if (rc < 0) {
 			LOG_ERR("prepare: read bid %u: %d", bid, rc);
