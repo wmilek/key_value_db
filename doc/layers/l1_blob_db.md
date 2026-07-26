@@ -75,7 +75,7 @@ binds it to an empty payload. After every successful `blob_db_mount()`:
 
 - `blob_db_exists(1)` is `true`; `blob_db_get(1, …)` never returns `-ENOENT`
   (on a virgin store it yields the empty payload);
-- `blob_db_alloc_id()` never returns 1 — the first user-visible id is **2**;
+- `blob_db_alloc_id()` never returns 1;
 - `blob_db_delete(1)` is **undefined behavior**: the root id stays live for
   the lifetime of the store.
 
@@ -137,7 +137,7 @@ int      blob_db_unmount(void);
 
 /* Allocate a fresh id: never returned before, strictly greater than every
  * previously returned id, across all remounts and crashes (contract §2).
- * Never returns BLOB_DB_ROOT_ID (= 1); the first user-visible id is 2.
+ * Never returns BLOB_DB_ROOT_ID (= 1).
  * RAM operation; returns 0 when not mounted (0 is never a valid id). Also
  * the watermark client crash-recovery is built on (l1_model_container.md §4). */
 uint64_t blob_db_alloc_id(void);
@@ -349,8 +349,10 @@ the persisted ceiling never lowers. Reserving the id in the library closes
 that window structurally: there is no state in which id 1 is allocated but
 unowned.
 
-Consequences: the first user-visible allocation is id = 2, and
-`blob_db_count()` is 1 (not 0) after a fresh format — the root blob counts.
+Consequences: `blob_db_count()` is 1 (not 0) after a fresh format — the root
+blob counts. The concrete value of the first allocated id is deliberately
+**not specified**: clients may rely only on "never 0, never 1, strictly
+increasing" — ids are opaque.
 
 ---
 

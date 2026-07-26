@@ -273,7 +273,8 @@ draft implementation and will be reworked against the final API; the
 (`tests/lib/blob_db_contract/`, see `l1_model_container.md` §1).
 
 1. mount on erased partition formats; root id 1 bound with an empty payload
-   (`exists(1)`, `count()==1`); first `alloc_id()==2`
+   (`exists(1)`, `count()==1`); first `alloc_id()` returns an id > 1 (the
+   concrete value is not contractual)
 2. alloc+bind → get round-trip (payload with NUL bytes)
 3. ids strictly monotonic; survive remount
 4. get/delete on missing id → `-ENOENT`; exists → false
