@@ -27,8 +27,15 @@ config BLOB_CONTAINER_KVLIST
 config BLOB_CONTAINER_KVHASH
 	bool "kvhash — O(1) map container"
 	help
-	  Map shape (map_ops) backed by hash buckets.
-	  NOT YET IMPLEMENTED — skeleton only.
+	  Map shape (map_ops) backed by a fixed directory of hash buckets, each
+	  bucket a packed pair-list blob. Lookups are O(load factor). The bucket
+	  count is fixed at create time from map_config.initial_capacity.
+
+if BLOB_CONTAINER_KVHASH
+module = BLOB_CONTAINER_KVHASH
+module-str = BLOB_CONTAINER_KVHASH
+source "subsys/logging/Kconfig.template.log_config"
+endif
 
 config BLOB_CONTAINER_KVTREE
 	bool "kvtree — O(log n) ordered map container"

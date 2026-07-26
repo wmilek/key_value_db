@@ -88,3 +88,8 @@ jobs:
           west build -p always -b nrf5340dk/nrf5340/cpuapp -d build/nrf_ubi key_value_db/app -- \
             -DCONFIG_BLOB_DB_BACKEND_UBI=y \
             -DCONFIG_UBI_MAX_NR_OF_DATA_PEBS=126
+
+      - name: Build app — kvdb L3 (ARM)
+        run: |
+          west build -p always -b nrf5340dk/nrf5340/cpuapp -d build/nrf_kvdb key_value_db/app -- \
+            -DCONFIG_BLOBDB_KVDB=y
