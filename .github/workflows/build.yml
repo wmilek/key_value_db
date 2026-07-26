@@ -1,55 +1,90 @@
 name: Build
 
+# Runs entirely inside the official Zephyr CI Docker image
+# (ghcr.io/zephyrproject-rtos/ci) — it ships west, the Zephyr SDK, and the
+# native_sim host tools, so no per-run toolchain setup is needed.
+
 on:
   push:
+    branches: [main]
+    paths-ignore:
+      - 'doc/**'
+      - '**.md'
+      - 'LICENSE'
+      - '.github/workflows/docs.yml'
   pull_request:
-  schedule:
-    - cron: "0 0 * * *"
+    paths-ignore:
+      - 'doc/**'
+      - '**.md'
+      - 'LICENSE'
+      - '.github/workflows/docs.yml'
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
 
 permissions:
   contents: read
 
 jobs:
-  build:
-    name: Build app and tests
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-22.04, macos-14, windows-2025]
-    runs-on: ${{ matrix.os }}
+  native-sim:
+    name: native_sim (twister + UBI backend)
+    runs-on: ubuntu-latest
+    container:
+      image: ghcr.io/zephyrproject-rtos/ci:latest
+      options: --user root
+    env:
+      CMAKE_PREFIX_PATH: /opt/toolchains
     steps:
       - name: Checkout
         uses: actions/checkout@v4
         with:
-          path: example-application
+          path: key_value_db
           persist-credentials: false
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: 3.12
-
-      - name: Setup Zephyr project
-        uses: zephyrproject-rtos/action-zephyr-setup@v1
-        with:
-          app-path: example-application
-          toolchains: arm-zephyr-eabi
-          ccache-cache-key: ${{ matrix.os }}
-
-      - name: Build firmware
-        working-directory: example-application
-        shell: bash
+      - name: Initialize west workspace
         run: |
-          if [ "${{ runner.os }}" = "Windows" ]; then
-            EXTRA_TWISTER_FLAGS="--short-build-path -O/tmp/twister-out"
-          fi
-          west twister -T app -v --inline-logs --integration $EXTRA_TWISTER_FLAGS
+          git config --global --add safe.directory '*'
+          west init -l key_value_db
+          west update --narrow -o=--depth=1
 
-      - name: Twister Tests
-        working-directory: example-application
-        shell: bash
+      - name: Twister — apps & tests (native_sim, flash_area backend)
         run: |
-          if [ "${{ runner.os }}" = "Windows" ]; then
-            EXTRA_TWISTER_FLAGS="--short-build-path -O/tmp/twister-out"
-          fi
-          west twister -T tests -v --inline-logs --integration $EXTRA_TWISTER_FLAGS
+          west twister -T key_value_db -p native_sim -v --inline-logs
+
+      - name: Build app on the UBI backend (native_sim)
+        run: |
+          west build -p always -b native_sim -d build/kvdb_ubi key_value_db/app -- \
+            -DCONFIG_BLOB_DB_BACKEND_UBI=y \
+            -DCONFIG_UBI_MAX_NR_OF_DATA_PEBS=2046
+
+  cross-build:
+    name: nrf5340dk cross-build (both backends)
+    runs-on: ubuntu-latest
+    container:
+      image: ghcr.io/zephyrproject-rtos/ci:latest
+      options: --user root
+    env:
+      CMAKE_PREFIX_PATH: /opt/toolchains
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          path: key_value_db
+          persist-credentials: false
+
+      - name: Initialize west workspace
+        run: |
+          git config --global --add safe.directory '*'
+          west init -l key_value_db
+          west update --narrow -o=--depth=1
+
+      - name: Build app — flash_area backend (ARM)
+        run: |
+          west build -p always -b nrf5340dk/nrf5340/cpuapp -d build/nrf_flash key_value_db/app
+
+      - name: Build app — UBI backend (ARM)
+        run: |
+          west build -p always -b nrf5340dk/nrf5340/cpuapp -d build/nrf_ubi key_value_db/app -- \
+            -DCONFIG_BLOB_DB_BACKEND_UBI=y \
+            -DCONFIG_UBI_MAX_NR_OF_DATA_PEBS=126
