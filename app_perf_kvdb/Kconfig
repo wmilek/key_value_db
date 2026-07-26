@@ -10,12 +10,16 @@ source "subsys/logging/Kconfig.template.log_config"
 
 config APP_PERF_KVDB_N_KEYS
 	int "Number of data keys in the store"
-	default 64
-	range 8 512
+	default 768
+	range 8 2048
 	help
 	  Size of the predicted key set ("k000".."kNNN"). Every run verifies
-	  all of them and rewrites every 4th one. Keep the per-bucket packed
-	  size under CONFIG_BLOB_DB_MAX_PAYLOAD_LEN (see kvhash).
+	  all of them (twice) and rewrites every 4th one. Sized so a rerun on
+	  the nRF5340-DK's QSPI NOR lasts about a minute at the default (from
+	  app_perf/RESULTS.md: ~34 ms per get, ~51 ms per set). Keep the
+	  per-bucket packed size under CONFIG_BLOB_DB_MAX_PAYLOAD_LEN (see
+	  kvhash). Changing this (or VAL_LEN) on a store populated with a
+	  different geometry triggers an automatic wipe + repopulation.
 
 config APP_PERF_KVDB_VAL_LEN
 	int "Fill bytes per value"

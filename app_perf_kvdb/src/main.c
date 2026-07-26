@@ -8,7 +8,10 @@
  * "gen"). Every value in the store is fully predicted by (key index,
  * generation), so a rerun can prove the previous run's content survived:
  *
- *   run 1 (empty store) : populate N_KEYS keys, stamp gen = 1
+ *   run 1 (empty store) : blob_db_prepare() the write path, then populate
+ *                         N_KEYS keys, stamp gen = 1 (geometry recorded;
+ *                         a build with different N_KEYS/VAL_LEN wipes the
+ *                         store and repopulates instead of failing verify)
  *   run r (r >= 2)      : 1. VERIFY every key against the expectation for
  *                            the stored generation G (timed get loop)
  *                         2. MODIFY: rewrite the deterministic subset
@@ -72,6 +75,16 @@ struct val {
 	uint32_t gen;   /* generation that wrote this value */
 	uint32_t idx;   /* key index (GHOST_IDX for the ghost key) */
 	uint8_t  fill[VAL_LEN];
+};
+
+/* The gen key stores the generation plus the geometry that populated the
+ * store. A build with different N_KEYS/VAL_LEN cannot verify the inherited
+ * content, so a geometry mismatch triggers a wipe + repopulation instead of
+ * a spurious VERIFY FAIL. */
+struct gen_rec {
+	uint32_t gen;
+	uint16_t n_keys;
+	uint16_t val_len;
 };
 
 static void key_name(char *buf, size_t sz, unsigned int i)
@@ -175,13 +188,28 @@ static int verify_generation(kvdb_t *db, uint32_t G, const char *label)
 	return 0;
 }
 
-/* First run: fill the empty store and stamp gen = 1. Timed. */
+/* First run: fill the empty store and stamp gen = 1. Timed.
+ *
+ * blob_db_prepare() first pre-formats the blob_db buckets the id allocator
+ * will land in, so the timed loop measures the warm write path — without it
+ * every first touch of a 64 KB QSPI sector pays a ~1 s erase inside the
+ * loop (see app_perf/RESULTS.md). Reported as its own bench line. */
 static int populate(kvdb_t *db)
 {
 	char key[8];
 	struct val v;
-	int64_t t = k_uptime_get();
 	int ops = 0;
+
+	int64_t t = k_uptime_get();
+	int prepared = blob_db_prepare(N_KEYS * 2);
+
+	if (prepared < 0) {
+		LOG_ERR("prepare: %d", prepared);
+		return prepared;
+	}
+	bench_line("prepare", prepared, k_uptime_delta(&t));
+
+	t = k_uptime_get();
 
 	for (uint32_t i = 0; i < N_KEYS; i++) {
 		key_name(key, sizeof(key), i);
@@ -203,9 +231,9 @@ static int populate(kvdb_t *db)
 	}
 	ops++;
 
-	uint32_t gen = 1;
+	struct gen_rec rec = { .gen = 1, .n_keys = N_KEYS, .val_len = VAL_LEN };
 
-	rc = kvdb_set(db, GEN_KEY, &gen, sizeof(gen));  /* commit point */
+	rc = kvdb_set(db, GEN_KEY, &rec, sizeof(rec));  /* commit point */
 	if (rc != 0) {
 		return rc;
 	}
@@ -253,7 +281,9 @@ static int modify(kvdb_t *db, uint32_t G)
 	}
 	ops++;
 
-	rc = kvdb_set(db, GEN_KEY, &next, sizeof(next));  /* commit point */
+	struct gen_rec rec = { .gen = next, .n_keys = N_KEYS, .val_len = VAL_LEN };
+
+	rc = kvdb_set(db, GEN_KEY, &rec, sizeof(rec));  /* commit point */
 	if (rc != 0) {
 		return rc;
 	}
@@ -306,9 +336,42 @@ int main(void)
 	printk("mount+open   :         %6" PRId64 " ms\n", k_uptime_delta(&t));
 
 	uint32_t G = 0;
+	struct gen_rec rec;
 	size_t len;
 
-	rc = kvdb_get(&db, GEN_KEY, &G, sizeof(G), &len);
+	rc = kvdb_get(&db, GEN_KEY, &rec, sizeof(rec), &len);
+	if (rc == 0 && len == sizeof(rec) &&
+	    (rec.n_keys != N_KEYS || rec.val_len != VAL_LEN)) {
+		/* Store was populated by a build with different geometry —
+		 * its content cannot verify against this build's predictions.
+		 * Wipe (logical, O(1)) and repopulate. */
+		printk("state: geometry changed (stored %u/%u, built %u/%u) -> wipe\n",
+		       rec.n_keys, rec.val_len, (unsigned)N_KEYS, (unsigned)VAL_LEN);
+		rc = -ENOENT;
+	} else if (rc == -ENOMEM || (rc == 0 && len != sizeof(rec))) {
+		/* Unknown gen record layout (older/newer build) — same treatment. */
+		printk("state: unknown gen record (len=%zu) -> wipe\n", len);
+		rc = -ENOENT;
+	}
+
+	if (rc == -ENOENT && kvdb_has(&db, GEN_KEY)) {
+		/* Wipe path: drop everything, rebootstrap, reopen. */
+		rc = blob_db_erase_all();
+		if (rc != 0) {
+			LOG_ERR("erase_all: %d", rc);
+			goto out;
+		}
+		rc = rootreg_init();
+		if (rc == 0) {
+			rc = kvdb_open(&db, "perf", &cfg);
+		}
+		if (rc != 0) {
+			LOG_ERR("reopen after wipe: %d", rc);
+			goto out;
+		}
+		rc = -ENOENT;   /* fall through to population */
+	}
+
 	if (rc == -ENOENT) {
 		printk("state: empty store -> initial population\n");
 		rc = populate(&db);
@@ -316,10 +379,11 @@ int main(void)
 			goto out;
 		}
 		G = 1;
-	} else if (rc != 0 || len != sizeof(G)) {
+	} else if (rc != 0) {
 		LOG_ERR("gen key unreadable: rc=%d len=%zu", rc, len);
 		goto out;
 	} else {
+		G = rec.gen;
 		printk("state: rerun, store at gen %u\n", G);
 	}
 
