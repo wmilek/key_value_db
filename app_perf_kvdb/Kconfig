@@ -1,0 +1,34 @@
+# kvdb perf app — Kconfig entry point.
+
+menu "Zephyr"
+source "Kconfig.zephyr"
+endmenu
+
+module = APP_PERF_KVDB
+module-str = APP_PERF_KVDB
+source "subsys/logging/Kconfig.template.log_config"
+
+config APP_PERF_KVDB_N_KEYS
+	int "Number of data keys in the store"
+	default 64
+	range 8 512
+	help
+	  Size of the predicted key set ("k000".."kNNN"). Every run verifies
+	  all of them and rewrites every 4th one. Keep the per-bucket packed
+	  size under CONFIG_BLOB_DB_MAX_PAYLOAD_LEN (see kvhash).
+
+config APP_PERF_KVDB_VAL_LEN
+	int "Fill bytes per value"
+	default 16
+	range 0 200
+	help
+	  Derived-pattern bytes stored in each value, in addition to the
+	  8-byte {gen, idx} stamp that verification checks.
+
+config APP_PERF_KVDB_FRESH_START
+	bool "Format the store at boot (start over)"
+	help
+	  Erase the blob_db store before opening kvdb, so this run behaves
+	  like the very first one (initial population at gen 1). Use once to
+	  reset a board whose flash already holds a previous run's store;
+	  on native_sim, prefer the --flash_erase command-line option.
