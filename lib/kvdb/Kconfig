@@ -6,5 +6,29 @@ config BLOBDB_KVDB
 	depends on BLOB_DB
 	select BLOB_ROOTREG
 	help
-	  kvdb — string key -> value interface over any Map container.
-	  NOT YET IMPLEMENTED — skeleton only.
+	  kvdb — string key -> value interface over any Map container. Turns
+	  NUL-terminated string keys into the byte-slice keys a Map container
+	  speaks; the backing container is chosen at create time and persisted.
+	  See doc/layers/l3_interfaces.md.
+
+if BLOBDB_KVDB
+
+choice
+	prompt "kvdb default backend"
+	default KVDB_DEFAULT_BACKEND_HASH
+	help
+	  Backend built for an instance opened with KVDB_BACKEND_DEFAULT (a NULL
+	  or unset config). A caller may still request a different backend
+	  explicitly, provided that container is also enabled.
+
+config KVDB_DEFAULT_BACKEND_HASH
+	bool "kvhash (O(1) hash buckets)"
+	select BLOB_CONTAINER_KVHASH
+
+endchoice
+
+module = BLOBDB_KVDB
+module-str = BLOBDB_KVDB
+source "subsys/logging/Kconfig.template.log_config"
+
+endif # BLOBDB_KVDB

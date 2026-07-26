@@ -1,6 +1,6 @@
 # L3 — Access Interfaces
 
-Status: draft (pre-implementation)
+Status: `kvdb` implemented (kvhash backend); `blobfs`/`settings` draft
 · Part of the stack in `doc/architecture.md` · Governed by `doc/principles.md`
 · Builds on L2: `doc/layers/l2_containers.md`
 
@@ -17,29 +17,43 @@ payload encodings they store *through* the container; all persistence mechanics
 Each interface:
 
 - binds to a **shape** (Map, Sequence), never to a concrete container (P6);
-- gets its concrete backend from a Kconfig `choice` (P4);
-- finds its root through the **root registry** (P5);
+- picks a backend either from a Kconfig default (P4) **or per-instance at
+  runtime**, and persists the choice so a later open re-binds it;
+- finds its roots through the **root registry** (P5);
 - inherits L1's v1 concurrency contract: single-threaded, caller serializes.
 
-## 2. Root ownership — via the root registry
+## 2. Roots — multiple named instances via the root registry
 
 Id = 1 is owned by the root registry (`doc/layers/l1_root_registry.md`);
-interfaces never touch it directly. Each interface holds a compile-time
-registry key and resolves its container root through it:
+interfaces never touch it directly. An interface is **not** a singleton: it
+supports as many independent instances as the caller names, each hanging off
+its own registry key. The instance name (a short string) is hashed to a 32-bit
+id and combined with the interface's FourCC magic:
 
 ```c
-#define KVDB_ROOT    ROOTREG_KEY('KVDB', 0)
-#define BLOBFS_ROOT  ROOTREG_KEY('BLFS', 0)
-
-/* in open(): */
-rootreg_get_or_create(KVDB_ROOT, &root_id);
-/* if blob_db_get(root_id) == -ENOENT: freshly allocated — bind the empty
- * container now (defined, recoverable state; registry doc §7). */
+key = ROOTREG_KEY('KVDB', fnv1a(name));   /* one per distinct name */
+rootreg_get_or_create(key, &meta_id);     /* durable; may be freshly allocated */
 ```
 
-Each L3 interface `select`s `BLOB_ROOTREG`. Enabling a new interface later is
-just a new key — no root-format migration. The single-integer principle is
-preserved: the whole system still hangs off id = 1, through the registry.
+The registry entry does not point straight at the container. It points at a
+small **meta** blob the interface owns, which records *which backend built the
+store* and the id of the container's own structure root:
+
+```
+rootreg[ ROOTREG_KEY('KVDB', hash(name)) ]  ->  meta { backend, struct_root }
+                                                            |
+                                          map_ops(struct_root) runs the map
+```
+
+This indirection is what lets the backend be chosen at runtime and still be
+re-bound correctly on a later open: the meta is read first, its `backend` byte
+selects the provider, and only then are `map_ops` calls issued against
+`struct_root`. The container never sees the meta — L2 stays ignorant of L3.
+The name is stored in the meta too, so a 32-bit hash collision between two
+different names is *detected* (`-EEXIST`), never silently merged.
+
+Each L3 interface `select`s `BLOB_ROOTREG`. Enabling a new interface, or a new
+named instance, is just another key — no root-format migration.
 
 ## 3. `kvdb` — key/value database
 
@@ -48,26 +62,44 @@ veneer over any **Map** container — keys pass through as bytes (without the
 NUL), values verbatim.
 
 ```c
-int  kvdb_open   (kvdb_t *db);                 /* attach via id=1; lazy-create */
-int  kvdb_set    (kvdb_t *db, const char *key, const void *val, size_t len);
-int  kvdb_get    (kvdb_t *db, const char *key, void *out, size_t out_sz, size_t *len);
-int  kvdb_del    (kvdb_t *db, const char *key);
-bool kvdb_has    (kvdb_t *db, const char *key);
-int  kvdb_foreach(kvdb_t *db, kvdb_cb_t cb, void *user);
+enum kvdb_backend { KVDB_BACKEND_DEFAULT, KVDB_BACKEND_HASH,
+                    KVDB_BACKEND_TREE, KVDB_BACKEND_LIST };
+
+struct kvdb_config {
+        enum kvdb_backend backend;          /* preferred impl — create-time only */
+        size_t            initial_capacity; /* hint (hash: bucket count) */
+};
+
+int  kvdb_open  (kvdb_t *db, const char *name, const struct kvdb_config *cfg);
+int  kvdb_set   (kvdb_t *db, const char *key, const void *val, size_t len);
+int  kvdb_get   (kvdb_t *db, const char *key, void *out, size_t out_sz, size_t *len);
+int  kvdb_delete(kvdb_t *db, const char *key);
+bool kvdb_has   (kvdb_t *db, const char *key);
 ```
 
-Backend `choice` and resulting profile:
+**Instances.** Distinct `name`s are fully independent stores (§2); the same
+name always attaches to the same store. Names are 1..`KVDB_NAME_MAX` bytes.
 
-| Backend | Cost profile | Pick when |
-|---|---|---|
-| `KVDB_BACKEND_KVLIST` | O(n), smallest code | ≲ tens of keys |
-| `KVDB_BACKEND_KVHASH` | O(1) point ops | many keys, no ordering needed |
-| `KVDB_BACKEND_KVTREE` | O(log n), sorted `foreach`, prefix/range scans | ordered iteration matters |
+**Creation config.** `cfg` is a *preference*, consumed **only when the named
+instance does not yet exist**. It names the backend to build and a capacity
+hint for it. On every subsequent open the persisted structure governs and `cfg`
+is ignored (a conflicting `cfg` is not an error — the stored store wins). Pass
+`NULL`, or `KVDB_BACKEND_DEFAULT`, to accept the Kconfig-selected default. A
+backend requested (or previously stored) but not compiled into the build fails
+cleanly with `-ENOTSUP`.
 
-The API is identical across backends; only costs (and `foreach` order) change.
-`kvdb_foreach` and `blobfs_readdir` inherit the iterator rules from the L1
-contract §4: callback returns 0/non-zero (Zephyr convention), and mutating
-the store from inside the callback is undefined behavior.
+Backend profiles:
+
+| Backend | Cost profile | Pick when | Status |
+|---|---|---|---|
+| `KVDB_BACKEND_LIST` (kvlist) | O(n), smallest code | ≲ tens of keys | planned |
+| `KVDB_BACKEND_HASH` (kvhash) | O(1) point ops | many keys, no ordering needed | **implemented** |
+| `KVDB_BACKEND_TREE` (kvtree) | O(log n), sorted scans | ordered iteration matters | planned |
+
+The API is identical across backends; only costs change. Ordered iteration
+(`kvdb_foreach`) is **deferred**: it needs an `iterate` op on `map_ops`, which
+the shipped Map shape does not yet define. It lands with the first backend that
+can order keys (kvtree).
 
 ## 4. `blobfs` — filesystem-like interface
 
@@ -119,14 +151,14 @@ instead of NVS. Smallest of the three; may ship after `kvdb`/`blobfs`.
 ## 6. Kconfig
 
 ```
-config KVDB                        bool "Key/value DB interface"   depends on BLOB_CONTAINERS
+config BLOBDB_KVDB                 bool "kvdb (L3)"                depends on BLOB_DB
                                    select BLOB_ROOTREG
-choice KVDB_BACKEND                prompt "kvdb backing container" depends on KVDB
-  config KVDB_BACKEND_KVLIST       select CONTAINER_KVLIST
-  config KVDB_BACKEND_KVHASH       select CONTAINER_KVHASH
-  config KVDB_BACKEND_KVTREE       select CONTAINER_KVTREE
+# The default backend is a Kconfig choice; a caller may request a *different*
+# backend at runtime provided that container is also enabled.
+choice                             prompt "kvdb default backend"   depends on BLOBDB_KVDB
+  config KVDB_DEFAULT_BACKEND_HASH select BLOB_CONTAINER_KVHASH    # implemented
 endchoice
-config KVDB_MAX_KEY_LEN            int "Max key length"            default 64
+# (KVDB_DEFAULT_BACKEND_{LIST,TREE} join the choice as those containers land.)
 
 config BLOBFS                      bool "Filesystem-like interface" depends on BLOB_CONTAINERS
                                    select BLOB_ROOTREG
