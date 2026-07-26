@@ -13,6 +13,29 @@ config BLOB_DB
 
 if BLOB_DB
 
+choice BLOB_DB_BACKEND
+	prompt "blob_db storage backend"
+	default BLOB_DB_BACKEND_FLASH_AREA
+	help
+	  Selects the substrate blob_db stores blobs on. Both expose the same
+	  PEB-addressed store interface (lib/blob_db/blob_db_store.h); the
+	  on-flash layouts are NOT interchangeable.
+
+config BLOB_DB_BACKEND_FLASH_AREA
+	bool "Raw partition (flash_area)"
+	help
+	  Store directly on the raw storage partition via Zephyr's flash_area
+	  API. This is the original behaviour.
+
+config BLOB_DB_BACKEND_UBI
+	bool "UBI volume"
+	select UBI_ENABLE
+	help
+	  Store on a dynamic UBI volume, gaining wear-leveling and bad-block
+	  handling. blob_db's in-place slot append maps onto ubi_leb_write_at().
+
+endchoice
+
 config BLOB_DB_PARTITION_LABEL
 	string "Storage partition label"
 	default "storage"
