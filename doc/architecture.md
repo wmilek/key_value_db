@@ -64,10 +64,11 @@ L3 ──map_ops / seq_ops──► L2 ──blob_db API──► L1 ──flash
 
 An i-node id (`uint64_t`) is a persistent pointer: L1 guarantees it stays valid
 for the blob's lifetime and is never reused. A container is nothing more than a
-root i-node id plus a rule for interpreting the i-nodes reachable from it. The
-first id ever assigned is **1** (L1's root convention), so a client — or the
-whole L3 layer — that remembers only the integer 1 re-opens everything after
-reboot: no journal replay, no index rebuild, no side-band state (P3, P5).
+root i-node id plus a rule for interpreting the i-nodes reachable from it. Id
+**1** is reserved by L1 and always bound after mount (the root convention,
+L1 contract D7), so a client — or the whole L3 layer — that remembers only
+the integer 1 re-opens everything after reboot: no journal replay, no index
+rebuild, no side-band state (P3, P5).
 
 ## 4. Layer summaries
 
