@@ -21,7 +21,9 @@ myst_enable_extensions = []
 suppress_warnings = ['myst.header', 'myst.xref_missing']
 
 templates_path = ['_templates']
-exclude_patterns = ['_build_sphinx', '_doxygen', 'Thumbs.db', '.DS_Store']
+# proposals/sizing is a measurement harness (see its README), not a doc page.
+exclude_patterns = ['_build_sphinx', '_doxygen', 'proposals/sizing',
+                    'Thumbs.db', '.DS_Store']
 
 # -- Options for HTML output -------------------------------------------------
 # https://www.sphinx-doc.org/en/master/usage/configuration.html#options-for-html-output

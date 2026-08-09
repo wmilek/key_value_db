@@ -27,6 +27,7 @@ This is a simple Sphinx documentation setup for ``example-application``.
    :caption: Design — proposals
 
    proposals/2026-08-09-large-payloads
+   proposals/2026-08-09-large-payloads-cost
 
 .. toctree::
    :maxdepth: 1

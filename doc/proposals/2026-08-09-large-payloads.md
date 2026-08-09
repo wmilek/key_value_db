@@ -4,6 +4,12 @@ Status: **proposal / for review** · 2026-08-09
 · Target contract: `doc/layers/l1_blob_db.md` (§3 R6/R7, §4, §5.4 D4)
 · Target implementation design: `doc/impl/l1_bucketlog.md` (§3, §5, §7, §13)
 · Governed by `doc/principles.md`
+· **Costed, and its recommendation revised, in
+  `doc/proposals/2026-08-09-large-payloads-cost.md`** — read that addendum
+  alongside §5 and §11 here: it measures the feature (+2.3 KB `.text`,
+  16 B `.bss` per segment), and under a filesystem workload it adds a
+  segmented pwrite (D7), fixes the default chunk size (D8), and ranks a
+  streaming slot walk *ahead* of Stage 2 (D9).
 
 **The ask.** `CONFIG_BLOB_DB_MAX_PAYLOAD_LEN` is 256 B by default and capped
 at 4096 B by its Kconfig range. Can it be raised to **hundreds of kilobytes**?
