@@ -52,7 +52,7 @@ its simplest possible form — a pair list in a single i-node.
 A registry key is a `uint64_t` composed of a FourCC-style magic and an
 instance number, both compile-time constants in the client's source:
 
-```c
+```none
 #define ROOTREG_KEY(magic32, instance32) \
         (((uint64_t)(magic32) << 32) | (uint32_t)(instance32))
 
