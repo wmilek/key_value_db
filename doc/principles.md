@@ -34,8 +34,9 @@ container, L2 depends on L1). Tunables are Kconfig options, not magic numbers.
 ## P5 — Single-integer reachability
 
 An i-node id is a persistent pointer; a structure is its root id plus an
-interpretation. Id = 1 is the root convention — one remembered integer
-re-opens everything after reboot. No side-band persistent state.
+interpretation. Id = 1 is the root convention — always present after mount,
+one remembered integer re-opens everything after reboot. No side-band
+persistent state.
 
 ## P6 — Strict downward layering
 

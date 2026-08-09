@@ -23,6 +23,12 @@ This is a simple Sphinx documentation setup for ``example-application``.
    impl/l1_bucketlog
 
 .. toctree::
+   :maxdepth: 1
+   :caption: Design — reviews
+
+   reviews/2026-07-26-design-doc-review
+
+.. toctree::
    :maxdepth: 2
    :caption: Zephyr
 

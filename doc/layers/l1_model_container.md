@@ -51,10 +51,11 @@ value blob   "bar"                            own id: vid
 list blob    [(kid1,vid1), (kid2,vid2), …]    own id: list_id   ← container root
 ```
 
-The client persists nothing but `list_id` (P5) — bound to id = 1 directly in
-a minimal build, or typically kept as an entry in the root registry helper
-(`l1_root_registry.md`), which itself hangs off id = 1. Everything is
-reachable from it.
+The client persists nothing but `list_id` (P5) — in a minimal build the list
+lives at id = 1 directly (id 1 always exists after mount; the client simply
+`update`s it, no allocation needed), or typically `list_id` is kept as an
+entry in the root registry helper (`l1_root_registry.md`), which itself
+occupies id = 1. Everything is reachable from it.
 
 ## 3. The basic flow
 
@@ -66,9 +67,10 @@ blob_db_update(list_id, empty pair list)      ← one atomic write: binds the ro
 ```
 
 The container exists from the moment the `update` commits; the client
-persists `list_id` (as id = 1, or in the id = 1 root). Crash before the bind:
-an allocated id and nothing on flash — no residue at all. Crash after: an
-empty, fully valid container.
+persists `list_id` (by building the list at id = 1 itself — skipping the
+alloc — or by recording `list_id` in the id = 1 registry). Crash before the
+bind: an allocated id and nothing on flash — no residue at all. Crash after:
+an empty, fully valid container.
 
 ### 3.2 First insert — `set("foo", "bar")`
 

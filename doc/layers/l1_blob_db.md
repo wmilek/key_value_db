@@ -1,6 +1,6 @@
 # L1 — `blob_db`: Stable-ID Blob Store — Contract & Requirements
 
-Status: v3 · **Contract specification** — implementation-agnostic; everything
+Status: v4 (reserved root id, D7) · **Contract specification** — implementation-agnostic; everything
 upper layers may rely on (P6) is in this document and nothing more.
 · Part of the stack in `doc/architecture.md` · Governed by `doc/principles.md`
 · Lower boundary: `doc/layers/l0_flash.md` · Consumed by: `doc/layers/l2_containers.md`
@@ -69,20 +69,32 @@ leave unreferenced blobs — is demonstrated operation by operation in
 
 ### Root convention
 
-The very first `alloc_id` after a fresh format returns **id = 1**:
+**Id = 1 is reserved and always present** (decision D7). Format — and
+therefore the first mount of a virgin store — consumes id 1 internally and
+binds it to an empty payload. After every successful `blob_db_mount()`:
+
+- `blob_db_exists(1)` is `true`; `blob_db_get(1, …)` never returns `-ENOENT`
+  (on a virgin store it yields the empty payload);
+- `blob_db_alloc_id()` never returns 1;
+- `blob_db_delete(1)` is **undefined behavior**: the root id stays live for
+  the lifetime of the store.
+
+The header exposes the constant as `BLOB_DB_ROOT_ID`.
 
 ```
-First boot:  id = blob_db_alloc_id()                     →  id = 1
-             blob_db_update(1, root_payload, ...)        ← binds the root
-On mount:    blob_db_get(1, ...)                         ← always finds the root
+First boot:  blob_db_mount()                     → id 1 bound, empty payload
+             blob_db_update(1, root_payload, …)  ← the owner claims it
+On mount:    blob_db_get(1, ...)                 ← always finds the root
 ```
 
-One remembered integer bootstraps everything (P5). The only rule is that
-**exactly one component owns id = 1 in a given build**. A minimal system may
-bind id = 1 directly, as above. When the **root registry** helper
-(`doc/layers/l1_root_registry.md`) is enabled — the expected case in the full
-stack — the registry is that owner, and other clients keep their roots in it
-under registry keys instead of competing for id = 1.
+One remembered integer bootstraps everything (P5), and no allocation step is
+needed to obtain it — an empty payload at id 1 *is* the virgin state. The
+only rule is that **exactly one component owns id = 1 in a given build**. A
+minimal system may write id = 1 directly, as above. When the **root
+registry** helper (`doc/layers/l1_root_registry.md`) is enabled — the
+expected case in the full stack — the registry is that owner, and other
+clients keep their roots in it under registry keys instead of competing for
+id = 1.
 
 ---
 
@@ -119,8 +131,13 @@ Any implementation of this contract must satisfy:
 int      blob_db_mount(void);
 int      blob_db_unmount(void);
 
+/* The reserved root id — always live between mount and unmount (§2, D7).
+ * Reference the macro, not the literal 1. */
+#define BLOB_DB_ROOT_ID  ((uint64_t)1)
+
 /* Allocate a fresh id: never returned before, strictly greater than every
  * previously returned id, across all remounts and crashes (contract §2).
+ * Never returns BLOB_DB_ROOT_ID (= 1).
  * RAM operation; returns 0 when not mounted (0 is never a valid id). Also
  * the watermark client crash-recovery is built on (l1_model_container.md §4). */
 uint64_t blob_db_alloc_id(void);
@@ -313,6 +330,29 @@ Rejected: an *atomic* multi-update (a transaction API). It would require an
 internal journal with mount-time redo — the intent mechanism moved into the
 library, made mandatory for all clients and binding every allocator (D1).
 Multi-op atomicity remains client discipline per the model container.
+
+### 5.7 D7 — Reserved root id: the library binds id = 1 at format
+
+**Decision: id 1 is consumed and bound (to an empty payload) by format
+itself; it is never returned by `alloc_id`, and `delete(1)` is UB.** Callers
+get an unconditional anchor: `get(1)` / `exists(1)` / `update(1, …)` need no
+pre-check and no bootstrap sequence, and "virgin store" is detected by id 1
+holding an empty payload — a plain read, not an allocation race.
+
+Rejected alternative: the client-bound convention (the very first `alloc_id`
+after format returns 1 and the owner binds it). It required every id = 1
+owner to run a bootstrap protocol whose failure mode was "store is not
+virgin — refuse", and it depended on the id counter recovering to exactly 1
+after a crash between the client's `alloc_id` and its bind — a property the
+durable leading id ceiling (impl §13.1) deliberately does not provide, since
+the persisted ceiling never lowers. Reserving the id in the library closes
+that window structurally: there is no state in which id 1 is allocated but
+unowned.
+
+Consequences: `blob_db_count()` is 1 (not 0) after a fresh format — the root
+blob counts. The concrete value of the first allocated id is deliberately
+**not specified**: clients may rely only on "never 0, never 1, strictly
+increasing" — ids are opaque.
 
 ---
 

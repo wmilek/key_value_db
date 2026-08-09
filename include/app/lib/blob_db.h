@@ -62,8 +62,9 @@ extern "C" {
  * Consequences:
  * - `blob_db_exists(1)` is always `true` between mount and unmount.
  * - `blob_db_get(1, ...)` never returns `-ENOENT`.
- * - `blob_db_alloc_id()` never returns 1; the first user-visible allocation
- *   is id = 2. (The library consumes id 1 internally at format time.)
+ * - `blob_db_alloc_id()` never returns 1. (The library consumes id 1
+ *   internally at format time; which id an allocation actually yields is
+ *   not part of the contract — treat ids as opaque.)
  * - `blob_db_delete(1)` is undefined behavior — the root id must not be
  *   deleted.
  *
@@ -123,11 +124,11 @@ int blob_db_unmount(void);
  * built on.
  *
  * Never returns `BLOB_DB_ROOT_ID` (= 1); that id is reserved and consumed at
- * format time (see @ref blob_db_root). The first user-visible allocation on a
- * fresh store is id = 2.
+ * format time (see @ref blob_db_root). The concrete value of the first
+ * user-visible allocation is not part of the contract.
  *
- * @return a fresh id (>= 2), or 0 if not mounted (0 is never a valid id) or
- *         the id ceiling could not be persisted.
+ * @return a fresh id (never 0 or `BLOB_DB_ROOT_ID`), or 0 if not mounted
+ *         (0 is never a valid id) or the id ceiling could not be persisted.
  */
 uint64_t blob_db_alloc_id(void);
 
@@ -245,7 +246,7 @@ int blob_db_iterate(blob_db_iter_cb_t cb, void *user);
  *
  * All blobs are destroyed, all sectors are erased, masters are
  * re-initialized, and `BLOB_DB_ROOT_ID` is bound to an empty payload
- * (see @ref blob_db_root). The next user-visible `alloc_id` returns 2.
+ * (see @ref blob_db_root). The id space is reset.
  *
  * @retval 0        success
  * @retval -ENODEV  not mounted
@@ -259,7 +260,7 @@ int blob_db_format(void);
  *
  * Fast counterpart to `blob_db_format()`: the DB is left in the same visible
  * state as after a fresh format (no live blobs except an empty
- * `BLOB_DB_ROOT_ID`, next user-visible `alloc_id` = 2), but the underlying
+ * `BLOB_DB_ROOT_ID`, id space reset), but the underlying
  * sectors are not erased and no compaction runs. Prior on-flash records
  * become unreachable garbage that a later compaction — or the next
  * `blob_db_format()` — will reclaim.
@@ -272,7 +273,7 @@ int blob_db_format(void);
  * Postconditions, identical to `blob_db_format()`:
  * - `blob_db_exists(BLOB_DB_ROOT_ID)` is `true`, payload is empty.
  * - `blob_db_count()` is 1.
- * - The next `blob_db_alloc_id()` returns 2.
+ * - The id space is reset, exactly as after `blob_db_format()`.
  *
  * Unlike `update`/`delete`, this call is NOT crash-atomic: a crash mid-call
  * can leave some blobs destroyed and others still live. The store stays

@@ -14,7 +14,8 @@ keep that id. The root registry is the answer: a *global registry of
 structure roots*, mapping compile-time keys to root ids.
 
 The registry is a **helper, not a mandate**: a build that does not enable it
-may bind id = 1 directly (L1 contract, root convention). When it *is* enabled,
+may use id = 1 directly (L1 contract, root convention — id 1 always exists
+after mount). When it *is* enabled,
 it is the single **owner of id = 1** — nothing else in that system may bind,
 rebind, or assume anything about id = 1.
 
@@ -51,7 +52,7 @@ its simplest possible form — a pair list in a single i-node.
 A registry key is a `uint64_t` composed of a FourCC-style magic and an
 instance number, both compile-time constants in the client's source:
 
-```c
+```none
 #define ROOTREG_KEY(magic32, instance32) \
         (((uint64_t)(magic32) << 32) | (uint32_t)(instance32))
 
@@ -119,24 +120,23 @@ All mutations rewrite the registry image in RAM and commit with **one**
 
 ## 6. Bootstrap — how id = 1 comes to exist
 
-Run once after `blob_db_mount()`, before any other storage user:
+Run once after `blob_db_mount()`, before any other storage user. Mount
+guarantees id = 1 exists (L1 root convention, D7): on a virgin or freshly
+formatted store it is bound to an **empty payload**, so `get(1)` never
+returns `-ENOENT` and no allocation step is involved:
 
 ```
 rootreg_init():
-    rc = blob_db_get(1, buf, ...)
-    if rc == 0:
-        verify magic 'RREG' + version        → ready
-        else                                 → -ENOTSUP (foreign format; refuse)
-    if rc == -ENOENT:                        # virgin store
-        id = blob_db_alloc_id()              # must return 1 (root convention)
-        if id != 1: return -EIO              # store is not virgin — refuse
-        blob_db_update(1, empty registry)    # bind: one atomic write
+    blob_db_get(1, buf, ...)                 # always succeeds after mount
+    if len == 0:                             # virgin store (post-format state)
+        blob_db_update(1, empty registry)    # claim: one atomic write
+    else if magic 'RREG' + version match:    → ready
+    else:                                    → -ENOTSUP (foreign payload; refuse)
 ```
 
-A crash between `alloc_id` and the bind leaves nothing on flash; the next
-boot repeats the sequence and gets id 1 again (nothing was written, the
-counter recovers to 1). After this point, id = 1 is bound to the registry for
-the lifetime of the store.
+A crash before the claiming `update` leaves the empty payload untouched; the
+next boot repeats the sequence — idempotent, no residue possible. After this
+point, id = 1 holds the registry image for the lifetime of the store.
 
 ## 7. `get_or_create` — the entry is the creation intent
 
@@ -201,12 +201,15 @@ format migration.
 
 ## 10. Testing
 
-1. virgin bootstrap: mount → init → id 1 bound, magic/version correct
-2. foreign id 1 (wrong magic) → `-ENOTSUP`, registry refuses to touch it
+1. virgin bootstrap: mount → init → id 1 rebound from the empty post-format
+   payload to a registry image, magic/version correct
+2. foreign id 1 (wrong magic / non-empty non-registry payload) → `-ENOTSUP`,
+   registry refuses to touch it
 3. get/set/unregister round-trips; `-EEXIST` on duplicate; `-ENOSPC` at cap
 4. `get_or_create` idempotence: same key → same id across remounts
-5. crash injection at every §6/§7 step: virgin re-bootstrap; registered-but-
-   unbound root returned again and bindable; no residue anywhere
+5. crash injection at every §6/§7 step: virgin re-bootstrap (empty payload
+   re-claimed); registered-but-unbound root returned again and bindable; no
+   residue anywhere
 6. persistence across remount; registry readable with all entries after
    power loss during an unrelated registry mutation (old or new image, never
    torn)

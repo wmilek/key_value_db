@@ -272,7 +272,9 @@ draft implementation and will be reworked against the final API; the
 *contract-level* coverage lives in the model-container acceptance suite
 (`tests/lib/blob_db_contract/`, see `l1_model_container.md` §1).
 
-1. mount on erased partition formats; `count()==0`; first `alloc_id()==1`
+1. mount on erased partition formats; root id 1 bound with an empty payload
+   (`exists(1)`, `count()==1`); first `alloc_id()` returns an id > 1 (the
+   concrete value is not contractual)
 2. alloc+bind → get round-trip (payload with NUL bytes)
 3. ids strictly monotonic; survive remount
 4. get/delete on missing id → `-ENOENT`; exists → false
@@ -312,10 +314,12 @@ draft implementation and will be reworked against the final API; the
    container's watermark recovery and (future) root-registry `get_or_create`
    depend on. It subsumes both earlier monotonicity patches (tombstones toward
    the scan max, the `hint↑` compaction ride-along). Cost: one master write
-   per block of 256 allocations. Note: this means a crash that returns id = 1
-   but never binds it does **not** recover `next_id` to 1 — the root
-   convention holds on a *fresh format*, and a registry-enabled build that
-   needs virgin re-bootstrap resolves this at the rootreg layer, not here.
+   per block of 256 allocations. Note: the ceiling never lowers, so `next_id`
+   never recovers to a previously issued value after a crash — which is why
+   the root convention is realized as a *reserved* id (contract D7): format
+   itself consumes and binds id = 1, so no client ever depends on the counter
+   recovering to exactly 1, and virgin re-bootstrap is detected by id 1's
+   empty payload (rootreg §6), not by re-allocating it.
 2. **Steady-state RAM story.** *(Resolved: re-scan.)* The implementation
    keeps **no** `write_cursor[N]` array; each write re-walks the target
    bucket (`walk_bucket`) to find the append cursor (+1 read on
