@@ -400,47 +400,89 @@ K buckets instead of one.
 
 ## 7. Kconfig
 
-`BLOB_DB_MAX_PAYLOAD_LEN` currently means two different things at once — "the
-largest slot" (which sizes buffers, C7/C8) and "the largest blob a client may
-store" (which is a policy bound). Segmentation separates them:
+`BLOB_DB_MAX_PAYLOAD_LEN` today means "the largest single slot". Segmentation
+introduces a second, larger quantity — "the largest logical object" — and the
+two must not share a name.
+
+**Do not redefine the existing symbol.** An earlier draft of this section
+proposed promoting `BLOB_DB_MAX_PAYLOAD_LEN` to the logical cap and adding
+`BLOB_DB_MAX_INLINE_LEN` for the old meaning. That is unsafe: `kvhash` derives
+*three* things from it (`kvhash.c:45-55`) —
+
+```c
+#define MAX_BUCKETS  ((MAX_PAYLOAD - DIR_HDR_LEN) / 8u)   /* directory capacity */
+static uint8_t dir_buf[MAX_PAYLOAD];                      /* .bss */
+static uint8_t bkt_buf[MAX_PAYLOAD];                      /* .bss */
+```
+
+— so a build that raised the symbol to 262 144 without touching `kvhash`
+would compile cleanly and then (a) allocate 512 KB of `.bss`, (b) let a new
+map be created with 32 767 buckets instead of 31, and (c) let one hash bucket
+pack 256 KB, silently turning every kvhash bucket into a segmented blob. A
+rename that fails *loudly* would be fine; this one fails silently, and the
+same trap waits for any out-of-tree client.
+
+So the existing symbol keeps its exact current meaning, default and value, and
+the new quantity gets a new name:
 
 ```
-config BLOB_DB_MAX_INLINE_LEN          # was BLOB_DB_MAX_PAYLOAD_LEN
+config BLOB_DB_MAX_PAYLOAD_LEN         # UNCHANGED meaning: largest single slot
 	int "Max single-slot payload length in bytes"
 	default 256
 	range 1 65535                  # C2; the real bound is checked at mount (§4)
 
 config BLOB_DB_LARGE_PAYLOADS
-	bool "Payloads larger than one slot (segmented)"
+	bool "Objects larger than one slot (segmented)"
 	default n                      # P4: off = today's code, byte for byte
 
-config BLOB_DB_MAX_PAYLOAD_LEN
-	int "Max logical payload length in bytes"
-	default BLOB_DB_MAX_INLINE_LEN
-	range BLOB_DB_MAX_INLINE_LEN 16777216
-	depends on BLOB_DB_LARGE_PAYLOADS || <default only>
+config BLOB_DB_MAX_OBJECT_LEN          # NEW: the logical cap
+	int "Max logical object length in bytes"
+	depends on BLOB_DB_LARGE_PAYLOADS
+	default 262144
+	range BLOB_DB_MAX_PAYLOAD_LEN 16777216
 
 config BLOB_DB_SEGMENT_LEN
-	int "Segment size (0 = auto: largest sustainable slot for the geometry)"
+	int "Segment size (0 = auto, per geometry — see cost addendum D8)"
+	depends on BLOB_DB_LARGE_PAYLOADS
 	default 0
+
+config BLOB_DB_MAX_SEGMENTS
+	int "Max segments per object (sets .bss: 16 B each)"
+	depends on BLOB_DB_LARGE_PAYLOADS
+	default 0                      # 0 = derive from MAX_OBJECT_LEN / segment size
 ```
 
-Migration for in-tree users of the old symbol:
+Consequences, and they are all good ones:
 
-| User | Change |
-|---|---|
-| `lib/containers/kvhash/kvhash.c:45` | `MAX_PAYLOAD` → `MAX_INLINE_LEN` (its two static buffers must stay slot-sized) |
-| `lib/rootreg/rootreg.c:47` | `BUILD_ASSERT` → `MAX_INLINE_LEN` (registry image is small by design) |
-| `app_perf/src/main.c:52`, `app_perf/Kconfig:26`, `app_perf_kvdb/*` | `MAX_INLINE_LEN` |
-| `tests/lib/blob_db/src/main.c`, `tests/lib/blob_db_contract/src/model_container.c` | `MAX_INLINE_LEN` for the existing stack arrays; new cases for the segmented path |
-| `include/app/lib/blob_db.h:166` | doc comment: `0..CONFIG_BLOB_DB_MAX_PAYLOAD_LEN`, with the inline/segmented distinction |
+- **No in-tree client changes at all.** `kvhash`, `rootreg`, `app_perf`, and
+  both test suites keep compiling untouched, with identical buffer sizes and
+  identical on-flash behaviour. The migration table this section used to carry
+  is empty.
+- Existing clients keep their slot-sized buffers by default, which is what
+  they want — none of them should grow to hundreds of kilobytes.
+- A client that *wants* large objects opts in explicitly by referencing
+  `MAX_OBJECT_LEN` and the pread/pwrite API. Opting in is visible in the
+  source rather than implied by a Kconfig value.
+- The only doc change is `include/app/lib/blob_db.h:166`, which should now say
+  `len` is bounded by `CONFIG_BLOB_DB_MAX_PAYLOAD_LEN`, or by
+  `CONFIG_BLOB_DB_MAX_OBJECT_LEN` when `BLOB_DB_LARGE_PAYLOADS` is enabled.
 
-Keeping `BLOB_DB_MAX_PAYLOAD_LEN` as the *logical* cap means client code that
-only bounds-checks against it keeps compiling and gets the larger limit for
-free; only code that *allocates* off it has to move, and that is exactly the
-code that must not grow to 256 KB.
+### 7.1 What a small-object client sees
 
----
+Nothing, by design. Spelled out because it is the first question any existing
+user asks:
+
+| | `LARGE_PAYLOADS=n` | `LARGE_PAYLOADS=y`, payload ≤ slot |
+|---|---|---|
+| `alloc_id` / `get` / `update` / `delete` / `exists` / `count` / `iterate` / `format` / `erase_all` / `prepare` | unchanged | unchanged |
+| Bytes written to flash for a small blob | unchanged | **byte-identical** — no `INDEXED`/`SEGMENT` bits set |
+| `.text` / `.bss` | unchanged | +2.3 KB / +16 B per configured segment |
+| Extra work on the write path | none | one `len > inline_max` comparison |
+| Kconfig symbols they use | unchanged | unchanged |
+
+Segmentation engages only when a single `update` exceeds the slot bound. A
+store that never stores a large object is indistinguishable, on flash and at
+the API, from one built without the feature.
 
 ## 8. Contract impact (`doc/layers/l1_blob_db.md`)
 
@@ -493,13 +535,33 @@ Extends `tests/lib/blob_db/` (unit) and `tests/lib/blob_db_contract/`
 
 ## 10. Compatibility
 
-- **Stage 1**: no on-flash change. A store written before it mounts unchanged.
-- **Stage 2**: additive. A store containing only inline slots mounts and reads
-  identically under new code — the new flag bits are simply absent. Old code
-  reading a *new* store misreads an indexed slot as an opaque payload, so the
-  master format version (§11-D2) must be bumped and old code must refuse the
-  store with `-ENOTSUP` rather than hand out an index record as data. This is
-  the one genuine forward-compatibility hazard in the proposal.
+**Existing stores and existing small-object clients are unaffected** — see
+§7.1 for the API/build side. On flash:
+
+- **Stage 1**: master stays 24 B; the only change is stamping `version = 1`
+  into the byte currently declared `reserved` (`blob_db_internal.h:56`, always
+  written as 0). An old store reads back `version = 0` and is accepted as v0.
+  No size change, no CRC-coverage change, nothing to migrate.
+- **Stage 2**: additive for slots — a store with only inline payloads is
+  byte-identical, since the new flag bits are simply never set. The master
+  grows to 32 B only when `BLOB_DB_LARGE_PAYLOADS=y`, to carry `seg_owner`
+  (§6.5). New code distinguishes the two by reading 24 B first and checking
+  the version byte: `0` → v0 layout, CRC over the leading 20 B; `1` → re-read
+  32 B, CRC over the leading 28 B.
+
+**The one real hazard is backward, not forward.** Old firmware mounting a
+*new* (32 B-master) store computes its CRC over the wrong span, judges both
+masters invalid, and — per `blob_db_mount()`'s current logic
+(`blob_db.c:304`) — **reformats**, destroying the store rather than failing
+cleanly. Nothing in the new code can prevent that, because the old code's
+behaviour is already fixed in the field.
+
+That is precisely why the version byte belongs in **Stage 1**, shipped ahead
+of any store that could contain segments: firmware that already understands
+the field can be taught to answer `-ENOTSUP` on an unknown version. Devices
+updated to Stage 1 first are then safe to move to Stage 2; devices that jump
+straight from today's code to Stage 2 are not. Downgrade after Stage 2 is
+never supported.
 
 ---
 
@@ -509,10 +571,14 @@ Extends `tests/lib/blob_db/` (unit) and `tests/lib/blob_db_contract/`
   or keep writes whole-blob and accept that a 256 KB write needs a 256 KB
   caller buffer? Recommendation: **adopt** — without it the write side
   reproduces exactly the RAM problem the proposal exists to solve.
-- **D2 — Master format version (§6.5, §10).** Bump the master to 32 B with an
-  explicit `version` field now (closing `l1_bucketlog.md` §13.4), so old
-  firmware refuses a segmented store instead of misreading it. Recommendation:
-  **yes**, and do it in Stage 1 where it is free.
+- **D2 — Master format version (§6.5, §10).** Introduce the `version` field in
+  **Stage 1**, reusing the existing `reserved` byte so the master stays 24 B
+  and nothing on flash changes size (closing `l1_bucketlog.md` §13.4). The
+  32 B master carrying `seg_owner` then arrives with Stage 2. Doing the
+  version byte early is what lets fielded firmware refuse a future segmented
+  store instead of reformatting it (§10). Recommendation: **yes**, and treat
+  the Stage-1 half as a prerequisite for shipping Stage 2 to any device that
+  is already deployed.
 - **D3 — Segment id namespace.** Segments consume ids from the same counter
   (proposed) versus a reserved high range (e.g. bit 63 set). Recommendation:
   **same counter** — 2⁶⁴ is not a scarce resource, and a reserved range adds a
