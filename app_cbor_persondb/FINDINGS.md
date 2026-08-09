@@ -89,12 +89,118 @@ diagnostic costing seconds, not a routine health check.
 
 > `blob_db.h` @ref blob_db_count
 
-### B5 — `MAX_PAYLOAD_LEN` is Kconfig-capped at 4096 (moderate, `read`)
+### B5 — One Kconfig symbol does five unrelated jobs (major, `read`)
 
 `config BLOB_DB_MAX_PAYLOAD_LEN … range 1 4096`. Nothing in the on-flash format
-requires it — a slot is `14 + val_len` inside a sector that is 64 KB on the DK.
-The cap transitively limits a `kvhash` map to ~2.09 MB (K1), which is what
-forces this app to shard.
+requires 4096 — a slot is `14 + val_len` inside a sector that is 64 KB on the
+DK. But raising it is not the fix it looks like, because the symbol is
+overloaded:
+
+| # | Job | Site |
+|---|---|---|
+| 1 | L1 write limit — `update` rejects a longer payload | `blob_db.c:915` |
+| 2 | L1 walk sanity bound — the check that stops a slot walk running off into garbage | `blob_db.c:201`, `:502` |
+| 3 | L1 stack buffer — `append_slot` builds the slot in `14 + MAX + 32` bytes **on the stack** | `blob_db.c:593` |
+| 4 | L2 bucket size **and** bucket count — `MAX_BUCKETS = (MAX−8)/8`, plus `2 × MAX` of static `.bss` | `kvhash.c:47,54-55` |
+| 5 | L1½ registry capacity — `BUILD_ASSERT(8 + 16 × ROOTREG_MAX_ROOTS ≤ MAX)` | `rootreg.c:47` |
+
+Job 4 is two jobs wearing one hat: **bucket size and bucket count are the same
+number**, so capacity is `MAX²/8` and neither factor can be moved alone. That
+coupling is the actual cause of K1, and it is why more payload is not more
+capacity in any useful sense.
+
+**What a 10× raise (4096 → 40960) would do.**
+
+Helps:
+
+- **K1 dissolves.** Map capacity `MAX²/8` = 209 MB — one map holds anything an
+  8 MiB part can store, so this app would not shard at all.
+- **K2 softens.** A 40 KB bucket holds ~113 person entries instead of ~11, so
+  the tail stops mattering and the 5.5 σ over-provisioning goes away.
+
+Costs, in increasing order of severity:
+
+- **RAM (B6).** `kvhash`'s two static buffers go 8 KB → **80 KB**; with
+  `blob_db`'s 128 KB that is 208 KB of the nRF5340's 512 KB.
+- **Stack.** `append_slot`'s frame goes ~4.1 KB → **~41 KB**. The existing
+  `CONFIG_MAIN_STACK_SIZE=32768` no longer holds a single call.
+- **K5 explodes if the extra buckets are used.** `MAX_BUCKETS` becomes 5 119, so
+  a directory is **40 KB**, rewritten on every bucket creation (K5). ~4 400
+  creations × 40 KB ≈ **176 MB**, against 15 MB today — and since a 40 KB blob
+  leaves no room to append a second version in a 64 KB sector, *every one of
+  those rewrites forces a compaction*: ~7 h of erases for bookkeeping alone.
+- **The append log stops working above ~½ sector.** A `blob_db` bucket is one
+  sector and updates are appends. A payload of `P` allows `⌊(peb−16)/(P+14)⌋`
+  versions before compaction: 4 KB gives ~16, 40 KB gives **1**. The practical
+  ceiling is `peb_size / versions_wanted` — for a 64 KB sector and ~16 appends,
+  **~4 KB. The present cap is well matched to the DK's flash**, which looks less
+  like an arbitrary limit than it first appears.
+- **Portability.** A slot must fit a sector (`14 + len ≤ peb_size − 16`), so
+  anything above ~4066 is unusable on a 4 KB-sector part — internal flash, and
+  `native_sim`'s default. Raising the `range` is harmless; raising the *default*
+  would break those targets. And nothing checks it (B9).
+
+**The variant that does work, and what it reveals.** Raise `MAX` *and* keep
+asking for ~511 buckets: the directory stays 4 KB and one map holds 20.9 MB.
+But then 10 000 entries land 19.6 per bucket, so every `set` rewrites a 7.1 KB
+bucket instead of 885 B — K4 worsens 8×, and the fill's appended bytes go from
+~21 MB to ~39 MB.
+
+Writing the cost out for one map of `B` buckets, `N` entries of size `e`:
+
+```
+bucket rewrites  ≈ e·N·(N/B + 1)/2        falls with more buckets
+directory rewrites ≈ 8·B²                 rises with more buckets
+```
+
+| Layout | bucket rewrites | directory rewrites | total |
+|---|---|---|---|
+| 1 map, 511 buckets | 37.4 MB | 2 MB | 39 MB |
+| 1 map, 1 046 buckets (the optimum for a flat directory) | 17.3 MB | 8.7 MB | 26 MB |
+| **8 maps × 511 (this app)** | **6.2 MB** | **15 MB** | **21 MB** |
+
+Sharding wins because *N maps × 511 buckets is a two-level directory*: 4 088
+buckets addressed through eight 4 KB directories instead of one 32 KB one. The
+workaround K1 forces on the application is, by accident, the better structure.
+
+**Direction.** Raising the number is the wrong lever. In value order:
+
+1. **Let the `kvhash` directory span more than one blob** (or derive bucket ids
+   from the root id instead of storing them). This removes `MAX_BUCKETS`, hence
+   K1's 2.09 MB ceiling, hence K5's 4 KB rewrite — and leaves `MAX_PAYLOAD` free
+   to stay at the ~4 KB the append log wants. It is the one change that fixes
+   K1, K3, K4 and K5 together, and it is what the two-level table above is
+   pointing at.
+2. **Split the symbol** so L1's write limit, L2's bucket size and L2's bucket
+   count are three Kconfig options, not one.
+3. Raise the `range` maximum (it is arbitrary) but not the default, and add the
+   mount-time check of B9.
+
+**Eliminating it entirely is worse.** Job 2 needs *some* bound or a corrupt
+`val_len` walks a bucket off its end; job 3 needs a bounded buffer or a
+streaming write path; job 4 needs a size for its static buffers. "No limit"
+really means "derive it from `peb_size` at runtime", which sizes those buffers
+from `CONFIG_BLOB_DB_SECTOR_BUF_SIZE` — 64 KB — making `kvhash` cost 128 KB of
+`.bss` on top of `blob_db`'s 128 KB. That is B6 doubled, to buy a payload size
+the append log cannot use anyway.
+
+### B9 — Nothing checks that a maximum-size payload fits a sector (moderate, `read`)
+
+A slot needs `14 + val_len` bytes inside a sector whose usable space is
+`peb_size − 16`. `mount()` validates `peb_size ≤ CONFIG_BLOB_DB_SECTOR_BUF_SIZE`
+and nothing else; there is no assertion, at build or at mount, that
+`CONFIG_BLOB_DB_MAX_PAYLOAD_LEN + 14 ≤ peb_size − 16`.
+
+Configure `MAX_PAYLOAD_LEN=4096` against a 4 KB-sector part — the Kconfig
+permits it, and it is `native_sim`'s default geometry — and a maximum-size
+payload can never be stored. The failure is not a refused mount but `-ENOSPC`
+from `blob_db_update` (`blob_db.c:963`) at whatever moment an application first
+writes a large enough blob, after compacting a bucket for nothing.
+
+> `blob_db_mount()` sector check at `blob_db.c:272`; the `-ENOSPC` at `:963`
+
+Direction: check it at mount, where `peb_size` is known, and fail with
+`-ENOTSUP` like the sector-size check immediately above it.
 
 ### B6 — 128 KB of `.bss` for sector buffers (moderate, `read`)
 
