@@ -161,6 +161,94 @@ Stage 1 is therefore small and independently useful:
 That lands ~2 KB (native_sim) / ~32 KB (QSPI NOR) with no format change, and
 it is a prerequisite for Stage 2 rather than throwaway work.
 
+### 4.1 Make every future format change detectable — and refuse, don't reformat
+
+A separate requirement, raised in review and worth stating as a standing
+property rather than a fix for this proposal: **software must always be able
+to detect that a store was written in a format it does not understand, and
+decide what to do about it.** Today it cannot, and the gap is already a
+contract violation.
+
+**The live defect.** Contract §4 lists `-ENOTSUP` ("foreign on-flash format")
+and §5.1 D1 states that "each allocator uses a distinct on-flash magic so a
+mismatched mount fails cleanly with `-ENOTSUP`". The implementation does the
+opposite: `read_master()` reports *invalid* for both a wrong magic and a bad
+CRC, and `blob_db_mount()` treats "neither master valid" as "virgin
+partition" and formats (`blob_db.c:304`). A store written by another
+allocator — or by a future version of this one — is therefore **erased on
+first mount by older firmware**, silently. This is true of the code on `main`
+today, with or without large payloads.
+
+**Why a plain version field is not enough.** Adding `version` somewhere in
+`blob_db_master_hdr` does not solve it, because `hdr_crc32` lives at
+`sizeof(hdr) - 4` and covers everything before it (`hdr_crc32()`,
+`blob_db.c:79`). The moment the header grows, the CRC's span and position
+both move, so old code cannot validate the header at all — it fails the CRC
+check *before* it ever reaches the version field, and lands right back in the
+reformat path. The discriminator has to be readable and verifiable **without
+knowing the header's size**.
+
+**Mechanism — a frozen self-describing prefix.** Split the master header into
+a small prefix that is guaranteed never to change again, plus a
+version-specific body:
+
+```c
+/* Frozen for all time. Any blob_db, of any vintage, can parse exactly this
+ * much and reach a decision. */
+struct __packed blob_db_compat_hdr {   /* 12 B */
+	uint8_t  magic[4];        /* allocator identity (contract D1)        */
+	uint8_t  format_major;    /* incompatible — refuse if > known        */
+	uint8_t  format_minor;    /* additive — unknown extras are ignorable */
+	uint16_t hdr_len;         /* total master header length              */
+	uint16_t reserved;
+	uint16_t prefix_crc16;    /* CCITT over the leading 10 B             */
+};
+/* then: generation, state, compacting_bid, next_id_hint, [seg_owner], hdr_crc32 */
+```
+
+Two CRCs, deliberately: `prefix_crc16` is what lets *any* version trust
+`format_major` without understanding the body, and the existing `hdr_crc32`
+keeps covering the body for code that does. Mount becomes:
+
+```
+read 12 B prefix from master A and B
+  prefix CRC bad on both, and both sectors read all-0xff  -> virgin: format
+  prefix CRC bad on both, sectors NOT erased              -> -ENOTSUP: refuse
+  wrong magic                                             -> -ENOTSUP: refuse
+  format_major > BLOB_DB_FORMAT_MAJOR                     -> -ENOTSUP: refuse
+  otherwise: read hdr_len bytes, verify hdr_crc32, proceed
+```
+
+Three consequences worth being explicit about:
+
+- **Erased is not the same as unrecognized.** Distinguishing them is the whole
+  fix: virgin flash reads all-`0xff` and should be formatted; a sector holding
+  bytes we cannot parse must never be. That check is what turns silent
+  destruction into a clean refusal.
+- **Pick the winner before checking the version.** With A and B at different
+  majors (an interrupted upgrade), choose the highest generation among prefixes
+  that pass, then apply the major check to *that* one. Falling back to the older
+  master would silently mount a stale view of an upgraded store.
+- **`format_major` is checked, not the header size.** Growing the body for an
+  additive change bumps `format_minor` and `hdr_len`; old code reads the fields
+  it knows and ignores the tail. Only genuinely incompatible changes bump
+  `format_major`, and those are the ones old code refuses.
+
+**Do it in Stage 1, now.** This reshapes the master, which is a breaking change
+— and it is the *last* undetectable one, because after it every future change
+announces itself. There is no deployed hardware, so the cost today is zero and
+falls to "flash-day migration" the moment there is. It also closes
+`l1_bucketlog.md` §13.4 and finally delivers the `-ENOTSUP` the contract has
+promised since v1.
+
+One judgement call to leave to the implementation: a store whose prefix parses
+and whose *body* CRC fails on both masters is corruption, not foreignness — a
+power loss during the very first format can produce it. Refusing there is
+correct but turns a bad first boot into a device needing explicit
+`blob_db_format()`. Suggest gating that one case on a Kconfig
+(`BLOB_DB_AUTOFORMAT_ON_CORRUPT`, default `y` for development, `n` for
+production) rather than hard-coding either answer.
+
 ---
 
 ## 5. Recommendation
@@ -538,30 +626,23 @@ Extends `tests/lib/blob_db/` (unit) and `tests/lib/blob_db_contract/`
 **Existing stores and existing small-object clients are unaffected** — see
 §7.1 for the API/build side. On flash:
 
-- **Stage 1**: master stays 24 B; the only change is stamping `version = 1`
-  into the byte currently declared `reserved` (`blob_db_internal.h:56`, always
-  written as 0). An old store reads back `version = 0` and is accepted as v0.
-  No size change, no CRC-coverage change, nothing to migrate.
-- **Stage 2**: additive for slots — a store with only inline payloads is
-  byte-identical, since the new flag bits are simply never set. The master
-  grows to 32 B only when `BLOB_DB_LARGE_PAYLOADS=y`, to carry `seg_owner`
-  (§6.5). New code distinguishes the two by reading 24 B first and checking
-  the version byte: `0` → v0 layout, CRC over the leading 20 B; `1` → re-read
-  32 B, CRC over the leading 28 B.
+- **Stage 1** reshapes the master around the frozen compatibility prefix
+  (§4.1) and sets `format_major = 1`. This is a **breaking change**: stores
+  written by today's code are not readable afterwards. With no deployed
+  hardware that costs nothing, and it is deliberately taken now because it is
+  the last change that older software cannot detect.
+- **Stage 2** is additive for slots — a store holding only inline payloads is
+  byte-identical, since the new flag bits are never set. The master body grows
+  to carry `seg_owner` (§6.5), which bumps `format_minor` and `hdr_len`, not
+  `format_major`: Stage-1 software mounting a Stage-2 store reads the fields it
+  knows and ignores the tail.
 
-**The one real hazard is backward, not forward.** Old firmware mounting a
-*new* (32 B-master) store computes its CRC over the wrong span, judges both
-masters invalid, and — per `blob_db_mount()`'s current logic
-(`blob_db.c:304`) — **reformats**, destroying the store rather than failing
-cleanly. Nothing in the new code can prevent that, because the old code's
-behaviour is already fixed in the field.
-
-That is precisely why the version byte belongs in **Stage 1**, shipped ahead
-of any store that could contain segments: firmware that already understands
-the field can be taught to answer `-ENOTSUP` on an unknown version. Devices
-updated to Stage 1 first are then safe to move to Stage 2; devices that jump
-straight from today's code to Stage 2 are not. Downgrade after Stage 2 is
-never supported.
+After Stage 1 the compatibility story is a property of the format rather than
+of any particular change: an unknown `format_major` is refused with
+`-ENOTSUP`, an unknown `format_minor` is tolerated, and an unparseable sector
+that is not erased is never reformatted. Downgrade across a `format_major`
+bump is not supported, but it is now *detected and refused* rather than
+silently destructive.
 
 ---
 
@@ -571,7 +652,14 @@ never supported.
   or keep writes whole-blob and accept that a 256 KB write needs a 256 KB
   caller buffer? Recommendation: **adopt** — without it the write side
   reproduces exactly the RAM problem the proposal exists to solve.
-- **D2 — Master format version (§6.5, §10).** Introduce the `version` field in
+- **D0 — Frozen compatibility prefix (§4.1).** Reshape the master header now
+  so that every future format change is detectable by older software, and make
+  mount refuse an unparseable store with `-ENOTSUP` instead of reformatting it.
+  This is a breaking change and the last undetectable one. Recommendation:
+  **yes, in Stage 1** — it is free today, it closes a standing contract
+  violation, and it subsumes D2.
+- **D2 — Master format version (§6.5, §10)** — *subsumed by D0 if that is
+  adopted; kept here as the narrower fallback.* Introduce the `version` field in
   **Stage 1**, reusing the existing `reserved` byte so the master stays 24 B
   and nothing on flash changes size (closing `l1_bucketlog.md` §13.4). The
   32 B master carrying `seg_owner` then arrives with Stage 2. Doing the
