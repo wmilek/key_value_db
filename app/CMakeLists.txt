@@ -1,5 +1,5 @@
 #-------------------------------------------------------------------------------
-# Zephyr Example Application
+# Zephyr Key-Value DB — blob_db demo application
 #
 # Copyright (c) 2021 Nordic Semiconductor ASA
 # SPDX-License-Identifier: Apache-2.0
