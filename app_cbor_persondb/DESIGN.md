@@ -1,8 +1,7 @@
 # `app_cbor_persondb` — CBOR person/credential database
 
-Status: **v0.1 — requirements only, for discussion.** The design proposal is
-deliberately *not* in this document yet; §8 lists the questions that must be
-settled before it is written.
+Status: **v0.2 — requirements settled, design proposal open for review.**
+Implementation has not started.
 
 The design document for this test application, kept beside the code it
 describes. Governed by `doc/principles.md` · consumes the stack in
@@ -11,54 +10,70 @@ describes. Governed by `doc/principles.md` · consumes the stack in
 | | |
 |---|---|
 | Application | `app_cbor_persondb/` |
-| This document | requirements (now) → design proposal → as-built notes |
-| Also here | `README.md` (the good-practices guide, R-F) and `RESULTS.md` (measured numbers), following the `app_perf*/` convention |
+| This document | requirements (§1–§6) → design proposal (§7–§10) → as-built notes |
+| `FINDINGS.md` | the flaw/limitation register — the *probe* output |
+| `README.md` | the good-practices guide (R-F) — the *showcase* output |
+| `RESULTS.md` | measured numbers, `native_sim` and nRF5340-DK |
 
 ---
 
 ## 1. Purpose
 
-A sample application that shows how to build a **real, non-trivial domain
-database** on this storage stack, and that doubles as a **worked set of good
-practices** for anyone putting the stack into a product.
+A test application that does two jobs at once, and is designed so that neither
+job compromises the other:
 
-The domain is deliberately concrete — physical access control:
+1. **Showcase.** Build a real, non-trivial domain database the way the stack
+   intends it to be built, and write down the practices that emerge. This is
+   requirement R-F.
+2. **Probe.** Push the stack hard enough that its flaws and limits become
+   visible, and record every one of them. A limitation that this app trips over
+   is a limitation a product would trip over.
 
-> A population of *persons*. Each person holds a set of *permissions* and is
-> assigned one or more *credentials* (card IDs). A reader presents a card ID
-> and must decide, quickly, whether that credential grants a given permission.
+These are compatible as long as one rule is respected:
 
-This is a good vehicle because it exercises the three things a real embedded
-database has to get right at once: a **serialization format** with optional and
-repeated fields, a **secondary index** for the query that actually matters, and
-**scale** — enough data that the storage layer's real costs show up.
+> **No premature optimization.** The app implements the natural, idiomatic
+> design. Where that design performs badly, the number is measured and recorded
+> as a finding — it is *not* engineered around. Working around a weakness hides
+> it, and hiding it defeats job 2.
+
+The line between the two: a *good practice* is a way of using the API correctly
+(ordering writes so a crash fails safe, keeping keys regenerable, opening
+handles once). A *workaround* is a contortion that exists only because a layer
+underperforms (caching, denormalizing, second indexes). The app does the first
+and documents the second as an unimplemented mitigation in `FINDINGS.md`.
+
+The domain is physical access control:
+
+> A population of *persons*. Each person holds permissions and is assigned one
+> or more *credentials* (card IDs). A reader presents a card ID and must decide
+> whether that credential grants a given permission.
+
+Good vehicle: it needs a serialization format with optional and repeated fields,
+a secondary index for the query that actually matters, and enough scale that the
+storage layer's real costs surface.
 
 ## 2. Scope
 
 In scope:
 
-- one new test application in `app_cbor_persondb/`, built for `native_sim` and
-  `nrf5340dk/nrf5340/cpuapp` and picked up by `west twister -T app_cbor_persondb`
-  like the existing `app_perf*` apps;
-- a written good-practices guide derived from the app's own code;
-- reference performance numbers at the specified fill level.
+- one test application in `app_cbor_persondb/`, built for `native_sim` and
+  `nrf5340dk/nrf5340/cpuapp`, picked up by
+  `west twister -T app_cbor_persondb` like the existing `app_perf*` apps;
+- the good-practices guide (`README.md`);
+- the findings register (`FINDINGS.md`);
+- reference performance numbers at the specified scale (`RESULTS.md`).
 
-Out of scope (explicit non-goals):
+Out of scope:
 
 - **No changes to `lib/` or `include/app/lib/`.** The app is a *client* of the
-  published API. If a limitation is hit, it is documented as a finding, not
-  patched around by editing the library. (This is the point of a sample: it
-  proves the shipped API is sufficient — see `l1_model_container.md` for the
-  same discipline one layer down.)
+  published API. A limitation it hits is written down, not patched around by
+  editing the library. Fixes belong in follow-up work driven by `FINDINGS.md`.
 - No new container or L3 interface.
-- No BLE/NFC/reader hardware integration; credentials arrive as strings from a
-  synthetic dataset.
-- Not a security product. Access decisions are demonstrated, not hardened
-  (no key material, no anti-replay, no secure element).
+- No reader hardware; credentials arrive as strings from a synthetic dataset.
+- Not a security product. Access decisions are demonstrated, not hardened (no
+  key material, no anti-replay, no secure element).
 
 ## 3. Stakeholder requirements
-
-Verbatim from the request, split into testable items.
 
 | Id | Requirement |
 |---|---|
@@ -67,129 +82,215 @@ Verbatim from the request, split into testable items.
 | **R-C1** | The stored object is a **person**. |
 | **R-C2** | A person carries **permissions, as an array of strings**. |
 | **R-C3** | A person has **credential card IDs (strings)** assigned to them. |
-| **R-D** | Given a credential, it must be possible to get the person and check a permission **very quickly**. |
-| **R-E** | Demonstrate performance with the database sized at **~50 % of the external flash available on the DK board**. |
+| **R-D** | Given a credential, it must be possible to get the person and check a permission **quickly**. |
+| **R-E** | Demonstrate performance with the database sized at **~50 % of the external flash available on the DK board** — 4 MiB of an 8 MiB MX25R6435F. |
 | **R-F** | The application is delivered as a **set of good practices** for using the system. |
+| **R-G** | Any drawback visible in a lower layer is **recorded as a finding**. |
 
 ## 4. Constraints the existing stack imposes
 
-These are measured or read out of the current tree, not assumed. They are what
-makes R-D and R-E non-trivial, so they belong in the requirements.
+Read out of the tree and the existing hardware captures, not assumed.
 
 | Id | Constraint | Source |
 |---|---|---|
-| **C1** | `kvdb` is the only implemented L3 interface, and `kvhash` its only implemented backend. No ordered iteration, no `foreach`. | `lib/kvdb/kvdb.c`, `doc/layers/l3_interfaces.md` §3 |
-| **C2** | A `kvhash` instance holds at most `(MAX_PAYLOAD−8)/8` buckets of `MAX_PAYLOAD` bytes each. `CONFIG_BLOB_DB_MAX_PAYLOAD_LEN` is capped at 4096 → **511 buckets × 4 KB ≈ 2.09 MB per named instance**. | `lib/containers/kvhash/kvhash.c:47`, `lib/blob_db/Kconfig` |
-| **C3** | One `kvhash` entry costs `4 + klen + vlen` and must fit a single payload, so a value is bounded by ~4 KB. | `kvhash.c:291` |
-| **C4** | Every `blob_db` operation reads a **whole sector**. On the DK's MX25R6435F that is 64 KB per read, so **per-op cost is essentially independent of payload size**. Measured: 16.9 ms per `blob_db` read; `kvdb_get` ≈ **34.9 ms**, `kvdb_set` ≈ **55.9 ms**. | `blob_db.c` `read_bucket()`; `app_perf/RESULTS.md`, `app_perf_kvdb/RESULTS.md` |
-| **C5** | A `blob_db` bucket is one sector; a blob lands in `id % n_buckets`. 8 MB / 64 KB = 128 sectors − 3 reserved = **125 buckets**. | `blob_db.c`, `blob_db_internal.h` |
-| **C6** | Compacting one bucket costs **five 64 KB erases** (master, scratch, bucket, scratch, master). One erase measured at ~1.1 s. | `compact_commit()`; `app_perf_kvdb/RESULTS.md` |
+| **C1** | `kvdb` is the only implemented L3 interface and `kvhash` its only backend. No ordered iteration, no `foreach`. | `lib/kvdb/kvdb.c`, `doc/layers/l3_interfaces.md` §3 |
+| **C2** | A `kvhash` instance holds at most `(MAX_PAYLOAD−8)/8` buckets of `MAX_PAYLOAD` bytes. `CONFIG_BLOB_DB_MAX_PAYLOAD_LEN` is capped at 4096 → **511 buckets × 4 KB ≈ 2.09 MB per named instance**. | `kvhash.c:47`, `lib/blob_db/Kconfig` |
+| **C3** | One `kvhash` entry costs `4 + klen + vlen` and must fit a single payload. | `kvhash.c:291` |
+| **C4** | Every `blob_db` operation reads a **whole sector** — 64 KB on the DK — so per-op cost is essentially independent of payload size. Measured: 16.9 ms per read; `kvdb_get` ≈ **34.9 ms**, `kvdb_set` ≈ **55.9 ms**. | `blob_db.c:870,928,990,1052`; `app_perf/RESULTS.md`, `app_perf_kvdb/RESULTS.md` |
+| **C5** | A `blob_db` bucket is one sector; a blob lands in `id % n_buckets`. 8 MiB / 64 KB = 128 − 3 reserved = **125 buckets**. | `blob_db.c`, `blob_db_internal.h` |
+| **C6** | Compacting one bucket costs **five 64 KB erases**; one erase measured at ~1.1 s. | `compact_commit()`; `app_perf_kvdb/RESULTS.md` |
 | **C7** | Single-threaded: the caller serializes every call across every open instance. | `blob_db.h` §concurrency |
-| **C8** | Each `kvdb_set`/`kvdb_delete` is individually atomic; there is **no multi-key transaction**. | `blob_db.h` §atomicity |
+| **C8** | Each `kvdb_set`/`kvdb_delete` is individually atomic; **no multi-key transaction**. | `blob_db.h` §atomicity |
+| **C9** | No occupancy or geometry introspection: the API exposes no partition size, sector size, free space or fill level. | `include/app/lib/blob_db.h` |
 
-Two consequences deserve to be stated as requirements rather than left implicit,
-because they drive the whole design:
+Three consequences drive the whole design and are lifted into requirements:
 
-- **C2 ⇒ one `kvdb` instance cannot hold a 4 MB dataset.** Reaching R-E
-  requires spreading the data over several named instances.
-- **C8 ⇒ a person record and its index entries cannot be updated atomically
-  together.** The application must define an ordering that fails safe.
+- **C2 ⇒** 10 000 person records (~3.6 MB) do not fit one `kvdb` instance. The
+  app must shard across named instances by hand.
+- **C8 ⇒** a person record and its credential-index entries cannot be updated
+  together atomically. The app must define an ordering that fails safe.
+- **C9 ⇒** the app cannot ask the stack how full it is. R-E reporting has to be
+  reconstructed from devicetree plus the app's own accounting.
 
 ## 5. Derived functional requirements
 
 | Id | Requirement | Rationale |
 |---|---|---|
-| **F1** | Person records are stored as CBOR under `kvdb`, keyed by person id. | R-A, R-B, R-C1 |
-| **F2** | The CBOR schema carries: person id, display fields, permissions as an array of text strings, and card IDs as an array of text strings. | R-C2, R-C3 |
-| **F3** | A **credential index** maps card ID → the data needed to answer an access question, so that a permission check on a presented card costs **one** `kvdb_get`, not two. | R-D, C4 |
-| **F4** | The full person record remains the authoritative copy; anything denormalized into the index is derived from it and rebuildable. | R-D vs. correctness |
-| **F5** | Index and record updates are ordered so that a power cut leaves a **fail-safe (deny)** state, never a fail-open one. | C8, P7 |
-| **F6** | The dataset is generated by a pure function of the record index, so any record can be re-derived and verified without shadow state. | C1 (no iteration), P3 |
-| **F7** | The store is sized at boot from the **real partition geometry** and a configurable fill target, defaulting to 50 %. | R-E, P4 |
-| **F8** | Population is **batched and resumable across reboots**, with committed progress. | R-E (see §6), P7 |
-| **F9** | Every run after the fill completes verifies a deterministic sample of the store against the generator, mutates a bounded subset, and re-verifies. | P8 |
-| **F10** | The run reports measured timings per phase, plus the achieved fill in bytes and per cent. | R-E |
+| **F1** | Person records are CBOR, stored under `kvdb`, keyed by person id. | R-A, R-B, R-C1 |
+| **F2** | The schema carries id, display fields, a validity window, a PIN hash, permissions as an **array of text strings**, and card IDs as an **array of text strings**. | R-C2, R-C3 |
+| **F3** | A **credential index** maps card ID → person id, because without it a card cannot be resolved at all (C1: no iteration). It stores the person id and nothing else — no denormalized permission state. | R-D, no-premature-optimization |
+| **F4** | The person record is the single authoritative copy of permissions. | correctness |
+| **F5** | Card assignment writes the person record **first**, the index **second**; revocation deletes the index **first**, the person **second**. Either crash point leaves a *deny*. | C8, P7 |
+| **F6** | Every record is a pure function of its index, so any record is re-derivable and verifiable without shadow state. | C1, P3 |
+| **F7** | Dataset scale is 10 000 persons (Kconfig), sized so live content lands near 4 MiB. | R-E |
+| **F8** | Population is batched and **resumable across reboots** with committed progress; replay of an interrupted batch is idempotent. | R-E fill time, P7 |
+| **F9** | Every run after the fill verifies a deterministic sample against the generator, mutates a bounded subset, and re-verifies — proving what the *previous boot* wrote. | P8 |
+| **F10** | The run reports per-phase timings, the achieved size in bytes and per cent, and **read/write amplification**. | R-E, R-G |
+| **F11** | Failures that reveal a limit (`-ENOSPC` from a full `kvhash` bucket) are **counted and reported**, not treated as fatal. | R-G |
 
-## 6. The R-E cost problem — needs a decision
+## 6. Dataset sizing
 
-R-E asks for ~50 % of 8 MB = **~4 MB of live data**. Working that through C2–C6
-with a plausible record:
+Chosen to be a realistic access-control record, then checked against R-E — not
+padded to hit a number. Averages over the 10 000 generated persons:
 
 ```
-person record   ≈ 227 B CBOR   (id, name, dept, 12 permission strings, 2 cards)
-person entry    = 4 + 9 + 227  = 240 B
-credential entry= 4 + 14 + 11  =  29 B   × 2 cards
-per person      ≈ 298 B
+person record, CBOR map with 9 integer-keyed pairs
+  1 id           uint          6 B      100000 + index
+  2 name         tstr         18 B      "Ada Aalto-0042"
+  3 dept         tstr         14 B
+  4 title        tstr         16 B
+  5 valid_from   uint          6 B      epoch seconds
+  6 valid_until  uint          6 B
+  7 pin          bstr(16)     18 B
+  8 permissions  [tstr]      226 B      10..22 strings, mean 16, ~13 B each
+  9 cards        [tstr]     39.5 B      1..4 strings, mean 2.5, 14 hex chars
+                            -------
+                            ~349.5 B
 ```
 
-| Quantity | Value |
+| | |
 |---|---|
-| Persons to reach 4 MB | ≈ 14 000 |
-| Credentials | ≈ 28 000 |
-| `kvdb_set` calls to populate | ≈ 42 000 |
-| Population, ops only (42 000 × 55.9 ms) | **≈ 39 min** |
-| Bytes appended to flash during the fill (bucket rewrite amplification) | ≈ 34 MB |
-| Resulting bucket compactions (≈ 1 100 × 5.7 s) | **≈ 1.8 h** |
-| **Total one-time fill on the DK** | **≈ 2.4 h** |
+| person `kvhash` entry (`4 + klen 9 + 349.5`) | 362.5 B |
+| credential entry (`4 + klen 14 + CBOR uint 5`) | 23 B |
+| credentials per person (mean) | 2.5 |
+| **per person, all-in** | **420 B** |
+| × 10 000 persons | **4 200 000 B = 4.01 MiB** |
+| as a fraction of the 8 MiB MX25R6435F | **50.1 %** |
 
-Steady state afterwards is fine — a verify/mutate/re-verify run is ~1 min, and
-the R-D hot path is one 34.9 ms lookup. The problem is purely the *one-time
-fill*, and it is a genuine property of the v1 bucket-log at high occupancy, not
-a bug in the app.
+R-E is met by the realistic record, which is the outcome we wanted: no padding,
+no contrivance.
 
-Levers, in decreasing order of effect:
+**Shard count** follows from C2/C3 plus the hash distribution. With 511 buckets
+per instance, `S` people shards give a mean of `10000/(511·S)` entries per
+bucket; a bucket overflows past ~11 person entries. At `S = 8` the mean is 2.45
+and the expected number of buckets reaching 12 entries is 0.03 — safe, with the
+tail handled by F11 rather than by extra margin. Credentials are small enough
+that all 25 000 fit **one** shard (mean 49 entries ≈ 1.1 KB per bucket).
 
-1. **Fewer, larger records.** Cost is per *operation*, not per byte (C4). A
-   person record of ~800 B instead of ~227 B reaches the same 4 MB with ~5 000
-   persons and ~15 000 sets — roughly a **3× reduction** in both op count and
-   appended bytes. It needs a bigger record to be *plausible* (an access-control
-   record with a biometric template is realistic; padding for its own sake is
-   not).
-2. **One credential per person instead of two.** Removes ~14 000 sets and most
-   of the index's write amplification, at the cost of not demonstrating the
-   many-cards-per-person case.
-3. **Default the fill target below 50 %,** and treat 50 % as a documented
-   opt-in long run.
-4. **Make the fill unattended-friendly** (F8) and simply accept the hours.
+That asymmetry — the same 511-bucket instance holds 25 000 small entries
+comfortably but only ~5 600 large ones — is finding **K2**.
 
-My recommendation is **1 + 4**: keep 50 % as the default because that is what
-was asked for, make the record realistically large so the fill is ~45 min rather
-than ~2.4 h, and make it resumable so an interrupted run costs nothing.
+**Cost of the fill.** 35 000 `kvdb_set` calls at 55.9 ms ≈ 33 min of operations,
+plus ~37 MB of appended bytes driving ~1 250 bucket compactions at ~5.7 s ≈ 2 h.
+**One-time population on the DK is therefore ≈ 2.5 h.** This is not designed
+around; it is finding **B1/B2/K4/K5** and is why F8 exists.
 
-## 7. Acceptance criteria
+---
+
+# Design proposal
+
+## 7. Structure
+
+```
+app_cbor_persondb/
+├── DESIGN.md  FINDINGS.md  README.md  RESULTS.md
+├── CMakeLists.txt  Kconfig  prj.conf  sample.yaml  VERSION
+├── boards/  native_sim.{conf,overlay}
+│            nrf5340dk_nrf5340_cpuapp.{conf,overlay}
+└── src/
+    ├── person.h/.c     domain type + CBOR codec (zcbor). Knows nothing of storage.
+    ├── dataset.h/.c    pure generator: index → person. Knows nothing of storage or CBOR.
+    ├── persondb.h/.c   the store: shard fan-out, record + credential index, auth.
+    └── main.c          phases, benchmarks, reporting.
+```
+
+The split is itself a demonstrated practice: the codec, the domain data and the
+storage policy are three independent things, and only `persondb.c` calls `kvdb`.
+
+## 8. Data model
+
+**Person record** — CBOR map, integer keys (compact and stable), canonical
+encoding (`CONFIG_ZCBOR_CANONICAL=y`). Schema as in §6. Permissions and card
+IDs are text strings, per R-C2/R-C3.
+
+**Credential index** — a separate `kvdb` instance, `card ID → CBOR uint person
+id`. Nothing else is stored in it. The temptation to also cache a permission
+bitmask here is exactly the premature optimization the app refuses; §10 measures
+what that refusal costs and `FINDINGS.md` records it as an unimplemented
+mitigation.
+
+**Instances** (10 total, all `KVDB_BACKEND_HASH`, `initial_capacity = 511`):
+
+| Name | Contents |
+|---|---|
+| `ppl0`..`ppl7` | person id → CBOR person record |
+| `crd0` | card ID → CBOR person id |
+| `meta` | header, population progress, revision counter |
+
+Shard selection is `person_index % 8` for people and a single instance for
+cards. Keys: `"p%08X"` for persons, the 14-hex-char card UID verbatim for
+credentials.
+
+## 9. Behaviour
+
+**Boot.** `blob_db_mount()` → `rootreg_init()` → open all 10 instances once and
+keep the handles (an instance handle is a `{root, ops}` pair with no resources —
+reopening per query would cost two extra sector reads).
+
+**Fill (F8).** Read `meta/prog`. Populate persons `[done, done+BATCH)`, commit
+`prog`, repeat. On reboot the fill resumes from the committed count; replaying a
+partial batch rewrites the same deterministic values, so replay is free.
+`blob_db_prepare()` runs first so the one-off ~1.1 s sector erases are reported
+as their own phase rather than smeared through the measurement.
+
+**Verify (F9).** A deterministic sample of persons is re-derived from the
+generator and compared field by field against what CBOR decoding returns, and
+each person's cards are resolved through the index back to that person.
+
+**Mutate (F9).** A bounded subset gains a temporary card at odd revisions and
+loses it at even ones, so the expected state is a pure function of
+`(index, rev)` and a rerun proves the previous boot's writes survived. The two
+orderings of F5 are both exercised — assignment person-first, revocation
+index-first.
+
+**Report (F10).** Live bytes by the app's own accounting, blob-level live bytes
+via `blob_db_iterate()`, partition size from `FIXED_PARTITION_SIZE()` — read
+from devicetree behind the library's back, because C9 leaves no other route.
+That detour is finding **B3**.
+
+## 10. Measurements
+
+| Bench | What it costs | Why |
+|---|---|---|
+| `auth` | card → person id → record → permission string compare (**2 `kvdb_get`**) | R-D, the headline |
+| `byid` | person id → record (1 `kvdb_get`) | the index's share of `auth` |
+| `miss` | unknown card (1 `kvdb_get`, `-ENOENT`) | negative-lookup cost |
+| `grant` | read-modify-write one record (1 get + 1 set) | mutation cost |
+| `cbor` | encode + decode in RAM, no flash | isolates the codec |
+| `fill` | the whole population, with compaction visible | R-E |
+
+Every phase also reports **amplification**: bytes moved on flash ÷ bytes the
+application asked for. For `auth` that is 4 × 64 KB of sector reads to answer a
+question about ~365 B of data — the number that makes finding **B1** concrete
+rather than theoretical.
+
+`cbor` exists to answer "is CBOR the bottleneck?" in advance. The expected answer
+is no, by three orders of magnitude, which retires the question.
+
+## 11. Acceptance criteria
 
 - **A1** Builds for `native_sim` and `nrf5340dk/nrf5340/cpuapp`; passes
-  `west twister -T <app> -p native_sim`.
-- **A2** On `native_sim` configured with the DK's geometry (8 MB partition,
-  64 KB sectors), a full run reaches the configured fill target and reports
-  `VERIFY PASS`.
-- **A3** A second run of the same binary verifies the content written by the
-  first — persistence across "reboot" is proven, not asserted.
-- **A4** The reported hot-path measurement (R-D) is shown next to the naive
-  two-lookup path, so the index's value is quantified rather than claimed.
-- **A5** `RESULTS.md` records measured `native_sim` numbers and, for the DK,
-  either measured hardware numbers or clearly-labelled projections derived from
-  the constants in C4/C6.
-- **A6** The good-practices guide (R-F) states each practice, points at the
-  lines of the app that implement it, and gives the failure it prevents.
+  `west twister -T app_cbor_persondb -p native_sim`.
+- **A2** On `native_sim` configured with the DK's geometry (8 MiB partition,
+  64 KB sectors) a full run reaches 10 000 persons and reports `VERIFY PASS`.
+- **A3** A second run verifies content written by the first.
+- **A4** `RESULTS.md` carries measured nRF5340-DK numbers.
+- **A5** `FINDINGS.md` records every limitation hit, each with the evidence that
+  demonstrates it and the measurement that quantifies it.
+- **A6** `README.md` states each practice, points at the code that implements
+  it, and names the failure it prevents.
 
-## 8. Open questions
+## 12. Decisions
 
-1. **Record size / fill time (§6).** Accept the ~2.4 h fill, or take lever 1
-   (larger, biometric-template-carrying person records) to bring it to ~45 min?
-   My recommendation is lever 1 + resumable fill.
-2. **CBOR codec.** Use **zcbor** (Zephyr's own CBOR library — add `zcbor` to the
-   `name-allowlist` in `west.yml`), or hand-roll a minimal CBOR subset to keep
-   the manifest untouched? I recommend zcbor: hand-rolling a serializer in a
-   document about good practices would undercut the message.
-3. **"External flash available" = 8 MB?** Both existing DK overlays give the
-   whole MX25R6435F to `storage_partition`, so 50 % is 4 MB. Confirm.
-4. **Cards per person:** 2 (demonstrates the multi-credential case, doubles the
-   index cost) or 1?
-5. **Hardware numbers.** I cannot run the DK from here. Will you run the app on
-   the board (as with `app_perf_kvdb`'s S/N 960115021 capture) so `RESULTS.md`
-   carries measurements, or should it ship with projections labelled as such?
+Settled during review; recorded so they are not relitigated.
 
-**Settled.** Naming and placement: the app is `app_cbor_persondb/`, and all of
-its documentation lives inside it — this design document, the `README.md`
-good-practices guide (R-F), and `RESULTS.md`. Nothing is added under `doc/`.
+| # | Decision |
+|---|---|
+| D1 | **Scale is 10 000 persons**, and the record is realistic rather than sized to hit a target. It lands at 4.01 MiB ≈ 50 % of the DK's external flash. |
+| D2 | **No premature optimization.** The natural design is implemented and measured; mitigations are documented, not built. |
+| D3 | **zcbor** is the codec — Zephyr's own CBOR library (P1). Requires adding `zcbor` to the `name-allowlist` in `west.yml`. |
+| D4 | **4 MiB of the 8 MiB MX25R6435F** is the R-E target; both existing DK overlays already give the whole part to `storage_partition`. |
+| D5 | **1–4 credentials per person** (mean 2.5), varying per person, as in a real population. |
+| D6 | **Hardware numbers will be measured on the DK**, so `RESULTS.md` ships measurements rather than projections. |
+| D7 | The app is `app_cbor_persondb/` and **all of its documentation lives inside it**. Nothing is added under `doc/`. |
+| D8 | The app is **both** probe and showcase; §1 states the rule that keeps the two compatible. |
