@@ -28,6 +28,7 @@ This is a simple Sphinx documentation setup for ``example-application``.
 
    proposals/2026-08-09-large-payloads
    proposals/2026-08-09-large-payloads-cost
+   proposals/2026-08-09-kvhash-impact
 
 .. toctree::
    :maxdepth: 1
