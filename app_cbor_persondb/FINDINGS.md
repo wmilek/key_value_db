@@ -1,7 +1,8 @@
 # Findings — limitations of the stack, as seen from an application
 
-Status: **v0.2 — seeded from code reading during design (2026-08-09).**
-No measurements yet; the app is not implemented.
+Status: **v0.3 — the app is implemented and measured on `native_sim`
+(2026-08-09).** Numbers below are from `RESULTS.md`; hardware measurement on
+the nRF5340-DK is outstanding.
 
 This is the *probe* output of `app_cbor_persondb` (see `DESIGN.md` §1). Every
 drawback the app trips over on its way to a working 4 MiB person database is
@@ -82,7 +83,7 @@ taken after it, not before.**
 
 ## L1 — `blob_db`
 
-### B1 — Every operation reads a whole sector (major, `read`)
+### B1 — Every operation reads a whole sector (major, **`measured`**)
 
 `blob_db_get`, `update`, `delete` and `exists` all call `read_bucket()`, which
 issues `blob_db_store_read(bucket_offset(bid), buf, st.peb_size)` — the entire
@@ -95,9 +96,17 @@ the payload is 5 bytes or 4 KB. It is the single cause of every latency figure
 here: the measured 16.9 ms `blob_db` read (`app_perf/RESULTS.md`) is 64 KB at
 ~4 MB/s, not a seek or an erase.
 
-Impact: resolving a credential and checking a permission costs 2 map gets =
-**4 sector reads = 256 KB** to answer a question about ~365 B of data — read
-amplification of roughly **700×**.
+**Measured.** Resolving a credential and checking a permission is 2 map gets =
+**4 sector reads = 256 KB of flash to answer a question about 365 B** — read
+amplification of **711×**. A negative lookup is worse in relative terms: 128 KB
+to learn that a card does not exist, **26 214×**. A write is 9.98 blob
+operations and 638 KB (1 799×), because the credential index is maintained per
+card. See `RESULTS.md` §4.
+
+The same table settles what the serialization format costs: CBOR encode plus
+decode is 6 µs against the decision's 599 µs on `native_sim` — **1.0 %** — and a
+projected **0.009 %** on hardware. The format is not the cost; the sector read
+is.
 
 Direction (not implemented): the format already stores per-slot lengths, so a
 get could read the bucket header, walk slot headers with short reads, and fetch
@@ -449,15 +458,28 @@ value-size distribution*, which the application must work out itself.
 Concretely: the same 511-bucket map holds 25 000 credential entries (23 B)
 comfortably but only a few thousand person entries (362 B).
 
-**The evidence is the over-provisioning, not a failure.** Per `DESIGN.md` D11
-the app stays inside the limit rather than working around it — no overflow
-chains, no retry-on-`-ENOSPC`. But because there is no per-bucket occupancy
-query (K10) and no growth path (K3), the margin has to be chosen **blind and up
-front**, and getting it wrong surfaces as `-ENOSPC` hours into a fill. That
-forces a 5.5 σ margin: **eight people maps where four would have held the
-bytes**, mean bucket load 22 % of capacity. Half the provisioned capacity buys
-nothing but ignorance of the tail. The compound-Poisson table is in
-`DESIGN.md` §6.1; that an application has to compute one at all is the finding.
+**It fired, and how it fired is the finding.** The design sized the store with
+an analytic compound-Poisson model that put eight person maps at 5.5 σ of
+headroom and ~0.03 expected overflows. The first full fill returned `-ENOSPC` at
+person 9 232, with one bucket at 4 158 B against a 4 096 B ceiling.
+
+The model was not badly built. It was fed a mean entry size that later grew by
+14 %, and a right-skewed compound-Poisson tail is heavier than the Gaussian
+intuition behind "5.5 σ". Both are ordinary mistakes — and **neither is
+detectable at run time**, because there is no per-bucket occupancy query (K10)
+and the bucket count cannot change after create (K3). The failure arrives 92 %
+of the way through a fill that is a projected 2.5 h on hardware, and the only
+repair is a reformat.
+
+Sizing therefore had to move to **enumeration**: `tools/sizing.py` replays the
+real hash over the real population and reports the fullest bucket
+(`RESULTS.md` §9). It says sixteen maps, fullest bucket 66 % full — **sixteen
+where four would hold the bytes.** That over-provisioning, and the offline
+script needed to justify it, is what the missing introspection costs.
+
+The application could only do this because its dataset is a pure function of an
+index. **A deployment whose records arrive from outside cannot enumerate them
+ahead of time, and has no recourse but to over-provision blindly.**
 
 Direction: bucket splitting, an overflow chain, or — cheapest and most useful —
 simply reporting per-bucket occupancy so an application can see the cliff coming
@@ -485,9 +507,12 @@ The directory is `8 + 8 × n_buckets` = **4 KB at 511 buckets**.
 
 > `kvhash.c:319-328`
 
-Impact: filling eight people shards creates ~3 700 buckets, so ~3 700 directory
-rewrites of 4 KB ≈ **15 MB of flash writes for bookkeeping alone** — comparable
-to the ~21 MB the data costs, and a large share of B2's compaction load.
+Impact: filling sixteen person maps creates ~5 800 buckets, so ~5 800 directory
+rewrites of 4 KB ≈ **23 MB of flash writes for bookkeeping alone** — more than
+the ~4.3 MB of data it is bookkeeping for, and a large share of B2's compaction
+load. Note the tension with K2: every map added to buy bucket headroom adds
+directory traffic here, so the two findings pull in opposite directions and the
+application has to trade them off with no visibility into either.
 
 Direction: the directory is a dense array of ids; a bucket's id could be derived
 rather than stored, or the directory chunked so a publish rewrites 64 B.
@@ -612,7 +637,7 @@ This is the finding that makes K2 expensive rather than merely present: a
 an application size to a measured tail instead of a guessed one, and would turn
 K2 from a cliff into a gauge.
 
-### K11 — The directory is re-read from flash on every single operation (major, `read`)
+### K11 — The directory is re-read from flash on every single operation (major, **`measured`**)
 
 `kvhash_get`, `kvhash_set` and `kvhash_del` all open with `dir_load(root, &n)`,
 which is a `blob_db_get(root)` — and by B1 that is a **whole 64 KB sector read**
@@ -622,9 +647,11 @@ before the operation has even located its bucket.
 
 So **every map operation costs at least two `blob_db` operations**, and the
 first of them exists only to look up an integer. That is the whole reason a map
-get is 34.9 ms rather than 17.5 ms, and it is half of R-D's 4-sector-read
-`check` path — this app pays 128 KB of the 256 KB it reads per access decision
-purely to learn two bucket ids.
+get is 34.9 ms rather than 17.5 ms.
+
+**Measured:** the `check` path performs exactly 4 blob operations per decision
+and `byid` exactly 2 (`RESULTS.md` §4). Half of every one of those — **128 KB of
+the 256 KB an access decision moves** — is spent learning two bucket ids.
 
 The obvious reply is to cache the directory, and P3 ("no caches") is why it is
 not. But the tension is narrower than it looks: the directory is 4 KB, is

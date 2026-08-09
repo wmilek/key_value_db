@@ -1,0 +1,104 @@
+# app_cbor_persondb — Kconfig entry point.
+#
+# Copyright (c) 2026
+# SPDX-License-Identifier: Apache-2.0
+
+menu "Zephyr"
+source "Kconfig.zephyr"
+endmenu
+
+module = APP_CBOR_PERSONDB
+module-str = APP_CBOR_PERSONDB
+source "subsys/logging/Kconfig.template.log_config"
+
+choice APP_CBOR_PERSONDB_FRONTEND
+	prompt "Frontend"
+	default APP_CBOR_PERSONDB_FRONTEND_BENCH
+	help
+	  Both frontends drive the same scenario layer (DESIGN.md §9); they
+	  differ only in how the operations are invoked and rendered.
+
+config APP_CBOR_PERSONDB_FRONTEND_BENCH
+	bool "Automatic benchmark run"
+	help
+	  Unattended: open, prepare, fill (resuming in batches), verify,
+	  mutate, re-verify, benchmark, report, exit. The source of RESULTS.md.
+
+config APP_CBOR_PERSONDB_FRONTEND_SHELL
+	bool "Interactive shell"
+	select SHELL
+	help
+	  The same operations under "persondb <cmd>", for poking a live store
+	  on the board — including power-cutting a fill and inspecting what
+	  survived.
+
+endchoice
+
+config APP_CBOR_PERSONDB_N_PERSONS
+	int "Number of persons in the dataset"
+	default 10000
+	range 8 200000
+	help
+	  Dataset scale. At the default the store holds roughly 4 MiB of
+	  live content — about 50 % of the nRF5340-DK's 8 MiB external
+	  flash (DESIGN.md §6). Lower it for a quick run; the smoke scenario
+	  in sample.yaml uses 200.
+
+config APP_CBOR_PERSONDB_PEOPLE_MAPS
+	int "Number of person map shards"
+	default 16
+	range 1 64
+	help
+	  A kvhash map holds at most (MAX_PAYLOAD-8)/8 buckets, so the person
+	  records must be spread over several maps. Sixteen puts the fullest
+	  bucket at 66 % of the 4 KB ceiling for the default dataset.
+
+	  This number was arrived at by enumerating the whole population
+	  offline (tools/sizing.py) after an analytic tail estimate got it
+	  wrong and the fill hit -ENOSPC — see DESIGN.md §6.1 and
+	  FINDINGS.md K2. If you change the person count, the record shape, or
+	  CONFIG_BLOB_DB_MAX_PAYLOAD_LEN, rerun that script: there is no
+	  per-bucket occupancy query to warn you (FINDINGS.md K10), and the
+	  failure is a local -ENOSPC partway through a fill.
+
+config APP_CBOR_PERSONDB_FILL_BATCH
+	int "Persons per resumable fill batch"
+	default 256
+	range 1 65536
+	help
+	  Progress is committed to the superblock after each batch, so an
+	  interrupted fill resumes from the last committed count instead of
+	  starting over. Replaying a partial batch rewrites identical values,
+	  so replay is free.
+
+config APP_CBOR_PERSONDB_VERIFY_SAMPLES
+	int "Persons verified per run"
+	default 256
+	range 1 65536
+	help
+	  Verifying all 10 000 persons costs about 6 minutes per pass on the
+	  DK, so a run checks a deterministic spread instead. Every sampled
+	  person is compared field by field against the generator, and each of
+	  its cards is resolved back through the credential index.
+
+config APP_CBOR_PERSONDB_MUTATE_COUNT
+	int "Persons touched per mutation round"
+	default 64
+	range 1 4096
+	help
+	  Each run revokes the previous revision's temporary cards and grants
+	  the next revision's, exercising both fail-safe orderings
+	  (DESIGN.md F5) and proving across a reboot that the previous run's
+	  writes survived.
+
+config APP_CBOR_PERSONDB_BENCH_SAMPLES
+	int "Operations per benchmark phase"
+	default 200
+	range 1 65536
+
+config APP_CBOR_PERSONDB_FRESH_START
+	bool "Erase the store at boot (start over)"
+	help
+	  Drop everything before opening, so this run behaves like the very
+	  first one. Use once to reset a board that already holds a store; on
+	  native_sim prefer the --flash_erase command-line option.

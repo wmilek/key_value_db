@@ -1,7 +1,7 @@
 # `app_cbor_persondb` — CBOR person/credential database
 
-Status: **v0.4 — requirements settled; design proposal open for review.**
-Implementation has not started.
+Status: **v0.5 — implemented and measured on `native_sim`.**
+Hardware measurement on the nRF5340-DK is outstanding (A4).
 
 The design document for this test application, kept beside the code it
 describes. Governed by `doc/principles.md` · consumes the stack in
@@ -164,14 +164,20 @@ person record, CBOR map with 9 integer-keyed pairs
 
 | | |
 |---|---|
-| person entry (`4 + klen 9 + 349.5`) | 362.5 B |
-| credential entry (`4 + klen 14 + CBOR uint 5`) | 23 B |
-| credentials per person (mean) | 2.5 |
-| **per person, all-in** | **420 B** |
-| × 10 000 persons | **4 200 000 B = 4.01 MiB** |
-| of the 8 MiB MX25R6435F | **50.1 %** |
+| | estimated | **measured** |
+|---|--:|--:|
+| person entry (`4 + klen 9 + record`) | 362.5 B | 376 B |
+| credential entry (`4 + klen 14 + CBOR uint 5`) | 23 B | 23 B |
+| credentials per person (mean) | 2.5 | 2.49 |
+| **per person, all-in** | 420 B | **433 B** |
+| × 10 000 persons | 4.01 MiB | **4 336 158 B = 4.13 MiB** |
+| of the 8 MiB MX25R6435F | 50.1 % | **51.6 %** |
 
-R-E is met by the realistic record — the outcome we wanted.
+R-E is met by the realistic record — the outcome we wanted. (The permission
+vocabulary was lengthened once, from ~11-character names to qualified ones
+averaging ~14, after the first implementation landed at 45.8 %. Qualified
+permission identifiers are what a real facility uses; this was a correction to
+the model, not padding to hit a number.)
 
 ### 6.1 Sizing to fit (R-J)
 
@@ -180,29 +186,46 @@ bucket overflows while the store is nearly empty, and nothing warns first
 (K2, K10). The app therefore picks a map count that keeps every bucket far from
 that edge, and does not attempt to run near it.
 
-Bucket load is compound Poisson — a Poisson number of entries, each of variable
-size. With `S` people maps of 511 buckets and 10 000 persons:
+**The first attempt at this was wrong, and how it was wrong is the finding.**
+An analytic compound-Poisson model — a Poisson number of entries per bucket,
+each of variable size — put eight person maps at 5.5 σ of headroom and ~0.03
+expected overflows. The implementation hit `-ENOSPC` at person 9 232.
 
-| `S` | mean entries/bucket | mean bytes | σ bytes | headroom to 4 KB | expected overflows |
-|---|---|---|---|---|---|
-| 4 | 4.89 | 1 772 | 824 | 2.8 σ | ~4 buckets |
-| 6 | 3.26 | 1 181 | 673 | 4.3 σ | ~0.3 buckets |
-| **8** | **2.45** | **885** | **583** | **5.5 σ** | **~0.03 buckets** |
+The model was not badly built; it was fed a mean entry size that later grew by
+14 %, and a right-skewed compound-Poisson tail is heavier than the Gaussian
+intuition behind "5.5 σ". Both are ordinary mistakes, and neither is detectable
+at run time, because there is no per-bucket occupancy query (K10) and the
+bucket count cannot change after create (K3).
 
-**Eight people maps**, mean bucket load 22 % of capacity. All 25 000 credential
-entries (23 B) fit **one** map — mean 49 entries ≈ 1.1 KB per bucket, 27 % — so
-nine maps in total.
+So the number is now obtained by **enumerating the actual population through
+the actual hash** — `tools/sizing.py`, which replicates `fnv1a`, the key
+format and the CBOR sizing rules:
+
+| person maps | mean bucket | **fullest bucket** | over 4 KB |
+|---|--:|--:|--:|
+| 8 | 1 009 B | **4 158 B** | **1** |
+| 12 | 764 B | 3 286 B | 0 |
+| **16** | **660 B** | **2 711 B** | **0** |
+| 24 | 553 B | 2 409 B | 0 |
+| 32 | 499 B | 2 369 B | 0 |
+
+**Sixteen person maps**, fullest bucket at 66 % of the ceiling. Beyond about
+sixteen the maximum stops falling — it is set by the Poisson tail over a growing
+number of buckets rather than by the mean — while every extra map adds
+directory-rewrite traffic (K5), so more is not freely better. All 24 932
+credential entries fit **one** map: 23 B each, fullest bucket 1 587 B.
 
 Two things worth stating plainly:
 
 - The asymmetry is the finding: the same 511-bucket map holds 25 000 small
   entries comfortably but only a few thousand large ones (**K2**).
-- Choosing 5.5 σ rather than 3 σ is not caution for its own sake. Because there
-  is no per-bucket occupancy query (**K10**) and no growth path (**K3**), the
-  margin must be picked *blind and up front*, and the penalty for getting it
-  wrong is discovering `-ENOSPC` hours into a fill. **Over-provisioning is what
-  the API's lack of introspection costs**, and that cost — 8 maps where 4 would
-  have held the bytes — is the measurement, not a workaround.
+- **Sixteen maps where four would hold the bytes is what the API's lack of
+  introspection costs.** The margin must be chosen up front and blind, and the
+  penalty for getting it wrong is an `-ENOSPC` partway through a multi-hour
+  fill with no repair short of a reformat. That over-provisioning is the
+  measurement, not a workaround — and this application can size by enumeration
+  only because its dataset is a pure function of an index (F6). One whose data
+  arrives from outside could not.
 
 ### 6.2 Cost of the fill
 
@@ -504,6 +527,6 @@ Settled during review; recorded so they are not relitigated.
 | D8 | The app is **both** probe and showcase; §1 states the rule that keeps the two compatible. |
 | D9 | The person management functionality is an **internal application API** (§8), not proposed for `lib/`. |
 | D10 | It is implemented on **L2 `map_ops` + `rootreg` + `blob_db`**, not L3 `kvdb` (§12). `kvdb` is not linked into the image. |
-| D11 | **Size to fit, do not fight C2** (R-J): eight people maps put mean bucket load at 22 % of capacity, 5.5 σ from the ceiling. `-ENOSPC` is not an expected path, and the app does not provoke it to make the limit visible — the over-provisioning it forces *is* the visible cost (§6.1). |
+| D11 | **Size to fit, do not fight C2** (R-J): sixteen person maps put the fullest bucket at 66 % of the ceiling, a number obtained by enumerating the population rather than by modelling its tail — the model was tried, and was wrong (§6.1). `-ENOSPC` is not an expected path, and the app does not provoke it; the over-provisioning it forces *is* the visible cost. |
 | D12 | A **scenario layer** (§9) holds every operation on a population, and never prints. |
 | D13 | **Two frontends** — automatic benchmark and interactive shell — selected by Kconfig, shipped as separate `sample.yaml` scenarios, plus a small `smoke` scenario that actually runs in CI. |

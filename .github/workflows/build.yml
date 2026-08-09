@@ -93,3 +93,14 @@ jobs:
         run: |
           west build -p always -b nrf5340dk/nrf5340/cpuapp -d build/nrf_kvdb key_value_db/app -- \
             -DCONFIG_BLOBDB_KVDB=y
+
+      - name: Build app_cbor_persondb — benchmark frontend (ARM)
+        run: |
+          west build -p always -b nrf5340dk/nrf5340/cpuapp -d build/nrf_persondb \
+            key_value_db/app_cbor_persondb
+
+      - name: Build app_cbor_persondb — shell frontend (ARM)
+        run: |
+          west build -p always -b nrf5340dk/nrf5340/cpuapp -d build/nrf_persondb_shell \
+            key_value_db/app_cbor_persondb -- \
+            -DCONFIG_APP_CBOR_PERSONDB_FRONTEND_SHELL=y
