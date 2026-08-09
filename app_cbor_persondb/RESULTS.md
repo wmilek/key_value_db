@@ -3,7 +3,8 @@
 Keep this file honest: update it when the shape of the app changes or when
 regenerating on new hardware.
 
-**Status: `native_sim` measured; nRF5340-DK not yet run.** Per `DESIGN.md` D6
+**Status: `native_sim` measured; nRF5340-DK cross-built and sized, but not
+yet run on the board.** Per `DESIGN.md` D6
 the DK numbers will be measured on the board, so the hardware column below is
 a *projection* from this repository's existing captures and is labelled as such
 everywhere it appears. It is not a substitute for `A4`.
@@ -77,7 +78,93 @@ Whole-run phases:
 | mutate | 249 ms | 64 revoked + 64 assigned, one revision |
 | re-verify | 277 ms | same |
 
-## 5. Projected — nRF5340-DK (**not yet measured**)
+
+## 4a. Footprint — nRF5340-DK (measured)
+
+Cross-built with Zephyr SDK 1.0.1 (`arm-zephyr-eabi`) for
+`nrf5340dk/nrf5340/cpuapp`. These are real target numbers; only the *timings*
+in §5 remain projections.
+
+| | FLASH | of 1 MB | RAM | of 448 KB |
+|---|--:|--:|--:|--:|
+| benchmark frontend | 59 072 B | 5.6 % | **157 584 B** | **34.4 %** |
+| shell frontend | 93 476 B | 8.9 % | 162 328 B | 35.4 % |
+
+The Zephyr shell subsystem is the entire difference: +34 KB FLASH, +4.7 KB RAM.
+
+### ROM — where the 59 KB goes
+
+| Component | Bytes | % |
+|---|--:|--:|
+| Zephyr kernel, drivers, libc | 27 128 | 46.0 % |
+| linker//build artefacts not attributed to a path | 10 840 | 18.4 % |
+| **`app_cbor_persondb` (all six sources)** | **7 830** | **13.3 %** |
+| `hal_nordic` | 6 034 | 10.2 % |
+| **storage stack** — `blob_db` 3 772 + `kvhash` 1 124 + `rootreg` 484 | **5 380** | **9.1 %** |
+| **zcbor** | **1 754** | **3.0 %** |
+
+The app's own split: `scenario.c` 2 266, `persondb.c` 2 098, `person_cbor.c`
+1 680, `dataset.c` 998, `ui_bench.c` 784, `main.c` 4.
+
+**The whole storage stack is 5.4 KB of ROM and CBOR adds 1.75 KB.** Nothing
+about this application is ROM-constrained.
+
+### RAM — where the 158 KB goes
+
+| Component | Bytes | % of image RAM |
+|---|--:|--:|
+| **`blob_db` `g_bbuf` + `g_bbuf_new`** | **131 072** | **83.2 %** |
+| main stack (`CONFIG_MAIN_STACK_SIZE`) | 12 288 | 7.8 % |
+| **`kvhash` `dir_buf` + `bkt_buf`** | **8 192** | **5.2 %** |
+| interrupt + idle + logging stacks | 3 136 | 2.0 % |
+| kernel objects, drivers, libc | ~2 600 | 1.6 % |
+| **the application itself (`g_db`)** | **248** | **0.16 %** |
+
+**This is finding B6, measured.** The application owns 248 bytes of RAM. Two
+`blob_db` sector buffers own 131 072 — five hundred times as much, and 83 % of
+everything the image uses — for no reason other than that the DK's QSPI part
+has 64 KB erase blocks. The streaming slot walk proposed on
+`claude/blob-db-max-payload-increase-6qobv5` would take the image from ~158 KB
+to roughly 28 KB.
+
+### Stack: sized by measurement, not by habit
+
+`prj.conf` originally carried `CONFIG_MAIN_STACK_SIZE=32768`, copied from
+`app_perf_kvdb`. Compiling with `-fstack-usage` gives the real frames, and the
+deepest chain is the write path:
+
+```
+scenario_bench 2464 + persondb_person_put 824 + kvhash_set 88
+              + blob_db_update 64 + append_slot 4200   =  7640 B
+```
+
+`append_slot` alone is **55 %** of the requirement — blob_db builds every slot
+in a `CONFIG_BLOB_DB_MAX_PAYLOAD_LEN + 46` byte **stack** frame (B5, job 3).
+12 KB gives ~1.5× margin over the measured worst case and returns 20 KB of RAM.
+Staging that slot in the existing `.bss` scratch — Stage 1 of the large-payload
+proposal — would take this application's stack requirement to about 3.5 KB.
+
+Neither target can measure peak stack at run time: `native_sim`'s main thread
+runs on a host pthread stack Zephyr never paints, so the report reads 24 B. The
+app carries the instrumentation for hardware
+(`-DCONFIG_INIT_STACKS=y -DCONFIG_THREAD_STACK_INFO=y`), where it is meaningful.
+
+### Reproducing
+
+The convenient route is the Zephyr CI image, which is what
+`.github/workflows/build.yml` uses:
+
+```
+docker run --rm -v "$PWD/..:/ws" -w /ws ghcr.io/zephyrproject-rtos/ci:latest bash -c \
+  'west init -l key_value_db && west update --narrow -o=--depth=1 && \
+   west build -p always -b nrf5340dk/nrf5340/cpuapp key_value_db/app_cbor_persondb \
+              -t ram_report'
+```
+
+Swap `ram_report` for `rom_report`, or drop `-t` for a plain build. The numbers
+above were taken with a local SDK 1.0.1 install, which gives identical results.
+
+## 5. Projected timings — nRF5340-DK (**not yet measured**)
 
 Derived from `app_perf_kvdb/RESULTS.md`: a `blob_db` read is 17.45 ms and a
 write ~21 ms on the MX25R6435F at 8 MHz Quad-SPI. Multiplying by this app's

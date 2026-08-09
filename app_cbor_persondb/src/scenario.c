@@ -536,6 +536,26 @@ int scenario_report_get(struct scenario *s, struct scenario_report *out)
 		}
 	}
 
+	/* Peak stack, when the build can measure it. Enable with
+	 *   -DCONFIG_INIT_STACKS=y -DCONFIG_THREAD_STACK_INFO=y
+	 * Worth knowing because the number is set by a library constant rather
+	 * than by this application's call depth: blob_db's append_slot() builds
+	 * every slot in a CONFIG_BLOB_DB_MAX_PAYLOAD_LEN + 46 byte stack frame
+	 * (FINDINGS.md B5, job 3). */
+/* Not on POSIX: native_sim's main thread runs on a host pthread stack that
+	 * Zephyr never paints, so the scan reports a meaningless few bytes. */
+#if defined(CONFIG_INIT_STACKS) && defined(CONFIG_THREAD_STACK_INFO) && \
+	!defined(CONFIG_ARCH_POSIX)
+	{
+		size_t unused = 0;
+
+		if (k_thread_stack_space_get(k_current_get(), &unused) == 0) {
+			out->stack_size = CONFIG_MAIN_STACK_SIZE;
+			out->stack_used = CONFIG_MAIN_STACK_SIZE - unused;
+		}
+	}
+#endif
+
 	out->credentials = creds;
 	out->logical_bytes = person_bytes;
 	out->mean_record = populated ? (uint32_t)(person_bytes / populated) : 0;

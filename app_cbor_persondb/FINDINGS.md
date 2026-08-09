@@ -314,7 +314,7 @@ that is a silent dependency, so the app carries a `BUILD_ASSERT` on
 `CONFIG_BLOB_DB_MAX_PAYLOAD_LEN` and a mount-time check of the same inequality
 against the real geometry.
 
-### B6 — 128 KB of `.bss` for sector buffers (moderate, `read`)
+### B6 — 128 KB of `.bss` for sector buffers (major, **`measured`**)
 
 `g_bbuf` and `g_bbuf_new` are each `CONFIG_BLOB_DB_SECTOR_BUF_SIZE` — 64 KB on
 the DK, so **128 KB, a quarter of the nRF5340's 512 KB RAM**, permanently
@@ -324,7 +324,29 @@ Awkward beside principle P3 ("minimum RAM usage … no caches"). It *is* O(1), b
 the constant is set by the flash part's erase-block size — the one thing the
 application cannot change.
 
-Direction: B1's short-read get would remove the need for one of the two.
+**Measured on the DK** (`RESULTS.md` §4a). The image uses 157 584 B of RAM:
+
+| | bytes | share |
+|---|--:|--:|
+| `blob_db` `g_bbuf` + `g_bbuf_new` | **131 072** | **83.2 %** |
+| main stack | 12 288 | 7.8 % |
+| `kvhash` `dir_buf` + `bkt_buf` | 8 192 | 5.2 % |
+| **the whole application** (`g_db`) | **248** | **0.16 %** |
+
+The application owns 248 bytes; the two sector buffers own five hundred times
+that, and 83 % of everything the image uses. Against it, the entire storage
+stack costs 5.4 KB of ROM — so this stack is not large, it is *RAM-shaped*, and
+shaped by a constant nobody using it can influence.
+
+The stack tells the same story from the other side. The deepest chain in this
+app is 7 640 B, and `append_slot`'s `MAX_PAYLOAD + 46` byte frame is 4 200 of
+them — **55 % of the application's stack budget is one library function's local
+buffer** (B5, job 3).
+
+Direction: B1's short-read get removes the need for the buffers entirely — the
+image would drop from ~158 KB to roughly 28 KB — and staging the slot in
+existing scratch takes the stack requirement to ~3.5 KB. Together they are worth
+more RAM than everything else in this register combined.
 
 ### B7 — First write to a fresh bucket stalls ~1.1 s (moderate, `read`)
 

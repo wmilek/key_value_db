@@ -157,6 +157,14 @@ struct scenario_report {
 	uint32_t fill_permille;   /* of the partition */
 	uint32_t mean_record;     /* mean encoded person, bytes */
 	uint32_t credentials;
+
+	/* Peak main-stack usage, when CONFIG_INIT_STACKS makes it knowable.
+	 * Worth reporting: blob_db builds every slot on the caller's stack
+	 * (CONFIG_BLOB_DB_MAX_PAYLOAD_LEN + 46 bytes of it), so the stack this
+	 * app must reserve is set by a library constant, not by its own call
+	 * depth. 0 means the build cannot measure it. */
+	size_t   stack_used;
+	size_t   stack_size;
 };
 
 /**
