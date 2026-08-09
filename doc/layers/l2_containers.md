@@ -84,6 +84,12 @@ the planned interfaces:
 **Map** — key-addressed (`map_ops`):
 `create · open · get(key) · set(key) · del(key) · has(key) · iterate`
 
+> Implemented so far (`include/app/lib/containers/shape_map.h`): the point
+> subset `create(root, map_config) · get · set · del`, plus `map_config` for
+> create-time hints (e.g. hash bucket count). `open` collapses into "resolve
+> root, then call these"; `has` is an L3 convenience over `get`; `iterate`
+> is deferred until an ordered backend (kvtree) needs it.
+
 Keys and values are opaque byte strings (`ptr + len`); key semantics (strings,
 paths, hashes) belong to L3. Concrete containers export a `const struct
 map_ops`/`seq_ops` instance; the L3 backend `choice` (P4) decides which instance
@@ -152,22 +158,29 @@ Two optimizations of the ground case, protocol unchanged:
 O(n) everything; smallest code of the Map providers. Intended for ≲ tens of
 keys, and as `kvhash`'s per-bucket representation.
 
-### 4.3 `kvhash` — k→v hash
+### 4.3 `kvhash` — k→v hash  *(implemented)*
 
-Root holds a fixed array of bucket ids; each bucket is a `kvlist` chain
-(therefore `CONTAINER_KVHASH` **selects** `CONTAINER_KVLIST`).
+Root holds a fixed array of bucket ids; each bucket is a single blob holding a
+packed pair list.
 
 ```
-root   { magic 'CKVH', nbuckets, bucket_id[nbuckets] }     nbuckets fixed at create
-bucket = kvlist pair-array node (§4.2; 0 = empty bucket, created lazily)
+root   { magic 'KVHA', nbuckets, version, bucket_id[nbuckets] }   nbuckets fixed at create
+bucket = ( u16 klen, u16 vlen, key bytes, val bytes )*            0 = empty, created lazily
 ```
 
-`nbuckets` defaults to `CONFIG_CONTAINER_KVHASH_BUCKETS` (default 64; root must
-fit one i-node payload) and is frozen into the root at `create` — no online
-resize in v1. Lookup: hash key (FNV-1a) → read root → walk one bucket chain;
-with n/nbuckets small this is O(1) average, ~2–3 flash reads. Set/del mutate one
-bucket entry node and, only when a bucket head changes, the root — one or two
-atomic updates, root last as the commit point.
+`nbuckets` comes from `map_config.initial_capacity` at `create` (default 8,
+capped so the directory fits one i-node payload) and is frozen into the root —
+no online resize in v1. Lookup: hash key (FNV-1a) → read root → scan one bucket
+blob; with n/nbuckets small this is O(1) average, ~2 flash reads. Set/del
+rewrite one bucket blob and, only when a bucket is first created, the root — one
+or two atomic updates, root last as the commit point.
+
+> **v1 implementation note.** The shipped bucket is a *self-contained packed
+> pair-list blob*, not a `kvlist` chain — so kvhash does **not** select kvlist,
+> and a bucket that outgrows one payload returns `-ENOSPC` (rather than
+> overflow-chaining). Promoting buckets to full kvlist chains (§4.2), and
+> online resize, are future revisions; the on-flash `version` byte reserves
+> room to evolve the layout.
 
 ### 4.4 `kvtree` — k→v tree
 

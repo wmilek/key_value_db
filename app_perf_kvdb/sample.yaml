@@ -1,0 +1,7 @@
+sample:
+  description: kvdb (L3) demo and performance benchmark
+  name: kvdb-perf
+common:
+  build_only: true
+tests:
+  perf.kvdb: {}
