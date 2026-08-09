@@ -192,12 +192,62 @@ directly on L1:
   a pwrite by definition (`l3_interfaces.md` §4), so this is not speculative
   generality. D4 in the contract reserved `blob_db_read` but never the write
   side.
-- **O(1) seek.** This is the decisive reason to do the chunking at L1 rather
-  than keep it in an L2 `seq` chain. A `seq` chain is a linked list: reaching
-  offset X in a 256 KB file costs up to 131 sequential blob reads. The index
-  record is a direct block table: **2 reads, independent of offset**. It is
-  the same conclusion filesystem design reached decades ago — direct block
-  pointers over FAT-style chains, for random access.
+- **O(1) seek — i.e. an index, not a chain.** The `seq` container
+  (`l2_containers.md` §4.1) is a linked list of chunk nodes: reaching offset X
+  in a 256 KB file costs up to 131 sequential blob reads. An index record is a
+  direct block table: **2 reads, independent of offset**. Same conclusion
+  filesystem design reached decades ago — direct block pointers over
+  FAT-style chains.
+
+  Note this is an argument about **index vs. chain**, *not* about where the
+  chunking lives. An index-based chunker layered above `blob_db` would seek in
+  O(1) just as well. The reasons to put it inside L1 are different ones — see
+  §3.2.
+
+### 3.2 Why inside L1 and not a layer above it
+
+The obvious alternative is a chunking module **above** `blob_db`, using only
+its public API: split the object into N ordinary blobs, keep their ids in an
+index blob, hand the caller the index blob's id. It needs no L1 change at all,
+and — as §3.1 notes — it seeks in O(1) too. The current contract in fact
+*prescribes* this (§5.4 D4: "large data is chained at L2"), so proposing to
+move it down is proposing to reverse a recorded decision. The case for doing
+so:
+
+| | **Above L1** (chunker over the public API) | **Inside L1** (this proposal) |
+|---|---|---|
+| Chunk ids | user-visible; consume the caller's id space | internal; never returned by `alloc_id` |
+| `count()` / `iterate()` | see every chunk as a blob — fsck, diagnostics and every other client see them too | see logical blobs only |
+| Crash between chunk writes and index commit | orphan blobs that L1 **cannot** identify — they carry no owner tag and look exactly like legitimate data | one idempotent rule: a `SEGMENT` slot its owner's live index does not list is garbage |
+| Reclaiming those orphans | client-side mark-and-sweep over the whole store, per client | generic sweep in `blob_db`, one implementation |
+| Who implements it | every client that needs a big value: `blobfs`, `kvdb` values, `kvhash` buckets, a grown `rootreg` | once |
+| Cost when unused | zero | zero (`BLOB_DB_LARGE_PAYLOADS=n`) |
+| On-flash format | unchanged | additive; needs a version bump (base §11-D2) |
+
+**The load-bearing row is orphan reclaim.** Above L1, the chunk blobs are
+indistinguishable from real data: nothing on flash says "this blob is chunk 7
+of blob 4711". A crash between writing the chunks and committing the index
+therefore leaks blobs that no generic mechanism can ever collect — only a
+client that remembers what it was doing can, which is precisely the
+mark-and-sweep discipline the model container documents
+(`l1_model_container.md` §4), now owed by every client that stores a large
+value. Inside L1, the segment header carries `owner_id`, so a single sweep
+that no client participates in cleans up after any crash. P7's "no permanent
+leak (must)" is satisfied structurally rather than by convention.
+
+The second row matters more than it looks: with chunking above L1,
+`blob_db_count()` on a store holding one 256 KB file reports 132, not 1, and
+`blob_db_iterate()` hands every chunk to an fsck callback that has no way to
+know what it is.
+
+**Honest counter-argument.** Keeping it above L1 preserves the narrow L1
+contract (P6) and costs the core library nothing — and if exactly one client
+ever needs large objects, "written once" is the same work either way. If the
+decision is to keep `blob_db` minimal, the coherent version of that choice is
+a **single** shared chunking module above L1 (an L1½ helper next to `rootreg`,
+not a per-client protocol), which owns the index format and the sweep, and
+which every large-value client uses. That gets rows 5 and 6 of the table but
+still cannot get rows 2–4, because it cannot tag or hide its chunks.
 
 ---
 
@@ -281,10 +331,22 @@ Decisions this adds to the six in the base proposal §11:
   Trades ~12–25 % space efficiency for graceful behaviour near full.
 - **D9 — Rank the streaming slot walk ahead of Stage 2.** It is worth more
   RAM than this entire proposal costs, and it is not coupled to it.
+- **D10 — Inside L1, or a shared chunking helper above it (§3.2).** This is
+  the layering question and it should be settled before any code. Inside L1
+  is recommended, on orphan reclaim and chunk invisibility; the fallback if
+  L1 must stay minimal is one shared L1½ module, **not** per-client chunking.
+  Either way it reverses contract D4, which currently sends large data to an
+  L2 `seq` chain.
 
 ---
 
 ## 7. Summary
+
+The proposal is to segment large payloads **inside** `blob_db`, not to add a
+chunking layer above it (§3.2) — the deciding factor is that chunks written
+above L1 are indistinguishable from real blobs, so a crash mid-write leaks
+data that no generic sweep can ever reclaim. That reverses contract D4 and is
+the decision to settle first.
 
 Making blobs large is cheap: **+2.3 KB of flash, +16 bytes of RAM per
 supported segment**, and the code size does not grow with the payload. On the
