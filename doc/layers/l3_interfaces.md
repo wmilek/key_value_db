@@ -30,7 +30,7 @@ supports as many independent instances as the caller names, each hanging off
 its own registry key. The instance name (a short string) is hashed to a 32-bit
 id and combined with the interface's FourCC magic:
 
-```c
+```none
 key = ROOTREG_KEY('KVDB', fnv1a(name));   /* one per distinct name */
 rootreg_get_or_create(key, &meta_id);     /* durable; may be freshly allocated */
 ```
