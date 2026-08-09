@@ -246,18 +246,94 @@ implemented.
 
 ## L2 — `kvhash` and the Map shape
 
-### K1 — A map tops out near 2.09 MB (major, `read`)
+### K1 — `MAX_BUCKETS` caps a map near 2.09 MB nominal, ~450 KB usable (major, `read`)
 
-The directory must fit one blob payload, so `n_buckets ≤ (MAX_PAYLOAD − 8)/8 =
-511`, and each bucket's packed list must also fit one payload. Capacity is
-`MAX_PAYLOAD × (MAX_PAYLOAD − 8)/8 ≈ 2.09 MB`.
+**Where the number comes from.** The directory is one blob, laid out as
 
-> `kvhash.c:45-50`
+```
+[u32 magic 'KVHA'] [u16 n_buckets] [u16 version] [u64 bucket_id] × n
+```
 
-Impact: 10 000 person records (~3.6 MB) **cannot live in one map**. The app
-shards across eight, and implements its own fan-out. Nothing in L2 or L3 helps:
-naming, hashing, fan-out and per-shard capacity accounting are all the
-application's problem (V4).
+so `dir_len(n) = 8 + 8n` and the bound is
+`MAX_BUCKETS = (MAX_PAYLOAD − 8)/8`. At `MAX_PAYLOAD` 4096 that is **511**, and
+`dir_len(511) = 4096` exactly — 511 is simply the largest `n` whose directory
+still fits one payload.
+
+> `kvhash.c:12-14` (layout), `:47` (bound), `:111-114` (`dir_len`)
+
+Note what is *not* the limit: `n_buckets` is stored as a **u16**, so the
+on-flash format already allows 65 535 buckets. Only the "directory is one blob"
+rule binds. Lifting it needs no format break.
+
+**Capacity is quadratic in the payload size**, because the same symbol sets both
+factors (B5):
+
+| `MAX_PAYLOAD` | `MAX_BUCKETS` | directory | nominal map capacity |
+|---|---|---|---|
+| 256 — **the Kconfig default** | 31 | 256 B | **7.9 KB** |
+| 1024 — what `app_perf_kvdb` uses | 127 | 1016 B | 130 KB |
+| 2048 | 255 | 2040 B | 522 KB |
+| 4096 — the Kconfig maximum | 511 | 4088 B | 2.09 MB |
+
+The out-of-the-box configuration gives a map holding **7.9 KB** — and with
+`DEFAULT_BUCKETS = 8` (K9's NULL-config path) a map holding **2 KB**.
+
+**Nominal capacity is not usable capacity.** 2.09 MB assumes every bucket packs
+perfectly full. Real load is compound Poisson, and a bucket overflows at 4096 B
+(K2), so the safe entry count is set by the *tail*. Solving
+`λe + 5.5·√(λ(e² + s²)) ≤ 4096` for a 511-bucket map:
+
+| entry size | safe entries/map | usable bytes | of nominal |
+|---|---|---|---|
+| 16 B | ~92 900 | 1.49 MB | 71 % |
+| 64 B | ~16 700 | 1.07 MB | 51 % |
+| **23 B** — this app's credentials | **~60 400** | **1.39 MB** | **66 %** |
+| 256 B | ~2 260 | 578 KB | 28 % |
+| **362 B** — this app's persons | **~1 280** | **463 KB** | **22 %** |
+| 1024 B | ~216 | 221 KB | 11 % |
+| 2048 B | ~60 | 123 KB | 6 % |
+
+So a `kvhash` map holds **~1 280 person records, not the ~5 700 the nominal
+figure suggests** — the tail costs 4×, and the loss grows with entry size
+because `MAX_BUCKETS` cannot rise to compensate (K3: it cannot rise at all).
+This is the table an application actually needs, and no layer provides it.
+
+**Impact here.** 10 000 person records cannot live in one map, or in two, or in
+four. The app shards across eight and writes its own fan-out; naming, hashing
+and per-shard capacity accounting are all its problem (V4).
+
+**Direction — stop storing bucket ids.** The directory exists only because each
+bucket's id is whatever `blob_db_alloc_id()` returned when that bucket was first
+touched. If instead a map allocated its bucket ids **contiguously at create
+time** and derived them,
+
+```c
+bucket_id = base_id + (fnv1a(key) % n_buckets);
+```
+
+then the whole directory collapses to `{magic, version, n_buckets, base_id}` —
+**16 bytes, fixed** — and:
+
+- `MAX_BUCKETS` disappears; bucket count is bounded only by the u16 field
+  (K1, K3);
+- there is no directory to rewrite when a bucket is created (**K5**, ~15 MB of
+  writes in this app's fill);
+- lazy creation still works for free — an allocated-but-unbound id already reads
+  back as `-ENOENT`, which is exactly "empty bucket", so the presence flag the
+  directory was carrying is redundant;
+- every operation loses a flash read (**K11**).
+
+`alloc_id()` is a RAM operation whose only cost is advancing the durable ceiling
+every 256 ids, so reserving 511 up front is two master writes. The contract
+explicitly supports it: *"an allocated-but-unbound id is durable — a later mount
+never re-issues it."*
+
+A cheaper half-measure, for the record: the directory spends **8 bytes per
+bucket** on a u64 id in a store whose ids start at 2 and increase by one. Four
+bytes would double `MAX_BUCKETS` to 1022 and capacity to 4.2 MB — but it would
+cap the store at 2³² lifetime allocations, and the "no reuse" contract is u64 on
+purpose. Not recommended; noted because it shows how much of the 4 KB directory
+is unused range.
 
 ### K2 — Overflow is per-bucket and depends on entry-size variance (major, `read`)
 
@@ -432,6 +508,38 @@ This is the finding that makes K2 expensive rather than merely present: a
 `map_ops.stat(root)` returning entry count and peak bucket occupancy would let
 an application size to a measured tail instead of a guessed one, and would turn
 K2 from a cliff into a gauge.
+
+### K11 — The directory is re-read from flash on every single operation (major, `read`)
+
+`kvhash_get`, `kvhash_set` and `kvhash_del` all open with `dir_load(root, &n)`,
+which is a `blob_db_get(root)` — and by B1 that is a **whole 64 KB sector read**
+before the operation has even located its bucket.
+
+> `kvhash.c:117-143` (`dir_load`), called at `:219`, `:265`, `:339`
+
+So **every map operation costs at least two `blob_db` operations**, and the
+first of them exists only to look up an integer. That is the whole reason a map
+get is 34.9 ms rather than 17.5 ms, and it is half of R-D's 4-sector-read
+`check` path — this app pays 128 KB of the 256 KB it reads per access decision
+purely to learn two bucket ids.
+
+The obvious reply is to cache the directory, and P3 ("no caches") is why it is
+not. But the tension is narrower than it looks: the directory is 4 KB, is
+immutable except when a bucket is *created*, and there are only as many of them
+as there are open maps. `kvdb_t` already keeps `{root, ops}` in RAM across
+calls, so keeping the directory beside it is the same pattern at a larger
+constant — 4 KB per map, 36 KB for this app's nine.
+
+The derived-bucket-id design in K1 makes the argument moot instead of winning
+it: with `bucket_id = base_id + hash % n_buckets` the per-map state is
+**16 bytes**, small enough to live in the handle without anyone calling it a
+cache, and the directory read disappears. **A map get becomes one sector read
+instead of two — R-D's cost halves**, with no denormalization, no index, and no
+change to the on-flash format beyond the root record's own layout.
+
+This is the strongest single conclusion in this register: `MAX_BUCKETS` (K1),
+the directory rewrites (K5), and half of every read (K11) are all the same
+decision — storing bucket ids that could have been computed.
 
 ---
 
