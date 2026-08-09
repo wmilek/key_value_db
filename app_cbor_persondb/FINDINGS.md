@@ -24,6 +24,62 @@ friction.
 
 ---
 
+## Cross-reference — the large-payloads proposal
+
+Branch `claude/blob-db-max-payload-increase-6qobv5` proposes Stage 1
+(housekeeping) and Stage 2 (segmented payloads) for `blob_db`, plus a revised
+ordering in its cost addendum. Reviewed 2026-08-09 against this register.
+
+| Finding | Proposal's effect |
+|---|---|
+| **B1** whole-sector reads | **Fixed** — cost addendum §3 mitigation 3, the streaming slot walk: "cuts read amplification to ~1×". Ranked #2, ahead of Stage 2 itself. |
+| **B6** 128 KB `.bss` | **Fixed** by the same change — "`.bss` on the QSPI board from 128 KB to ~1 KB". |
+| **B5** one symbol, five jobs | **Partly.** Fixes job 3 (`append_slot` staged in `.bss`, not a `MAX_PAYLOAD` stack frame) and job 1 (mount-time bound instead of a Kconfig `range`). Deliberately does **not** touch job 4 — `MAX_PAYLOAD → MAX_BUCKETS` is left alone, and the companion note says so explicitly. |
+| **B9** no payload-vs-sector check | **Fixed** — Stage 1 item 3, and §1.1 sharpens it (see B10). |
+| **B8** permanent orphan leak | **Partly.** Introduces exactly the machinery B8 asks for — an owner-tagged segment plus a mount-time sweep — but only for L1's own segments. Application-level orphans (this app's nine map roots) are still uncollectable. Its §3.2 argues the general case cannot be solved above L1, which is the same conclusion from the other side. |
+| **K1** `MAX_BUCKETS` cap | **Partly**, as an explicit non-goal followed by a follow-up sketch: a pread directory lifts the cap. See the caveat below. |
+| **K5** directory rewrite | **Partly**, same sketch — and only when the directory is large enough to segment. |
+| **K7** shared scratch buffers | **Halved** — `dir_buf` disappears under the pread directory. |
+| **K11** directory read per op | **Not fixed; arguably worsened.** See below. |
+| **B2** five erases per compaction, **B3** no introspection, **B4** O(n²) walks, **B7** `prepare()` sizing, **K2** bucket overflow, **K3** fixed bucket count, **K4** bucket rewrite amplification, **K6** no iteration, **K9** silent clamp, **K10** no `stat`, **V1**–**V4** | **Untouched.** Out of scope, and the companion note is explicit that `kvhash` needs no change. |
+
+**Where I disagree — the pread directory and K11.** The companion note's
+follow-up replaces `dir_bucket(idx)` with
+`blob_db_read(root, 8 + idx*8, &id, 8)` and concludes that the directory "never
+needs to be resident", removing the bucket cap. The RAM claim is right. The
+access-cost claim does not follow:
+
+- an **inline** directory still costs one bucket read to locate the slot, so
+  pread saves RAM and nothing else;
+- a **segmented** directory costs index-read + segment-read = **two** flash
+  operations where today's whole-blob get costs one (the proposal's own §6.8
+  gives pread as 2 reads).
+
+So a map get goes from 2 flash operations to 2 or 3, never to 1. The same
+applies to `dir_set_bucket` → `blob_db_write`: NOR cannot program a programmed
+byte back up, so an 8-byte pwrite still appends a fresh slot — the whole
+directory if inline, one segment if not. K5 improves only in the segmented
+case, and not by much.
+
+The derived-bucket-id design in **K1** reaches further for less: allocate the
+bucket ids contiguously at create time, compute
+`bucket_id = base_id + hash % n_buckets`, and the directory becomes 16 fixed
+bytes that live in the map handle. Bucket cap gone (K1), rewrite gone entirely
+(K5), `dir_buf` gone (K7), **and the directory read gone (K11) — one flash
+operation per map get instead of two.** It needs no large-payload support, no
+new API and no format break beyond the root record, so it is independent of
+this proposal and cheaper than its follow-up. Worth putting to the proposal's
+author as an alternative to the pread-directory sketch.
+
+**Sequencing.** Stage 1 is a deliberate, breaking on-flash format change. If it
+lands after this app, existing stores — including a completed 10 000-person
+fill — are unreadable and must be repopulated, at ≈ 2.5 h. Landing Stage 1
+first is worth ~130 KB of RAM and ~2× on every read to this app, and would move
+the numbers in `RESULTS.md` substantially, so **the measurements should be
+taken after it, not before.**
+
+---
+
 ## L1 — `blob_db`
 
 ### B1 — Every operation reads a whole sector (major, `read`)
@@ -201,6 +257,53 @@ writes a large enough blob, after compacting a bucket for nothing.
 
 Direction: check it at mount, where `peb_size` is known, and fail with
 `-ENOTSUP` like the sector-size check immediately above it.
+
+### B10 — A payload above half a sector can be written once but never rewritten (major, `read`)
+
+*Found by `doc/proposals/2026-08-09-large-payloads.md` §1.1 on branch
+`claude/blob-db-max-payload-increase-6qobv5`; recorded here because it bounds
+this application.*
+
+B9 is about binding a payload once. **Rebinding is twice as strict.** A bucket
+is an append-only log, so an update appends a second slot beside the live one;
+if that overflows, `compact_bucket()` runs, and the compacted image still
+contains the live slot. Room for both is therefore required:
+
+```
+sustainable max = ⌊(peb_size − 16)/2⌋ − 14
+                = 2 026 B   on 4 KB sectors
+                = 32 746 B  on 64 KB sectors
+```
+
+Above it the first `update` succeeds and every later one returns `-ENOSPC`
+(`blob_db.c:963`) — a blob that can be created but not changed, which the
+contract's "id stability" clause says should not exist.
+
+**On the default 4 KB geometry, `CONFIG_BLOB_DB_MAX_PAYLOAD_LEN=4096` is
+therefore doubly wrong**: 4096 exceeds even the write-once ceiling of 4066
+(B9), and anything above 2026 is write-once in practice. The Kconfig `range`
+permits both.
+
+Generalized, the rule this app has to respect is per *`blob_db` bucket*, not
+per blob: after compaction a sector holds all its live slots, and an update
+needs room for one more copy of the blob being rewritten —
+
+```
+live_bytes(bucket) + slot_size(largest blob) ≤ peb_size − 16
+```
+
+With 4 KB blobs in a 64 KB sector that allows ~94 % occupancy, so this app's
+~53 % is comfortable. But it means **the store's maximum safe fill is a
+function of its largest blob**, which no layer reports (B3) — one more number
+an application must derive for itself.
+
+**Consequence for this application:** built on plain `native_sim` (4 KB
+sectors) with `MAX_PAYLOAD_LEN=4096`, `kvhash` bucket blobs above 2026 B would
+become unrewritable and the fill would fail confusingly. The app's `native_sim`
+overlay sets a 64 KB erase-block size to mirror the DK, which avoids it — but
+that is a silent dependency, so the app carries a `BUILD_ASSERT` on
+`CONFIG_BLOB_DB_MAX_PAYLOAD_LEN` and a mount-time check of the same inequality
+against the real geometry.
 
 ### B6 — 128 KB of `.bss` for sector buffers (moderate, `read`)
 
