@@ -117,6 +117,10 @@ int kvdb_set(kvdb_t *db, const char *key, const void *val, size_t len);
 /**
  * @brief Fetch the value for @p key.
  *
+ * @param db      open handle
+ * @param key     NUL-terminated key
+ * @param out     (out) buffer the value is copied into
+ * @param out_sz  capacity of @p out, in bytes
  * @param out_len (out, optional) true value length (set even on -ENOMEM)
  *
  * @retval 0        found; value copied into @p out
