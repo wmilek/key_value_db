@@ -162,11 +162,21 @@ container but a statistical property of *the application's key hash and
 value-size distribution*, which the application must work out itself.
 
 Concretely: the same 511-bucket map holds 25 000 credential entries (23 B)
-comfortably but only ~5 600 person entries (362 B). Sizing the people shards
-meant computing a Poisson tail by hand — `DESIGN.md` §6.
+comfortably but only a few thousand person entries (362 B).
 
-Direction: bucket splitting, an overflow chain, or simply reporting per-bucket
-occupancy so an application can see the cliff coming.
+**The evidence is the over-provisioning, not a failure.** Per `DESIGN.md` D11
+the app stays inside the limit rather than working around it — no overflow
+chains, no retry-on-`-ENOSPC`. But because there is no per-bucket occupancy
+query (K10) and no growth path (K3), the margin has to be chosen **blind and up
+front**, and getting it wrong surfaces as `-ENOSPC` hours into a fill. That
+forces a 5.5 σ margin: **eight people maps where four would have held the
+bytes**, mean bucket load 22 % of capacity. Half the provisioned capacity buys
+nothing but ignorance of the tail. The compound-Poisson table is in
+`DESIGN.md` §6.1; that an application has to compute one at all is the finding.
+
+Direction: bucket splitting, an overflow chain, or — cheapest and most useful —
+simply reporting per-bucket occupancy so an application can see the cliff coming
+and size to 3 σ instead of 5.5 σ.
 
 ### K3 — `n_buckets` is fixed at create time (major, `read`)
 
@@ -236,8 +246,13 @@ finds out as a `-ENOSPC` (K2) some hours into a fill.
 ### K10 — No entry count or size on a map (moderate, `read`)
 
 `map_ops` has `create`/`get`/`set`/`del` and nothing else. An application cannot
-ask how many entries a map holds or how close a shard is to K2's cliff, so it
-cannot decide when to add a shard. With K6 it cannot even count them by walking.
+ask how many entries a map holds or how close a bucket is to K2's cliff, so it
+cannot decide when to add a map. With K6 it cannot even count them by walking.
+
+This is the finding that makes K2 expensive rather than merely present: a
+`map_ops.stat(root)` returning entry count and peak bucket occupancy would let
+an application size to a measured tail instead of a guessed one, and would turn
+K2 from a cliff into a gauge.
 
 ---
 
@@ -309,7 +324,9 @@ lacks.
 
 Findings that need the running app before they can be stated honestly:
 
-- actual `-ENOSPC` rate from K2 at 10 000 persons (F11 counts them);
+- whether the §6.1 sizing rule holds — a single `-ENOSPC` during a full fill
+  means it did not, and the margin needed is larger still (F11 counts them,
+  A8 asserts zero);
 - whether the fill matches the ≈ 2.5 h estimate, and how much of it is B2;
 - compaction behaviour and latency spikes at ~50 % occupancy;
 - whether CBOR encode/decode is measurable at all next to B1 (expected: no);

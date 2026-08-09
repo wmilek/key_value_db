@@ -1,6 +1,6 @@
 # `app_cbor_persondb` — CBOR person/credential database
 
-Status: **v0.3 — requirements settled; design proposal open for review.**
+Status: **v0.4 — requirements settled; design proposal open for review.**
 Implementation has not started.
 
 The design document for this test application, kept beside the code it
@@ -10,7 +10,7 @@ describes. Governed by `doc/principles.md` · consumes the stack in
 | | |
 |---|---|
 | Application | `app_cbor_persondb/` |
-| This document | requirements (§1–§6) → design proposal (§7–§13) → as-built notes |
+| This document | requirements (§1–§6) → design proposal (§7–§14) → as-built notes |
 | `FINDINGS.md` | the flaw/limitation register — the *probe* output |
 | `README.md` | the good-practices guide (R-F) — the *showcase* output |
 | `RESULTS.md` | measured numbers, `native_sim` and nRF5340-DK |
@@ -30,16 +30,20 @@ the other:
 
 One rule keeps them compatible:
 
-> **No premature optimization.** The app implements the natural, idiomatic
-> design. Where that design performs badly, the number is measured and recorded
+> **No premature optimization, and no fighting the implementation.** The app
+> implements the natural, idiomatic design and stays inside the limits it is
+> given. Where that design performs badly, the number is measured and recorded
 > as a finding — it is *not* engineered around. Working around a weakness hides
-> it, and hiding it defeats job 2.
+> it, and hiding it defeats job 2. Running deliberately at a limit to make it
+> fail is the same mistake from the other side: it produces a failure the app
+> provoked rather than one a product would hit.
 
 The line: a *good practice* is using the API correctly (choosing the right
-layer, ordering writes so a crash fails safe, keeping keys regenerable, opening
-handles once). A *workaround* is a contortion that exists only because a layer
-underperforms (caching, denormalizing, shadow indexes). The app does the first
-and records the second in `FINDINGS.md` as an unimplemented mitigation.
+layer, sizing inside the documented capacity, ordering writes so a crash fails
+safe, keeping keys regenerable, opening handles once). A *workaround* is a
+contortion that exists only because a layer underperforms (caching,
+denormalizing, shadow indexes, overflow chains). The app does the first, and
+records the second in `FINDINGS.md` as an unimplemented mitigation.
 
 The domain is physical access control:
 
@@ -52,9 +56,14 @@ The domain is physical access control:
 In scope:
 
 - one test application in `app_cbor_persondb/`, built for `native_sim` and
-  `nrf5340dk/nrf5340/cpuapp`, picked up by `west twister -T app_cbor_persondb`;
-- an **internal Person Access API** (§8) that the rest of the application is
-  written against — the app's own domain contract, not a new library;
+  `nrf5340dk/nrf5340/cpuapp`;
+- a **person management API** internal to the application (§8) — the domain
+  contract, not a new library;
+- a **scenario layer** above it (§9) holding everything a caller does *with* a
+  population — fill, verify, mutate, measure — so that the frontends stay thin;
+- **two frontends** over that layer, selected by Kconfig and built as separate
+  `sample.yaml` scenarios (§10): an interactive shell and an automatic
+  benchmark;
 - the good-practices guide (`README.md`), findings register (`FINDINGS.md`) and
   reference numbers (`RESULTS.md`).
 
@@ -63,10 +72,9 @@ Out of scope:
 - **No changes to `lib/` or `include/app/lib/`.** The app is a *client*. A
   limitation it hits is written down, not patched around by editing the
   library. Fixes are follow-up work driven by `FINDINGS.md`.
-- No new container or L3 interface. The internal API of §8 lives in the
-  application; whether any of it deserves promotion into `lib/` is a question
-  `FINDINGS.md` raises, not one this app answers.
-- No reader hardware; credentials arrive as strings from a synthetic dataset.
+- No new container or L3 interface. Whether any of §8 deserves promotion into
+  `lib/` is a question `FINDINGS.md` raises, not one this app answers.
+- No reader hardware; credentials are strings from a synthetic dataset.
 - Not a security product. Access decisions are demonstrated, not hardened.
 
 ## 3. Stakeholder requirements
@@ -82,7 +90,9 @@ Out of scope:
 | **R-E** | Demonstrate performance with the database at **~50 % of the external flash on the DK** — 4 MiB of an 8 MiB MX25R6435F. |
 | **R-F** | Delivered as a **set of good practices** for using the system. |
 | **R-G** | Any drawback visible in a lower layer is **recorded as a finding**. |
-| **R-H** | The person-access functionality is an **API internal to the application**. It may build on **L2** rather than being confined to L3. |
+| **R-H** | The person-management functionality is an **API internal to the application**. It may build on **L2** rather than being confined to L3. |
+| **R-I** | A **separate layer** sits between that API and the test using it, so more than one frontend can share it. |
+| **R-J** | Stay **inside** the implementation's limits: size the dataset to what fits rather than working around a capacity ceiling. |
 
 ## 4. Constraints the existing stack imposes
 
@@ -91,24 +101,26 @@ Read out of the tree and the existing hardware captures, not assumed.
 | Id | Constraint | Source |
 |---|---|---|
 | **C1** | `kvhash` is the only implemented Map provider and `kvdb` the only L3 interface. No ordered iteration, no `foreach`, at either layer. | `lib/kvdb/kvdb.c`, `doc/layers/l3_interfaces.md` §3 |
-| **C2** | A `kvhash` instance holds at most `(MAX_PAYLOAD−8)/8` buckets of `MAX_PAYLOAD` bytes. `CONFIG_BLOB_DB_MAX_PAYLOAD_LEN` is capped at 4096 → **511 buckets × 4 KB ≈ 2.09 MB per map**. | `kvhash.c:45-50`, `lib/blob_db/Kconfig` |
+| **C2** | A `kvhash` map holds at most `(MAX_PAYLOAD−8)/8` buckets of `MAX_PAYLOAD` bytes. `CONFIG_BLOB_DB_MAX_PAYLOAD_LEN` is capped at 4096 → **511 buckets × 4 KB ≈ 2.09 MB per map**, and a *single bucket* is the real limit: it overflows at 4 KB of packed entries regardless of how empty the store is. | `kvhash.c:45-50,291`, `lib/blob_db/Kconfig` |
 | **C3** | One `kvhash` entry costs `4 + klen + vlen` and must fit a single payload. | `kvhash.c:291` |
-| **C4** | Every `blob_db` operation reads a **whole sector** — 64 KB on the DK — so per-op cost is essentially independent of payload size. Measured: 16.9 ms/read; `kvdb_get` ≈ **34.9 ms**, `kvdb_set` ≈ **55.9 ms**. | `blob_db.c:870,928,990,1052`; `app_perf*/RESULTS.md` |
+| **C4** | Every `blob_db` operation reads a **whole sector** — 64 KB on the DK — so per-op cost is essentially independent of payload size. Measured: 16.9 ms/read; a map get ≈ **34.9 ms**, a map set ≈ **55.9 ms**. | `blob_db.c:870,928,990,1052`; `app_perf*/RESULTS.md` |
 | **C5** | A `blob_db` bucket is one sector; a blob lands in `id % n_buckets`. 8 MiB / 64 KB = 128 − 3 reserved = **125 buckets**. | `blob_db_internal.h` |
 | **C6** | Compacting one bucket costs **five 64 KB erases**; one erase measured at ~1.1 s. | `compact_commit()`; `app_perf_kvdb/RESULTS.md` |
-| **C7** | Single-threaded: the caller serializes every call across every open instance — including across *different* handles, since `kvhash` scratch buffers are file-scope. | `blob_db.h`; `kvhash.c:54-55` |
+| **C7** | Single-threaded: the caller serializes every call across every open map — including across *different* roots, since `kvhash` scratch buffers are file-scope. | `blob_db.h`; `kvhash.c:54-55` |
 | **C8** | Each `blob_db_update`/`delete` is individually atomic; **no multi-key or multi-blob transaction**. | `blob_db.h` §atomicity |
 | **C9** | No occupancy or geometry introspection at any layer: no partition size, sector size, free space, fill level, or per-map entry count. | `blob_db.h`, `shape_map.h` |
 | **C10** | `CONFIG_ROOTREG_MAX_ROOTS` defaults to **8**. | `lib/rootreg/Kconfig` |
 
 Consequences that drive the design:
 
-- **C2 ⇒** 10 000 person records (~3.6 MB) do not fit one map. The app must
-  shard, and nothing in L2 or L3 helps it do so.
+- **C2 ⇒** 10 000 person records (~3.6 MB) do not fit one map, and per-R-J the
+  answer is to spread them over enough maps that every bucket sits well inside
+  4 KB — not to add overflow handling. §6 does that arithmetic.
 - **C8 ⇒** a person record and its credential-index entries cannot be updated
   together atomically. The app must define an ordering that fails safe.
-- **C9 ⇒** the app cannot ask the stack how full it is; R-E reporting has to be
-  reconstructed from devicetree plus the app's own accounting.
+- **C9 ⇒** the app cannot ask the stack how full it is, or how close a bucket is
+  to C2's ceiling. R-E reporting is reconstructed from devicetree plus the app's
+  own accounting, and margin has to be chosen blind — see §6.
 
 ## 5. Derived functional requirements
 
@@ -116,17 +128,19 @@ Consequences that drive the design:
 |---|---|---|
 | **F1** | Person records are CBOR, keyed by person id. | R-A, R-B, R-C1 |
 | **F2** | The schema carries id, display fields, a validity window, a PIN hash, permissions as an **array of text strings**, and card IDs as an **array of text strings**. | R-C2, R-C3 |
-| **F3** | A **credential index** maps card ID → person id, because without it a card cannot be resolved at all (C1: no iteration). It stores the person id and nothing else. | R-D, no-premature-optimization |
+| **F3** | A **credential index** maps card ID → person id, because without it a card cannot be resolved at all (C1). It stores the person id and nothing else. | R-D, no-premature-optimization |
 | **F4** | The person record is the single authoritative copy of permissions. | correctness |
 | **F5** | Card assignment writes the person record **first**, the index **second**; revocation deletes the index **first**, the person **second**. Either crash point leaves a *deny*. | C8, P7 |
 | **F6** | Every record is a pure function of its index, so any record is re-derivable and verifiable without shadow state. | C1, P3 |
-| **F7** | Scale is 10 000 persons (Kconfig), sized so live content lands near 4 MiB. | R-E |
+| **F7** | Scale is 10 000 persons (Kconfig), spread over enough maps that no bucket approaches C2's ceiling. | R-E, R-J |
 | **F8** | Population is batched and **resumable across reboots** with committed progress; replay of an interrupted batch is idempotent. | R-E fill time, P7 |
-| **F9** | Every run after the fill verifies a deterministic sample against the generator, mutates a bounded subset, and re-verifies — proving what the *previous boot* wrote. | P8 |
-| **F10** | The run reports per-phase timings, achieved size in bytes and per cent, and **read/write amplification**. | R-E, R-G |
-| **F11** | Failures that reveal a limit (`-ENOSPC` from a full `kvhash` bucket) are **counted and reported**, not fatal. | R-G |
-| **F12** | All application code above the storage layer speaks only the internal Person Access API (§8) — domain vocabulary, no keys, no shards, no CBOR, no ids. | R-H |
+| **F9** | A run verifies a deterministic sample against the generator, mutates a bounded subset, and re-verifies — proving what the *previous boot* wrote. | P8 |
+| **F10** | Per-phase timings, achieved size in bytes and per cent, and **read/write amplification** are reported. | R-E, R-G |
+| **F11** | `-ENOSPC` from a full bucket is **counted and reported**, never fatal. It is not an expected path (F7 sizes it away); if it fires, the sizing rule in §6 was wrong and that is the finding. | R-G |
+| **F12** | Application code above the person management API speaks only domain vocabulary — no keys, shards, blob ids or CBOR. | R-H |
 | **F13** | The whole database is reachable from **one** registry key, via an app-owned superblock. | P5, R-H |
+| **F14** | Everything done *with* a population — fill, verify, mutate, benchmark, report — lives in the scenario layer (§9), not in a frontend. | R-I |
+| **F15** | The frontends contain no storage or dataset logic; each is argument parsing and printing over §9. | R-I |
 
 ## 6. Dataset sizing
 
@@ -145,7 +159,7 @@ person record, CBOR map with 9 integer-keyed pairs
   8 permissions  [tstr]      226 B      10..22 strings, mean 16, ~13 B each
   9 cards        [tstr]     39.5 B      1..4 strings, mean 2.5, 14 hex chars
                             -------
-                            ~349.5 B
+                            ~349.5 B     (worst case ~660 B)
 ```
 
 | | |
@@ -159,20 +173,42 @@ person record, CBOR map with 9 integer-keyed pairs
 
 R-E is met by the realistic record — the outcome we wanted.
 
-**Shard count** follows from C2/C3 plus the hash distribution. With 511 buckets
-per map, `S` people shards give a mean of `10000/(511·S)` entries per bucket; a
-bucket overflows past ~11 person entries. At `S = 8` the mean is 2.45 and the
-expected number of buckets reaching 12 is 0.03 — safe, with the tail handled by
-F11 rather than by extra margin. Credentials are small enough that all 25 000
-fit **one** map (mean 49 entries ≈ 1.1 KB per bucket).
+### 6.1 Sizing to fit (R-J)
 
-That asymmetry — the same 511-bucket map holds 25 000 small entries comfortably
-but only ~5 600 large ones — is finding **K2**.
+C2's real limit is not the 2.09 MB per map, it is the **4 KB per bucket**: a
+bucket overflows while the store is nearly empty, and nothing warns first
+(K2, K10). The app therefore picks a map count that keeps every bucket far from
+that edge, and does not attempt to run near it.
 
-**Cost of the fill.** 35 000 map writes at ~55.9 ms ≈ 33 min, plus ~37 MB of
-appended bytes driving ~1 250 compactions at ~5.7 s ≈ 2 h. **One-time
-population on the DK is therefore ≈ 2.5 h.** Not designed around; it is
-findings **B1/B2/K4/K5**, and it is why F8 exists.
+Bucket load is compound Poisson — a Poisson number of entries, each of variable
+size. With `S` people maps of 511 buckets and 10 000 persons:
+
+| `S` | mean entries/bucket | mean bytes | σ bytes | headroom to 4 KB | expected overflows |
+|---|---|---|---|---|---|
+| 4 | 4.89 | 1 772 | 824 | 2.8 σ | ~4 buckets |
+| 6 | 3.26 | 1 181 | 673 | 4.3 σ | ~0.3 buckets |
+| **8** | **2.45** | **885** | **583** | **5.5 σ** | **~0.03 buckets** |
+
+**Eight people maps**, mean bucket load 22 % of capacity. All 25 000 credential
+entries (23 B) fit **one** map — mean 49 entries ≈ 1.1 KB per bucket, 27 % — so
+nine maps in total.
+
+Two things worth stating plainly:
+
+- The asymmetry is the finding: the same 511-bucket map holds 25 000 small
+  entries comfortably but only a few thousand large ones (**K2**).
+- Choosing 5.5 σ rather than 3 σ is not caution for its own sake. Because there
+  is no per-bucket occupancy query (**K10**) and no growth path (**K3**), the
+  margin must be picked *blind and up front*, and the penalty for getting it
+  wrong is discovering `-ENOSPC` hours into a fill. **Over-provisioning is what
+  the API's lack of introspection costs**, and that cost — 8 maps where 4 would
+  have held the bytes — is the measurement, not a workaround.
+
+### 6.2 Cost of the fill
+
+35 000 map writes at ~55.9 ms ≈ 33 min, plus ~37 MB of appended bytes driving
+~1 250 compactions at ~5.7 s ≈ 2 h. **One-time population on the DK is ≈ 2.5 h.**
+Not designed around; it is findings **B1/B2/K4/K5**, and it is why F8 exists.
 
 ---
 
@@ -187,160 +223,189 @@ app_cbor_persondb/
 ├── boards/  native_sim.{conf,overlay}
 │            nrf5340dk_nrf5340_cpuapp.{conf,overlay}
 └── src/
-    ├── access.h        THE INTERNAL API (§8) — domain vocabulary only
-    ├── access.c        its implementation on L2 + rootreg + blob_db (§9)
+    ├── main.c            starts the selected frontend, nothing else
+    ├── ui_bench.c        frontend: automatic run          (FRONTEND_BENCH)
+    ├── ui_shell.c        frontend: interactive commands   (FRONTEND_SHELL)
+    ├── scenario.h/.c     §9 — operations on a whole population
+    ├── persondb.h/.c     §8 — the person management API
     ├── person_cbor.h/.c  CBOR codec (zcbor). Knows nothing about storage.
-    ├── dataset.h/.c    pure generator: index → person. Knows nothing about
-    │                   storage or CBOR.
-    └── main.c          phases, benchmarks, reporting. Calls only access.h.
+    └── dataset.h/.c      pure generator: index → person. Knows nothing about
+                          storage or CBOR.
 ```
 
-Four modules with one dependency direction, mirroring the stack's own P6:
+Four layers inside the application, one dependency direction, mirroring P6:
 
 ```
-main.c ──► access.h ──► access.c ──► kvhash map_ops ──► rootreg ──► blob_db
-              ▲                └────► person_cbor ◄──── dataset
-              └── dataset (to build inputs and to verify outputs)
+  ui_bench.c   ui_shell.c          frontends — parse and print only (F15)
+        └──────┬──────┘
+          scenario.h                populations: fill, verify, mutate, measure
+               │                                                        (F14)
+          persondb.h                domain: persons, cards, permissions,
+               │                    decisions                       (F12/R-H)
+    ┌──────────┴──────────┐
+ person_cbor.h        dataset.h     codec            generator
+          │
+   kvhash map_ops ─► rootreg ─► blob_db               the stack
 ```
 
-`main.c` never sees a key, a shard, an id or a CBOR byte. That separation is
-itself a demonstrated practice, and it is what makes the storage layout in §9
-replaceable without touching the benchmark or the verification logic.
+Each boundary is narrow enough to be replaceable: swapping CBOR for another
+encoding touches `person_cbor` only; swapping the storage layout touches
+`persondb.c` only; adding a third frontend touches neither.
 
-## 8. The internal Person Access API (R-H)
+## 8. The person management API (R-H)
 
-`src/access.h`. Domain operations only — no storage vocabulary escapes it.
+`src/persondb.h`. Domain operations only — no storage vocabulary escapes it.
 
 ```c
-struct access_person {                   /* fixed capacity, no heap (P2/P3) */
+struct persondb_person {                 /* fixed capacity, no heap (P2/P3) */
         uint32_t id;
-        char     name [ACCESS_NAME_MAX  + 1];
-        char     dept [ACCESS_DEPT_MAX  + 1];
-        char     title[ACCESS_TITLE_MAX + 1];
-        uint32_t valid_from, valid_until;      /* epoch seconds */
+        char     name [PERSONDB_NAME_MAX  + 1];
+        char     dept [PERSONDB_DEPT_MAX  + 1];
+        char     title[PERSONDB_TITLE_MAX + 1];
+        uint32_t valid_from, valid_until;          /* epoch seconds */
         uint8_t  pin_hash[16];
         uint8_t  n_perms;
-        char     perm[ACCESS_PERMS_MAX][ACCESS_PERM_MAX + 1];
+        char     perm[PERSONDB_PERMS_MAX][PERSONDB_PERM_MAX + 1];
         uint8_t  n_cards;
-        char     card[ACCESS_CARDS_MAX][ACCESS_CARD_LEN + 1];
+        char     card[PERSONDB_CARDS_MAX][PERSONDB_CARD_LEN + 1];
 };
 
-enum access_decision {
-        ACCESS_GRANTED, ACCESS_DENIED, ACCESS_UNKNOWN_CARD, ACCESS_EXPIRED,
+enum persondb_decision {
+        PERSONDB_GRANTED, PERSONDB_DENIED,
+        PERSONDB_UNKNOWN_CARD, PERSONDB_EXPIRED,
 };
 
 /* lifecycle */
-int access_open (struct access_db *db);   /* attach, or build a virgin store */
-int access_close(struct access_db *db);
+int persondb_open (struct persondb *db);  /* attach, or build a virgin store */
+int persondb_close(struct persondb *db);
 
 /* enrollment */
-int access_person_put   (struct access_db *db, const struct access_person *p);
-int access_person_get   (struct access_db *db, uint32_t id,
-                         struct access_person *out);
-int access_person_delete(struct access_db *db, uint32_t id);
+int persondb_person_put   (struct persondb *db, const struct persondb_person *p);
+int persondb_person_get   (struct persondb *db, uint32_t id,
+                           struct persondb_person *out);
+int persondb_person_delete(struct persondb *db, uint32_t id);
 
-/* credentials — the orderings of F5 live here, not in the caller */
-int access_card_assign(struct access_db *db, uint32_t person_id, const char *card);
-int access_card_revoke(struct access_db *db, const char *card);
-int access_card_owner (struct access_db *db, const char *card, uint32_t *person_id);
+/* credentials — F5's orderings live here, not in any caller */
+int persondb_card_assign(struct persondb *db, uint32_t person_id, const char *card);
+int persondb_card_revoke(struct persondb *db, const char *card);
+int persondb_card_owner (struct persondb *db, const char *card, uint32_t *person_id);
 
 /* permissions */
-int access_permission_grant (struct access_db *db, uint32_t id, const char *perm);
-int access_permission_revoke(struct access_db *db, uint32_t id, const char *perm);
+int persondb_permission_grant (struct persondb *db, uint32_t id, const char *perm);
+int persondb_permission_revoke(struct persondb *db, uint32_t id, const char *perm);
 
 /* the decision — R-D */
-int access_check(struct access_db *db, const char *card, const char *perm,
-                 uint32_t now, enum access_decision *out,
-                 struct access_person *who /* optional */);
+int persondb_check(struct persondb *db, const char *card, const char *perm,
+                   uint32_t now, enum persondb_decision *out,
+                   struct persondb_person *who /* optional */);
 
-/* app-owned persistent state, so main.c needs no store of its own */
-int access_progress_get(struct access_db *db, uint32_t *populated, uint32_t *rev);
-int access_progress_set(struct access_db *db, uint32_t  populated, uint32_t  rev);
+/* app-owned persistent state, so no caller needs a store of its own */
+int persondb_progress_get(struct persondb *db, uint32_t *populated, uint32_t *rev);
+int persondb_progress_set(struct persondb *db, uint32_t  populated, uint32_t  rev);
 
 /* introspection for the probe (F10/F11) */
-int access_stat(struct access_db *db, struct access_stat *st);
+int persondb_stat(struct persondb *db, struct persondb_stat *st);
 ```
 
-`access_check` is deliberately implemented the obvious way — resolve the card,
-load the person through `access_person_get`, check the validity window, compare
-the permission string. It does **not** shortcut the decode, and the credential
-index stores nothing but a person id. What that costs is measured in §11; the
-shortcut is recorded as an unimplemented mitigation.
+`persondb_check` is implemented the obvious way — resolve the card, load the
+person through `persondb_person_get`, check the validity window, compare the
+permission string. It does **not** shortcut the decode, and the credential index
+stores nothing but a person id. What that costs is measured in §11; the shortcut
+is recorded as an unimplemented mitigation.
 
-## 9. Storage layout — and why L2 rather than L3
+## 9. The scenario layer (R-I)
 
-**The layout.** One registry key, one app-owned superblock, ten maps:
+`src/scenario.h`. Everything a caller does *with a population*, so no frontend
+reimplements it and both measure the same thing.
+
+```c
+struct scenario;                              /* owns a struct persondb */
+
+int scenario_open (struct scenario *s);
+int scenario_close(struct scenario *s);
+
+/* population, resumable (F8). Fills at most `budget` persons, returns how
+ * many it actually wrote and whether the dataset is now complete. */
+int scenario_fill(struct scenario *s, uint32_t budget,
+                  struct scenario_fill_report *out);
+
+/* verification (F9): re-derive `samples` persons from the generator and
+ * compare, resolving each card back through the index. */
+int scenario_verify(struct scenario *s, uint32_t samples,
+                    struct scenario_verify_report *out);
+
+/* one mutation round (F9): revoke the previous revision's temporary cards,
+ * grant the next revision's, commit the revision. Idempotent on replay. */
+int scenario_mutate(struct scenario *s, struct scenario_mutate_report *out);
+
+/* measurement (§11). Each fills a struct bench_result: ops, ms, us/op,
+ * bytes moved on flash, amplification. */
+int scenario_bench(struct scenario *s, enum scenario_bench which,
+                   uint32_t samples, struct bench_result *out);
+
+/* one-shot store report (F10) */
+int scenario_report(struct scenario *s, struct scenario_report *out);
+
+/* single-shot domain actions the shell needs, by dataset index rather than
+ * by person id, so a human can drive the generator */
+int scenario_person_show(struct scenario *s, uint32_t index,
+                         struct persondb_person *out);
+int scenario_card_of    (struct scenario *s, uint32_t index, uint8_t slot,
+                         char *card_out, size_t sz);
+```
+
+Reports are plain structs; the layer never prints. That is what lets the shell
+render a table and the benchmark render a `bench` line from the same call, and
+what would let a future frontend emit JSON without touching any logic.
+
+## 10. Frontends
+
+One application, one Kconfig `choice`, two `sample.yaml` scenarios.
 
 ```
-rootreg[ ROOTREG_KEY('PADB', 1) ] ──► superblock blob   (CBOR, app-owned)
-                                        1 version
-                                        2 [ root_id ]×8   people shards
-                                        3 root_id         credential index
-                                        4 n_persons, populated, rev
-                                            │
-        kvhash_map_ops on each root ────────┘
+choice APP_CBOR_PERSONDB_FRONTEND
+        default APP_CBOR_PERSONDB_FRONTEND_BENCH
+config APP_CBOR_PERSONDB_FRONTEND_BENCH  bool "Automatic benchmark run"
+config APP_CBOR_PERSONDB_FRONTEND_SHELL  bool "Interactive shell"  select SHELL
+endchoice
 ```
 
-Everything is reachable from the integer 1 (P5): `rootreg_get` → superblock id
-→ `blob_db_get` → nine map roots. Boot costs **two** sector reads.
+**`ui_bench.c` — automatic.** The unattended run, and the source of
+`RESULTS.md`: open → prepare → fill (resuming, in batches) → verify → mutate →
+re-verify → bench suite → report → exit. On `native_sim` it exits with a status
+reflecting the verdict, so it works as a twister scenario.
 
-Person key `"p%08X"`, credential key the 14-hex-char UID verbatim, shard
-`person_index % 8`.
+**`ui_shell.c` — interactive.** The same operations under `persondb <cmd>`, for
+poking a live store on the DK:
 
-**Why not L3.** `kvdb` was the obvious starting point and does not fit this
-shape. The comparison, for nine maps:
+| Command | Calls |
+|---|---|
+| `stat` | `scenario_report` |
+| `fill <n>` | `scenario_fill` |
+| `verify [n]` | `scenario_verify` |
+| `mutate` | `scenario_mutate` |
+| `bench <which> [n]` | `scenario_bench` |
+| `show <index>` | `scenario_person_show` |
+| `check <card> <perm>` | `persondb_check`, timed |
+| `card <card>` | `persondb_card_owner` |
+| `grant`/`revoke <id> <perm>` | `persondb_permission_*` |
+| `assign`/`unassign` | `persondb_card_*` |
 
-| | L3 — nine `kvdb` instances | L2 — superblock + nine roots |
+Being able to `fill 500`, pull the power, reboot and `stat` is the most direct
+demonstration of F8 and F5 that this app can offer — and it is only possible
+because §9 exists.
+
+**`sample.yaml`.**
+
+| Scenario | Config | Runs? |
 |---|---|---|
-| Boot | 9 × (registry read + meta-blob read) = **18 sector reads** | registry + superblock = **2** |
-| Persistent overhead | 9 registry entries + 9 × 32 B meta blobs | 1 entry + 1 superblock |
-| Registry capacity | 9 of `ROOTREG_MAX_ROOTS`, which defaults to **8** (C10) — does not fit out of the box | 1 |
-| Progress commit | `kvdb_set` = 2 reads + 1 write | `blob_db_update` = 1 read + 1 write |
-| Per-operation cost | identical — `kvdb_get` is `strlen` + `ops->get` | identical |
-| Shard fan-out, naming, capacity accounting | the app's problem | the app's problem |
-| What it buys | named instances; backend recorded per instance | direct control of the root graph |
+| `app.cbor_persondb.bench` | `FRONTEND_BENCH`, 10 000 persons | build only — a full fill is ~2.5 h on hardware |
+| `app.cbor_persondb.shell` | `FRONTEND_SHELL` | build only |
+| `app.cbor_persondb.smoke` | `FRONTEND_BENCH`, `N_PERSONS=200` | **runs on `native_sim`**, console harness on `VERIFY PASS` |
 
-L3 costs nine times the boot I/O and blows the default registry capacity, in
-exchange for a naming feature this app does not need — it has one superblock and
-knows its own shards. This is R-H's "may use L2", and it is the practice worth
-teaching: **use the highest layer whose shape matches; drop down when it
-doesn't.** It is also finding **V4** stated from the other side — once you shard,
-`kvdb` stops being useful, which bounds L3's current audience to small stores of
-a few named instances.
-
-**Creation and the crash window.** `rootreg_get_or_create` may return an
-allocated-but-unbound id (its contract, `rootreg.h`). `access_open` detects the
-virgin case with `blob_db_get(sb_id) == -ENOENT`, allocates nine ids, calls
-`kvhash_map_ops.create` on each, and binds the superblock **last** — the single
-atomic write that publishes the whole structure. A crash before that write
-leaves the maps unreferenced. `blob_db` has no reachability GC and compaction
-reclaims only tombstones and superseded slots, so those blobs are lost until a
-format: finding **B8**, and the same window `kvdb` itself has (`kvdb.c:118`).
-
-## 10. Behaviour
-
-**Boot.** `blob_db_mount()` → `rootreg_init()` → `access_open()`.
-
-**Fill (F8).** `access_progress_get()`; populate persons `[done, done+BATCH)`
-via `access_person_put` + `access_card_assign`; `access_progress_set()`; repeat.
-On reboot the fill resumes from the committed count, and replaying a partial
-batch rewrites the same deterministic values, so replay is free.
-`blob_db_prepare()` runs first so the one-off ~1.1 s sector erases are reported
-as their own phase instead of smearing through the measurement.
-
-**Verify (F9).** A deterministic sample is re-derived by `dataset` and compared
-field by field against `access_person_get`, and each person's cards are resolved
-through `access_card_owner` back to that person.
-
-**Mutate (F9).** A bounded subset gains a temporary card at odd revisions and
-loses it at even ones, so expected state is a pure function of `(index, rev)`
-and a rerun proves the previous boot's writes survived. Both orderings of F5 are
-exercised — assignment person-first, revocation index-first.
-
-**Report (F10).** Live bytes from the app's accounting; blob-level live bytes
-via `blob_db_iterate()`; partition size from `FIXED_PARTITION_SIZE()`, read from
-devicetree behind the library's back because C9 leaves no other route — finding
-**B3**.
+The smoke scenario is the point of making the scale a Kconfig knob: CI executes
+the whole pipeline — fill, verify, mutate, re-verify — in seconds, so the code
+paths are regression-tested even though the headline configuration is not.
 
 ## 11. Measurements
 
@@ -358,25 +423,72 @@ application asked for. For `check` that is 4 × 64 KB of sector reads to answer 
 question about ~365 B — the number that makes finding **B1** concrete.
 
 `cbor` answers "is CBOR the bottleneck?" in advance. Expected answer: no, by
-three orders of magnitude — which retires the question and justifies R-B costing
+three orders of magnitude — which retires the question and shows R-B costs
 nothing.
 
-## 12. Acceptance criteria
+## 12. Storage layout — and why L2 rather than L3
 
-- **A1** Builds for `native_sim` and `nrf5340dk/nrf5340/cpuapp`; passes
-  `west twister -T app_cbor_persondb -p native_sim`.
-- **A2** On `native_sim` with the DK's geometry (8 MiB partition, 64 KB sectors)
-  a full run reaches 10 000 persons and reports `VERIFY PASS`.
-- **A3** A second run verifies content written by the first.
+**The layout.** One registry key, one app-owned superblock, nine maps:
+
+```
+rootreg[ ROOTREG_KEY('PADB', 1) ] ──► superblock blob   (CBOR, app-owned)
+                                        1 version
+                                        2 [ root_id ]×8   people maps
+                                        3 root_id         credential index
+                                        4 n_persons, populated, rev
+                                            │
+        kvhash_map_ops on each root ────────┘
+```
+
+Everything is reachable from the integer 1 (P5): `rootreg_get` → superblock id
+→ `blob_db_get` → nine map roots. Boot costs **two** sector reads. Person key
+`"p%08X"`, credential key the 14-hex-char UID verbatim, map `index % 8`.
+
+**Why not L3.** `kvdb` was the obvious starting point and does not fit:
+
+| | L3 — nine `kvdb` instances | L2 — superblock + nine roots |
+|---|---|---|
+| Boot | 9 × (registry read + meta-blob read) = **18 sector reads** | registry + superblock = **2** |
+| Persistent overhead | 9 registry entries + 9 × 32 B meta blobs | 1 entry + 1 superblock |
+| Registry capacity | 9 of `ROOTREG_MAX_ROOTS`, default **8** (C10) — does not fit | 1 |
+| Progress commit | `kvdb_set` = 2 reads + 1 write | `blob_db_update` = 1 read + 1 write |
+| Per-operation cost | identical — `kvdb_get` is `strlen` + `ops->get` | identical |
+| Fan-out, naming, capacity accounting | the app's problem | the app's problem |
+| What it buys | named instances; backend recorded per instance | direct control of the root graph |
+
+L3 costs nine times the boot I/O and overruns the default registry, to buy a
+naming feature this app does not need. This is R-H's "may use L2", and the
+practice worth teaching: **use the highest layer whose shape matches; drop down
+when it doesn't.** It is finding **V4** from the other side — once you shard,
+`kvdb` stops paying for itself.
+
+**Creation and the crash window.** `rootreg_get_or_create` may return an
+allocated-but-unbound id (its contract). `persondb_open` detects the virgin case
+with `blob_db_get(sb_id) == -ENOENT`, allocates nine ids, calls
+`kvhash_map_ops.create` on each, and binds the superblock **last** — the single
+atomic write that publishes the structure. A crash before it leaves the maps
+unreferenced, and `blob_db` has no reachability GC: finding **B8**, the same
+window `kvdb` itself has (`kvdb.c:118`).
+
+## 13. Acceptance criteria
+
+- **A1** Builds for `native_sim` and `nrf5340dk/nrf5340/cpuapp`; all three
+  `sample.yaml` scenarios pass `west twister -T app_cbor_persondb -p native_sim`.
+- **A2** The `smoke` scenario runs to `VERIFY PASS` in CI.
+- **A3** On `native_sim` with the DK's geometry a full 10 000-person run reaches
+  the target and reports `VERIFY PASS`; a second run verifies the first's
+  content.
 - **A4** `RESULTS.md` carries measured nRF5340-DK numbers.
-- **A5** `FINDINGS.md` records every limitation hit, with the evidence that
-  demonstrates it and the measurement that quantifies it.
-- **A6** `README.md` states each practice, points at the code that implements
-  it, and names the failure it prevents.
-- **A7** `main.c` contains no key string, shard index, blob id or CBOR call —
-  the check that F12 actually held.
+- **A5** `FINDINGS.md` records every limitation hit, with the evidence and the
+  measurement that quantifies it.
+- **A6** `README.md` states each practice, points at the code, and names the
+  failure it prevents.
+- **A7** No frontend contains a key string, shard index, blob id or CBOR call,
+  and neither does `scenario.c` — the check that F12/F15 held.
+- **A8** No `-ENOSPC` occurs during a full fill. If one does, §6.1's sizing rule
+  is wrong and that becomes the finding.
 
-## 13. Decisions
+## 14. Decisions
 
 Settled during review; recorded so they are not relitigated.
 
@@ -390,5 +502,8 @@ Settled during review; recorded so they are not relitigated.
 | D6 | **Hardware numbers measured on the DK**, so `RESULTS.md` ships measurements. |
 | D7 | The app is `app_cbor_persondb/` and **all its documentation lives inside it**. |
 | D8 | The app is **both** probe and showcase; §1 states the rule that keeps the two compatible. |
-| D9 | The person-access functionality is an **internal application API** (§8). It is not proposed for `lib/`; whether part of it should be promoted is a question for `FINDINGS.md`. |
-| D10 | That API is implemented on **L2 `map_ops` + `rootreg` + `blob_db`**, not on L3 `kvdb`, for the reasons tabulated in §9. `kvdb` is not linked into the image. |
+| D9 | The person management functionality is an **internal application API** (§8), not proposed for `lib/`. |
+| D10 | It is implemented on **L2 `map_ops` + `rootreg` + `blob_db`**, not L3 `kvdb` (§12). `kvdb` is not linked into the image. |
+| D11 | **Size to fit, do not fight C2** (R-J): eight people maps put mean bucket load at 22 % of capacity, 5.5 σ from the ceiling. `-ENOSPC` is not an expected path, and the app does not provoke it to make the limit visible — the over-provisioning it forces *is* the visible cost (§6.1). |
+| D12 | A **scenario layer** (§9) holds every operation on a population, and never prints. |
+| D13 | **Two frontends** — automatic benchmark and interactive shell — selected by Kconfig, shipped as separate `sample.yaml` scenarios, plus a small `smoke` scenario that actually runs in CI. |
