@@ -24,12 +24,6 @@ This is a simple Sphinx documentation setup for ``example-application``.
 
 .. toctree::
    :maxdepth: 1
-   :caption: Design — applications
-
-   apps/persondb
-
-.. toctree::
-   :maxdepth: 1
    :caption: Design — reviews
 
    reviews/2026-07-26-design-doc-review

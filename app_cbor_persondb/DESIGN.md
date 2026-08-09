@@ -1,10 +1,18 @@
-# Sample application — CBOR person/credential database
+# `app_cbor_persondb` — CBOR person/credential database
 
 Status: **v0.1 — requirements only, for discussion.** The design proposal is
 deliberately *not* in this document yet; §8 lists the questions that must be
 settled before it is written.
 
-Governed by `doc/principles.md` · Consumes the stack in `doc/architecture.md`
+The design document for this test application, kept beside the code it
+describes. Governed by `doc/principles.md` · consumes the stack in
+`doc/architecture.md`.
+
+| | |
+|---|---|
+| Application | `app_cbor_persondb/` |
+| This document | requirements (now) → design proposal → as-built notes |
+| Also here | `README.md` (the good-practices guide, R-F) and `RESULTS.md` (measured numbers), following the `app_perf*/` convention |
 
 ---
 
@@ -29,8 +37,9 @@ repeated fields, a **secondary index** for the query that actually matters, and
 
 In scope:
 
-- one new sample application, built for `native_sim` and
-  `nrf5340dk/nrf5340/cpuapp`;
+- one new test application in `app_cbor_persondb/`, built for `native_sim` and
+  `nrf5340dk/nrf5340/cpuapp` and picked up by `west twister -T app_cbor_persondb`
+  like the existing `app_perf*` apps;
 - a written good-practices guide derived from the app's own code;
 - reference performance numbers at the specified fill level.
 
@@ -180,8 +189,7 @@ than ~2.4 h, and make it resumable so an interrupted run costs nothing.
 5. **Hardware numbers.** I cannot run the DK from here. Will you run the app on
    the board (as with `app_perf_kvdb`'s S/N 960115021 capture) so `RESULTS.md`
    carries measurements, or should it ship with projections labelled as such?
-6. **Naming and placement.** `app_persondb/` alongside `app_perf_kvdb/`, with
-   this document at `doc/apps/persondb.md` — or somewhere else?
-7. **Scope of the good-practices guide (R-F):** a `README.md` inside the app
-   directory, or a stack-level document under `doc/` that happens to cite the
-   app? I lean towards the app README, cross-linked from `doc/`.
+
+**Settled.** Naming and placement: the app is `app_cbor_persondb/`, and all of
+its documentation lives inside it — this design document, the `README.md`
+good-practices guide (R-F), and `RESULTS.md`. Nothing is added under `doc/`.
