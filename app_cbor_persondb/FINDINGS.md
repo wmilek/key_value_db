@@ -233,15 +233,88 @@ caller's job to notice and call `create`. The shape offers no
 `blob_db_get(root) == -ENOENT` probe — reaching *past* L2 into L1 to do it,
 which breaks the layering the shape is supposed to provide.
 
-### K9 — `initial_capacity` is silently clamped (moderate, `read`)
+### K9 — Requested capacity is reinterpreted, then silently clamped, and cannot be read back (moderate alone; **major** with K2+K3, `read`)
 
-`buckets_for()` clamps a request above `MAX_BUCKETS` down to `MAX_BUCKETS` and
-returns nothing. `create` reports success either way, and there is no query for
-the capacity a map actually got. An application that asks for 4 096 buckets
-gets 511 and is never told — its capacity planning is then wrong by 8×, and it
-finds out as a `-ENOSPC` (K2) some hours into a fill.
+Three separate problems stack on one field.
 
-> `kvhash.c:97-109`
+**(a) The units do not match the contract.** `shape_map.h` documents
+`initial_capacity` as *"expected entry count"* and `kvdb.h` repeats it as
+*"entry-count hint"*. `kvhash` uses the number **verbatim as the bucket count**:
+
+```c
+static uint16_t buckets_for(size_t initial_capacity)
+{
+        size_t n = initial_capacity ? initial_capacity : DEFAULT_BUCKETS;
+        if (n < 2)            { n = 2; }
+        if (n > MAX_BUCKETS)  { n = MAX_BUCKETS; }
+        return (uint16_t)n;
+}
+```
+
+> `kvhash.c:97-109`, `shape_map.h:40`, `kvdb.h:74`
+
+Entries and buckets differ by the load factor — the one number that decides
+whether K2's 4 KB bucket ceiling is ever reached. Saying "I expect 10 000
+entries" is read as "give me 10 000 buckets".
+
+**(b) The clamp is silent.** `MAX_BUCKETS = (MAX_PAYLOAD − 8)/8` = 511 at
+`MAX_PAYLOAD` 4096. Anything larger is clamped with no error, no warning, and
+`create()` returning 0. The only trace is a `LOG_DBG` inside the container's own
+log module, off in any normal build.
+
+This is not hypothetical — **it already happens in this tree**.
+`app_perf_kvdb` runs with `CONFIG_BLOB_DB_MAX_PAYLOAD_LEN=1024`, so
+`MAX_BUCKETS` is 127, and asks for:
+
+```c
+.initial_capacity = N_KEYS / 2,        /* 768 / 2 = 384 */
+```
+
+> `app_perf_kvdb/src/main.c:452`, `app_perf_kvdb/prj.conf:10`
+
+384 requested, **127 delivered**, nothing said. It happens to be harmless there
+— 768 small entries over 127 buckets is 194 B per bucket — but the app's stated
+intent was silently overruled by a factor of three.
+
+**(c) It cannot be read back.** `map_ops` has no query (K10), and the value
+lives at `dir_buf[4]` inside `kvhash`'s private on-flash directory format.
+Reading it means `blob_db_get(root)` plus parsing L2's internals from the
+application — reaching *past* L2 into L1 **and** depending on a layout the
+container does not publish. Nor can an application compute the ceiling for
+itself: `MAX_BUCKETS`, `DIR_HDR_LEN` and the 8-bytes-per-id are all private to
+`kvhash.c`.
+
+**Why the combination is worse than the parts.** The bucket count is fixed at
+create time and persisted (K3), so a wrong value is baked into the store
+forever; the store gives no occupancy signal (K10); and the failure surfaces as
+a `-ENOSPC` from one bucket while the medium is nearly empty (K2), potentially
+hours into a fill, with no repair path short of a rebuild that needs iteration
+(K6) that does not exist.
+
+**The sharpest edge is cross-Kconfig coupling.**
+`CONFIG_BLOB_DB_MAX_PAYLOAD_LEN` is a single global symbol, and `MAX_BUCKETS`
+is derived from it. Another subsystem in the same image lowering it to the
+Kconfig default of 256 takes `MAX_BUCKETS` from 511 to 31 — map capacity from
+2.09 MB to **7.9 KB, a 265× drop** — while this application still asks for 511,
+still gets `0` back from `create()`, and dies a few hundred records into the
+fill. A build-time change made elsewhere silently invalidates a persisted
+capacity plan, and there is no runtime check that can catch it.
+
+**A related trap in the same function:** `cfg == NULL` or
+`initial_capacity == 0` yields `DEFAULT_BUCKETS = 8` — an eight-bucket, ~32 KB
+map that overflows at roughly ninety person-sized entries. For `kvdb` that is
+reached by `kvdb_open(db, name, NULL)`, which the header presents as the
+ordinary way to accept defaults.
+
+**What this app can do about it:** only a `BUILD_ASSERT` on
+`CONFIG_BLOB_DB_MAX_PAYLOAD_LEN`, replicating kvhash's private formula in
+application source. That defence is worth having, and having to write it is
+itself part of the finding.
+
+Direction, cheapest first: return `-ENOSPC` (or at minimum `LOG_WRN`) instead of
+clamping; export the capacity formula from `kvhash.h`; add the `map_ops.stat()`
+of K10 so the delivered count is readable; and settle whether the field means
+entries or buckets, in the shape's own words.
 
 ### K10 — No entry count or size on a map (moderate, `read`)
 
