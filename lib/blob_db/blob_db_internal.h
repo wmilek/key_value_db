@@ -29,6 +29,22 @@
 #define BLOB_DB_STATE_CLEAN       0x00
 #define BLOB_DB_STATE_COMPACTING  0x01
 
+/* On-flash format version.
+ *
+ * MAJOR marks an incompatible change: software that does not know a major
+ * refuses the store with -ENOTSUP rather than touching it. MINOR marks an
+ * additive one: fields are appended to the master body and hdr_len grows, so
+ * older software validates and reads the prefix of the header it knows and
+ * ignores the tail. A minor bump must keep hdr_len <= BLOB_DB_MASTER_HDR_MAX;
+ * exceeding that is a major change.
+ */
+#define BLOB_DB_FORMAT_MAJOR      1
+#define BLOB_DB_FORMAT_MINOR      0
+
+/* Largest master header any version may declare. Bounds the read buffer that
+ * older software must be able to stage a foreign header in. */
+#define BLOB_DB_MASTER_HDR_MAX    128
+
 /* Durable id allocation (contract §2 "no reuse", impl design §13.1).
  *
  * next_id_hint on the master is a LEADING ceiling: an exclusive upper bound
@@ -46,19 +62,67 @@
 #define BLOB_DB_SLOT_F_SEALED     (1u << 0)
 #define BLOB_DB_SLOT_F_TOMBSTONE  (1u << 1)
 
-/* Master sector header (24 B). Lives at offset 0 of sectors 0 and 1; the
- * sector with the higher valid generation is authoritative. */
-struct __packed blob_db_master_hdr {
-	uint8_t  magic[4];        /* 'B','D','M','S' */
-	uint32_t generation;      /* monotonic LE */
-	uint8_t  state;           /* BLOB_DB_STATE_* */
-	uint16_t compacting_bid;  /* meaningful only when state == COMPACTING */
-	uint8_t  reserved;
-	uint64_t next_id_hint;    /* high-water mark for next id; refined at mount */
-	uint32_t hdr_crc32;       /* CRC32-IEEE over the preceding 20 bytes */
+/* Every flag bit this version understands. A slot carrying a bit outside this
+ * mask was written by software we do not understand, and its payload must not
+ * be handed out as data — see slot_view_at().
+ *
+ * This is defense in depth, not the primary guard: introducing a slot flag
+ * changes what a payload *means*, so it is a MAJOR format change and mount
+ * refuses the store before any slot is read (§ format version above). The mask
+ * covers the case where that discipline is broken.
+ */
+#define BLOB_DB_SLOT_F_KNOWN                                                   \
+	(BLOB_DB_SLOT_F_SEALED | BLOB_DB_SLOT_F_TOMBSTONE)
+
+/* Frozen compatibility prefix (12 B).
+ *
+ * THIS LAYOUT MUST NEVER CHANGE. It is what lets blob_db of any vintage read
+ * format_major out of a store written by any other vintage and decide whether
+ * it understands the rest — including a store written by software that did not
+ * exist when it was compiled.
+ *
+ * It carries its own CRC, separate from the body's, and that separation is the
+ * point: a *newer* writer still produces a prefix whose CRC verifies, so its
+ * format_major can be trusted and the store deliberately refused; bit rot
+ * produces a prefix whose CRC fails, which is a different (recoverable)
+ * situation. Sharing one CRC with the body would conflate them, and — worse —
+ * would move with the body, so older software could not even locate it.
+ */
+struct __packed blob_db_compat_hdr {
+	uint8_t  magic[4];        /* 'B','D','M','S' — allocator identity      */
+	uint8_t  format_major;    /* incompatible; refuse what you don't know  */
+	uint8_t  format_minor;    /* additive within a major; safe to ignore   */
+	uint16_t hdr_len;         /* total master header length, incl. prefix  */
+	uint16_t reserved;
+	uint16_t prefix_crc16;    /* CRC16-CCITT(0xffff) over the leading 10 B */
 };
-BUILD_ASSERT(sizeof(struct blob_db_master_hdr) == 24,
+BUILD_ASSERT(sizeof(struct blob_db_compat_hdr) == 12,
+	     "blob_db_compat_hdr is frozen; changing it breaks every reader");
+
+/* Master sector header (64 B). Lives at offset 0 of sectors 0 and 1; the
+ * sector with the higher valid generation is authoritative.
+ *
+ * Fixed size with reserved padding, deliberately: hdr_crc32 stays at a
+ * constant offset over a constant span, so a later MINOR revision that
+ * consumes reserved space does not move anything an older reader depends on.
+ * A change that cannot fit here — or that older software would misread rather
+ * than merely miss — is a MAJOR change instead. The sector is >= 4 KB, so the
+ * padding is free.
+ */
+struct __packed blob_db_master_hdr {
+	struct blob_db_compat_hdr compat;  /*  0..11                            */
+	uint32_t generation;      /* 12..15  monotonic LE                       */
+	uint8_t  state;           /* 16      BLOB_DB_STATE_*                    */
+	uint16_t compacting_bid;  /* 17..18  meaningful only when COMPACTING    */
+	uint8_t  reserved0;       /* 19                                         */
+	uint64_t next_id_hint;    /* 20..27  leading id ceiling                 */
+	uint8_t  reserved1[32];   /* 28..59  future MINOR revisions             */
+	uint32_t hdr_crc32;       /* 60..63  CRC32-IEEE over bytes [0, 60)      */
+};
+BUILD_ASSERT(sizeof(struct blob_db_master_hdr) == 64,
 	     "blob_db_master_hdr layout drift");
+BUILD_ASSERT(sizeof(struct blob_db_master_hdr) <= BLOB_DB_MASTER_HDR_MAX,
+	     "master header exceeds the bound older readers can stage");
 
 /* Bucket sector header (16 B). Lives at offset 0 of every bucket sector,
  * written once after that sector is erased. */

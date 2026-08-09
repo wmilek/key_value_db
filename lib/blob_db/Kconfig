@@ -46,10 +46,36 @@ config BLOB_DB_PARTITION_LABEL
 config BLOB_DB_MAX_PAYLOAD_LEN
 	int "Max payload length in bytes"
 	default 256
-	range 1 4096
+	range 1 65535
 	help
 	  Maximum payload size accepted by blob_db_update. Slot size on flash
 	  is bounded by this plus a 14-byte header.
+
+	  The upper bound here is only the on-flash field width (val_len is
+	  16-bit). The binding limit is the erase-block geometry, which is a
+	  runtime property: a bucket is an append-only log, so a rebind needs
+	  two slots to fit before compaction can reclaim the first. Mount
+	  therefore refuses a build whose cap exceeds
+	  (sector_size - 16) / 2 - 14 — about 2026 B on 4 KB sectors and
+	  32746 B on 64 KB sectors.
+
+config BLOB_DB_AUTOFORMAT_ON_CORRUPT
+	bool "Format when both master sectors are unreadable"
+	default y
+	help
+	  Controls what mount does when neither master can be parsed AND the
+	  sectors are not erased — bit rot, or a power loss during the very
+	  first format.
+
+	  y (development): format and carry on, so a bad first boot is not a
+	  device needing manual intervention.
+
+	  n (production): return -EIO and leave the partition untouched, so the
+	  caller decides whether to discard it with blob_db_format().
+
+	  This does NOT apply to a store written in a format this build does not
+	  understand. That is always refused with -ENOTSUP and never formatted,
+	  regardless of this option.
 
 config BLOB_DB_SECTOR_BUF_SIZE
 	int "Max flash sector size in bytes"

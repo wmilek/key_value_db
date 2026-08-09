@@ -100,9 +100,23 @@ extern "C" {
  * (see @ref blob_db_root); on a virgin store it is bound to an empty
  * payload.
  *
+ * An **unrecognized** store is never destroyed. If a master sector parses but
+ * declares a format this build does not understand — a newer version, or
+ * another allocator's magic — mount returns `-ENOTSUP` and writes nothing;
+ * discarding it is the caller's decision, via `blob_db_format()`. Only a
+ * partition whose master sectors read as erased is treated as virgin and
+ * formatted automatically. (If both masters are unreadable but *not* erased —
+ * bit rot, or a power loss during the first format —
+ * `CONFIG_BLOB_DB_AUTOFORMAT_ON_CORRUPT` chooses between reformatting and
+ * `-EIO`.)
+ *
  * @retval 0       success
  * @retval -EALREADY already mounted
- * @retval -EIO    flash I/O error or partition not found
+ * @retval -EIO    flash I/O error, partition not found, or both masters
+ *                 unreadable with `BLOB_DB_AUTOFORMAT_ON_CORRUPT` disabled
+ * @retval -ENOTSUP foreign on-flash format, a sector larger than
+ *                 `CONFIG_BLOB_DB_SECTOR_BUF_SIZE`, or a payload cap the
+ *                 partition geometry cannot sustain
  * @retval -ENODEV partition_label not present in the device tree
  */
 int blob_db_mount(void);

@@ -207,6 +207,17 @@ int blob_db_multi_delete(const uint64_t *ids, int  *results,     size_t n);
 Errors: `-ENOENT`, `-ENOSPC`, `-ENOMEM`, `-EINVAL`, `-EIO`, `-ENODEV` (not
 mounted), `-EALREADY` (double mount), `-ENOTSUP` (foreign on-flash format).
 
+**Mount never destroys a store it does not understand.** A partition whose
+master sectors read as *erased* is virgin and is formatted. A partition
+carrying a format this build cannot read — a newer version of this allocator,
+or a different one (§5.1) — yields `-ENOTSUP` with nothing written; discarding
+it is the caller's decision, expressed by calling `blob_db_format()`.
+Distinguishing the two is a property of the on-flash format, not a heuristic:
+every version stamps a version-and-identity record that any other version can
+parse and verify. Consequently a caller must treat mount failure as a real
+outcome — the pre-v1 behaviour of silently reformatting anything unparseable
+is gone.
+
 **Concurrency contract (v1):** single-threaded — caller serializes. v2 may
 add a `k_mutex`. Corollary used by client recovery: at most one mutation is
 in flight per database.

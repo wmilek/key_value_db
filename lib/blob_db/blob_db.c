@@ -55,6 +55,11 @@ static void walk_bucket(const uint8_t *buf, uint64_t target_id,
 static uint8_t g_bbuf[BLOB_DB_SECTOR_BUF_MAX];
 static uint8_t g_bbuf_new[BLOB_DB_SECTOR_BUF_MAX];
 
+/* Set while compaction owns g_bbuf_new, so append_slot() — which also stages
+ * there — can assert the two never overlap. Debug builds only; release
+ * compiles the assert away and this stays a dead store. */
+static bool g_bbuf_new_busy;
+
 /* Single global instance. v1 is single-threaded; caller serializes. */
 static struct {
 	bool      mounted;
@@ -83,26 +88,109 @@ static uint32_t hdr_crc32(const void *buf, size_t total)
 
 /* Master sector helpers -------------------------------------------------- */
 
-static int read_master(uint8_t slot, struct blob_db_master_hdr *out, bool *valid)
+/* CRC16-CCITT over the frozen part of the compatibility prefix (everything
+ * before prefix_crc16 itself). */
+static uint16_t prefix_crc(const void *buf)
 {
-	*valid = false;
+	return crc16_ccitt(0xffff, (const uint8_t *)buf,
+			   offsetof(struct blob_db_compat_hdr, prefix_crc16));
+}
 
-	int rc = blob_db_store_read(peb_offset(slot), out, sizeof(*out));
+/* How a master sector presents itself. The distinction between FOREIGN and
+ * CORRUPT is the whole point of the separate prefix CRC (see
+ * blob_db_internal.h): a newer writer produces a prefix that verifies, so we
+ * can trust its version and refuse on purpose; bit rot produces one that does
+ * not, and the other master may still be good. */
+enum master_class {
+	MASTER_ERASED,   /* header region is all 0xff — never written */
+	MASTER_CORRUPT,  /* written, but unparseable — treat as absent */
+	MASTER_FOREIGN,  /* parses, and says it is a format we do not know */
+	MASTER_OK,
+};
+
+static const char *const master_class_str[] = {
+	"erased", "corrupt", "foreign", "ok"
+};
+
+static int read_master(uint8_t slot, struct blob_db_master_hdr *out,
+		       enum master_class *cls)
+{
+	uint8_t buf[BLOB_DB_MASTER_HDR_MAX];
+
+	*cls = MASTER_CORRUPT;
+
+	int rc = blob_db_store_read(peb_offset(slot), buf, sizeof(buf));
 	if (rc < 0) {
 		LOG_ERR("master %u read failed: %d", slot, rc);
 		return rc;
 	}
 
-	if (memcmp(out->magic, MASTER_MAGIC, 4) != 0) {
+	/* Erased means virgin, and only virgin may be formatted. Check the
+	 * whole staging window, not just the prefix, so a sector holding
+	 * anything at all is never mistaken for untouched flash. */
+	bool erased = true;
+
+	for (size_t i = 0; i < sizeof(buf); i++) {
+		if (buf[i] != 0xff) {
+			erased = false;
+			break;
+		}
+	}
+	if (erased) {
+		*cls = MASTER_ERASED;
 		return 0;
 	}
-	uint32_t want = hdr_crc32(out, sizeof(*out));
-	if (out->hdr_crc32 != want) {
-		LOG_WRN("master %u CRC mismatch (got 0x%08x want 0x%08x)",
-			slot, out->hdr_crc32, want);
+
+	const struct blob_db_compat_hdr *c =
+		(const struct blob_db_compat_hdr *)buf;
+
+	if (c->prefix_crc16 != prefix_crc(buf)) {
+		LOG_WRN("master %u: prefix CRC bad — treating as corrupt", slot);
+		return 0;   /* MASTER_CORRUPT */
+	}
+
+	/* From here the prefix is trustworthy, so anything we reject is a
+	 * deliberate refusal rather than a guess. */
+	if (memcmp(c->magic, MASTER_MAGIC, 4) != 0) {
+		LOG_ERR("master %u: foreign magic %02x%02x%02x%02x",
+			slot, c->magic[0], c->magic[1], c->magic[2], c->magic[3]);
+		*cls = MASTER_FOREIGN;
 		return 0;
 	}
-	*valid = true;
+	if (c->format_major != BLOB_DB_FORMAT_MAJOR) {
+		LOG_ERR("master %u: format major %u, this build knows %u",
+			slot, c->format_major, BLOB_DB_FORMAT_MAJOR);
+		*cls = MASTER_FOREIGN;
+		return 0;
+	}
+	if (c->hdr_len < sizeof(struct blob_db_master_hdr) ||
+	    c->hdr_len > BLOB_DB_MASTER_HDR_MAX) {
+		LOG_ERR("master %u: hdr_len %u outside [%zu, %u]", slot,
+			c->hdr_len, sizeof(struct blob_db_master_hdr),
+			BLOB_DB_MASTER_HDR_MAX);
+		*cls = MASTER_FOREIGN;
+		return 0;
+	}
+	if (c->format_minor > BLOB_DB_FORMAT_MINOR) {
+		/* Additive revision: fields we do not know sit in reserved
+		 * space at offsets we do not read. Mount it. */
+		LOG_INF("master %u: format 1.%u (this build is 1.%u) — "
+			"reading the fields we know",
+			slot, c->format_minor, BLOB_DB_FORMAT_MINOR);
+	}
+
+	/* hdr_crc32 is at a fixed offset for this major, so the span is ours
+	 * to compute regardless of what a newer minor appended. */
+	uint32_t want = hdr_crc32(buf, sizeof(struct blob_db_master_hdr));
+
+	if (((const struct blob_db_master_hdr *)buf)->hdr_crc32 != want) {
+		LOG_WRN("master %u: body CRC mismatch — treating as corrupt",
+			slot);
+		return 0;   /* MASTER_CORRUPT */
+	}
+
+	memcpy(out, buf, sizeof(*out));
+	*cls = MASTER_OK;
 	return 0;
 }
 
@@ -115,17 +203,37 @@ static int write_master(uint8_t slot, uint32_t gen, uint8_t state,
 		return rc;
 	}
 
-	struct blob_db_master_hdr hdr = {
-		.generation     = gen,
-		.state          = state,
-		.compacting_bid = compacting_bid,
-		.reserved       = 0,
-		.next_id_hint   = next_id_hint,
-	};
-	memcpy(hdr.magic, MASTER_MAGIC, 4);
-	hdr.hdr_crc32 = hdr_crc32(&hdr, sizeof(hdr));
+	/* Staged 0xff-filled so any write-alignment padding matches erased
+	 * flash rather than introducing zero bits. */
+	uint8_t buf[BLOB_DB_MASTER_HDR_MAX];
 
-	rc = blob_db_store_write(peb_offset(slot), &hdr, sizeof(hdr));
+	memset(buf, 0xff, sizeof(buf));
+
+	struct blob_db_master_hdr *hdr = (struct blob_db_master_hdr *)buf;
+
+	memset(hdr, 0, sizeof(*hdr));
+	memcpy(hdr->compat.magic, MASTER_MAGIC, 4);
+	hdr->compat.format_major = BLOB_DB_FORMAT_MAJOR;
+	hdr->compat.format_minor = BLOB_DB_FORMAT_MINOR;
+	hdr->compat.hdr_len      = sizeof(*hdr);
+	hdr->compat.reserved     = 0;
+	hdr->compat.prefix_crc16 = prefix_crc(hdr);
+
+	hdr->generation     = gen;
+	hdr->state          = state;
+	hdr->compacting_bid = compacting_bid;
+	hdr->next_id_hint   = next_id_hint;
+	hdr->hdr_crc32      = hdr_crc32(hdr, sizeof(*hdr));
+
+	const size_t a = st.write_align ? st.write_align : 1;
+	const size_t len = ROUND_UP(sizeof(*hdr), a);
+
+	if (len > sizeof(buf)) {
+		LOG_ERR("write_align %zu too large to stage a master", a);
+		return -ENOTSUP;
+	}
+
+	rc = blob_db_store_write(peb_offset(slot), buf, len);
 	if (rc < 0) {
 		LOG_ERR("master %u write failed: %d", slot, rc);
 		return rc;
@@ -278,6 +386,17 @@ int blob_db_mount(void)
 		goto err_close;
 	}
 
+	/* Floor as well as ceiling: read_master() stages a fixed
+	 * BLOB_DB_MASTER_HDR_MAX window, and a read must never cross a PEB
+	 * boundary (blob_db_store.h). It also keeps the sustainable-payload
+	 * arithmetic below from underflowing on an absurd geometry. */
+	if (st.peb_size < BLOB_DB_MASTER_HDR_MAX) {
+		LOG_ERR("sector size %zu below the %u B minimum blob_db supports",
+			st.peb_size, BLOB_DB_MASTER_HDR_MAX);
+		rc = -ENOTSUP;
+		goto err_close;
+	}
+
 	if (st.n_pebs < BLOB_DB_FIRST_BUCKET + 1) {
 		LOG_ERR("partition too small: %u sectors (need ≥ %u)",
 			st.n_pebs, BLOB_DB_FIRST_BUCKET + 1);
@@ -288,21 +407,67 @@ int blob_db_mount(void)
 	LOG_INF("partition %zu B, %u sectors of %zu B, %u buckets",
 		st.fa_size, st.n_pebs, st.peb_size, st.n_buckets);
 
+	/* Refuse a payload cap the geometry cannot sustain. A bucket is an
+	 * append-only log, so a rebind needs two slots to coexist before
+	 * compaction can reclaim the first — hence half the data area, not all
+	 * of it. Checked here because peb_size is a runtime property (P2); a
+	 * compile-time range cannot express it. */
+	{
+		const size_t sustainable =
+			(st.peb_size - BLOB_DB_BUCKET_DATA_OFF) / 2 -
+			BLOB_DB_SLOT_OVERHEAD;
+
+		if (CONFIG_BLOB_DB_MAX_PAYLOAD_LEN > sustainable) {
+			LOG_ERR("CONFIG_BLOB_DB_MAX_PAYLOAD_LEN=%u exceeds the "
+				"%zu B this geometry can rebind (sector %zu B)",
+				CONFIG_BLOB_DB_MAX_PAYLOAD_LEN, sustainable,
+				st.peb_size);
+			rc = -ENOTSUP;
+			goto err_close;
+		}
+	}
+
 	/* Pick the authoritative master. */
 	struct blob_db_master_hdr m_a, m_b;
-	bool va, vb;
+	enum master_class ca, cb;
 
-	rc = read_master(BLOB_DB_MASTER_A_SECTOR, &m_a, &va);
+	rc = read_master(BLOB_DB_MASTER_A_SECTOR, &m_a, &ca);
 	if (rc < 0) {
 		goto err_close;
 	}
-	rc = read_master(BLOB_DB_MASTER_B_SECTOR, &m_b, &vb);
+	rc = read_master(BLOB_DB_MASTER_B_SECTOR, &m_b, &cb);
 	if (rc < 0) {
 		goto err_close;
 	}
+	LOG_DBG("master A=%s B=%s", master_class_str[ca], master_class_str[cb]);
 
-	if (!va && !vb) {
-		LOG_INF("no valid master; formatting");
+	/* A parseable master declaring a format we do not know is never
+	 * touched — not mounted, and above all not formatted. This is the
+	 * -ENOTSUP the contract has always promised (l1_blob_db.md §4, §5.1).
+	 * Checked before anything else, and on BOTH sectors: if an interrupted
+	 * upgrade left A on our format and B ahead of it, falling back to A
+	 * would silently mount a stale view of an upgraded store. */
+	if (ca == MASTER_FOREIGN || cb == MASTER_FOREIGN) {
+		LOG_ERR("refusing to mount a foreign store (A=%s B=%s); "
+			"use blob_db_format() to discard it deliberately",
+			master_class_str[ca], master_class_str[cb]);
+		rc = -ENOTSUP;
+		goto err_close;
+	}
+
+	if (ca != MASTER_OK && cb != MASTER_OK) {
+		if (ca == MASTER_ERASED && cb == MASTER_ERASED) {
+			LOG_INF("virgin partition; formatting");
+		} else if (IS_ENABLED(CONFIG_BLOB_DB_AUTOFORMAT_ON_CORRUPT)) {
+			LOG_WRN("both masters unreadable (A=%s B=%s); "
+				"reformatting per CONFIG_BLOB_DB_AUTOFORMAT_ON_CORRUPT",
+				master_class_str[ca], master_class_str[cb]);
+		} else {
+			LOG_ERR("both masters unreadable (A=%s B=%s); refusing",
+				master_class_str[ca], master_class_str[cb]);
+			rc = -EIO;
+			goto err_close;
+		}
 		rc = format_masters_fresh();
 		if (rc < 0) {
 			goto err_close;
@@ -310,9 +475,9 @@ int blob_db_mount(void)
 	} else {
 		bool pick_a;
 
-		if (va && !vb) {
+		if (ca == MASTER_OK && cb != MASTER_OK) {
 			pick_a = true;
-		} else if (!va && vb) {
+		} else if (ca != MASTER_OK && cb == MASTER_OK) {
 			pick_a = false;
 		} else {
 			pick_a = m_a.generation >= m_b.generation;
@@ -499,6 +664,13 @@ static bool slot_view_at(const uint8_t *buf, off_t off, struct slot_view *out)
 	if (!(shdr->flags & BLOB_DB_SLOT_F_SEALED)) {
 		return false;
 	}
+	/* Written by a version we do not understand: its payload does not mean
+	 * what we would take it to mean, so it is not data. Mount should have
+	 * refused the store already (a new slot flag is a MAJOR change); this
+	 * is the backstop if that discipline ever slips. */
+	if (shdr->flags & ~(uint8_t)BLOB_DB_SLOT_F_KNOWN) {
+		return false;
+	}
 	if (shdr->val_len > CONFIG_BLOB_DB_MAX_PAYLOAD_LEN) {
 		return false;
 	}
@@ -590,8 +762,17 @@ static int append_slot(uint16_t bid, off_t write_cursor, uint64_t id,
 		       uint8_t extra_flags, const void *payload,
 		       uint16_t val_len)
 {
-	uint8_t buf[BLOB_DB_SLOT_OVERHEAD + CONFIG_BLOB_DB_MAX_PAYLOAD_LEN +
-		    BLOB_DB_MAX_WRITE_ALIGN];
+	/* Staged in the compaction scratch buffer rather than on the stack:
+	 * at CONFIG_BLOB_DB_MAX_PAYLOAD_LEN=4096 a stack frame here was ~4.1 KB,
+	 * over the 4 KB bound contract R7 sets. g_bbuf_new is sector-sized and
+	 * a slot is smaller than a sector by construction, so it always fits.
+	 *
+	 * Safe because compaction always *completes* before its caller appends
+	 * — blob_db_update()/blob_db_delete() call compact_bucket() and only
+	 * then append_slot(), never the other way round. The assert pins that. */
+	__ASSERT(!g_bbuf_new_busy, "append_slot re-entered compaction scratch");
+
+	uint8_t *buf = g_bbuf_new;
 
 	struct blob_db_slot_hdr *shdr = (struct blob_db_slot_hdr *)buf;
 
@@ -761,12 +942,16 @@ static int compact_bucket(uint16_t bid)
 		return -EINVAL;
 	}
 
+	g_bbuf_new_busy = true;
+
 	const size_t new_len = build_compacted_image(g_bbuf, g_bbuf_new, bid);
 
 	LOG_INF("compact bid=%u: new bucket has %zu B (was up to %zu B)",
 		bid, new_len, st.peb_size);
 
-	return compact_commit(bid, g_bbuf_new, new_len);
+	rc = compact_commit(bid, g_bbuf_new, new_len);
+	g_bbuf_new_busy = false;
+	return rc;
 }
 
 /* Mount-time recovery for a partition we found in COMPACTING(bid) state.

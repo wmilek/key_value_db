@@ -56,21 +56,65 @@ Per-bucket mean at 100 k blobs: 49 entries.
 
 ## 3. On-flash format
 
-### 3.1 Master sector (24 B header; rest of the sector reserved)
+### 3.1 Master sector (64 B header; rest of the sector reserved)
+
+Two parts: a frozen compatibility prefix that any version can parse, and a
+body that belongs to the current format major.
 
 ```
-magic[4]        = 'B','D','M','S'
-generation[4]   = monotonic LE              /* latest valid gen wins        */
-state[1]        = CLEAN | COMPACTING
+/* --- frozen prefix (12 B) — this layout never changes ------------------- */
+magic[4]         = 'B','D','M','S'          /* allocator identity (D1)      */
+format_major[1]  = 1                        /* incompatible; refuse unknown */
+format_minor[1]  = 0                        /* additive; safe to ignore     */
+hdr_len[2]       = 64                       /* total header length          */
+reserved[2]
+prefix_crc16[2]  = CRC16-CCITT(0xffff) over the preceding 10 B
+
+/* --- body (format major 1) ---------------------------------------------- */
+generation[4]    = monotonic LE             /* latest valid gen wins        */
+state[1]         = CLEAN | COMPACTING
 compacting_bid[2]
-reserved[1]
-next_id_hint[8] = id-counter persistence    /* see §5.1 and §13.1           */
-hdr_crc32[4]    = CRC32-IEEE over preceding 20 B
+reserved0[1]
+next_id_hint[8]  = id-counter persistence   /* see §5.1 and §13.1           */
+reserved1[32]                               /* future MINOR revisions       */
+hdr_crc32[4]     = CRC32-IEEE over bytes [0, 60)
 ```
 
 Double-buffered: writes alternate between sectors 0/1 with incrementing
 generation; a torn master write loses the new generation and the previous
 master still wins.
+
+**Two CRCs, and the split is load-bearing.** A *newer* writer still produces a
+prefix whose CRC verifies, so an older reader can trust `format_major` and
+refuse the store deliberately. Bit rot produces a prefix whose CRC fails —
+a different situation, in which the other master may still be good. One
+combined CRC would conflate them, and worse, would move as the header grows,
+so an older reader could not even locate it.
+
+The body is a fixed 64 B with reserved padding so `hdr_crc32` stays at a
+constant offset over a constant span. A MINOR revision consumes reserved space
+and moves nothing; older software validates the same span and reads the fields
+it knows. Anything that does not fit — or that older software would *misread*
+rather than merely miss, such as a new slot flag — is a MAJOR change instead.
+
+**Mount classifies each master sector**, and only one of the four outcomes may
+write to flash:
+
+| Sector reads as | Class | Mount |
+|---|---|---|
+| all `0xff` across the header window | erased | virgin — format |
+| prefix CRC fails | corrupt | ignore it; the other master may be good |
+| prefix verifies, foreign magic or unknown major | **foreign** | `-ENOTSUP`, touch nothing |
+| prefix and body verify | ok | candidate; highest generation wins |
+
+A foreign sector on *either* slot refuses the whole store, before generation
+is considered: an interrupted upgrade can leave the old format on one slot and
+a newer one on the other, and falling back to the older would silently mount a
+stale view. When neither master is usable and neither is erased,
+`BLOB_DB_AUTOFORMAT_ON_CORRUPT` decides between reformatting (development) and
+`-EIO` (production). Recovering that way rewrites the masters but does not
+erase buckets, so surviving blobs stay readable and mount's defensive scan
+(§5.1) re-raises the id ceiling past them.
 
 ### 3.2 Bucket layout (one sector)
 
@@ -228,10 +272,12 @@ the next compaction.
 ## 7. Kconfig
 
 ```
-BLOB_DB                    bool, select FLASH, FLASH_MAP, CRC
-BLOB_DB_PARTITION_LABEL    string, default "storage"
-BLOB_DB_MAX_PAYLOAD_LEN    int, default 256, range 1 4096
-BLOB_DB_MULTI              bool, default n   # batch ops (§5.8, contract D6)
+BLOB_DB                        bool, select FLASH, FLASH_MAP, CRC
+BLOB_DB_PARTITION_LABEL        string, default "storage"
+BLOB_DB_MAX_PAYLOAD_LEN        int, default 256, range 1 65535  # geometry checked at mount
+BLOB_DB_SECTOR_BUF_SIZE        int, default 4096
+BLOB_DB_AUTOFORMAT_ON_CORRUPT  bool, default y   # see §3.1
+BLOB_DB_MULTI                  bool, default n   # batch ops (§5.8, contract D6)
 module = BLOB_DB (standard LOG pattern)
 ```
 
@@ -324,11 +370,17 @@ draft implementation and will be reworked against the final API; the
    keeps **no** `write_cursor[N]` array; each write re-walks the target
    bucket (`walk_bucket`) to find the append cursor (+1 read on
    `update`/`delete`), honoring contract R1 (O(1) steady-state RAM).
-3. **Sector-size portability.** 4 KB stack buffers assume ≤ 4 KB erase
-   sectors; parts with larger erase blocks need either a Kconfig'd buffer or
-   an explicit supported-geometry statement.
-4. **Master format version field** — add alongside the magic for bucket-log
-   format evolution.
+3. **Sector-size portability.** *(Resolved.)* The sector buffers are sized by
+   `BLOB_DB_SECTOR_BUF_SIZE` and mount refuses a partition whose sector is
+   larger. Slot staging moved off the stack into the compaction scratch, so
+   the payload cap no longer drives stack depth (contract R7). The cap itself
+   is checked against the geometry at mount: a bucket is an append-only log,
+   so a rebind needs two slots to coexist, bounding the payload at
+   `(sector − 16) / 2 − 14` — about 2026 B on 4 KB sectors, 32 746 B on 64 KB.
+4. **Master format version field.** *(Resolved.)* Superseded by the frozen
+   compatibility prefix (§3.1): `format_major` / `format_minor` / `hdr_len`
+   under their own CRC, so software of any vintage can classify a store it did
+   not write and refuse it rather than reformat it.
 5. **Debug bound-check for UB `update`** — optional Kconfig
    (`BLOB_DB_ASSERT_BOUND`): get-shaped scan + `__ASSERT` in debug builds,
    nothing in release.

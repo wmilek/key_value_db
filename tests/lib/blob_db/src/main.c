@@ -7,6 +7,7 @@
  */
 
 #include <errno.h>
+#include <stddef.h>
 #include <stdint.h>
 #include <string.h>
 
@@ -351,6 +352,79 @@ ZTEST(blob_db, test_compaction_preserves_ids)
 }
 
 /* 14. Injected COMPACTING(bid) at a higher master gen is recovered cleanly. */
+/* --- raw master-sector access, for forging on-flash states ---------------
+ *
+ * Deliberately a private copy of the layout rather than the library's own
+ * header: if blob_db's master ever drifts, these tests must fail loudly
+ * rather than silently follow it. sizeof and the two CRC spans are asserted
+ * below for the same reason.
+ */
+#define TEST_SECTOR_SZ  4096
+
+struct __packed master_img {
+	/* frozen compatibility prefix */
+	uint8_t  magic[4];
+	uint8_t  format_major;
+	uint8_t  format_minor;
+	uint16_t hdr_len;
+	uint16_t reserved;
+	uint16_t prefix_crc16;
+	/* body */
+	uint32_t generation;
+	uint8_t  state;
+	uint16_t cbid;
+	uint8_t  reserved0;
+	uint64_t next_id_hint;
+	uint8_t  reserved1[32];
+	uint32_t hdr_crc32;
+};
+BUILD_ASSERT(sizeof(struct master_img) == 64, "master layout drift");
+BUILD_ASSERT(offsetof(struct master_img, prefix_crc16) == 10, "prefix drift");
+BUILD_ASSERT(offsetof(struct master_img, hdr_crc32) == 60, "body drift");
+
+/* The format this build of blob_db writes. Asserted rather than assumed, so
+ * a version bump breaks these tests instead of quietly reinterpreting them. */
+#define TEST_FORMAT_MAJOR  1
+
+static void master_seal(struct master_img *m)
+{
+	m->prefix_crc16 = crc16_ccitt(0xffff, (const uint8_t *)m,
+				      offsetof(struct master_img, prefix_crc16));
+	m->hdr_crc32 = crc32_ieee((const uint8_t *)m,
+				  offsetof(struct master_img, hdr_crc32));
+}
+
+static void master_read_raw(uint8_t slot, struct master_img *m)
+{
+	const struct flash_area *fa;
+
+	zassert_ok(flash_area_open(BLOB_DB_TEST_PARTITION_ID, &fa));
+	zassert_ok(flash_area_read(fa, (off_t)slot * TEST_SECTOR_SZ, m, sizeof(*m)));
+	flash_area_close(fa);
+}
+
+static void master_write_raw(uint8_t slot, const struct master_img *m)
+{
+	const struct flash_area *fa;
+
+	zassert_ok(flash_area_open(BLOB_DB_TEST_PARTITION_ID, &fa));
+	zassert_ok(flash_area_erase(fa, (off_t)slot * TEST_SECTOR_SZ, TEST_SECTOR_SZ));
+	zassert_ok(flash_area_write(fa, (off_t)slot * TEST_SECTOR_SZ, m, sizeof(*m)));
+	flash_area_close(fa);
+}
+
+/* Leave the metadata sectors erased so the next mount sees a virgin store.
+ * Every test that deliberately leaves an unmountable partition behind must
+ * call this, or the following test's fixture cannot mount. */
+static void masters_erase(void)
+{
+	const struct flash_area *fa;
+
+	zassert_ok(flash_area_open(BLOB_DB_TEST_PARTITION_ID, &fa));
+	zassert_ok(flash_area_erase(fa, 0, 3 * TEST_SECTOR_SZ));
+	flash_area_close(fa);
+}
+
 ZTEST(blob_db, test_mid_compaction_crash_recovery)
 {
 	uint64_t a = put_blob("AA", 2);
@@ -358,43 +432,33 @@ ZTEST(blob_db, test_mid_compaction_crash_recovery)
 
 	zassert_ok(blob_db_unmount());
 
-	const struct flash_area *fa;
-
-	zassert_ok(flash_area_open(BLOB_DB_TEST_PARTITION_ID, &fa));
-
 	/* Read current master A to learn its gen. */
-	struct master_hdr_pkt {
-		uint8_t  magic[4];
-		uint32_t generation;
-		uint8_t  state;
-		uint16_t cbid;
-		uint8_t  reserved;
-		uint64_t next_id_hint;
-		uint32_t crc;
-	} __packed mhdr;
+	struct master_img mhdr;
 
-	zassert_ok(flash_area_read(fa, 0, &mhdr, sizeof(mhdr)));
+	master_read_raw(0, &mhdr);
+	zassert_equal(mhdr.format_major, TEST_FORMAT_MAJOR,
+		      "format major changed; revisit these tests");
 
 	/* Build a COMPACTING master with much higher gen, written to slot B. */
-	struct master_hdr_pkt injected = mhdr;
+	struct master_img injected = mhdr;
 
-	injected.magic[0] = 'B';
-	injected.magic[1] = 'D';
-	injected.magic[2] = 'M';
-	injected.magic[3] = 'S';
 	injected.generation = mhdr.generation + 100;
 	injected.state = 1;          /* COMPACTING */
 	injected.cbid = 42;          /* arbitrary bucket id */
-	injected.reserved = 0;
-	/* keep next_id_hint */
-	injected.crc = crc32_ieee((uint8_t *)&injected, 20);
-
-	zassert_ok(flash_area_erase(fa, 4096, 4096));   /* master B sector */
-	zassert_ok(flash_area_write(fa, 4096, &injected, sizeof(injected)));
-
-	flash_area_close(fa);
+	master_seal(&injected);
+	master_write_raw(1, &injected);
 
 	zassert_ok(blob_db_mount(), "mount should run recover_compaction");
+
+	/* Recovery must actually have run: it commits a CLEAN master one
+	 * generation past the COMPACTING one, on the other slot. Without this
+	 * the case passes even when mount quietly ignores the injected master. */
+	struct master_img after_a;
+
+	master_read_raw(0, &after_a);
+	zassert_equal(after_a.generation, injected.generation + 1,
+		      "recovery did not commit a newer master");
+	zassert_equal(after_a.state, 0, "recovery left the store COMPACTING");
 
 	uint8_t buf[16];
 	size_t got;
@@ -687,4 +751,229 @@ ZTEST(blob_db, test_prepare_survives_remount)
 
 	/* Same cursor, same window — everything should already be prepared. */
 	zassert_equal(blob_db_prepare(4), 0);
+}
+
+
+/* --- on-flash format compatibility --------------------------------------
+ *
+ * The property under test: software must be able to tell that a store was
+ * written in a format it does not understand, and must refuse it rather than
+ * destroy it. Before the compatibility prefix existed, every case below ended
+ * in mount() reformatting the partition.
+ */
+
+/* A store declaring a newer major is refused — and, above all, left alone. */
+ZTEST(blob_db, test_foreign_major_is_refused_and_partition_untouched)
+{
+	uint64_t id = put_blob("KEEP", 4);
+
+	ARG_UNUSED(id);
+	zassert_ok(blob_db_unmount());
+
+	struct master_img m;
+
+	master_read_raw(0, &m);
+	zassert_equal(m.format_major, TEST_FORMAT_MAJOR);
+
+	struct master_img future = m;
+
+	future.format_major = TEST_FORMAT_MAJOR + 1;
+	master_seal(&future);
+	master_write_raw(0, &future);
+
+	zassert_equal(blob_db_mount(), -ENOTSUP,
+		      "a newer major must be refused, not mounted");
+
+	/* The assertion that matters: nothing was written. */
+	struct master_img after;
+
+	master_read_raw(0, &after);
+	zassert_mem_equal(&after, &future, sizeof(future),
+			  "mount modified a store it does not understand");
+
+	masters_erase();
+}
+
+/* A valid prefix carrying someone else's magic is another allocator's store
+ * (contract D1) — same rule, refuse and leave it. */
+ZTEST(blob_db, test_foreign_magic_is_refused)
+{
+	zassert_ok(blob_db_unmount());
+
+	struct master_img m;
+
+	master_read_raw(0, &m);
+	memcpy(m.magic, "XXXX", 4);
+	master_seal(&m);
+	master_write_raw(0, &m);
+
+	zassert_equal(blob_db_mount(), -ENOTSUP);
+
+	struct master_img after;
+
+	master_read_raw(0, &after);
+	zassert_mem_equal(&after, &m, sizeof(m), "foreign store was modified");
+
+	masters_erase();
+}
+
+/* An interrupted upgrade: our major on one slot, a newer one with a higher
+ * generation on the other. Falling back to the older slot would silently
+ * mount a stale view, so the whole store must be refused. */
+ZTEST(blob_db, test_split_major_refuses_without_falling_back)
+{
+	put_blob("AA", 2);
+	zassert_ok(blob_db_unmount());
+
+	struct master_img ours;
+
+	master_read_raw(0, &ours);
+	zassert_equal(ours.format_major, TEST_FORMAT_MAJOR);
+
+	struct master_img newer = ours;
+
+	newer.format_major = TEST_FORMAT_MAJOR + 1;
+	newer.generation = ours.generation + 50;
+	master_seal(&newer);
+	master_write_raw(1, &newer);
+
+	zassert_equal(blob_db_mount(), -ENOTSUP,
+		      "must not fall back to the older, understood master");
+
+	masters_erase();
+}
+
+/* Bit rot is NOT foreignness. A prefix whose CRC fails could be anything, so
+ * the other master stays authoritative and the store still mounts — this is
+ * what the separate prefix CRC buys over a single header CRC. */
+ZTEST(blob_db, test_corrupt_prefix_falls_back_to_the_good_master)
+{
+	uint64_t id = put_blob("SURVIVE", 7);
+
+	zassert_ok(blob_db_unmount());
+
+	/* Make A unambiguously authoritative, then wreck B's prefix. */
+	struct master_img good;
+
+	master_read_raw(0, &good);
+	good.generation += 10;
+	master_seal(&good);
+	master_write_raw(0, &good);
+
+	struct master_img rotten = good;
+
+	rotten.generation = good.generation + 1;   /* would win if it parsed */
+	master_seal(&rotten);
+	rotten.prefix_crc16 ^= 0xffff;             /* ...but it does not */
+	master_write_raw(1, &rotten);
+
+	zassert_ok(blob_db_mount(), "one rotten master must not brick the store");
+
+	uint8_t buf[8];
+	size_t got;
+
+	zassert_ok(blob_db_get(id, buf, sizeof(buf), &got));
+	zassert_equal(got, 7);
+	zassert_mem_equal(buf, "SURVIVE", 7);
+}
+
+/* An additive (minor) revision is readable: the fields we know sit at fixed
+ * offsets and the CRC span is ours to compute, so a longer header written by
+ * newer software still mounts. */
+ZTEST(blob_db, test_future_minor_is_tolerated)
+{
+	uint64_t id = put_blob("MINOR", 5);
+
+	zassert_ok(blob_db_unmount());
+
+	struct master_img m;
+
+	master_read_raw(0, &m);
+	m.generation += 10;
+	m.format_minor = 9;    /* far ahead of anything this build knows */
+	m.hdr_len = sizeof(m) + 8;  /* and claiming trailing fields we lack */
+	master_seal(&m);
+	master_write_raw(0, &m);
+
+	zassert_ok(blob_db_mount(), "an additive revision must still mount");
+
+	uint8_t buf[8];
+	size_t got;
+
+	zassert_ok(blob_db_get(id, buf, sizeof(buf), &got));
+	zassert_equal(got, 5);
+	zassert_mem_equal(buf, "MINOR", 5);
+}
+
+/* Neither master parses and neither is erased. With the development default
+ * this is recoverable — the store is reformatted rather than left dead. */
+ZTEST(blob_db, test_both_masters_corrupt_autoformats)
+{
+	Z_TEST_SKIP_IFNDEF(CONFIG_BLOB_DB_AUTOFORMAT_ON_CORRUPT);
+
+	uint64_t survivor = put_blob("STALE", 5);
+
+	zassert_ok(blob_db_unmount());
+
+	for (uint8_t slot = 0; slot < 2; slot++) {
+		struct master_img m;
+
+		master_read_raw(slot, &m);
+		/* Ensure the sector is non-erased even if it never held a
+		 * master, so this is "corrupt", not "virgin". */
+		memcpy(m.magic, "BDMS", 4);
+		m.hdr_len = sizeof(m);
+		master_seal(&m);
+		m.prefix_crc16 ^= 0xffff;
+		master_write_raw(slot, &m);
+	}
+
+	zassert_ok(blob_db_mount(), "development default should reformat");
+
+	/* Recovery rewrites the masters; it does NOT erase the buckets, so
+	 * whatever they still hold stays readable. That is deliberate — the
+	 * caller asked to recover, not to destroy — but it puts already-issued
+	 * ids back in front of a freshly reset id counter, so the invariant
+	 * that actually matters is that mount's defensive scan re-raised the
+	 * ceiling past them. */
+	zassert_true(blob_db_exists(BLOB_DB_ROOT_ID), "root must be live");
+	zassert_true(blob_db_alloc_id() > survivor,
+		     "reset id space must not re-issue a surviving id");
+}
+
+/* Same state, production policy: refuse and leave the partition for the
+ * caller to deal with. Covered by the lib.blob_db.no_autoformat config. */
+ZTEST(blob_db, test_both_masters_corrupt_refused_when_configured)
+{
+	Z_TEST_SKIP_IFDEF(CONFIG_BLOB_DB_AUTOFORMAT_ON_CORRUPT);
+
+	put_blob("STALE", 5);
+	zassert_ok(blob_db_unmount());
+
+	struct master_img before[2];
+
+	for (uint8_t slot = 0; slot < 2; slot++) {
+		struct master_img m;
+
+		master_read_raw(slot, &m);
+		memcpy(m.magic, "BDMS", 4);
+		m.hdr_len = sizeof(m);
+		master_seal(&m);
+		m.prefix_crc16 ^= 0xffff;
+		master_write_raw(slot, &m);
+		before[slot] = m;
+	}
+
+	zassert_equal(blob_db_mount(), -EIO,
+		      "production policy must refuse, not reformat");
+
+	for (uint8_t slot = 0; slot < 2; slot++) {
+		struct master_img after;
+
+		master_read_raw(slot, &after);
+		zassert_mem_equal(&after, &before[slot], sizeof(after),
+				  "refused mount modified master %u", slot);
+	}
+
+	masters_erase();
 }

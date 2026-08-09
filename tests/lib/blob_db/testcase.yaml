@@ -3,3 +3,9 @@ common:
   platform_allow: native_sim
 tests:
   lib.blob_db: {}
+  # Production policy for an unparseable-but-not-erased master: refuse with
+  # -EIO instead of reformatting. Exercises the other half of the recovery
+  # branch in blob_db_mount().
+  lib.blob_db.no_autoformat:
+    extra_configs:
+      - CONFIG_BLOB_DB_AUTOFORMAT_ON_CORRUPT=n
