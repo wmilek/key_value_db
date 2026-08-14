@@ -6,9 +6,9 @@
 # -- Project information -----------------------------------------------------
 # https://www.sphinx-doc.org/en/master/usage/configuration.html#project-information
 
-project = 'Example Application'
-copyright = '2024, The Zephyr Community'
-author = 'The Zephyr Community'
+project = 'Zephyr Key-Value DB'
+copyright = '2026, key_value_db contributors'
+author = 'key_value_db contributors'
 release = '1.0.0'
 
 # -- General configuration ---------------------------------------------------

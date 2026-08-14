@@ -5,8 +5,8 @@
 
 /* This devicetree overlay file will be automatically picked by the Zephyr
  * build system when building the sample for the nucleo_f302r8 board. It shows
- * how the example-application can be built on sample boards already provided
- * by Zephyr.
+ * how this application can be built on sample boards already provided by
+ * Zephyr.
  */
 
 / {

@@ -17,6 +17,7 @@ Status: v2 · Top-level document; per-layer detail lives in `doc/layers/`
 | `doc/layers/l2_containers.md` | L2 — containers: seq, kvlist, kvhash, kvtree |
 | `doc/layers/l3_interfaces.md` | L3 — access interfaces: kvdb, blobfs, settings |
 | `doc/impl/l1_bucketlog.md` | **Implementation design** (non-normative): the v1 bucket-log allocator — formats, algorithms, costs, open items |
+| `doc/reviews/*.md` | Dated reviews of this document set, with findings and their resolution |
 
 `doc/layers/` holds **requirements & contracts** — everything an upper layer
 may rely on (P6). `doc/impl/` holds **implementation designs**: feasibility
@@ -27,9 +28,17 @@ implemented** against the current contract — `alloc_id` + bind/rebind
 `update`, durable leading id ceiling (impl §13.1) — and validated on
 `native_sim` by a unit suite (`tests/lib/blob_db`) and the model-container
 acceptance suite (`tests/lib/blob_db_contract`, the sufficiency proof of
-`l1_model_container.md` with crash injection at every mutation step). The
-module tree above L1 (rootreg, containers, interfaces) is **scaffolded**
-(build-wired, Kconfig-gated `default n`) but not yet implemented.
+`l1_model_container.md` with crash injection at every mutation step).
+
+Above L1, the first vertical slice is **implemented and tested on
+`native_sim`**: the root registry (`lib/rootreg`, `tests/lib/rootreg`), the
+`kvhash` Map container (`lib/containers/kvhash`), and the `kvdb` interface
+(`lib/kvdb`, `tests/lib/kvdb`, exercising kvhash through it). `app_perf_kvdb`
+runs that slice end to end on hardware with cross-reboot verification and
+power-loss classification. The rest of the module tree — the `seq`, `kvlist`
+and `kvtree` containers, the shared intent helper, and `blobfs` — remains
+**scaffolded** (build-wired, Kconfig-gated `default n`) but not yet
+implemented.
 
 ## 2. The stack
 
@@ -145,20 +154,25 @@ their first `open`. No other initialization order exists.
 
 ## 7. Repository layout (target)
 
+`(exists)` marks an implemented module; everything else is scaffolded.
+
 ```
 lib/
-  blob_db/            L1  (exists)
-  rootreg/            L1½ root registry (owner of id = 1)
-  containers/         L2  seq/ kvlist/ kvhash/ kvtree/  (+ shared intent/)
-  kvdb/  blobfs/      L3
+  blob_db/            L1  (exists — flash_area + UBI store backends)
+  rootreg/            L1½ root registry, owner of id = 1  (exists)
+  containers/         L2  kvhash/ (exists) · seq/ kvlist/ kvtree/ intent/
+  kvdb/  blobfs/      L3  kvdb (exists) · blobfs
 include/app/lib/      blob_db.h · rootreg.h · containers/{shape_map,shape_seq,…}.h
                       · kvdb.h · blobfs.h
-tests/lib/            blob_db/ (exists) · blob_db_contract/ (model container)
-                      · rootreg/ · containers/* · kvdb/ · blobfs/
+tests/lib/            blob_db/ (exists) · blob_db_contract/ (exists, model
+                      container) · rootreg/ (exists) · kvdb/ (exists — covers
+                      kvhash) · containers/ · blobfs/
 tests/support/        flash_fault/ — fail-after-N-writes flash_area shim,
                       shared by all crash-injection suites
+app/                  blob_db demo · app_perf*/ benchmarks with hardware
+                      reference results (RESULTS.md)
 doc/                  this file · principles.md · layers/*.md (contracts)
-                      · impl/*.md (implementation designs)
+                      · impl/*.md (implementation designs) · reviews/*.md
 ```
 
 Each new module follows the `lib/blob_db/` pattern: own `Kconfig`,
