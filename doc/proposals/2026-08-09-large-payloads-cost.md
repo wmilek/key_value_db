@@ -214,6 +214,64 @@ Three mitigations, in increasing order of value:
    > read-amplification win on the hot path is real and was delivered; the RAM
    > win is smaller than stated and needs the bulk paths reworked separately.
 
+### 3.0 Measured on the board — what held, and what did not
+
+Both commits were run on the nRF5340-DK, back to back, storage on the
+MX25R6435F QSPI NOR. Full numbers and raw captures in
+`app_perf/RESULTS.md`; the projections above are left in place so the
+errors stay visible.
+
+| Projected here | Measured |
+|---|---|
+| 64 KB sector erase ≈ 1 s | **1.06–1.09 s**, three independent ways that agree |
+| 64 KB bucket read ≈ 16 ms | **16.9 ms** on the older build, **23.2 ms** on this one |
+| Streaming walk cuts point-op read amplification "to ~1×" | **2.70×** — the direction was right, the figure optimistic |
+| Streaming walk is "the highest-value change available" | **confirmed, decisively**: `read` 23180 → 460 µs/op (**×50**), `update` ×20 |
+
+The erase and bucket-read constants transferred. Two things did not.
+
+**Mitigation 3 was undersold, not oversold.** The estimate framed it as an
+amplification fix and predicted ~1×; the measurement is 2.70× amplification
+but **50× less time**. The reason is the term this section named and then
+under-weighted: on this part cost tracks *bytes*, not transactions. PR 2
+trades 1 whole-sector read for 605 small ones — 6× the transactions for 47×
+fewer bytes — and wins by a factor of 50. The risk that transaction overhead
+would eat the byte saving was real enough to warrant the measurement, and it
+is now closed.
+
+**The chunk size in the tables above is not the one the implementation
+picks.** Both tables assume 8 KB chunks on 64 KB sectors (K = 32). The auto
+rule starts at `sector / 4` but clamps to what a single slot can hold, and the
+index record is itself a single-slot payload — so the DK resolves to **2004 B**
+chunks, giving K = 131 for a 256 KB object. On 64 KB sectors the segment count
+is therefore set by `BLOB_DB_MAX_PAYLOAD_LEN`, **not** by the sector size, and
+the "4 KB sectors, 2 KB chunks" table is the better model for the DK as well.
+Two consequences worth carrying forward:
+
+- The 8 KB-chunk row's `2 MB read for 256 KB` (8×) never occurs at default
+  config. Measured sequential read in 64 B windows is **44.33×** — a different
+  workload from that row, so not a like-for-like falsification, but far from
+  the shape the table implies.
+- Reachable object size at default config is `MAX_SEGMENTS × chunk` =
+  128 × 2004 = **256512 B**, which mount reports at boot. Raising the reachable
+  size means raising `BLOB_DB_MAX_PAYLOAD_LEN` (bigger index slot) or
+  `MAX_SEGMENTS` (more RAM) — sector size does not help.
+
+Mitigation 1 (cache the last-read index) is consequently the top remaining
+item, and it now has a measured target rather than an argument: 44.33×
+amplification on windowed sequential reads, roughly half of it re-reading the
+index record on every call.
+
+Two things this section did **not** predict, both from `app_perf/RESULTS.md`:
+
+- **Segment write amplification is 1.02×** — the layout is near-optimal in
+  bytes, and essentially all of a large write's wall clock is erase. Cold and
+  warm large writes differ by 8.4× while writing the same bytes.
+- **A partial write does not avoid the erase.** A 64 B `pwrite` still pays two
+  sector erases, so it beats a whole-object rewrite by only **1.95×** in time
+  against 3.46× in bytes written. `blob_db_write` earns its keep in bytes, not
+  seconds, unless the touched range lands inside already-erased space.
+
 ### 3.1 What the filesystem premise changes in the base proposal
 
 Two additions become mandatory rather than optional once `blobfs` sits

@@ -493,17 +493,23 @@ static int bench_large(void)
 	bench_bytes("lg pwrite", N_PART, (size_t)N_PART * PART_LEN, t_pwrite);
 	io_line("lg pwrite", (size_t)N_PART * PART_LEN);
 
-	/* Spell the comparison out, since it is the point of the phase. */
+	/* Spell the comparison out, since it is the point of the phase. Two
+	 * decimals, because integer division reported the DK's real 1.95x as
+	 * "1x" — the truncation swallowed the entire result at these
+	 * parameters (app_perf/RESULTS.md). */
 	if (t_pwrite > 0 && N_PART > 0 && N_LARGE > 0) {
 		const uint64_t us_pw =
 			(uint64_t)t_pwrite * 1000ULL / (uint64_t)N_PART;
 		const uint64_t us_rw =
 			(uint64_t)t_rewrite * 1000ULL / (uint64_t)N_LARGE;
+		const uint64_t r100 = us_pw ? (us_rw * 100ULL + us_pw / 2) / us_pw
+					    : 0;
 
 		printk("partial vs whole-object write: %llu us vs %llu us/op"
-		       "  (%llux)\n",
+		       "  (%llu.%02llux)\n",
 		       (unsigned long long)us_pw, (unsigned long long)us_rw,
-		       (unsigned long long)(us_pw ? us_rw / us_pw : 0));
+		       (unsigned long long)(r100 / 100),
+		       (unsigned long long)(r100 % 100));
 	}
 
 	/* Objects must still read back correctly after all that. */

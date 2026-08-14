@@ -135,9 +135,14 @@ partial vs whole-object write: 2336281 us vs 4562250 us/op  (1x)
 
 The parenthesised ratio is integer-truncated and under-reports the
 result — the real figure is **1.95×**. (The same line prints `11x` for an
-`N_LARGE=1` build, where the whole-object cost is 39.7 s.) Worth fixing
-in `src/main.c`, since this line is the headline for why `blob_db_write`
-exists.
+`N_LARGE=1` build, where the whole-object cost is 39.7 s.)
+
+> **Fixed.** `src/main.c` now computes the ratio in hundredths and prints
+> two decimals, so the same inputs render `(1.95x)`. The capture below
+> predates the fix and is left as measured; re-running prints the ratio
+> correctly. The truncation mattered because at these parameters it
+> swallowed the entire result — this line is the headline for why
+> `blob_db_write` exists, and it was reporting `1x`.
 
 The win is real but modest at these parameters: a 64-byte `pwrite` still
 pays **2 sector erases** (64 erases over 32 ops ≈ 2 s of the 2.34 s), so
@@ -283,17 +288,34 @@ mount the store, which is what a downgrade to `255ce7a` hits:
 <err> app_perf: mount: -134
 ```
 
-Nothing is damaged — the refusal is deliberate. But the advice in that
-message cannot be followed: `blob_db_format()` opens with
-`if (!st.mounted) return -ENODEV;`, so it is unreachable for exactly the
-store that needs discarding. Erase the raw partition instead, from a
-throwaway app that goes under the library:
+Nothing is damaged — the refusal is deliberate.
+
+> **Fixed.** At the time of this run the advice in that message could not
+> be followed: `blob_db_format()` opened with
+> `if (!st.mounted) return -ENODEV;`, so the one store that needed
+> discarding — the one that cannot be mounted — was the one store it
+> refused. It now opens the partition itself when called unmounted,
+> applies the same geometry checks a mount does, and leaves the DB
+> mounted and usable. Two regression tests cover it
+> (`test_format_discards_an_unmountable_store`,
+> `test_format_on_a_mounted_store_stays_mounted`).
+
+So on a current build, discarding a foreign store is just:
+
+```c
+blob_db_format();      /* no mount needed; ~136 s for 8 MB */
+```
+
+On the build used for this run, the workaround was to reach under the
+library and erase the raw partition from a throwaway app:
 
 ```c
 const struct flash_area *fa;
 flash_area_open(FIXED_PARTITION_ID(storage_partition), &fa);
-flash_area_erase(fa, 0, fa->fa_size);   /* ~136 s for 8 MB */
+flash_area_erase(fa, 0, fa->fa_size);
 ```
 
 A blank partition then mounts as `virgin partition; formatting`. The
-same applies in reverse after running an older build.
+same applies in reverse after running an older build — and note the
+older build cannot use the fixed `blob_db_format()`, since the fix is
+not in it, so downgrades still need the raw erase.
