@@ -111,6 +111,24 @@ config BLOB_DB_SEGMENT_LEN
 
 endif # BLOB_DB_LARGE_PAYLOADS
 
+config BLOB_DB_IOSTATS
+	bool "Count flash operations and bytes"
+	help
+	  Count reads, writes and erases — operations and bytes — at the
+	  storage seam, and expose them through blob_db_iostats_get(). Both
+	  counts are kept because they can disagree: a change that moves fewer
+	  bytes may issue more transactions, and on a serial part each
+	  transaction carries a fixed command-and-address cost.
+
+	  Intended for benchmarks and regression guards. Unlike wall-clock,
+	  these numbers are deterministic, so they are meaningful on native_sim
+	  — where the flash simulator models no latency at all unless
+	  FLASH_SIMULATOR_SIMULATE_TIMING is set, and even then charges per
+	  call rather than per byte.
+
+	  A handful of counters and one call per store operation; leave it off
+	  in production builds.
+
 config BLOB_DB_AUTOFORMAT_ON_CORRUPT
 	bool "Format when both master sectors are unreadable"
 	default y

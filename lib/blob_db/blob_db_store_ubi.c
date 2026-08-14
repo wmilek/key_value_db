@@ -152,6 +152,8 @@ int blob_db_store_read(off_t off, void *buf, size_t len)
 	const size_t lnum = (size_t)off / g_leb_size;
 	const size_t within = (size_t)off % g_leb_size;
 
+	BLOB_DB_IO_NOTE(BLOB_DB_IO_READ, len);
+
 	/* An unmapped (never-written / erased) LEB has no backing PEB; blob_db
 	 * expects erased flash to read as 0xff. Checking is_mapped first avoids
 	 * the per-read error log ubi_leb_read emits on an unmapped LEB (blob_db
@@ -177,6 +179,7 @@ int blob_db_store_write(off_t off, const void *buf, size_t len)
 	const size_t lnum = (size_t)off / g_leb_size;
 	const size_t within = (size_t)off % g_leb_size;
 
+	BLOB_DB_IO_NOTE(BLOB_DB_IO_WRITE, len);
 	return ubi_leb_write_at(g_ubi, g_vol_id, lnum, within, buf, len);
 }
 
@@ -185,6 +188,8 @@ int blob_db_store_erase(off_t off, size_t len)
 	if (len == 0) {
 		return 0;
 	}
+
+	BLOB_DB_IO_NOTE(BLOB_DB_IO_ERASE, len);
 
 	const size_t first = (size_t)off / g_leb_size;
 	const size_t last = ((size_t)off + len - 1) / g_leb_size;

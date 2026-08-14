@@ -401,6 +401,37 @@ int blob_db_format(void);
  */
 int blob_db_erase_all(void);
 
+#if defined(CONFIG_BLOB_DB_IOSTATS)
+/**
+ * @brief Flash I/O actually performed, counted at the storage seam.
+ *
+ * Operation counts and byte counts are both kept, because they answer
+ * different questions and can point opposite ways: a change that reads fewer
+ * bytes may issue more transactions, and on a serial part each transaction
+ * carries a fixed command-and-address cost. Judging such a change on bytes
+ * alone flatters it; judging on operations alone condemns it.
+ *
+ * Counted below both backends, so `flash_area` and UBI are directly
+ * comparable for the same workload. Deterministic — the same workload yields
+ * the same numbers — which makes these usable as regression guards where
+ * wall-clock is not.
+ */
+struct blob_db_iostats {
+	uint32_t reads;          /**< read operations issued          */
+	uint32_t writes;         /**< write operations issued         */
+	uint32_t erases;         /**< erase operations issued         */
+	uint64_t bytes_read;     /**< bytes requested from the store  */
+	uint64_t bytes_written;  /**< bytes handed to the store       */
+	uint64_t bytes_erased;   /**< bytes covered by erase requests */
+};
+
+/** @brief Snapshot the counters. */
+void blob_db_iostats_get(struct blob_db_iostats *out);
+
+/** @brief Zero the counters, to measure one operation or phase in isolation. */
+void blob_db_iostats_reset(void);
+#endif /* CONFIG_BLOB_DB_IOSTATS */
+
 /**
  * @brief Pre-format the next @p n buckets the allocator will use.
  *

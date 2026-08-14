@@ -111,6 +111,40 @@ static uint32_t hdr_crc32(const void *buf, size_t total)
 	return crc32_ieee(buf, total - sizeof(uint32_t));
 }
 
+#if defined(CONFIG_BLOB_DB_IOSTATS)
+static struct blob_db_iostats g_io;
+
+void blob_db_io_note(enum blob_db_io_op op, size_t bytes)
+{
+	switch (op) {
+	case BLOB_DB_IO_READ:
+		g_io.reads++;
+		g_io.bytes_read += bytes;
+		break;
+	case BLOB_DB_IO_WRITE:
+		g_io.writes++;
+		g_io.bytes_written += bytes;
+		break;
+	case BLOB_DB_IO_ERASE:
+		g_io.erases++;
+		g_io.bytes_erased += bytes;
+		break;
+	}
+}
+
+void blob_db_iostats_get(struct blob_db_iostats *out)
+{
+	if (out) {
+		*out = g_io;
+	}
+}
+
+void blob_db_iostats_reset(void)
+{
+	memset(&g_io, 0, sizeof(g_io));
+}
+#endif /* CONFIG_BLOB_DB_IOSTATS */
+
 /* Master sector helpers -------------------------------------------------- */
 
 /* CRC16-CCITT over the frozen part of the compatibility prefix (everything
