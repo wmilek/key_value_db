@@ -1,6 +1,7 @@
 # L3 — Access Interfaces
 
-Status: `kvdb` implemented (kvhash backend); `blobfs`/`settings` draft
+Status: `kvdb` implemented (kvhash backend); `blobfs` implemented in its v1
+scope (§4.1); `settings` draft
 · Part of the stack in `doc/architecture.md` · Governed by `doc/principles.md`
 · Builds on L2: `doc/layers/l2_containers.md`
 
@@ -141,6 +142,36 @@ Cross-directory rename crash-semantics are **deferred to the blobfs
 implementation design** (`doc/impl/`, when written); until specified, v1 may
 restrict `rename` to within one directory (`-ENOTSUP` otherwise).
 
+### 4.1 What v1 ships
+
+The shipped module is the **flat** slice of the above: one directory, holding
+files, with the handle-free calls that need no iteration — `create`, `stat`,
+`read`, `write`, `truncate`, `unlink`, `rename`, plus `mount`/`unmount`.
+`name -> dirent { type, body id }` is the Map value; the **file body is its
+own blob**, so its payload length *is* the file size and a write is one
+`blob_db_update()` — L1 atomicity carries through untouched, and no new
+on-flash format appears at L3.
+
+Two gaps are structural rather than unfinished work, and both report
+`-ENOTSUP` rather than pretending:
+
+- **`mkdir` / `readdir`** wait on an `iterate` op in the Map shape (§3) —
+  the same op `kvdb_foreach` waits on. Nested directories follow it.
+- **File size** is capped by one blob payload
+  (`CONFIG_BLOB_DB_MAX_PAYLOAD_LEN`); `BLOBFS_FILE_CHUNKED` over `seq` is
+  what lifts it.
+
+`rename` is `set(to)` then `del(from)`: a crash between them leaves both names
+on one body — visible, never a lost file — and an occupied destination is
+refused rather than silently replaced.
+
+The Zephyr interop shim (`CONFIG_BLOBFS_FS_INTEROP`) registers a
+`struct fs_file_system_t` at `FS_TYPE_EXTERNAL_BASE`, synthesizing the file
+handles and access-mode checks the VFS expects on top of the handle-free API.
+Ops v1 cannot honor are left NULL — the VFS core turns a NULL op into
+`-ENOTSUP` by itself, so the shim stubs nothing. `sync` succeeds as a no-op:
+a write is durable before it returns.
+
 ## 5. `settings` registry (optional)
 
 A flat, typed configuration store (`"net/ip" → typed value`) over a Map backend
@@ -160,15 +191,21 @@ choice                             prompt "kvdb default backend"   depends on BL
 endchoice
 # (KVDB_DEFAULT_BACKEND_{LIST,TREE} join the choice as those containers land.)
 
-config BLOBFS                      bool "Filesystem-like interface" depends on BLOB_CONTAINERS
+# Shipped (§4.1):
+config BLOBDB_BLOBFS               bool "blobfs (L3)"              depends on BLOB_DB
                                    select BLOB_ROOTREG
-choice BLOBFS_DIR_BACKEND          prompt "directory container"    depends on BLOBFS
+                                   select BLOB_CONTAINER_KVHASH
+config BLOBFS_MAX_NAME_LEN         int "Max file name length"      default 12
+config BLOBFS_FS_INTEROP           bool "Register as Zephyr fs backend"  depends on FILE_SYSTEM
+config BLOBFS_FS_TYPE_OFFSET       int "Offset from FS_TYPE_EXTERNAL_BASE"  default 0
+config BLOBFS_FS_MAX_OPEN_FILES    int "Concurrently open files"   default 4
+# Planned, with the containers they wait on:
+choice BLOBFS_DIR_BACKEND          prompt "directory container"    depends on BLOBDB_BLOBFS
   config BLOBFS_DIR_KVHASH         select CONTAINER_KVHASH
   config BLOBFS_DIR_KVTREE         select CONTAINER_KVTREE         # sorted readdir
 endchoice
 config BLOBFS_FILE_CHUNKED         bool "Chunked file bodies"      select CONTAINER_SEQ
 config BLOBFS_MAX_PATH_LEN         int "Max path length"           default 128
-config BLOBFS_FS_INTEROP           bool "Register as Zephyr fs backend"  depends on FILE_SYSTEM
 
 config SETTINGS_KVDB               bool "Zephyr settings backend over kvdb"  depends on KVDB && SETTINGS
 ```
@@ -192,9 +229,16 @@ tests/lib/blobfs/ ztest
 - **`kvdb`**: one functional suite, executed as a twister scenario **per
   backend** (`extra_configs` swaps the `choice`), asserting identical observable
   behavior — the conformance guarantee that makes backends swappable.
-- **`blobfs`**: path walking, deep nesting, readdir, within-directory rename
-  (id stability), offset read/write at chunk boundaries, truncate grow/shrink,
-  short reads at EOF.
+- **`blobfs`**: Zephyr's own filesystem conformance bodies
+  (`$ZEPHYR_BASE/tests/subsys/fs/common`) compiled unmodified against a blobfs
+  mount — `test_fs_basic` (create/write/stat, seek, truncate, unlink, sync,
+  remount persistence) and `test_fs_open_flags` (the whole `FS_O_*` matrix) —
+  answering the same suite FAT and littlefs do, and needing none of the
+  per-filesystem bypass defines littlefs sets. Local tests cover the v1
+  boundaries: `-ENOTSUP` for directories and `statvfs`, the flat namespace,
+  the body size cap, rename, single-mount. Path walking, deep nesting and
+  readdir join when directories do; chunk-boundary read/write joins with
+  `seq`.
 - **Cross-interface**: enable `kvdb` + `blobfs` together; verify id = 1 root
   directory dispatch (§2) and mutual isolation.
 - **Persistence & crash**: remount and torn-write cases at this level are smoke
