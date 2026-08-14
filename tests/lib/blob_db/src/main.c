@@ -977,3 +977,124 @@ ZTEST(blob_db, test_both_masters_corrupt_refused_when_configured)
 
 	masters_erase();
 }
+
+/* --- compaction crash recovery: the scratch seal --------------------------
+ *
+ * compact_commit() writes the compacted image to scratch, then seals it with a
+ * trailer. recover_compaction() must trust the trailer, not the bucket header:
+ * the header is at offset 0 of the image and therefore survives a tear that
+ * lost everything after it.
+ */
+
+/* A torn scratch write must NOT be restored over an intact bucket. Before the
+ * seal existed this lost every blob in the bucket past the tear. */
+ZTEST(blob_db, test_torn_scratch_write_does_not_clobber_bucket)
+{
+	uint64_t id = put_blob("VICTIM", 6);
+	const uint16_t n_buckets = 2045;          /* 2048 sectors - 3 metadata */
+	const uint16_t bid = (uint16_t)(id % n_buckets);
+	const off_t bucket_off = (off_t)(3 + bid) * TEST_SECTOR_SZ;
+	const off_t scratch_off = 2 * TEST_SECTOR_SZ;
+
+	zassert_ok(blob_db_unmount());
+
+	/* Scratch: a valid bucket header and nothing else — exactly what a
+	 * write torn just after the header leaves behind. No seal. */
+	uint8_t bhdr[16];
+	const struct flash_area *fa;
+
+	zassert_ok(flash_area_open(BLOB_DB_TEST_PARTITION_ID, &fa));
+	zassert_ok(flash_area_read(fa, bucket_off, bhdr, sizeof(bhdr)));
+	zassert_ok(flash_area_erase(fa, scratch_off, TEST_SECTOR_SZ));
+	zassert_ok(flash_area_write(fa, scratch_off, bhdr, sizeof(bhdr)));
+	flash_area_close(fa);
+
+	struct master_img m;
+
+	master_read_raw(0, &m);
+	m.generation += 100;
+	m.state = 1;               /* COMPACTING */
+	m.cbid = bid;
+	master_seal(&m);
+	master_write_raw(1, &m);
+
+	zassert_ok(blob_db_mount());
+
+	uint8_t buf[8];
+	size_t got;
+
+	zassert_ok(blob_db_get(id, buf, sizeof(buf), &got),
+		   "recovery restored a truncated scratch image over the bucket");
+	zassert_equal(got, 6);
+	zassert_mem_equal(buf, "VICTIM", 6);
+}
+
+/* The other half of the window: the image DID land and was sealed, and the
+ * bucket was already erased when power went. Recovery must restore it. */
+ZTEST(blob_db, test_sealed_scratch_is_restored_over_erased_bucket)
+{
+	uint64_t id = put_blob("RESTORE", 7);
+	const uint16_t n_buckets = 2045;
+	const uint16_t bid = (uint16_t)(id % n_buckets);
+	const off_t bucket_off = (off_t)(3 + bid) * TEST_SECTOR_SZ;
+	const off_t scratch_off = 2 * TEST_SECTOR_SZ;
+
+	zassert_ok(blob_db_unmount());
+
+	/* Copy the live bucket image into scratch, seal it, then erase the
+	 * bucket — the state left by a crash between those two steps. */
+	static uint8_t image[TEST_SECTOR_SZ];
+	const struct flash_area *fa;
+
+	zassert_ok(flash_area_open(BLOB_DB_TEST_PARTITION_ID, &fa));
+	zassert_ok(flash_area_read(fa, bucket_off, image, sizeof(image)));
+
+	/* Trim the trailing erased bytes: the image is everything up to the
+	 * last non-0xff byte, which is what compaction would have written. */
+	size_t image_len = sizeof(image);
+
+	while (image_len > 16 && image[image_len - 1] == 0xff) {
+		image_len--;
+	}
+
+	struct __packed {
+		uint8_t  magic[4];
+		uint32_t image_len;
+		uint32_t image_crc32;
+		uint32_t seal_crc32;
+	} seal = {
+		.image_len = (uint32_t)image_len,
+		.image_crc32 = crc32_ieee(image, image_len),
+	};
+	BUILD_ASSERT(sizeof(seal) == 16, "seal layout drift");
+
+	memcpy(seal.magic, "BDSL", 4);
+	seal.seal_crc32 = crc32_ieee((const uint8_t *)&seal,
+				     sizeof(seal) - sizeof(uint32_t));
+
+	zassert_ok(flash_area_erase(fa, scratch_off, TEST_SECTOR_SZ));
+	zassert_ok(flash_area_write(fa, scratch_off, image, image_len));
+	zassert_ok(flash_area_write(fa, scratch_off + TEST_SECTOR_SZ - sizeof(seal),
+				    &seal, sizeof(seal)));
+	zassert_ok(flash_area_erase(fa, bucket_off, TEST_SECTOR_SZ));
+	flash_area_close(fa);
+
+	struct master_img m;
+
+	master_read_raw(0, &m);
+	m.generation += 100;
+	m.state = 1;               /* COMPACTING */
+	m.cbid = bid;
+	master_seal(&m);
+	master_write_raw(1, &m);
+
+	zassert_ok(blob_db_mount());
+
+	uint8_t buf[8];
+	size_t got;
+
+	zassert_ok(blob_db_get(id, buf, sizeof(buf), &got),
+		   "a sealed image was not restored over the erased bucket");
+	zassert_equal(got, 7);
+	zassert_mem_equal(buf, "RESTORE", 7);
+}

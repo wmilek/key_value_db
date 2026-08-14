@@ -28,6 +28,7 @@ LOG_MODULE_REGISTER(blob_db, CONFIG_BLOB_DB_LOG_LEVEL);
 /* On-flash magic strings, 4 bytes each (no NUL terminator). */
 static const uint8_t MASTER_MAGIC[4] = { 'B', 'D', 'M', 'S' };
 static const uint8_t BUCKET_MAGIC[4] = { 'B', 'D', 'B', 'H' };
+static const uint8_t SCRATCH_MAGIC[4] = { 'B', 'D', 'S', 'L' };
 
 /* Forward declarations (compaction helpers live below blob_db_mount). */
 static int recover_compaction(uint16_t bid);
@@ -866,6 +867,62 @@ static size_t build_compacted_image(const uint8_t *old_buf, uint8_t *new_buf,
 	return (size_t)new_cursor;
 }
 
+/* Byte offset of the scratch seal: the tail of the scratch sector, rounded
+ * down so the write stays aligned. The compacted image must end at or before
+ * it. */
+static inline size_t scratch_seal_len(void)
+{
+	const size_t a = st.write_align ? st.write_align : 1;
+
+	return ROUND_UP(sizeof(struct blob_db_scratch_seal), a);
+}
+
+static inline off_t scratch_seal_off(void)
+{
+	return (off_t)(st.peb_size - scratch_seal_len());
+}
+
+static int scratch_seal_write(off_t scratch_off, const uint8_t *image,
+			      size_t image_len)
+{
+	uint8_t buf[BLOB_DB_MAX_WRITE_ALIGN + sizeof(struct blob_db_scratch_seal)];
+	struct blob_db_scratch_seal *seal = (struct blob_db_scratch_seal *)buf;
+
+	memset(buf, 0xff, sizeof(buf));
+	memcpy(seal->magic, SCRATCH_MAGIC, 4);
+	seal->image_len   = (uint32_t)image_len;
+	seal->image_crc32 = crc32_ieee(image, image_len);
+	seal->seal_crc32  = hdr_crc32(seal, sizeof(*seal));
+
+	return blob_db_store_write(scratch_off + scratch_seal_off(), buf,
+				   scratch_seal_len());
+}
+
+/* Is the scratch sector a complete, self-consistent compacted image?
+ * `image` must already hold the sector's first peb_size bytes. */
+static bool scratch_seal_valid(const uint8_t *image, size_t *image_len)
+{
+	struct blob_db_scratch_seal seal;
+
+	memcpy(&seal, image + scratch_seal_off(), sizeof(seal));
+
+	if (memcmp(seal.magic, SCRATCH_MAGIC, 4) != 0) {
+		return false;
+	}
+	if (seal.seal_crc32 != hdr_crc32(&seal, sizeof(seal))) {
+		return false;
+	}
+	if (seal.image_len < BLOB_DB_BUCKET_DATA_OFF ||
+	    seal.image_len > (uint32_t)scratch_seal_off()) {
+		return false;
+	}
+	if (seal.image_crc32 != crc32_ieee(image, seal.image_len)) {
+		return false;
+	}
+	*image_len = seal.image_len;
+	return true;
+}
+
 /* Phase-2: persist the compacted image via master + scratch + bucket sequence.
  *
  *   1. write master inactive = COMPACTING(bid)                 ── enters atomic window
@@ -882,6 +939,16 @@ static int compact_commit(uint16_t bid, const uint8_t *new_buf, size_t new_len)
 	const off_t scratch_off = peb_offset(BLOB_DB_SCRATCH_SECTOR);
 	const off_t bucket_off  = bucket_offset(bid);
 
+	/* The seal has to fit after the image in the same sector. An image this
+	 * large means compaction reclaimed nothing worth having, which is the
+	 * -ENOSPC the caller would reach anyway. */
+	if (new_len > (size_t)scratch_seal_off()) {
+		LOG_WRN("compact bid=%u: image %zu B leaves no room to seal "
+			"scratch (limit %zu B)", bid, new_len,
+			(size_t)scratch_seal_off());
+		return -ENOSPC;
+	}
+
 	/* Step 1: enter atomic window. */
 	uint8_t inactive = !st.active_master;
 	int rc = write_master(inactive, st.master_gen + 1,
@@ -892,12 +959,17 @@ static int compact_commit(uint16_t bid, const uint8_t *new_buf, size_t new_len)
 	st.active_master = inactive;
 	st.master_gen++;
 
-	/* Step 2: scratch. */
+	/* Step 2: scratch, then seal it. The seal is what makes step 3 safe to
+	 * start: until it lands, recovery must leave the bucket alone. */
 	rc = blob_db_store_erase(scratch_off, st.peb_size);
 	if (rc < 0) {
 		return rc;
 	}
 	rc = blob_db_store_write(scratch_off, new_buf, new_len);
+	if (rc < 0) {
+		return rc;
+	}
+	rc = scratch_seal_write(scratch_off, new_buf, new_len);
 	if (rc < 0) {
 		return rc;
 	}
@@ -977,20 +1049,32 @@ static int recover_compaction(uint16_t bid)
 		return rc;
 	}
 
-	if (bucket_hdr_valid(g_bbuf, bid)) {
-		LOG_WRN("recover: scratch is sealed for bid %u; "
-			"restoring bucket from scratch", bid);
+	/* The tail seal — not the bucket header — decides whether the whole
+	 * image landed. The header is written first, so it survives a tear that
+	 * lost everything after it; restoring on the strength of the header
+	 * therefore overwrote intact buckets with truncated images. */
+	size_t image_len = 0;
+
+	if (scratch_seal_valid(g_bbuf, &image_len) &&
+	    bucket_hdr_valid(g_bbuf, bid)) {
+		LOG_WRN("recover: scratch sealed for bid %u (%zu B); "
+			"restoring bucket", bid, image_len);
 		rc = blob_db_store_erase(bucket_offset(bid), st.peb_size);
 		if (rc < 0) {
 			return rc;
 		}
-		rc = blob_db_store_write(bucket_offset(bid),
-				      g_bbuf, st.peb_size);
+		/* Only the image: the rest of the bucket must stay erased so
+		 * appends can continue after it. */
+		rc = blob_db_store_write(bucket_offset(bid), g_bbuf, image_len);
 		if (rc < 0) {
 			return rc;
 		}
 	} else {
-		LOG_WRN("recover: scratch invalid; bucket %u left as-is", bid);
+		/* Either the image never completed (crash before the seal, so
+		 * the bucket was never touched) or it is not for this bucket.
+		 * Leaving the bucket alone is the safe half of the window. */
+		LOG_WRN("recover: scratch unsealed or foreign; bucket %u left as-is",
+			bid);
 	}
 
 	rc = blob_db_store_erase(scratch_off, st.peb_size);

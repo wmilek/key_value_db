@@ -209,9 +209,10 @@ Build the compacted image (live slots only) in RAM, then:
 ```
 write master B  (gen+1, COMPACTING, bid, hint↑)  ─┐   hint↑: cover the highest
 erase scratch; write new image to scratch          │   id being dropped, so an
-erase bucket;  write new image to bucket           │   erased tombstone cannot
-erase scratch                                      │   unprotect its id
-write master A  (gen+2, CLEAN)                    ─┘   (subsumed by §13.1)
+seal scratch (trailer, written last — §6.1)        │   erased tombstone cannot
+erase bucket;  write new image to bucket           │   unprotect its id
+erase scratch                                      │   (subsumed by §13.1)
+write master A  (gen+2, CLEAN)                    ─┘
 ```
 
 The window is bracketed by master writes; any crash inside is recovered at
@@ -259,9 +260,31 @@ wins). Compaction composes them.
 |---|---|---|
 | before any write | both masters CLEAN | nothing |
 | during master-B write | B invalid, A CLEAN | not-yet-compacting |
-| during scratch erase/write | B = COMPACTING, scratch invalid | discard scratch; bucket untouched; write CLEAN |
-| during bucket erase/restore | B = COMPACTING, scratch valid | copy scratch → bucket; erase scratch; write CLEAN |
+| during scratch erase/write | B = COMPACTING, scratch **unsealed** | discard scratch; bucket untouched; write CLEAN |
+| during the scratch seal write | B = COMPACTING, seal partial → unsealed | as above; the bucket was never touched |
+| during bucket erase/restore | B = COMPACTING, scratch **sealed** | copy scratch → bucket; erase scratch; write CLEAN |
 | during final master-A write | B still COMPACTING | re-run recovery (idempotent); write CLEAN |
+
+**"Scratch valid" must mean "the whole image landed", and the bucket header
+cannot say that.** The header sits at offset 0 of the image, so it is written
+*first*; a write torn anywhere after it leaves a valid header over a truncated
+slot stream. Recovery that keyed off the header therefore restored the
+truncation over an intact bucket and lost every blob past the tear — a real
+data-loss path, fixed by sealing scratch with a trailer written *after* the
+image:
+
+```
+seal (16 B, at the tail of the scratch sector, written last)
+  magic[4]       = 'B','D','S','L'
+  image_len[4]   = bytes of compacted image at offset 0
+  image_crc32[4] = CRC32-IEEE over those bytes
+  seal_crc32[4]  = CRC32-IEEE over the preceding 12 B
+```
+
+The seal is at the tail rather than the header being written last so that every
+write stays forward-only, which the UBI backend's `ubi_leb_write_at()` mapping
+relies on. `compact_commit` refuses an image with no room to seal (`-ENOSPC`),
+which is the answer the caller reaches anyway when compaction reclaims nothing.
 
 ### 6.2 Torn slot
 

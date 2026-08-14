@@ -158,4 +158,29 @@ BUILD_ASSERT(BLOB_DB_SLOT_OVERHEAD == 14, "slot overhead drift");
 /* Data area within a bucket starts immediately after its header. */
 #define BLOB_DB_BUCKET_DATA_OFF   (sizeof(struct blob_db_bucket_hdr))
 
+/* Compaction scratch seal (16 B), written at the tail of the scratch sector
+ * AFTER the compacted image, and therefore the only trustworthy answer to
+ * "did the whole image land?".
+ *
+ * The bucket header cannot answer that question: it sits at offset 0 of the
+ * image, so it is the FIRST thing written, and a write torn anywhere after it
+ * leaves a perfectly valid header over a truncated slot stream. Recovery that
+ * trusted the header would copy that truncation over an intact bucket and lose
+ * every blob past the tear.
+ *
+ * Sealing at the tail keeps every write forward-only (offsets only increase),
+ * which the UBI backend's ubi_leb_write_at() mapping relies on — the reason
+ * the header is not simply written last instead.
+ */
+struct __packed blob_db_scratch_seal {
+	uint8_t  magic[4];        /* 'B','D','S','L'                          */
+	uint32_t image_len;       /* bytes of compacted image at offset 0      */
+	uint32_t image_crc32;     /* CRC32-IEEE over those image_len bytes     */
+	uint32_t seal_crc32;      /* CRC32-IEEE over the preceding 12 bytes    */
+};
+BUILD_ASSERT(sizeof(struct blob_db_scratch_seal) == 16,
+	     "blob_db_scratch_seal layout drift");
+
+#define BLOB_DB_SCRATCH_MAGIC     "BDSL"
+
 #endif /* LIB_BLOB_DB_INTERNAL_H_ */
