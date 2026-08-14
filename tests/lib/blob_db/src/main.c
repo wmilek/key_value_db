@@ -19,6 +19,9 @@
 
 #define BLOB_DB_TEST_PARTITION_ID  PARTITION_ID(storage_partition)
 
+/* native_sim overlay geometry: 8 MB of 4 KB sectors. */
+#define TEST_SECTOR_SZ  4096
+
 /* alloc + bind in one step — the contract's replacement for the old `put`. */
 static uint64_t put_blob(const void *payload, size_t len)
 {
@@ -211,7 +214,7 @@ ZTEST(blob_db, test_boundary_payload_len)
 /* 10. Corrupting a byte in a slot causes that slot (and everything after
  *     it in the same bucket) to drop out on next mount. A blob in a
  *     different bucket is unaffected. */
-ZTEST(blob_db, test_corrupted_slot_truncates_bucket)
+ZTEST(blob_db, test_corrupted_slot_is_invisible)
 {
 	uint64_t a = put_blob("AAA", 3);
 	uint64_t b = put_blob("BBB", 3);
@@ -250,6 +253,59 @@ ZTEST(blob_db, test_corrupted_slot_truncates_bucket)
 	zassert_ok(blob_db_get(b, buf, sizeof(buf), &got),
 		   "unrelated bucket should be intact");
 	zassert_mem_equal(buf, "BBB", 3);
+}
+
+/* A corrupt slot must not hide the slots after it in the same bucket.
+ *
+ * The resident-buffer walk treated a failed CRC as end-of-log, so one rotten
+ * slot made every later slot in that bucket unreachable until the next
+ * compaction. The header-driven walk knows each slot's size from its own
+ * header, so it steps over the rotten one and keeps going.
+ */
+ZTEST(blob_db, test_corrupt_slot_does_not_hide_later_slots)
+{
+	const uint16_t n_buckets = 2045;
+
+	/* Two ids exactly one full round of the bucket hash apart, so they
+	 * share a bucket with `first` written before `second`. */
+	uint64_t first = put_blob("FIRST", 5);
+
+	for (int i = 0; i < n_buckets - 1; i++) {
+		zassert_not_equal(blob_db_alloc_id(), 0, "alloc_id failed");
+	}
+	uint64_t second = put_blob("SECOND", 6);
+
+	zassert_equal(first % n_buckets, second % n_buckets,
+		      "test needs both ids in one bucket (%llu vs %llu)",
+		      (unsigned long long)first, (unsigned long long)second);
+	zassert_true(second > first, "second must be appended after first");
+
+	zassert_ok(blob_db_unmount());
+
+	/* Rot a bit in the FIRST slot's payload. NOR only goes 1->0. */
+	const off_t bucket_off = (off_t)(3 + (first % n_buckets)) * TEST_SECTOR_SZ;
+	const off_t payload_off = bucket_off + 16 + 4 + 8;
+	const struct flash_area *fa;
+	uint8_t byte;
+
+	zassert_ok(flash_area_open(BLOB_DB_TEST_PARTITION_ID, &fa));
+	zassert_ok(flash_area_read(fa, payload_off, &byte, 1));
+	zassert_not_equal(byte, 0, "need a set bit to clear");
+	byte &= (uint8_t)(byte - 1);   /* clears the lowest set bit */
+	zassert_ok(flash_area_write(fa, payload_off, &byte, 1));
+	flash_area_close(fa);
+
+	zassert_ok(blob_db_mount());
+
+	uint8_t buf[16];
+	size_t got;
+
+	zassert_equal(blob_db_get(first, buf, sizeof(buf), &got), -ENOENT,
+		      "the rotten slot itself must stay invisible");
+	zassert_ok(blob_db_get(second, buf, sizeof(buf), &got),
+		   "a later slot in the same bucket must remain reachable");
+	zassert_equal(got, 6);
+	zassert_mem_equal(buf, "SECOND", 6);
 }
 
 /* 11. Hitting bucket-full triggers per-bucket compaction; the latest
@@ -359,8 +415,6 @@ ZTEST(blob_db, test_compaction_preserves_ids)
  * rather than silently follow it. sizeof and the two CRC spans are asserted
  * below for the same reason.
  */
-#define TEST_SECTOR_SZ  4096
-
 struct __packed master_img {
 	/* frozen compatibility prefix */
 	uint8_t  magic[4];

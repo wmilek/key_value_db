@@ -18,7 +18,9 @@ That cost is not caused by segmentation — it is already in the current
 implementation, and it is also what makes `blob_db`'s `.bss` 128 KB on that
 board. **The opt-out question is therefore the wrong knob**: keeping
 small-payload-only saves ~2 KB of flash and ~2 KB of RAM, while the whole-
-sector buffering it leaves in place costs 128 KB (§5).
+sector buffering it leaves in place costs 128 KB (§5). See the correction in
+§3 on how much of that 128 KB the streaming walk actually recovers — less than
+this document first claimed.
 
 ---
 
@@ -173,11 +175,21 @@ Three mitigations, in increasing order of value:
 2. **Skip the cursor-finding read for prepared buckets** (§2). Removes ~40 %
    of a warm large write.
 3. **Walk the slot log by streaming reads instead of whole-sector reads** —
-   read the 14 B slot header, skip to the next, and read only the payload you
-   want. This cuts read amplification to ~1× *and* removes the reason for the
-   two sector-sized buffers, taking `.bss` on the QSPI board from 128 KB to
-   ~1 KB. It is the single highest-value change available to `blob_db` for a
-   filesystem workload, and it is **independent of this proposal**.
+   read the 12 B slot header + id, skip to the next, and read only the payload
+   you want. This cuts read amplification on the point operations to ~1×. It is
+   the highest-value change available to `blob_db` for a filesystem workload,
+   and it is **independent of this proposal**.
+
+   > **Correction, from implementing it.** This item originally also claimed it
+   > "removes the reason for the two sector-sized buffers, taking `.bss` on the
+   > QSPI board from 128 KB to ~1 KB". That was wrong. `count` / `iterate` and
+   > compaction decide liveness by asking "does a later slot share this id?",
+   > which is O(n²) in slots per bucket; served from flash that becomes O(n²)
+   > *reads*, which costs far more than the sector read it replaced (on a 64 KB
+   > bucket holding ~800 slots, hundreds of MB across a full scan). Those paths
+   > therefore keep a resident sector image, and one sector buffer stays. The
+   > read-amplification win on the hot path is real and was delivered; the RAM
+   > win is smaller than stated and needs the bulk paths reworked separately.
 
 ### 3.1 What the filesystem premise changes in the base proposal
 
@@ -315,7 +327,7 @@ one item up and adds two:
 | | Change | Cost | Why this order |
 |---|---|---|---|
 | **1** | Stage 1 (base proposal §4): scratch-staged slots, mount-time geometry check, symbol split | ~0, negative RAM | fixes a live R7 violation; prerequisite |
-| **2** | **Streaming slot walk** (§3 mitigation 3) — *new, not in the base proposal* | ~0.5 KB `.text`, **−130 KB `.bss`** on QSPI NOR | best return of anything here, helps every operation, independent of large payloads |
+| **2** | **Streaming slot walk** (§3 mitigation 3) — *new, not in the base proposal* | **+407 B `.text`** (measured), 8×→~1× read on the point ops; `.bss` unchanged (see §3 correction) | best return of anything here for the hot path, independent of large payloads |
 | **3** | Stage 2 segmentation (base proposal §6) + scatter `append2` | +2.3 KB `.text`, +16 B per segment | unlocks the filesystem |
 | **4** | **Segmented pwrite** `blob_db_write()` — *new* | ~0.4 KB `.text` | without it a filesystem write is O(file), not O(chunk) |
 | **5** | Last-index cache (§3 mitigation 1) | ~0.2 KB `.text`, +16 B `.bss` | halves sequential read cost |
@@ -329,8 +341,9 @@ Decisions this adds to the six in the base proposal §11:
 - **D8 — Default chunk size.** Recommendation: **1024 B on 4 KB sectors,
   8 KB on 64 KB sectors** — the rows in §2 that keep per-bucket headroom.
   Trades ~12–25 % space efficiency for graceful behaviour near full.
-- **D9 — Rank the streaming slot walk ahead of Stage 2.** It is worth more
-  RAM than this entire proposal costs, and it is not coupled to it.
+- **D9 — Rank the streaming slot walk ahead of Stage 2.** It removes the
+  read-amplification tax from every point operation and is not coupled to
+  segmentation. (Its RAM claim was overstated — see the §3 correction.)
 - **D10 — Inside L1, or a shared chunking helper above it (§3.2).** This is
   the layering question and it should be settled before any code. Inside L1
   is recommended, on orphan reclaim and chunk invisibility; the fallback if

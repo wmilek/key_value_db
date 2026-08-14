@@ -24,10 +24,10 @@ Costs achieved by this design (satisfying contract §3):
 |---|---|---|---|
 | `mount` | 2 (master A + B) + 2045 (bucket scan)¹ | 0 (or format if first ever) | O(1) |
 | `alloc_id()` | 0 | 0 (occasional id-hint persist) | O(1) |
-| `get(id)` | **1** (one bucket sector) | 0 | 4 KB stack |
-| `update(id, …)` | 0² | 1 (slot; on rebind the old slot becomes garbage) + occasional compact | 4 KB stack |
-| `delete(id)` | 1 (verify presence) | 1 (tombstone) | 4 KB stack |
-| `exists(id)` | 1 | 0 | 4 KB stack |
+| `get(id)` | 1 bucket header + 12 B per slot + 1 payload | 0 | O(1) |
+| `update(id, …)` | 1 bucket header + 12 B per slot² | 1 (slot; on rebind the old slot becomes garbage) + occasional compact | O(1) |
+| `delete(id)` | as `get` (verify presence) | 1 (tombstone) | O(1) |
+| `exists(id)` | as `get` | 0 | O(1) |
 | `count` / `iterate` | 2045 (full scan) | 0 | O(1) |
 | `compact_bucket` | 1 + master writes | 1 scratch + 1 bucket restore + 2 master | O(1) |
 
@@ -145,9 +145,19 @@ slot_size(val_len) = round_up(14 + val_len, W)
 
 ### 3.4 End-of-log detection
 
-The slot stream ends at the first offset where the slot would cross the
-sector end, `val_len > MAX_PAYLOAD_LEN`, `flags == 0xff` (erased), or the CRC
-fails. The bucket's write cursor is that offset.
+The slot stream ends at the first offset whose **header** cannot be trusted to
+size its own slot: `flags == 0xff` (erased), SEALED clear, a flag bit this
+version does not know, `val_len > MAX_PAYLOAD_LEN`, or a slot that would cross
+the sector end. The bucket's write cursor is that offset.
+
+A failed **CRC** deliberately does *not* end the log. The header alone gives the
+stride to the next slot, so a rotten slot is stepped over and the slots after it
+stay reachable; only the rotten slot itself is invisible, and the next
+compaction drops it. (The earlier resident-buffer walk verified every CRC as it
+went and treated a failure as end-of-log, which hid every later slot in that
+bucket until compaction.) Readers verify the CRC of the one slot they actually
+want, and fall back to the newest intact slot below it — so the visible value is
+always a committed one.
 
 ## 4. Slot semantics — latest wins
 
@@ -195,8 +205,17 @@ bound or freshly allocated (§13.5).
 
 ### 5.4 `get`
 
-Read the id's bucket sector into a 4 KB stack buffer (the only flash I/O),
-walk slots tracking the latest match, apply latest-wins (§4).
+Walk the bucket by slot header (12 B per slot: header + id), tracking the
+latest match, apply latest-wins (§4); then read and CRC-verify just that slot's
+payload. No whole-sector read — the point of the header-driven walk is that
+answering one lookup costs O(slots) small reads instead of one erase-block read,
+which on 64 KB sectors is the difference between ~12 B per slot and 64 KB.
+
+`count` / `iterate` and compaction keep working on a resident sector image:
+their liveness test is "does a later slot share this id?", which is O(n²) in
+slots, and turning each comparison into a flash read would cost far more than
+the sector read it replaced. They are diagnostics and maintenance, not the hot
+path (contract D5).
 
 ### 5.5 `delete`
 
@@ -329,7 +348,7 @@ for headers), `<zephyr/logging/log.h>`.
 | Crash mid-slot write | CRC/erased-flags → end-of-log; committed slots intact |
 | Crash mid-compaction | master state machine + scratch (§6.1); ids unaffected |
 | Crash mid-master write | older valid master wins |
-| Bit corruption in a slot | CRC catches it; everything after it in that bucket is unreachable until next compaction |
+| Bit corruption in a slot | CRC catches it; **only that slot** is unreachable — the header-driven walk steps over it (§3.4) and the next compaction drops it. Readers fall back to the newest intact slot for the id |
 | Partition full | `update` returns `-ENOSPC` after attempting compaction of the target bucket |
 | One bucket overflows | as above, per-bucket; round-robin allocation keeps fill uniform, so buckets fill together |
 | Id space exhaustion | 2⁶⁴ allocations ≈ 5800 years at 100 M/s — not reachable |
