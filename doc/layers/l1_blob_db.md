@@ -177,6 +177,14 @@ int      blob_db_size (uint64_t id, size_t *out_size);
 int      blob_db_read (uint64_t id, size_t offset, void *out, size_t len,
                        size_t *out_read);
 
+/* Overwrite part of a payload, extending it (zero-filling any gap) if the
+ * range runs past the end. Atomic in the same sense as `update`. Touches only
+ * the storage the range covers, so changing a few bytes of a large object does
+ * not rewrite all of it. -EFBIG when growing an INLINE payload past a single
+ * slot: promote it with get + update, which is cheap while it is still that
+ * small. */
+int      blob_db_write(uint64_t id, size_t offset, const void *buf, size_t len);
+
 /* Format the partition (erase all blobs, reset the id counter to 1). For
  * factory reset / tests. */
 int      blob_db_format(void);
@@ -309,11 +317,16 @@ append that makes a small write atomic makes a large one atomic.
 L2's `seq` remains the right answer for *streams* (logs, queues, append-mostly
 data), not for large single values.
 
-Writes stay whole-blob at this layer: `update` takes the complete payload. A
-segmented **pwrite** — touching only the segments a range covers, instead of
-rewriting the object — is the next step for a filesystem client, where a
-whole-object rewrite per small write is the difference between O(chunk) and
-O(file).
+Writes are no longer whole-blob only: `blob_db_write` touches just the storage
+a range covers, so a small change to a large object costs O(chunk) rather than
+O(object). That is what makes a filesystem viable on this layer — a four-byte
+`blobfs_write` into a 256 KB file writes one segment, not the file.
+
+The whole-object checksum a full `update` records is **not** maintained across a
+partial write: recomputing it would mean reading the entire object, which is the
+cost the operation exists to avoid. Every byte stays covered by its own slot's
+CRC; a flag in the index record marks the whole-object value stale so a future
+fsck can tell "not maintained" from "mismatch".
 
 ### 5.5 D5 — Iteration is read-only: mutation from the callback is UB
 

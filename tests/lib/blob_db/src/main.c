@@ -1187,7 +1187,7 @@ ZTEST(blob_db, test_sealed_scratch_is_restored_over_erased_bucket)
  * without needing per-id state. This is what makes "no leaked segments"
  * testable at all — count() and iterate() deliberately cannot see them.
  */
-static int live_segment_slots(void)
+static void count_segment_slots(int *out_live, int *out_tombs)
 {
 	const struct flash_area *fa;
 
@@ -1243,7 +1243,32 @@ static int live_segment_slots(void)
 	}
 
 	flash_area_close(fa);
-	return live - tombs;
+	if (out_live) {
+		*out_live = live - tombs;
+	}
+	if (out_tombs) {
+		*out_tombs = tombs;
+	}
+}
+
+static int live_segment_slots(void)
+{
+	int live;
+
+	count_segment_slots(&live, NULL);
+	return live;
+}
+
+/* Segments released so far. A rewrite tombstones one id per segment it
+ * replaces, so the delta across an operation is exactly how many segments that
+ * operation rewrote — which "live count" cannot show, since every replacement
+ * both adds and retires one. */
+static int released_segment_slots(void)
+{
+	int tombs;
+
+	count_segment_slots(NULL, &tombs);
+	return tombs;
 }
 
 static void fill_pattern(uint8_t *buf, size_t len, uint8_t seed)
@@ -1471,5 +1496,185 @@ ZTEST(blob_db, test_sweep_reclaims_orphan_segments)
 	master_write_raw(1, &m);
 	zassert_ok(blob_db_mount());
 	zassert_equal(live_segment_slots(), referenced, "sweep not idempotent");
+}
+#endif /* CONFIG_BLOB_DB_LARGE_PAYLOADS */
+
+#ifdef CONFIG_BLOB_DB_LARGE_PAYLOADS
+/* --- partial writes (blob_db_write) ------------------------------------- */
+
+/* Overwriting a few bytes must change the bytes and leave the rest alone. */
+ZTEST(blob_db, test_pwrite_segmented_updates_range_only)
+{
+	fill_pattern(big_src, BIG_LEN, 0x91);
+
+	uint64_t id = put_blob(big_src, BIG_LEN);
+	const size_t offs[] = { 0, 7, 1023, 1024, 4096, BIG_LEN / 3,
+				BIG_LEN - 5 };
+
+	for (size_t i = 0; i < ARRAY_SIZE(offs); i++) {
+		const size_t off = offs[i];
+		const size_t n = MIN((size_t)1500, BIG_LEN - off);
+		uint8_t patch[1500];
+
+		for (size_t b = 0; b < n; b++) {
+			patch[b] = (uint8_t)(0xA0 + ((off + b) & 0x0f));
+		}
+
+		zassert_ok(blob_db_write(id, off, patch, n),
+			   "pwrite at %zu", off);
+		memcpy(big_src + off, patch, n);   /* mirror the expectation */
+
+		size_t got = 0;
+
+		memset(big_dst, 0, BIG_LEN);
+		zassert_ok(blob_db_read(id, 0, big_dst, BIG_LEN, &got));
+		zassert_equal(got, BIG_LEN, "length changed by pwrite at %zu",
+			      off);
+		zassert_mem_equal(big_dst, big_src, BIG_LEN,
+				  "pwrite at %zu disturbed other bytes", off);
+	}
+}
+
+/* The point of the feature: a small write must not rewrite the object.
+ * Counted in segments, since that is what a rewrite would replace. */
+ZTEST(blob_db, test_pwrite_rewrites_only_touched_segments)
+{
+	fill_pattern(big_src, BIG_LEN, 0x92);
+
+	uint64_t id = put_blob(big_src, BIG_LEN);
+	const int segs = live_segment_slots();
+
+	zassert_true(segs > 8, "expected a decent segment count, got %d", segs);
+
+	/* Four bytes inside one segment: exactly one segment may be replaced. */
+	const int released_before = released_segment_slots();
+	const uint8_t four[4] = { 1, 2, 3, 4 };
+
+	zassert_ok(blob_db_write(id, 5000, four, sizeof(four)));
+
+	zassert_equal(released_segment_slots() - released_before, 1,
+		      "pwrite of 4 bytes rewrote more than one segment");
+	zassert_equal(live_segment_slots(), segs,
+		      "pwrite changed the live segment count");
+
+	memcpy(big_src + 5000, four, sizeof(four));
+
+	size_t got;
+
+	memset(big_dst, 0, BIG_LEN);
+	zassert_ok(blob_db_read(id, 0, big_dst, BIG_LEN, &got));
+	zassert_equal(got, BIG_LEN);
+	zassert_mem_equal(big_dst, big_src, BIG_LEN, "content after pwrite");
+
+	/* The contrast that gives the number meaning: a whole-object update
+	 * replaces every segment, so the same measurement returns K, not 1. */
+	const int before_full = released_segment_slots();
+
+	fill_pattern(big_src, BIG_LEN, 0x99);
+	zassert_ok(blob_db_update(id, big_src, BIG_LEN));
+	zassert_equal(released_segment_slots() - before_full, segs,
+		      "a full update should have replaced all %d segments", segs);
+}
+
+/* Writing past the end extends, and the gap reads as zeros. */
+ZTEST(blob_db, test_pwrite_extends_with_zero_fill)
+{
+	const size_t start = 4096;
+
+	fill_pattern(big_src, start, 0x93);
+
+	uint64_t id = put_blob(big_src, start);
+	const uint8_t tail[4] = { 0xde, 0xad, 0xbe, 0xef };
+	const size_t at = 20000;
+
+	zassert_ok(blob_db_write(id, at, tail, sizeof(tail)));
+
+	size_t n = 0;
+
+	zassert_ok(blob_db_size(id, &n));
+	zassert_equal(n, at + sizeof(tail), "extend did not grow the object");
+
+	memset(big_dst, 0xaa, BIG_LEN);
+	zassert_ok(blob_db_read(id, 0, big_dst, at + sizeof(tail), &n));
+	zassert_equal(n, at + sizeof(tail));
+	zassert_mem_equal(big_dst, big_src, start, "original bytes changed");
+	for (size_t i = start; i < at; i++) {
+		zassert_equal(big_dst[i], 0, "gap byte %zu not zero", i);
+	}
+	zassert_mem_equal(big_dst + at, tail, sizeof(tail), "tail bytes");
+}
+
+/* An inline payload is modified in place, and grown within its slot. */
+ZTEST(blob_db, test_pwrite_inline_payload)
+{
+	uint64_t id = put_blob("hello world", 11);
+	uint8_t buf[64];
+	size_t n;
+
+	zassert_ok(blob_db_write(id, 6, "WORLD", 5));
+	zassert_ok(blob_db_get(id, buf, sizeof(buf), &n));
+	zassert_equal(n, 11);
+	zassert_mem_equal(buf, "hello WORLD", 11);
+
+	/* Extend within the slot: the gap zero-fills. */
+	zassert_ok(blob_db_write(id, 14, "X", 1));
+	zassert_ok(blob_db_get(id, buf, sizeof(buf), &n));
+	zassert_equal(n, 15);
+	zassert_mem_equal(buf, "hello WORLD", 11);
+	zassert_equal(buf[11], 0);
+	zassert_equal(buf[12], 0);
+	zassert_equal(buf[13], 0);
+	zassert_equal(buf[14], 'X');
+
+	/* Past a single slot: refused, with the object left untouched. */
+	zassert_equal(blob_db_write(id, CONFIG_BLOB_DB_MAX_PAYLOAD_LEN, "y", 1),
+		      -EFBIG, "inline growth past a slot must be refused");
+	zassert_ok(blob_db_get(id, buf, sizeof(buf), &n));
+	zassert_equal(n, 15, "refused pwrite altered the payload");
+}
+
+/* pwrite survives a remount, and the sweep does not mistake the segments it
+ * left in place for orphans. */
+ZTEST(blob_db, test_pwrite_survives_remount_and_sweep)
+{
+	fill_pattern(big_src, BIG_LEN, 0x94);
+
+	uint64_t id = put_blob(big_src, BIG_LEN);
+	const uint8_t patch[64] = { 0 };
+
+	zassert_ok(blob_db_write(id, 3000, patch, sizeof(patch)));
+	memset(big_src + 3000, 0, sizeof(patch));
+
+	const int segs = live_segment_slots();
+
+	zassert_ok(blob_db_unmount());
+	zassert_ok(blob_db_mount());
+
+	size_t got;
+
+	memset(big_dst, 0, BIG_LEN);
+	zassert_ok(blob_db_read(id, 0, big_dst, BIG_LEN, &got));
+	zassert_equal(got, BIG_LEN);
+	zassert_mem_equal(big_dst, big_src, BIG_LEN, "content across remount");
+
+	/* Force a sweep for this owner: every segment the new index names must
+	 * survive it. */
+	zassert_ok(blob_db_unmount());
+
+	struct master_img m;
+
+	master_read_raw(0, &m);
+	m.generation += 100;
+	m.seg_owner = id;
+	master_seal(&m);
+	master_write_raw(1, &m);
+
+	zassert_ok(blob_db_mount());
+	zassert_equal(live_segment_slots(), segs,
+		      "sweep reclaimed segments the live index still names");
+
+	memset(big_dst, 0, BIG_LEN);
+	zassert_ok(blob_db_read(id, 0, big_dst, BIG_LEN, &got));
+	zassert_mem_equal(big_dst, big_src, BIG_LEN, "content after sweep");
 }
 #endif /* CONFIG_BLOB_DB_LARGE_PAYLOADS */

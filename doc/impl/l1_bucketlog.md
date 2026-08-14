@@ -300,6 +300,34 @@ listed. Crash inside step 3 → the slot fails its CRC, so the old index is stil
 live and the *new* segments are unlisted. Crash in step 4 → the old segments are
 not listed. In each case the losing generation is exactly the unlisted set.
 
+**Partial write** (`blob_db_write`) reuses the same window and the same commit,
+rewriting only the segments the range covers:
+
+```
+pwrite(id, offset, buf, len) on a segmented object:
+  new_total = max(total_len, offset + len);  new_K = ceil(new_total / seg_len)
+  1. master: seg_owner = id
+  2. new table := old table
+  3. for each segment the range touches, or beyond the old count:
+       materialise the chunk (old bytes, caller's bytes overlaid, zeros past
+       the old end) and append it under a FRESH id; new table[j] = that id
+  4. append the INDEXED slot                      ── ATOMIC COMMIT
+  5. tombstone only the ids where old table != new table
+  6. master: seg_owner = 0
+```
+
+`seg_len` is inherited from the existing index and never recomputed: the
+surviving segments are already cut at that stride, so changing it would
+misplace every byte they hold. Untouched segments keep their ids and their
+slots, which is the whole saving — a four-byte write replaces one segment, not
+K. Writing past the end extends sparsely, because a read of the gap between the
+old end and the new bytes is served as zeros.
+
+Growing an *inline* payload past one slot returns `-EFBIG` rather than promoting
+it to segmented in place. Such a payload still fits the caller's RAM, so
+`get` + `update` promotes it, and keeping that out of the library avoids a
+second whole-object staging buffer inside it.
+
 Mount runs the sweep only when the master carries a non-zero `seg_owner`, so the
 clean path pays nothing. The sweep walks every bucket by slot header, and for
 each live SEGMENT slot owned by that id checks the owner's index — O(N) sector

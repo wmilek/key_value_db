@@ -227,6 +227,17 @@ BUILD_ASSERT(sizeof(struct blob_db_index_hdr) == 16,
 #define BLOB_DB_INDEX_MAGIC       "BX"
 #define BLOB_DB_INDEX_VERSION     1
 
+/* Set when payload_crc32 covers the object as it stands. A partial write
+ * (blob_db_write) clears it rather than pay a full-object read to recompute a
+ * whole-object checksum — which would defeat the point of writing one segment.
+ * Every byte is still covered by its slot's CRC16; what lapses is only the
+ * end-to-end check across the gather.
+ *
+ * Nothing verifies payload_crc32 today: it is stored for a future fsck. The
+ * flag exists so that verifier can tell "mismatch" from "not maintained"
+ * instead of rejecting every object that was ever partially written. */
+#define BLOB_DB_INDEX_F_CRC32     (1u << 0)
+
 /* Prefix of a SEGMENT slot's payload, ahead of the chunk bytes.
  *
  * owner_id is what makes orphan reclaim possible with no RAM index: any

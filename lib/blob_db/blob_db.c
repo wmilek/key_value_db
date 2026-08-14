@@ -61,9 +61,11 @@ static int find_live_slot(uint16_t bid, uint64_t id, struct bucket_scan *sc,
 			  void *dst);
 
 #if defined(CONFIG_BLOB_DB_LARGE_PAYLOADS)
-/* Large-object entry points mount needs before their definitions. */
+/* Large-object entry points needed before their definitions. */
 static int seg_geometry_init(void);
 static int seg_sweep(uint64_t owner);
+static int pwrite_segmented(uint64_t id, size_t offset, const void *buf,
+			    size_t len);
 #endif
 
 /* Upper bound on the sector size we can hold in RAM. mount refuses larger
@@ -1721,56 +1723,26 @@ static int seg_sweep(uint64_t owner)
 	return persist_seg_owner(0);
 }
 
-/* Write `len` bytes at `id` as K segments plus an index record. `old_ids`
- * holds the outgoing generation (old_k entries) to release after the commit. */
-static int seg_update(uint64_t id, const void *payload, size_t len,
-		      const uint8_t *old_ids, uint16_t old_k)
+/* Chunk staging for partial writes. A chunk that the caller's range only
+ * partly covers has to be materialised from two sources before it can be
+ * appended, and it cannot share g_bbuf: writing a segment may compact its
+ * bucket, and compaction owns g_bbuf. At most two chunks per call are partial
+ * (the first and the last), but they still need somewhere to be built. */
+static uint8_t g_chunk[CONFIG_BLOB_DB_MAX_PAYLOAD_LEN];
+
+/* Build and commit the index record for `id`. This is THE COMMIT for any
+ * segmented write: before it the new segments are unreferenced, after it the
+ * old ones are. */
+static int index_commit(uint64_t id, const struct blob_db_index_hdr *h,
+			const uint8_t *ids, uint16_t k)
 {
-	const uint8_t *src = payload;
-	const size_t k = (len + g_seg_len - 1) / g_seg_len;
-
-	if (len > CONFIG_BLOB_DB_MAX_OBJECT_LEN) {
-		return -EFBIG;
-	}
-	if (k > g_seg_max) {
-		return -EFBIG;
-	}
-
-	int rc = persist_seg_owner(id);
-
-	if (rc < 0) {
-		return rc;
-	}
-
-	for (size_t j = 0; j < k; j++) {
-		const size_t n = MIN((size_t)g_seg_len, len - j * g_seg_len);
-		uint64_t sid;
-
-		rc = seg_write_chunk(id, (uint16_t)j, src + j * g_seg_len,
-				     (uint16_t)n, &sid);
-		if (rc < 0) {
-			return rc;   /* seg_owner stays set; sweep cleans up */
-		}
-		memcpy(g_seg_b + j * sizeof(uint64_t), &sid, sizeof(sid));
-	}
-
-	struct blob_db_index_hdr h = {
-		.version       = BLOB_DB_INDEX_VERSION,
-		.flags         = 0,
-		.total_len     = (uint32_t)len,
-		.payload_crc32 = crc32_ieee(src, len),
-		.seg_count     = (uint16_t)k,
-		.seg_len       = g_seg_len,
-	};
-
-	memcpy(h.magic, BLOB_DB_INDEX_MAGIC, 2);
-
 	const uint16_t idx_len =
-		(uint16_t)(sizeof(h) + k * sizeof(uint64_t));
+		(uint16_t)(sizeof(*h) + (size_t)k * sizeof(uint64_t));
 	const uint16_t bid = id_to_bucket(id);
 	bool formatted;
 
-	rc = read_bucket_hdr(bid, &formatted);
+	int rc = read_bucket_hdr(bid, &formatted);
+
 	if (rc < 0) {
 		return rc;
 	}
@@ -1806,16 +1778,213 @@ static int seg_update(uint64_t id, const void *payload, size_t len,
 			return rc;
 		}
 		cursor = sc.write_cursor;
-		if (cursor + (off_t)slot_size_for(idx_len) >
-		    (off_t)st.peb_size) {
+		if (cursor + (off_t)slot_size_for(idx_len) > (off_t)st.peb_size) {
 			return -ENOSPC;
 		}
 	}
 
-	/* THE COMMIT. Before this the new segments are unreferenced; after it
-	 * the old ones are. */
-	rc = append_slot2(bid, cursor, id, BLOB_DB_SLOT_F_INDEXED, &h,
-			  (uint16_t)sizeof(h), g_seg_b, idx_len);
+	return append_slot2(bid, cursor, id, BLOB_DB_SLOT_F_INDEXED, h,
+			    (uint16_t)sizeof(*h), ids, idx_len);
+}
+
+/* Read [off, off+len) of the object as it stands, from its segments. Anything
+ * at or past the current end reads as zeros, which is what makes a write past
+ * the end extend the object sparsely rather than expose old bytes. */
+static int old_bytes(uint64_t owner, const struct blob_db_index_hdr *h,
+		     const uint8_t *ids, uint16_t k, size_t off,
+		     uint8_t *out, size_t len)
+{
+	size_t done = 0;
+
+	while (done < len) {
+		const size_t pos = off + done;
+		const uint16_t seq = (uint16_t)(pos / h->seg_len);
+
+		if (pos >= h->total_len || seq >= k) {
+			memset(out + done, 0, len - done);
+			return 0;
+		}
+
+		const size_t skip = pos % h->seg_len;
+		size_t n = h->seg_len - skip;
+
+		if (n > len - done) {
+			n = len - done;
+		}
+		if (pos + n > h->total_len) {
+			n = h->total_len - pos;
+		}
+
+		int rc = seg_chunk_read(owner, seg_id_at(ids, seq), seq, skip,
+					out + done, n);
+		if (rc < 0) {
+			return rc;
+		}
+		done += n;
+	}
+	return 0;
+}
+
+/* Partial write into a segmented object: rewrite only the segments the range
+ * touches, keep the rest, and commit a new index naming the mixture.
+ *
+ * seg_len is inherited from the existing index, never recomputed — the
+ * surviving segments are already cut at that stride, so changing it would
+ * misplace every byte they hold.
+ */
+static int pwrite_segmented(uint64_t id, size_t offset, const void *buf,
+			    size_t len)
+{
+	struct blob_db_index_hdr h;
+	int k = index_load(id, g_seg_a, &h);
+
+	if (k < 0) {
+		return k;
+	}
+	if (k == 0) {
+		return -EIO;   /* caller already established it is indexed */
+	}
+
+	const uint16_t seg_len = h.seg_len;
+	const size_t new_total = MAX((size_t)h.total_len, offset + len);
+	const size_t new_k = (new_total + seg_len - 1) / seg_len;
+
+	if (new_total > CONFIG_BLOB_DB_MAX_OBJECT_LEN) {
+		return -EFBIG;
+	}
+	if (new_k > g_seg_max) {
+		return -EFBIG;
+	}
+	if (seg_len > sizeof(g_chunk)) {
+		return -EIO;   /* index written by a wider build */
+	}
+
+	int rc = persist_seg_owner(id);
+
+	if (rc < 0) {
+		return rc;
+	}
+
+	/* The new table starts as the old one and diverges only where a segment
+	 * is rewritten, so untouched segments keep their ids and their slots. */
+	memcpy(g_seg_b, g_seg_a, (size_t)k * sizeof(uint64_t));
+
+	const uint8_t *src = buf;
+
+	for (size_t j = 0; j < new_k; j++) {
+		const size_t cstart = j * seg_len;
+		const size_t cend = MIN(cstart + seg_len, new_total);
+		const size_t clen = cend - cstart;
+		const bool touched = (offset < cend) && (offset + len > cstart);
+		const bool fresh = (j >= (size_t)k);
+
+		if (!touched && !fresh) {
+			continue;
+		}
+
+		if (touched && offset <= cstart && offset + len >= cend) {
+			/* Fully overwritten: the caller's bytes are the chunk. */
+			memcpy(g_chunk, src + (cstart - offset), clen);
+		} else {
+			rc = old_bytes(id, &h, g_seg_a, (uint16_t)k, cstart,
+				       g_chunk, clen);
+			if (rc < 0) {
+				return rc;
+			}
+			if (touched) {
+				const size_t s = MAX(offset, cstart);
+				const size_t e = MIN(offset + len, cend);
+
+				memcpy(g_chunk + (s - cstart),
+				       src + (s - offset), e - s);
+			}
+		}
+
+		uint64_t sid;
+
+		rc = seg_write_chunk(id, (uint16_t)j, g_chunk, (uint16_t)clen,
+				     &sid);
+		if (rc < 0) {
+			return rc;   /* seg_owner stays set; the sweep tidies up */
+		}
+		memcpy(g_seg_b + j * sizeof(uint64_t), &sid, sizeof(sid));
+	}
+
+	struct blob_db_index_hdr nh = {
+		.version       = BLOB_DB_INDEX_VERSION,
+		.flags         = 0,   /* payload_crc32 no longer covers the object */
+		.total_len     = (uint32_t)new_total,
+		.payload_crc32 = 0,
+		.seg_count     = (uint16_t)new_k,
+		.seg_len       = seg_len,
+	};
+
+	memcpy(nh.magic, BLOB_DB_INDEX_MAGIC, 2);
+
+	rc = index_commit(id, &nh, g_seg_b, (uint16_t)new_k);
+	if (rc < 0) {
+		return rc;
+	}
+
+	/* Release exactly the segments that were replaced. */
+	for (uint16_t j = 0; j < (uint16_t)k; j++) {
+		const uint64_t was = seg_id_at(g_seg_a, j);
+
+		if (was != seg_id_at(g_seg_b, j)) {
+			uint8_t one[sizeof(uint64_t)];
+
+			memcpy(one, &was, sizeof(one));
+			seg_release(one, 1);
+		}
+	}
+	return persist_seg_owner(0);
+}
+
+/* Write `len` bytes at `id` as K segments plus an index record. `old_ids`
+ * holds the outgoing generation (old_k entries) to release after the commit. */
+static int seg_update(uint64_t id, const void *payload, size_t len,
+		      const uint8_t *old_ids, uint16_t old_k)
+{
+	const uint8_t *src = payload;
+	const size_t k = (len + g_seg_len - 1) / g_seg_len;
+
+	if (len > CONFIG_BLOB_DB_MAX_OBJECT_LEN) {
+		return -EFBIG;
+	}
+	if (k > g_seg_max) {
+		return -EFBIG;
+	}
+
+	int rc = persist_seg_owner(id);
+
+	if (rc < 0) {
+		return rc;
+	}
+
+	for (size_t j = 0; j < k; j++) {
+		const size_t n = MIN((size_t)g_seg_len, len - j * g_seg_len);
+		uint64_t sid;
+
+		rc = seg_write_chunk(id, (uint16_t)j, src + j * g_seg_len,
+				     (uint16_t)n, &sid);
+		if (rc < 0) {
+			return rc;   /* seg_owner stays set; sweep cleans up */
+		}
+		memcpy(g_seg_b + j * sizeof(uint64_t), &sid, sizeof(sid));
+	}
+
+	struct blob_db_index_hdr h = {
+		.version       = BLOB_DB_INDEX_VERSION,
+		.flags         = BLOB_DB_INDEX_F_CRC32,
+		.total_len     = (uint32_t)len,
+		.payload_crc32 = crc32_ieee(src, len),
+		.seg_count     = (uint16_t)k,
+		.seg_len       = g_seg_len,
+	};
+
+	memcpy(h.magic, BLOB_DB_INDEX_MAGIC, 2);
+
+	rc = index_commit(id, &h, g_seg_b, (uint16_t)k);
 	if (rc < 0) {
 		return rc;
 	}
@@ -2419,6 +2588,91 @@ int blob_db_read(uint64_t id, size_t offset, void *out, size_t len,
 		*out_read = len;
 	}
 	return 0;
+}
+
+int blob_db_write(uint64_t id, size_t offset, const void *buf, size_t len)
+{
+	if (!st.mounted) {
+		return -ENODEV;
+	}
+	if (len > 0 && !buf) {
+		return -EINVAL;
+	}
+	if (id == 0) {
+		return -ENOENT;
+	}
+	if (offset + len < offset) {
+		return -EINVAL;   /* range wraps */
+	}
+	if (len == 0) {
+		return 0;
+	}
+
+	const uint16_t bid = id_to_bucket(id);
+	bool formatted;
+	int rc = read_bucket_hdr(bid, &formatted);
+
+	if (rc < 0) {
+		return rc;
+	}
+	if (!formatted) {
+		return -ENOENT;
+	}
+
+	struct bucket_scan sc;
+
+	rc = find_live_slot(bid, id, &sc, g_bbuf);
+	if (rc < 0) {
+		return rc;
+	}
+
+#if defined(CONFIG_BLOB_DB_LARGE_PAYLOADS)
+	if (sc.target.hdr.flags & BLOB_DB_SLOT_F_INDEXED) {
+		return pwrite_segmented(id, offset, buf, len);
+	}
+#endif
+
+	/* Inline payload: read-modify-write the slot. */
+	const size_t have = sc.target.hdr.val_len;
+	const size_t need = MAX(offset + len, have);
+
+	if (need > CONFIG_BLOB_DB_MAX_PAYLOAD_LEN) {
+		/* Growing an inline payload past a single slot would mean
+		 * converting it to a segmented object mid-write. Deliberately
+		 * not done here: the object is still small enough for the caller
+		 * to hold, so promotion is a get() + update() away, and doing it
+		 * in the caller keeps a second full-object staging buffer out of
+		 * the library. */
+		return -EFBIG;
+	}
+
+	/* Make room BEFORE staging: compaction owns g_bbuf, which is where the
+	 * payload we are about to modify lives. */
+	const size_t ssz = slot_size_for((uint16_t)need);
+
+	if (sc.write_cursor + (off_t)ssz > (off_t)st.peb_size) {
+		rc = compact_bucket(bid);
+		if (rc < 0) {
+			return rc;
+		}
+		rc = find_live_slot(bid, id, &sc, g_bbuf);
+		if (rc < 0) {
+			return rc;
+		}
+		if (sc.write_cursor + (off_t)ssz > (off_t)st.peb_size) {
+			return -ENOSPC;
+		}
+	}
+
+	/* Zero anything between the old end and the new one, so a write past
+	 * the end extends with zeros rather than exposing stale bytes. */
+	if (need > have) {
+		memset(g_bbuf + have, 0, need - have);
+	}
+	memcpy(g_bbuf + offset, buf, len);
+
+	return append_slot(bid, sc.write_cursor, id, 0, g_bbuf,
+			   (uint16_t)need);
 }
 
 int blob_db_format(void)

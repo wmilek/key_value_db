@@ -359,8 +359,14 @@ one item up and adds two:
 Decisions this adds to the six in the base proposal §11:
 
 - **D7 — Adopt segmented pwrite** (`blob_db_write(id, offset, …)`) alongside
-  the reserved pread. Recommendation: **yes** — it is the difference between
-  8 KB and 264 KB per filesystem write.
+  the reserved pread. **RESOLVED: yes, implemented.** Measured cost
+  +1 557 B `.text` and +2 016 B `.bss` (one chunk staging buffer, sized by the
+  single-slot payload bound) with large payloads on, and +463 B `.text` with
+  them off, since partial writes work on inline payloads too. A four-byte write
+  into a 100 KB object now releases exactly one segment where a full `update`
+  releases all of them — asserted in the suite by counting released segments,
+  because the live count cannot show it (every replacement both adds and
+  retires one).
 - **D8 — Default chunk size.** Recommendation: **1024 B on 4 KB sectors,
   8 KB on 64 KB sectors** — the rows in §2 that keep per-bucket headroom.
   Trades ~12–25 % space efficiency for graceful behaviour near full.

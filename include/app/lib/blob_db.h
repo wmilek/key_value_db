@@ -245,6 +245,48 @@ int blob_db_read(uint64_t id, size_t offset, void *out, size_t len,
 		 size_t *out_read);
 
 /**
+ * @brief Overwrite part of a payload in place — pwrite-style.
+ *
+ * The counterpart to `blob_db_read()`, and the reason a filesystem can sit on
+ * this layer: `blob_db_update()` replaces the whole payload, so changing four
+ * bytes of a large object would rewrite all of it. This touches only the
+ * segments the range covers — on a 256 KB object in 8 KB segments that is 8 KB
+ * of flash instead of 264 KB.
+ *
+ * Writing past the current end **extends** the payload, and any gap between
+ * the old end and @p offset reads back as zeros. The update is atomic in the
+ * same sense as `update`: on crash the payload is either wholly the old one or
+ * wholly the new one.
+ *
+ * Growing an *inline* payload beyond `CONFIG_BLOB_DB_MAX_PAYLOAD_LEN` returns
+ * `-EFBIG` rather than converting it to a segmented object. Such a payload
+ * still fits comfortably in RAM, so the caller can promote it with
+ * `blob_db_get()` + `blob_db_update()`; keeping that out of the library avoids
+ * a second whole-object buffer inside it. Segmented objects grow normally, up
+ * to `CONFIG_BLOB_DB_MAX_OBJECT_LEN`.
+ *
+ * Note the whole-object checksum recorded by a full `update` is **not**
+ * maintained across a partial write — recomputing it would require reading the
+ * entire object, defeating the purpose. Every byte remains covered by its
+ * slot's own CRC.
+ *
+ * @param id        id previously returned by `alloc_id` and bound by `update`
+ * @param offset    byte offset to start writing at
+ * @param buf       bytes to write (may be NULL only if @p len == 0)
+ * @param len       number of bytes to write
+ *
+ * @retval 0        success
+ * @retval -ENOENT  id was never assigned, or has been deleted
+ * @retval -EFBIG   would exceed `CONFIG_BLOB_DB_MAX_OBJECT_LEN`, or would grow
+ *                  an inline payload past a single slot (see above)
+ * @retval -ENOSPC  no room to commit the change
+ * @retval -EINVAL  bad arguments
+ * @retval -ENODEV  not mounted
+ * @retval -EIO     flash I/O error
+ */
+int blob_db_write(uint64_t id, size_t offset, const void *buf, size_t len);
+
+/**
  * @brief Delete the blob with the given id.
  *
  * After this call, `get(id)` returns -ENOENT and the id is never reused.
