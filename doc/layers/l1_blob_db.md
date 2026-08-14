@@ -168,6 +168,15 @@ typedef int (*blob_db_iter_cb_t)(uint64_t id,
                                   void *user);
 int      blob_db_iterate(blob_db_iter_cb_t cb, void *user);
 
+/* Partial access. Reports and reads a payload without a buffer for the whole
+ * of it, so a payload larger than available RAM is still usable. Defined for
+ * every payload, inline or segmented; cost is independent of `offset`. A read
+ * at or past the end succeeds with *out_read = 0, and one overlapping the end
+ * is shortened — a short read, not an error. */
+int      blob_db_size (uint64_t id, size_t *out_size);
+int      blob_db_read (uint64_t id, size_t offset, void *out, size_t len,
+                       size_t *out_read);
+
 /* Format the partition (erase all blobs, reset the id counter to 1). For
  * factory reset / tests. */
 int      blob_db_format(void);
@@ -275,22 +284,36 @@ it (fail-fast) without obligating release builds to pay an existence check.
 Reads of dead ids stay defined (`-ENOENT`) because recovery and self-healing
 legitimately probe stale ids.
 
-### 5.4 D4 — Payload chunking lives at L2 (v1); pread extension reserved
+### 5.4 D4 — Payload chunking lives at L1 (amended); pread is part of the API
 
-v1 keeps L1 payloads single-chunk (bounded by `BLOB_DB_MAX_PAYLOAD_LEN`);
-large data is chained at L2 (`seq` container). If a future allocator spreads
-payloads transparently, whole-blob `get` becomes inadequate; the agreed
-extension is allocator-agnostic partial access:
+**Amended.** D4 originally kept L1 payloads single-chunk and chained large data
+at L2 (`seq` container). That is now reversed: **L1 chunks transparently** when
+`BLOB_DB_LARGE_PAYLOADS` is enabled, and the partial-access pair this decision
+reserved is part of §4 rather than a future extension.
 
-```c
-int blob_db_size(uint64_t id, size_t *out_size);
-int blob_db_read(uint64_t id, size_t offset, void *out, size_t len,
-                 size_t *out_read);
-```
+The reversal was decided on **orphan reclaim**. Chunks written above L1 are
+ordinary blobs carrying no mark of what they belong to, so a crash between
+writing them and committing the index leaks blobs that no generic mechanism can
+identify — only a client that remembers its own intent can, making
+mark-and-sweep (`l1_model_container.md` §4) an obligation for every client that
+stores a large value. Inside L1 each segment records its owner, so one
+idempotent sweep that no client participates in reclaims after any crash, and
+P7's "no permanent leak (must)" is structural. Secondary: chunks stay invisible
+to `count`/`iterate`, and the mechanism is written once instead of per client.
 
-A multi-chunk write must commit by writing the id's index record **last**, so
-"no partial reads" (§2) holds unchanged. Writes stay whole-blob until a
-concrete consumer needs streaming.
+The commit rule this decision already stated is unchanged and is what preserves
+§2: a multi-chunk write commits by writing the id's index record **last**, so
+"atomicity" and "no partial reads" hold with no new primitive — the single slot
+append that makes a small write atomic makes a large one atomic.
+
+L2's `seq` remains the right answer for *streams* (logs, queues, append-mostly
+data), not for large single values.
+
+Writes stay whole-blob at this layer: `update` takes the complete payload. A
+segmented **pwrite** — touching only the segments a range covers, instead of
+rewriting the object — is the next step for a filesystem client, where a
+whole-object rewrite per small write is the difference between O(chunk) and
+O(file).
 
 ### 5.5 D5 — Iteration is read-only: mutation from the callback is UB
 

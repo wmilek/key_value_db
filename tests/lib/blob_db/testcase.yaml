@@ -9,3 +9,9 @@ tests:
   lib.blob_db.no_autoformat:
     extra_configs:
       - CONFIG_BLOB_DB_AUTOFORMAT_ON_CORRUPT=n
+  # Segmented large objects. Bumps the on-flash format major, so this config
+  # also covers that older software refuses such a store.
+  lib.blob_db.large_payloads:
+    extra_configs:
+      - CONFIG_BLOB_DB_LARGE_PAYLOADS=y
+      - CONFIG_MAIN_STACK_SIZE=32768

@@ -44,7 +44,8 @@ config BLOB_DB_PARTITION_LABEL
 	  refer to a fixed-partitions child node in the device tree.
 
 config BLOB_DB_MAX_PAYLOAD_LEN
-	int "Max payload length in bytes"
+	int "Max single-slot payload length in bytes"
+	default 2016 if BLOB_DB_LARGE_PAYLOADS
 	default 256
 	range 1 65535
 	help
@@ -58,6 +59,57 @@ config BLOB_DB_MAX_PAYLOAD_LEN
 	  therefore refuses a build whose cap exceeds
 	  (sector_size - 16) / 2 - 14 — about 2026 B on 4 KB sectors and
 	  32746 B on 64 KB sectors.
+
+config BLOB_DB_LARGE_PAYLOADS
+	bool "Objects larger than one slot (segmented)"
+	help
+	  Store an object too large for one slot as K segment slots plus an index
+	  slot at the object's id, committed by writing the index last. Adds
+	  blob_db_size() and blob_db_read() and bumps the on-flash format major,
+	  so software without this option refuses such a store rather than
+	  misreading an index record as data.
+
+	  Off (default) is today's implementation byte for byte: no segmented
+	  writes, no new code, the format major older builds already understand.
+
+	  Note the index record is itself a single-slot payload, so the reachable
+	  object size is bounded by BLOB_DB_MAX_PAYLOAD_LEN — which is why
+	  enabling this raises that default from 256 to 2016. Mount reports the
+	  achievable maximum and refuses a configuration that cannot reach
+	  BLOB_DB_MAX_OBJECT_LEN.
+
+if BLOB_DB_LARGE_PAYLOADS
+
+config BLOB_DB_MAX_OBJECT_LEN
+	int "Max logical object length in bytes"
+	default 131072
+	range BLOB_DB_MAX_PAYLOAD_LEN 16777216
+	help
+	  Largest payload blob_db_update() will accept. Reachability depends on
+	  the geometry and on MAX_SEGMENTS; mount refuses a build that cannot
+	  reach this and names the shortfall.
+
+config BLOB_DB_MAX_SEGMENTS
+	int "Max segments per object"
+	default 128
+	range 2 8192
+	help
+	  Sets the RAM cost of the feature: two segment-id tables of 8 bytes per
+	  segment, so 16 B each. This is the knob that converts "how large an
+	  object do I need" into bytes of .bss.
+
+config BLOB_DB_SEGMENT_LEN
+	int "Segment size in bytes (0 = derive from the geometry)"
+	default 0
+	range 0 65535
+	help
+	  0 picks sector_size / 4, clamped to what a slot can hold, which leaves
+	  room for several segments plus rebind headroom in each bucket. Chunk
+	  sizes that divide a bucket evenly maximise capacity but leave a full
+	  bucket with no headroom, so the partition hits -ENOSPC abruptly instead
+	  of degrading.
+
+endif # BLOB_DB_LARGE_PAYLOADS
 
 config BLOB_DB_AUTOFORMAT_ON_CORRUPT
 	bool "Format when both master sectors are unreadable"

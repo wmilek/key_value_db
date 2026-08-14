@@ -204,11 +204,18 @@ ZTEST(blob_db, test_boundary_payload_len)
 	zassert_equal(got, sizeof(big));
 	zassert_mem_equal(back, big, sizeof(big));
 
-	/* MAX+1 payload is rejected by update. */
+	/* One byte past the configured cap is rejected by update. */
+#ifdef CONFIG_BLOB_DB_LARGE_PAYLOADS
+	/* One past the single-slot cap is a segmented write here, not an error;
+	 * the cap that still rejects is the logical one. */
+	static uint8_t over[CONFIG_BLOB_DB_MAX_OBJECT_LEN + 1];
+#else
 	uint8_t over[CONFIG_BLOB_DB_MAX_PAYLOAD_LEN + 1];
-	uint64_t id = blob_db_alloc_id();
+#endif
 
-	zassert_equal(blob_db_update(id, over, sizeof(over)), -EINVAL);
+	memset(over, 0x5a, sizeof(over));
+	zassert_equal(blob_db_update(big_id, over, sizeof(over)), -EINVAL,
+		      "a payload past the configured cap must be rejected");
 }
 
 /* 10. Corrupting a byte in a slot causes that slot (and everything after
@@ -429,16 +436,24 @@ struct __packed master_img {
 	uint16_t cbid;
 	uint8_t  reserved0;
 	uint64_t next_id_hint;
-	uint8_t  reserved1[32];
+	uint64_t seg_owner;
+	uint8_t  reserved1[24];
 	uint32_t hdr_crc32;
 };
 BUILD_ASSERT(sizeof(struct master_img) == 64, "master layout drift");
 BUILD_ASSERT(offsetof(struct master_img, prefix_crc16) == 10, "prefix drift");
 BUILD_ASSERT(offsetof(struct master_img, hdr_crc32) == 60, "body drift");
 
-/* The format this build of blob_db writes. Asserted rather than assumed, so
- * a version bump breaks these tests instead of quietly reinterpreting them. */
+/* The format major this build of blob_db writes. A build that can store
+ * segmented objects declares 2, because a slot flag changes what a payload
+ * means and older software must refuse such a store rather than misread it.
+ * Asserted rather than assumed, so a further bump breaks these tests instead
+ * of quietly reinterpreting them. */
+#ifdef CONFIG_BLOB_DB_LARGE_PAYLOADS
+#define TEST_FORMAT_MAJOR  2
+#else
 #define TEST_FORMAT_MAJOR  1
+#endif
 
 static void master_seal(struct master_img *m)
 {
@@ -1152,3 +1167,309 @@ ZTEST(blob_db, test_sealed_scratch_is_restored_over_erased_bucket)
 	zassert_equal(got, 7);
 	zassert_mem_equal(buf, "RESTORE", 7);
 }
+
+#ifdef CONFIG_BLOB_DB_LARGE_PAYLOADS
+/* --- large (segmented) objects ------------------------------------------
+ *
+ * An object too large for one slot becomes K segment slots plus an index slot
+ * at the object's id, committed by writing the index last.
+ */
+
+#define TEST_N_BUCKETS  2045
+#define TEST_SEG_FLAG   (1u << 3)
+#define TEST_TOMB_FLAG  (1u << 1)
+#define TEST_SEALED     (1u << 0)
+
+/* Live segment slots across the whole partition.
+ *
+ * Each segment is written once and tombstoned at most once, so
+ * (non-tombstone SEGMENT slots) - (tombstone SEGMENT slots) is the live count
+ * without needing per-id state. This is what makes "no leaked segments"
+ * testable at all — count() and iterate() deliberately cannot see them.
+ */
+static int live_segment_slots(void)
+{
+	const struct flash_area *fa;
+
+	zassert_ok(flash_area_open(BLOB_DB_TEST_PARTITION_ID, &fa));
+
+	const size_t align = flash_area_align(fa);
+	int live = 0, tombs = 0;
+
+	for (uint16_t bid = 0; bid < TEST_N_BUCKETS; bid++) {
+		const off_t base = (off_t)(3 + bid) * TEST_SECTOR_SZ;
+		uint8_t bh[4];
+
+		zassert_ok(flash_area_read(fa, base, bh, sizeof(bh)));
+		if (memcmp(bh, "BDBH", 4) != 0) {
+			continue;
+		}
+
+		off_t cursor = 16;
+
+		for (;;) {
+			struct __packed {
+				uint8_t  flags;
+				uint8_t  reserved;
+				uint16_t val_len;
+				uint64_t id;
+			} head;
+
+			if (cursor + 14 > TEST_SECTOR_SZ) {
+				break;
+			}
+			zassert_ok(flash_area_read(fa, base + cursor, &head,
+						   sizeof(head)));
+			if (head.flags == 0xff || !(head.flags & TEST_SEALED) ||
+			    head.val_len > CONFIG_BLOB_DB_MAX_PAYLOAD_LEN) {
+				break;
+			}
+
+			size_t ssz = 14 + head.val_len;
+
+			ssz = (ssz + align - 1) & ~(align - 1);
+			if (cursor + (off_t)ssz > TEST_SECTOR_SZ) {
+				break;
+			}
+			if (head.flags & TEST_SEG_FLAG) {
+				if (head.flags & TEST_TOMB_FLAG) {
+					tombs++;
+				} else {
+					live++;
+				}
+			}
+			cursor += ssz;
+		}
+	}
+
+	flash_area_close(fa);
+	return live - tombs;
+}
+
+static void fill_pattern(uint8_t *buf, size_t len, uint8_t seed)
+{
+	for (size_t i = 0; i < len; i++) {
+		buf[i] = (uint8_t)((i * 31u + seed) ^ (i >> 8));
+	}
+}
+
+#define BIG_LEN  (100u * 1024u)
+static uint8_t big_src[BIG_LEN];
+static uint8_t big_dst[BIG_LEN];
+
+/* Round-trip through both access paths, and confirm it really was segmented. */
+ZTEST(blob_db, test_large_object_roundtrip)
+{
+	fill_pattern(big_src, BIG_LEN, 0x11);
+
+	uint64_t id = put_blob(big_src, BIG_LEN);
+
+	zassert_true(live_segment_slots() > 1,
+		     "a 100 KB object should have been split into segments");
+
+	size_t n = 0;
+
+	zassert_ok(blob_db_size(id, &n));
+	zassert_equal(n, BIG_LEN, "size() must report the logical length");
+
+	memset(big_dst, 0, BIG_LEN);
+	zassert_ok(blob_db_read(id, 0, big_dst, BIG_LEN, &n));
+	zassert_equal(n, BIG_LEN);
+	zassert_mem_equal(big_dst, big_src, BIG_LEN, "read() round-trip");
+
+	memset(big_dst, 0, BIG_LEN);
+	zassert_ok(blob_db_get(id, big_dst, BIG_LEN, &n));
+	zassert_equal(n, BIG_LEN);
+	zassert_mem_equal(big_dst, big_src, BIG_LEN, "get() round-trip");
+
+	/* Survives a remount — the index and its segments are on flash. */
+	zassert_ok(blob_db_unmount());
+	zassert_ok(blob_db_mount());
+	memset(big_dst, 0, BIG_LEN);
+	zassert_ok(blob_db_read(id, 0, big_dst, BIG_LEN, &n));
+	zassert_mem_equal(big_dst, big_src, BIG_LEN, "survives remount");
+}
+
+/* Partial reads: segment boundaries and windows that straddle them. */
+ZTEST(blob_db, test_large_object_partial_reads)
+{
+	fill_pattern(big_src, BIG_LEN, 0x22);
+
+	uint64_t id = put_blob(big_src, BIG_LEN);
+	const size_t offsets[] = { 0, 1, 1023, 1024, 1025, 2047, 4096,
+				   BIG_LEN / 2, BIG_LEN - 3 };
+
+	for (size_t i = 0; i < ARRAY_SIZE(offsets); i++) {
+		const size_t off = offsets[i];
+		const size_t want = MIN((size_t)3000, BIG_LEN - off);
+		size_t got = 0;
+
+		memset(big_dst, 0, want);
+		zassert_ok(blob_db_read(id, off, big_dst, want, &got),
+			   "read at offset %zu", off);
+		zassert_equal(got, want, "short read at offset %zu", off);
+		zassert_mem_equal(big_dst, big_src + off, want,
+				  "wrong bytes at offset %zu", off);
+	}
+
+	/* At and past EOF: success with nothing copied, not an error. */
+	size_t got = 1;
+
+	zassert_ok(blob_db_read(id, BIG_LEN, big_dst, 16, &got));
+	zassert_equal(got, 0);
+	zassert_ok(blob_db_read(id, BIG_LEN + 999, big_dst, 16, &got));
+	zassert_equal(got, 0);
+
+	/* A window overlapping the end is shortened, not refused. */
+	zassert_ok(blob_db_read(id, BIG_LEN - 10, big_dst, 100, &got));
+	zassert_equal(got, 10);
+}
+
+/* Every rebind shape must leave exactly one generation of segments behind. */
+ZTEST(blob_db, test_large_object_rebind_releases_old_segments)
+{
+	fill_pattern(big_src, BIG_LEN, 0x33);
+
+	uint64_t id = put_blob(big_src, BIG_LEN);
+	const int after_first = live_segment_slots();
+
+	zassert_true(after_first > 1, "expected segments");
+
+	/* large -> large */
+	fill_pattern(big_src, BIG_LEN, 0x44);
+	zassert_ok(blob_db_update(id, big_src, BIG_LEN));
+	zassert_equal(live_segment_slots(), after_first,
+		      "rebind leaked a generation of segments");
+
+	size_t n;
+
+	memset(big_dst, 0, BIG_LEN);
+	zassert_ok(blob_db_read(id, 0, big_dst, BIG_LEN, &n));
+	zassert_mem_equal(big_dst, big_src, BIG_LEN, "rebound content");
+
+	/* large -> small: every segment must go */
+	zassert_ok(blob_db_update(id, "small", 5));
+	zassert_equal(live_segment_slots(), 0,
+		      "shrinking to inline left segments behind");
+
+	uint8_t small[8];
+
+	zassert_ok(blob_db_get(id, small, sizeof(small), &n));
+	zassert_equal(n, 5);
+	zassert_mem_equal(small, "small", 5);
+
+	/* small -> large again */
+	fill_pattern(big_src, BIG_LEN, 0x55);
+	zassert_ok(blob_db_update(id, big_src, BIG_LEN));
+	zassert_true(live_segment_slots() > 1, "regrew into segments");
+	memset(big_dst, 0, BIG_LEN);
+	zassert_ok(blob_db_read(id, 0, big_dst, BIG_LEN, &n));
+	zassert_mem_equal(big_dst, big_src, BIG_LEN, "regrown content");
+}
+
+/* Deleting a large object drops its segments too. */
+ZTEST(blob_db, test_large_object_delete_releases_segments)
+{
+	fill_pattern(big_src, BIG_LEN, 0x66);
+
+	uint64_t id = put_blob(big_src, BIG_LEN);
+
+	zassert_true(live_segment_slots() > 1, "expected segments");
+	zassert_equal(blob_db_count(), 2, "root + one object");
+
+	zassert_ok(blob_db_delete(id));
+	zassert_equal(live_segment_slots(), 0, "delete left segments behind");
+	zassert_equal(blob_db_count(), 1, "only the root should remain");
+	zassert_false(blob_db_exists(id));
+	zassert_equal(blob_db_read(id, 0, big_dst, 16, NULL), -ENOENT);
+	zassert_equal(blob_db_size(id, &(size_t){ 0 }), -ENOENT);
+}
+
+/* Segments are storage, not content: count/iterate must not report them. */
+ZTEST(blob_db, test_segments_are_invisible_to_count_and_iterate)
+{
+	fill_pattern(big_src, BIG_LEN, 0x77);
+
+	uint64_t id = put_blob(big_src, BIG_LEN);
+	const int segs = live_segment_slots();
+
+	zassert_true(segs > 1, "expected segments");
+	zassert_equal(blob_db_count(), 2,
+		      "count() reported segments as objects");
+
+	struct iter_ctx ctx = { 0 };
+
+	zassert_ok(blob_db_iterate(iter_cb, &ctx));
+	zassert_equal(ctx.hits, 2, "iterate() visited segments");
+
+	bool saw_id = false;
+
+	for (int i = 0; i < ctx.hits; i++) {
+		saw_id |= (ctx.saw[i] == id);
+	}
+	zassert_true(saw_id, "the object itself must be visited");
+}
+
+/* An interrupted segmented write leaves unreferenced segments; mount sweeps
+ * them. Forged directly: segments written for an owner that never got an index.
+ */
+ZTEST(blob_db, test_sweep_reclaims_orphan_segments)
+{
+	fill_pattern(big_src, BIG_LEN, 0x88);
+
+	uint64_t id = put_blob(big_src, BIG_LEN);
+	const int referenced = live_segment_slots();
+
+	/* A second object whose index we then destroy, so its segments become
+	 * orphans of a known owner. */
+	uint64_t victim = put_blob(big_src, BIG_LEN);
+	const int with_victim = live_segment_slots();
+
+	zassert_true(with_victim > referenced, "victim added segments");
+
+	zassert_ok(blob_db_unmount());
+
+	/* Zero the victim's bucket magic so its index is unreachable, and point
+	 * the master's sweep intent at it — the state a crash between writing
+	 * segments and committing the index leaves. */
+	const off_t vb = (off_t)(3 + (victim % TEST_N_BUCKETS)) * TEST_SECTOR_SZ;
+	const struct flash_area *fa;
+	uint8_t zeros[4] = { 0 };
+
+	zassert_ok(flash_area_open(BLOB_DB_TEST_PARTITION_ID, &fa));
+	zassert_ok(flash_area_write(fa, vb, zeros, sizeof(zeros)));
+	flash_area_close(fa);
+
+	struct master_img m;
+
+	master_read_raw(0, &m);
+	m.generation += 100;
+	m.seg_owner = victim;
+	master_seal(&m);
+	master_write_raw(1, &m);
+
+	zassert_ok(blob_db_mount(), "mount should sweep, not fail");
+
+	zassert_equal(live_segment_slots(), referenced,
+		      "sweep did not reclaim exactly the orphaned segments");
+
+	/* The untouched object must be intact throughout. */
+	size_t n;
+
+	memset(big_dst, 0, BIG_LEN);
+	zassert_ok(blob_db_read(id, 0, big_dst, BIG_LEN, &n));
+	zassert_equal(n, BIG_LEN);
+	zassert_mem_equal(big_dst, big_src, BIG_LEN,
+			  "sweep damaged an unrelated object");
+
+	/* Idempotent: a second sweep of the same owner changes nothing. */
+	zassert_ok(blob_db_unmount());
+	master_read_raw(0, &m);
+	m.generation += 100;
+	m.seg_owner = victim;
+	master_seal(&m);
+	master_write_raw(1, &m);
+	zassert_ok(blob_db_mount());
+	zassert_equal(live_segment_slots(), referenced, "sweep not idempotent");
+}
+#endif /* CONFIG_BLOB_DB_LARGE_PAYLOADS */

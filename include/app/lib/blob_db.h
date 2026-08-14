@@ -175,9 +175,18 @@ int blob_db_get(uint64_t id, void *out, size_t out_sz, size_t *out_len);
  * id of 0 or one not yet allocated with -EINVAL, but release builds owe no
  * such check.
  *
+ * With `CONFIG_BLOB_DB_LARGE_PAYLOADS` enabled, a payload longer than
+ * `CONFIG_BLOB_DB_MAX_PAYLOAD_LEN` is stored transparently as several segments
+ * plus an index record, up to `CONFIG_BLOB_DB_MAX_OBJECT_LEN`. The id, its
+ * stability, and the atomicity of the update are unchanged — only the number of
+ * flash writes grows. Read such a payload back with `blob_db_read()`;
+ * `blob_db_get()` still works but needs a buffer for the whole object.
+ *
  * @param id        id previously returned by `alloc_id`
  * @param payload   payload bytes (may be NULL only if @p len == 0)
- * @param len       payload length, in 0..CONFIG_BLOB_DB_MAX_PAYLOAD_LEN
+ * @param len       payload length, in 0..`CONFIG_BLOB_DB_MAX_PAYLOAD_LEN`, or
+ *                  0..`CONFIG_BLOB_DB_MAX_OBJECT_LEN` when
+ *                  `CONFIG_BLOB_DB_LARGE_PAYLOADS` is enabled
  *
  * @retval 0        success
  * @retval -EINVAL  bad arguments, or id was never allocated
@@ -186,6 +195,54 @@ int blob_db_get(uint64_t id, void *out, size_t out_sz, size_t *out_len);
  * @retval -EIO     flash I/O error
  */
 int blob_db_update(uint64_t id, const void *payload, size_t len);
+
+/**
+ * @brief Report the length of the payload bound to an id.
+ *
+ * The cheap way to size a blob before reading it: one bucket lookup, no
+ * payload copy, and no buffer needed. Works for any live id, whether its
+ * payload fits a single slot or (with `CONFIG_BLOB_DB_LARGE_PAYLOADS`) is
+ * segmented across several.
+ *
+ * @param id        id previously returned by `alloc_id` and bound by `update`
+ * @param out_size  (out) payload length in bytes
+ *
+ * @retval 0        success
+ * @retval -ENOENT  id was never assigned, or has been deleted
+ * @retval -EINVAL  bad arguments
+ * @retval -ENODEV  not mounted
+ * @retval -EIO     flash I/O error
+ */
+int blob_db_size(uint64_t id, size_t *out_size);
+
+/**
+ * @brief Read part of a payload — pread-style, with a caller-chosen window.
+ *
+ * The access path for payloads too large to hold in RAM: the caller's buffer
+ * bounds the transfer rather than the payload's size, so reading a 256 KB
+ * object through a 1 KB window costs 1 KB of RAM. A read that starts at or
+ * past the end of the payload succeeds with @p out_read set to 0; one that
+ * overlaps the end is shortened to what exists (a short read, not an error).
+ *
+ * Cost is independent of where @p offset falls: a segmented payload is
+ * addressed through an index record, not walked, so any offset is two bucket
+ * lookups (contract R2). Prefer this over `blob_db_get()` whenever the payload
+ * may be large; `get` still works but demands a buffer for the whole thing.
+ *
+ * @param id        id previously returned by `alloc_id` and bound by `update`
+ * @param offset    byte offset to start at
+ * @param out       (out) buffer to copy into (may be NULL only if @p len == 0)
+ * @param len       maximum bytes to copy
+ * @param out_read  (out, optional) bytes actually copied
+ *
+ * @retval 0        success; @p out_read bytes copied
+ * @retval -ENOENT  id was never assigned, or has been deleted
+ * @retval -EINVAL  bad arguments
+ * @retval -ENODEV  not mounted
+ * @retval -EIO     flash I/O error, or a segment is missing or mislabelled
+ */
+int blob_db_read(uint64_t id, size_t offset, void *out, size_t len,
+		 size_t *out_read);
 
 /**
  * @brief Delete the blob with the given id.

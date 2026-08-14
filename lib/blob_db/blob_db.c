@@ -60,6 +60,12 @@ static int slot_verify(uint16_t bid, const struct bucket_scan *sc, void *dst);
 static int find_live_slot(uint16_t bid, uint64_t id, struct bucket_scan *sc,
 			  void *dst);
 
+#if defined(CONFIG_BLOB_DB_LARGE_PAYLOADS)
+/* Large-object entry points mount needs before their definitions. */
+static int seg_geometry_init(void);
+static int seg_sweep(uint64_t owner);
+#endif
+
 /* Upper bound on the sector size we can hold in RAM. mount refuses larger
  * partitions. Two full-sector buffers live in .bss (below); the library is
  * single-threaded per contract §5 so sharing them across calls is safe. */
@@ -88,6 +94,7 @@ static struct {
 	uint32_t  master_gen;
 	uint64_t  next_id;         /* RAM: next id alloc_id will hand out */
 	uint64_t  next_id_hint;    /* durable leading ceiling (see internal.h) */
+	uint64_t  seg_owner;       /* segmented write in flight; 0 = none */
 } st;
 
 static inline off_t peb_offset(uint16_t peb)
@@ -173,8 +180,11 @@ static int read_master(uint8_t slot, struct blob_db_master_hdr *out,
 		*cls = MASTER_FOREIGN;
 		return 0;
 	}
-	if (c->format_major != BLOB_DB_FORMAT_MAJOR) {
-		LOG_ERR("master %u: format major %u, this build knows %u",
+	/* Read anything up to our own major; refuse above it. An older store
+	 * cannot contain records this build does not understand, so adopting it
+	 * is safe — the next master write upgrades it. */
+	if (c->format_major > BLOB_DB_FORMAT_MAJOR || c->format_major == 0) {
+		LOG_ERR("master %u: format major %u, this build reads up to %u",
 			slot, c->format_major, BLOB_DB_FORMAT_MAJOR);
 		*cls = MASTER_FOREIGN;
 		return 0;
@@ -213,6 +223,8 @@ static int read_master(uint8_t slot, struct blob_db_master_hdr *out,
 static int write_master(uint8_t slot, uint32_t gen, uint8_t state,
 			uint16_t compacting_bid, uint64_t next_id_hint)
 {
+	const uint64_t seg_owner = st.seg_owner;
+
 	int rc = blob_db_store_erase(peb_offset(slot), st.peb_size);
 	if (rc < 0) {
 		LOG_ERR("master %u erase failed: %d", slot, rc);
@@ -239,6 +251,7 @@ static int write_master(uint8_t slot, uint32_t gen, uint8_t state,
 	hdr->state          = state;
 	hdr->compacting_bid = compacting_bid;
 	hdr->next_id_hint   = next_id_hint;
+	hdr->seg_owner      = seg_owner;
 	hdr->hdr_crc32      = hdr_crc32(hdr, sizeof(*hdr));
 
 	const size_t a = st.write_align ? st.write_align : 1;
@@ -374,6 +387,7 @@ static int format_masters_fresh(void)
 	st.master_gen = 1;
 	st.next_id = 2;
 	st.next_id_hint = 2;
+	st.seg_owner = 0;
 	return bind_root_empty();
 }
 
@@ -505,6 +519,7 @@ int blob_db_mount(void)
 		st.master_gen = m->generation;
 		st.next_id_hint = m->next_id_hint;
 		st.next_id = m->next_id_hint;   /* ceiling is authoritative (§13.1) */
+		st.seg_owner = m->seg_owner;
 		LOG_INF("master %c gen=%u state=%u next_id_hint=%llu",
 			pick_a ? 'A' : 'B',
 			st.master_gen, m->state, st.next_id);
@@ -587,6 +602,24 @@ int blob_db_mount(void)
 	}
 
 	st.mounted = true;
+
+#if defined(CONFIG_BLOB_DB_LARGE_PAYLOADS)
+	rc = seg_geometry_init();
+	if (rc < 0) {
+		st.mounted = false;
+		goto err_close;
+	}
+	if (st.seg_owner != 0) {
+		LOG_WRN("segmented write to id %llu was interrupted; sweeping",
+			(unsigned long long)st.seg_owner);
+		rc = seg_sweep(st.seg_owner);
+		if (rc < 0) {
+			st.mounted = false;
+			goto err_close;
+		}
+	}
+#endif
+
 	LOG_INF("mount ok; next_id=%llu", st.next_id);
 	return 0;
 
@@ -907,9 +940,25 @@ static int find_live_slot(uint16_t bid, uint64_t id, struct bucket_scan *sc,
  * write still reads as erased in the padding region. */
 #define BLOB_DB_MAX_WRITE_ALIGN 32
 
+/* Scatter form: the slot's payload is `hdr_len` bytes from `hdr` followed by
+ * `val_len - hdr_len` bytes from `payload`. Lets a segment or index record be
+ * written without first concatenating its header and body into a buffer of
+ * their own. `hdr` may be NULL when hdr_len is 0. */
+static int append_slot2(uint16_t bid, off_t write_cursor, uint64_t id,
+			uint8_t extra_flags, const void *hdr, uint16_t hdr_len,
+			const void *payload, uint16_t val_len);
+
 static int append_slot(uint16_t bid, off_t write_cursor, uint64_t id,
 		       uint8_t extra_flags, const void *payload,
 		       uint16_t val_len)
+{
+	return append_slot2(bid, write_cursor, id, extra_flags, NULL, 0,
+			    payload, val_len);
+}
+
+static int append_slot2(uint16_t bid, off_t write_cursor, uint64_t id,
+			uint8_t extra_flags, const void *hdr, uint16_t hdr_len,
+			const void *payload, uint16_t val_len)
 {
 	/* Staged in the compaction scratch buffer rather than on the stack:
 	 * at CONFIG_BLOB_DB_MAX_PAYLOAD_LEN=4096 a stack frame here was ~4.1 KB,
@@ -930,11 +979,19 @@ static int append_slot(uint16_t bid, off_t write_cursor, uint64_t id,
 	shdr->val_len  = val_len;
 
 	memcpy(buf + sizeof(*shdr), &id, sizeof(id));
-	if (val_len > 0) {
-		memcpy(buf + sizeof(*shdr) + sizeof(id), payload, val_len);
+
+	uint8_t *pl = buf + sizeof(*shdr) + sizeof(id);
+
+	if (hdr_len > 0) {
+		memcpy(pl, hdr, hdr_len);
+	}
+	if (val_len > hdr_len) {
+		memcpy(pl + hdr_len, payload, (size_t)val_len - hdr_len);
 	}
 
-	uint16_t crc = slot_crc16(shdr, id, payload, val_len);
+	/* CRC over the assembled bytes, so the scatter and contiguous forms
+	 * produce identical slots. */
+	uint16_t crc = slot_crc16(shdr, id, pl, val_len);
 	const size_t crc_off = sizeof(*shdr) + sizeof(id) + val_len;
 
 	memcpy(buf + crc_off, &crc, sizeof(crc));
@@ -1244,6 +1301,532 @@ static int recover_compaction(uint16_t bid)
 	return 0;
 }
 
+#if defined(CONFIG_BLOB_DB_LARGE_PAYLOADS)
+/* Large objects — segmented payloads -------------------------------------
+ *
+ * An object too large for one slot is stored as K segment slots plus an index
+ * slot at the object's own id. The index write is the commit: until it lands
+ * the new segments are unreferenced, and after it the old ones are. Nothing
+ * here needs a new atomicity primitive — a single slot append already is one.
+ *
+ * Crash recovery is one rule: a SEGMENT slot whose owner's live index does not
+ * list it is garbage. It covers all three crash points (mid-segments, torn
+ * index, mid-release) because in every one the losing generation is exactly the
+ * set no live index references. seg_owner in the master says when to look.
+ */
+
+/* Segment-id tables. Sized by segment COUNT, not object size — 16 B per
+ * segment all in. Two, because a rebind holds the outgoing and incoming lists
+ * at once: the old one must survive until the new index commits so its
+ * segments can be released afterwards. */
+static uint8_t g_seg_a[8u * CONFIG_BLOB_DB_MAX_SEGMENTS];
+static uint8_t g_seg_b[8u * CONFIG_BLOB_DB_MAX_SEGMENTS];
+
+/* Derived at mount from the geometry; validated there too. */
+static uint16_t g_seg_len;      /* chunk bytes per segment */
+static uint16_t g_seg_max;      /* segments an index record can address */
+
+static inline size_t inline_max(void)
+{
+	return CONFIG_BLOB_DB_MAX_PAYLOAD_LEN;
+}
+
+/* Resolve segment geometry and refuse a build that cannot reach the configured
+ * object size. Runs at mount because peb_size is a runtime property (P2). */
+static int seg_geometry_init(void)
+{
+	size_t sl = CONFIG_BLOB_DB_SEGMENT_LEN;
+	const size_t chunk_cap = inline_max() - sizeof(struct blob_db_seg_hdr);
+
+	if (sl == 0) {
+		/* A quarter sector leaves several segments plus rebind headroom
+		 * in each bucket; chunk sizes that divide a bucket evenly are
+		 * denser but hit -ENOSPC abruptly at high fill. */
+		sl = st.peb_size / 4;
+	}
+	if (sl > chunk_cap) {
+		sl = chunk_cap;
+	}
+	if (sl == 0) {
+		LOG_ERR("segments: CONFIG_BLOB_DB_MAX_PAYLOAD_LEN=%zu leaves no "
+			"room for a chunk", inline_max());
+		return -ENOTSUP;
+	}
+
+	const size_t idx_cap =
+		(inline_max() - sizeof(struct blob_db_index_hdr)) / sizeof(uint64_t);
+	const size_t usable = MIN(idx_cap, (size_t)CONFIG_BLOB_DB_MAX_SEGMENTS);
+	const size_t reach = usable * sl;
+
+	if (reach < CONFIG_BLOB_DB_MAX_OBJECT_LEN) {
+		LOG_ERR("segments: can reach %zu B (%zu segments x %zu B) but "
+			"CONFIG_BLOB_DB_MAX_OBJECT_LEN=%u; raise "
+			"MAX_PAYLOAD_LEN (index capacity %zu) or MAX_SEGMENTS (%u)",
+			reach, usable, sl, CONFIG_BLOB_DB_MAX_OBJECT_LEN,
+			idx_cap, CONFIG_BLOB_DB_MAX_SEGMENTS);
+		return -ENOTSUP;
+	}
+
+	g_seg_len = (uint16_t)sl;
+	g_seg_max = (uint16_t)usable;
+	LOG_INF("segments: chunk %u B, up to %u per object (max object %zu B)",
+		g_seg_len, g_seg_max, reach);
+	return 0;
+}
+
+/* Record a segmented mutation in flight, so mount knows to sweep. Costs one
+ * master write; a segmented update already costs K slot writes. */
+static int persist_seg_owner(uint64_t owner)
+{
+	if (st.seg_owner == owner) {
+		return 0;
+	}
+
+	const uint8_t inactive = !st.active_master;
+	const uint64_t prev = st.seg_owner;
+
+	st.seg_owner = owner;
+
+	int rc = write_master(inactive, st.master_gen + 1, BLOB_DB_STATE_CLEAN,
+			      0, st.next_id_hint);
+	if (rc < 0) {
+		st.seg_owner = prev;
+		return rc;
+	}
+	st.active_master = inactive;
+	st.master_gen++;
+	return 0;
+}
+
+/* Load the index record for `id`. Returns K (> 0) with the segment ids copied
+ * into `ids` and the header into `h`; 0 when the id holds an inline payload;
+ * -ENOENT when it holds nothing live; -EIO for a malformed record. */
+static int index_load(uint64_t id, uint8_t *ids, struct blob_db_index_hdr *h)
+{
+	const uint16_t bid = id_to_bucket(id);
+	bool formatted;
+
+	int rc = read_bucket_hdr(bid, &formatted);
+
+	if (rc < 0) {
+		return rc;
+	}
+	if (!formatted) {
+		return -ENOENT;
+	}
+
+	struct bucket_scan sc;
+
+	rc = find_live_slot(bid, id, &sc, g_bbuf);
+	if (rc < 0) {
+		return rc;
+	}
+	if (!(sc.target.hdr.flags & BLOB_DB_SLOT_F_INDEXED)) {
+		return 0;
+	}
+	if (sc.target.hdr.val_len < sizeof(*h)) {
+		return -EIO;
+	}
+
+	memcpy(h, g_bbuf, sizeof(*h));
+	if (memcmp(h->magic, BLOB_DB_INDEX_MAGIC, 2) != 0 ||
+	    h->version != BLOB_DB_INDEX_VERSION) {
+		return -EIO;
+	}
+	if (h->seg_count == 0 || h->seg_count > g_seg_max || h->seg_len == 0 ||
+	    sc.target.hdr.val_len <
+		    sizeof(*h) + (size_t)h->seg_count * sizeof(uint64_t)) {
+		return -EIO;
+	}
+	memcpy(ids, g_bbuf + sizeof(*h),
+	       (size_t)h->seg_count * sizeof(uint64_t));
+	return h->seg_count;
+}
+
+static inline uint64_t seg_id_at(const uint8_t *ids, uint16_t seq)
+{
+	uint64_t v;
+
+	memcpy(&v, ids + (size_t)seq * sizeof(uint64_t), sizeof(v));
+	return v;
+}
+
+/* Copy [skip, skip+len) of segment `seq` into `out`. */
+static int seg_chunk_read(uint64_t owner, uint64_t seg_id, uint16_t seq,
+			  size_t skip, void *out, size_t len)
+{
+	const uint16_t bid = id_to_bucket(seg_id);
+	bool formatted;
+
+	int rc = read_bucket_hdr(bid, &formatted);
+
+	if (rc < 0) {
+		return rc;
+	}
+	if (!formatted) {
+		return -EIO;
+	}
+
+	struct bucket_scan sc;
+
+	rc = find_live_slot(bid, seg_id, &sc, g_bbuf);
+	if (rc == -ENOENT) {
+		LOG_ERR("segment %llu of %llu missing",
+			(unsigned long long)seg_id, (unsigned long long)owner);
+		return -EIO;
+	}
+	if (rc < 0) {
+		return rc;
+	}
+	if (!(sc.target.hdr.flags & BLOB_DB_SLOT_F_SEGMENT) ||
+	    sc.target.hdr.val_len < sizeof(struct blob_db_seg_hdr)) {
+		return -EIO;
+	}
+
+	struct blob_db_seg_hdr sh;
+
+	memcpy(&sh, g_bbuf, sizeof(sh));
+	if (sh.owner_id != owner || sh.seq != seq) {
+		LOG_ERR("segment %llu claims owner %llu seq %u, expected %llu/%u",
+			(unsigned long long)seg_id,
+			(unsigned long long)sh.owner_id, sh.seq,
+			(unsigned long long)owner, seq);
+		return -EIO;
+	}
+
+	const size_t have = sc.target.hdr.val_len - sizeof(sh);
+
+	if (skip + len > have) {
+		return -EIO;
+	}
+	memcpy(out, g_bbuf + sizeof(sh) + skip, len);
+	return 0;
+}
+
+/* Append one chunk as a fresh SEGMENT slot, retrying with a new id when the
+ * bucket it hashes to is full. A segment id is internal and arbitrary, so a
+ * fresh id is simply a different bucket — hash placement becomes a probe
+ * sequence, which a user-visible id (whose bucket is fixed) cannot do. */
+#define SEG_PLACEMENT_TRIES  8
+
+static int seg_write_chunk(uint64_t owner, uint16_t seq, const void *chunk,
+			   uint16_t chunk_len, uint64_t *out_id)
+{
+	struct blob_db_seg_hdr sh = {
+		.owner_id = owner, .seq = seq, .reserved = 0,
+	};
+	const uint16_t val_len = (uint16_t)(sizeof(sh) + chunk_len);
+	const size_t ssz = slot_size_for(val_len);
+
+	for (int try = 0; try < SEG_PLACEMENT_TRIES; try++) {
+		const uint64_t sid = blob_db_alloc_id();
+
+		if (sid == 0) {
+			return -EIO;
+		}
+
+		const uint16_t bid = id_to_bucket(sid);
+		bool formatted;
+		int rc = read_bucket_hdr(bid, &formatted);
+
+		if (rc < 0) {
+			return rc;
+		}
+
+		off_t cursor;
+
+		if (!formatted) {
+			rc = format_bucket(bid);
+			if (rc < 0) {
+				return rc;
+			}
+			cursor = BLOB_DB_BUCKET_DATA_OFF;
+		} else {
+			struct bucket_scan sc;
+
+			rc = scan_bucket_for(bid, sid, (off_t)st.peb_size, &sc);
+			if (rc < 0) {
+				return rc;
+			}
+			cursor = sc.write_cursor;
+		}
+
+		if (cursor + (off_t)ssz > (off_t)st.peb_size) {
+			rc = compact_bucket(bid);
+			if (rc == 0) {
+				struct bucket_scan sc;
+
+				rc = scan_bucket_for(bid, sid,
+						     (off_t)st.peb_size, &sc);
+				if (rc < 0) {
+					return rc;
+				}
+				cursor = sc.write_cursor;
+			}
+			if (cursor + (off_t)ssz > (off_t)st.peb_size) {
+				LOG_DBG("segment %u: bucket %u full, reprobing",
+					seq, bid);
+				continue;   /* fresh id -> different bucket */
+			}
+		}
+
+		rc = append_slot2(bid, cursor, sid, BLOB_DB_SLOT_F_SEGMENT,
+				  &sh, (uint16_t)sizeof(sh), chunk, val_len);
+		if (rc < 0) {
+			return rc;
+		}
+		*out_id = sid;
+		return 0;
+	}
+
+	LOG_ERR("segment %u: no bucket with room after %d probes", seq,
+		SEG_PLACEMENT_TRIES);
+	return -ENOSPC;
+}
+
+/* Tombstone a generation of segments. Best effort: what fails here is left for
+ * the sweep, which is why the caller keeps seg_owner set until it returns. */
+static void seg_release(const uint8_t *ids, uint16_t k)
+{
+	for (uint16_t j = 0; j < k; j++) {
+		const uint64_t sid = seg_id_at(ids, j);
+		const uint16_t bid = id_to_bucket(sid);
+		bool formatted;
+
+		if (read_bucket_hdr(bid, &formatted) < 0 || !formatted) {
+			continue;
+		}
+
+		struct bucket_scan sc;
+
+		if (scan_bucket_for(bid, sid, (off_t)st.peb_size, &sc) < 0) {
+			continue;
+		}
+		if (sc.write_cursor + (off_t)slot_size_for(0) >
+		    (off_t)st.peb_size) {
+			continue;   /* sweep will get it */
+		}
+		(void)append_slot2(bid, sc.write_cursor, sid,
+				   BLOB_DB_SLOT_F_TOMBSTONE |
+					   BLOB_DB_SLOT_F_SEGMENT,
+				   NULL, 0, NULL, 0);
+	}
+}
+
+/* Reclaim every SEGMENT slot owned by `owner` that its live index does not
+ * list. Idempotent, O(1) RAM beyond the tables, and the single rule that makes
+ * a segmented write crash-safe. Runs only when the master carries an owner. */
+static int seg_sweep(uint64_t owner)
+{
+	struct blob_db_index_hdr h;
+	uint16_t k = 0;
+	int rc = index_load(owner, g_seg_a, &h);
+
+	if (rc > 0) {
+		k = (uint16_t)rc;
+	} else if (rc < 0 && rc != -ENOENT) {
+		LOG_WRN("sweep: owner %llu index unreadable (%d); treating all "
+			"its segments as garbage", (unsigned long long)owner, rc);
+	}
+
+	size_t dropped = 0;
+
+	for (uint16_t bid = 0; bid < st.n_buckets; bid++) {
+		bool formatted;
+
+		if (read_bucket_hdr(bid, &formatted) < 0 || !formatted) {
+			continue;
+		}
+
+		off_t cursor = BLOB_DB_BUCKET_DATA_OFF;
+
+		for (;;) {
+			struct bucket_scan sc;
+
+			/* Walk this bucket one slot at a time by asking for a
+			 * target that cannot match, then stepping the cursor
+			 * ourselves via a scan limited to what we have seen. */
+			struct slot_head sh;
+
+			if (cursor + (off_t)BLOB_DB_SLOT_OVERHEAD >
+			    (off_t)st.peb_size) {
+				break;
+			}
+			if (blob_db_store_read(bucket_offset(bid) + cursor, &sh,
+					       sizeof(sh)) < 0) {
+				break;
+			}
+			if (sh.hdr.flags == 0xff ||
+			    !(sh.hdr.flags & BLOB_DB_SLOT_F_SEALED) ||
+			    (sh.hdr.flags & ~(uint8_t)BLOB_DB_SLOT_F_KNOWN) ||
+			    sh.hdr.val_len > CONFIG_BLOB_DB_MAX_PAYLOAD_LEN) {
+				break;
+			}
+
+			const size_t ssz = slot_size_for(sh.hdr.val_len);
+
+			if (cursor + (off_t)ssz > (off_t)st.peb_size) {
+				break;
+			}
+
+			const bool is_seg =
+				(sh.hdr.flags & BLOB_DB_SLOT_F_SEGMENT) &&
+				!(sh.hdr.flags & BLOB_DB_SLOT_F_TOMBSTONE) &&
+				sh.hdr.val_len >= sizeof(struct blob_db_seg_hdr);
+
+			cursor += ssz;
+
+			if (!is_seg) {
+				continue;
+			}
+
+			/* Only the live slot for this id matters; an older
+			 * duplicate is already superseded. */
+			rc = find_live_slot(bid, sh.id, &sc, g_bbuf);
+			if (rc < 0) {
+				continue;
+			}
+			if (!(sc.target.hdr.flags & BLOB_DB_SLOT_F_SEGMENT) ||
+			    sc.target.hdr.val_len <
+				    sizeof(struct blob_db_seg_hdr)) {
+				continue;
+			}
+
+			struct blob_db_seg_hdr seg;
+
+			memcpy(&seg, g_bbuf, sizeof(seg));
+			if (seg.owner_id != owner) {
+				continue;
+			}
+
+			bool listed = false;
+
+			for (uint16_t j = 0; j < k && !listed; j++) {
+				listed = (seg_id_at(g_seg_a, j) == sh.id);
+			}
+			if (listed) {
+				continue;
+			}
+
+			uint8_t one[sizeof(uint64_t)];
+
+			memcpy(one, &sh.id, sizeof(one));
+			seg_release(one, 1);
+			dropped++;
+		}
+	}
+
+	LOG_INF("sweep owner=%llu: dropped %zu orphan segment(s)",
+		(unsigned long long)owner, dropped);
+	return persist_seg_owner(0);
+}
+
+/* Write `len` bytes at `id` as K segments plus an index record. `old_ids`
+ * holds the outgoing generation (old_k entries) to release after the commit. */
+static int seg_update(uint64_t id, const void *payload, size_t len,
+		      const uint8_t *old_ids, uint16_t old_k)
+{
+	const uint8_t *src = payload;
+	const size_t k = (len + g_seg_len - 1) / g_seg_len;
+
+	if (len > CONFIG_BLOB_DB_MAX_OBJECT_LEN) {
+		return -EFBIG;
+	}
+	if (k > g_seg_max) {
+		return -EFBIG;
+	}
+
+	int rc = persist_seg_owner(id);
+
+	if (rc < 0) {
+		return rc;
+	}
+
+	for (size_t j = 0; j < k; j++) {
+		const size_t n = MIN((size_t)g_seg_len, len - j * g_seg_len);
+		uint64_t sid;
+
+		rc = seg_write_chunk(id, (uint16_t)j, src + j * g_seg_len,
+				     (uint16_t)n, &sid);
+		if (rc < 0) {
+			return rc;   /* seg_owner stays set; sweep cleans up */
+		}
+		memcpy(g_seg_b + j * sizeof(uint64_t), &sid, sizeof(sid));
+	}
+
+	struct blob_db_index_hdr h = {
+		.version       = BLOB_DB_INDEX_VERSION,
+		.flags         = 0,
+		.total_len     = (uint32_t)len,
+		.payload_crc32 = crc32_ieee(src, len),
+		.seg_count     = (uint16_t)k,
+		.seg_len       = g_seg_len,
+	};
+
+	memcpy(h.magic, BLOB_DB_INDEX_MAGIC, 2);
+
+	const uint16_t idx_len =
+		(uint16_t)(sizeof(h) + k * sizeof(uint64_t));
+	const uint16_t bid = id_to_bucket(id);
+	bool formatted;
+
+	rc = read_bucket_hdr(bid, &formatted);
+	if (rc < 0) {
+		return rc;
+	}
+
+	off_t cursor;
+
+	if (!formatted) {
+		rc = format_bucket(bid);
+		if (rc < 0) {
+			return rc;
+		}
+		cursor = BLOB_DB_BUCKET_DATA_OFF;
+	} else {
+		struct bucket_scan sc;
+
+		rc = scan_bucket_for(bid, id, (off_t)st.peb_size, &sc);
+		if (rc < 0) {
+			return rc;
+		}
+		cursor = sc.write_cursor;
+	}
+
+	if (cursor + (off_t)slot_size_for(idx_len) > (off_t)st.peb_size) {
+		rc = compact_bucket(bid);
+		if (rc < 0) {
+			return rc;
+		}
+
+		struct bucket_scan sc;
+
+		rc = scan_bucket_for(bid, id, (off_t)st.peb_size, &sc);
+		if (rc < 0) {
+			return rc;
+		}
+		cursor = sc.write_cursor;
+		if (cursor + (off_t)slot_size_for(idx_len) >
+		    (off_t)st.peb_size) {
+			return -ENOSPC;
+		}
+	}
+
+	/* THE COMMIT. Before this the new segments are unreferenced; after it
+	 * the old ones are. */
+	rc = append_slot2(bid, cursor, id, BLOB_DB_SLOT_F_INDEXED, &h,
+			  (uint16_t)sizeof(h), g_seg_b, idx_len);
+	if (rc < 0) {
+		return rc;
+	}
+
+	if (old_k > 0) {
+		seg_release(old_ids, old_k);
+	}
+	return persist_seg_owner(0);
+}
+#endif /* CONFIG_BLOB_DB_LARGE_PAYLOADS */
+
 uint64_t blob_db_alloc_id(void)
 {
 	if (!st.mounted) {
@@ -1301,6 +1884,24 @@ int blob_db_get(uint64_t id, void *out, size_t out_sz, size_t *out_len)
 	if (rc < 0) {
 		return rc;
 	}
+#if defined(CONFIG_BLOB_DB_LARGE_PAYLOADS)
+	if (sc.target.hdr.flags & BLOB_DB_SLOT_F_INDEXED) {
+		struct blob_db_index_hdr h;
+		int k = index_load(id, g_seg_a, &h);
+
+		if (k < 0) {
+			return k;
+		}
+		if (out_sz < h.total_len) {
+			if (out_len) {
+				*out_len = h.total_len;
+			}
+			return -ENOMEM;
+		}
+		rc = blob_db_read(id, 0, out, h.total_len, out_len);
+		return rc;
+	}
+#endif
 	if (out_sz < sc.target.hdr.val_len) {
 		return -ENOMEM;
 	}
@@ -1324,9 +1925,15 @@ int blob_db_update(uint64_t id, const void *payload, size_t len)
 	if (id == 0 || id >= st.next_id) {
 		return -EINVAL;
 	}
+#if defined(CONFIG_BLOB_DB_LARGE_PAYLOADS)
+	if (len > CONFIG_BLOB_DB_MAX_OBJECT_LEN) {
+		return -EINVAL;
+	}
+#else
 	if (len > CONFIG_BLOB_DB_MAX_PAYLOAD_LEN) {
 		return -EINVAL;
 	}
+#endif
 	if (len > 0 && !payload) {
 		return -EINVAL;
 	}
@@ -1344,6 +1951,11 @@ int blob_db_update(uint64_t id, const void *payload, size_t len)
 	}
 
 	off_t write_cursor;
+#if defined(CONFIG_BLOB_DB_LARGE_PAYLOADS)
+	/* An outgoing segmented generation has to be captured before the commit
+	 * replaces the index that names it, and released after. */
+	uint16_t old_k = 0;
+#endif
 
 	if (!formatted) {
 		rc = format_bucket(bid);
@@ -1361,7 +1973,24 @@ int blob_db_update(uint64_t id, const void *payload, size_t len)
 			return rc;
 		}
 		write_cursor = sc.write_cursor;
+#if defined(CONFIG_BLOB_DB_LARGE_PAYLOADS)
+		if (sc.target_off >= 0 &&
+		    (sc.target.hdr.flags & BLOB_DB_SLOT_F_INDEXED)) {
+			struct blob_db_index_hdr oh;
+			int k = index_load(id, g_seg_a, &oh);
+
+			if (k > 0) {
+				old_k = (uint16_t)k;
+			}
+		}
+#endif
 	}
+
+#if defined(CONFIG_BLOB_DB_LARGE_PAYLOADS)
+	if (len > CONFIG_BLOB_DB_MAX_PAYLOAD_LEN) {
+		return seg_update(id, payload, len, g_seg_a, old_k);
+	}
+#endif
 
 	const size_t ssz = slot_size_for((uint16_t)len);
 
@@ -1383,10 +2012,31 @@ int blob_db_update(uint64_t id, const void *payload, size_t len)
 		}
 	}
 
+#if defined(CONFIG_BLOB_DB_LARGE_PAYLOADS)
+	/* Shrinking a segmented object to an inline one: same commit-then-release
+	 * order, so a crash still leaves exactly one referenced generation. */
+	if (old_k > 0) {
+		rc = persist_seg_owner(id);
+		if (rc < 0) {
+			return rc;
+		}
+	}
+#endif
+
 	rc = append_slot(bid, write_cursor, id, 0, payload, (uint16_t)len);
 	if (rc < 0) {
 		return rc;
 	}
+
+#if defined(CONFIG_BLOB_DB_LARGE_PAYLOADS)
+	if (old_k > 0) {
+		seg_release(g_seg_a, old_k);
+		rc = persist_seg_owner(0);
+		if (rc < 0) {
+			return rc;
+		}
+	}
+#endif
 
 	LOG_DBG("update id=%llu bid=%u off=0x%lx len=%zu",
 		(unsigned long long)id, bid,
@@ -1443,11 +2093,41 @@ int blob_db_delete(uint64_t id)
 		}
 	}
 
+#if defined(CONFIG_BLOB_DB_LARGE_PAYLOADS)
+	uint16_t old_k = 0;
+
+	if (sc.target.hdr.flags & BLOB_DB_SLOT_F_INDEXED) {
+		struct blob_db_index_hdr oh;
+		int k = index_load(id, g_seg_a, &oh);
+
+		if (k > 0) {
+			old_k = (uint16_t)k;
+			rc = persist_seg_owner(id);
+			if (rc < 0) {
+				return rc;
+			}
+		}
+	}
+#endif
+
 	rc = append_slot(bid, write_cursor, id,
 			 BLOB_DB_SLOT_F_TOMBSTONE, NULL, 0);
 	if (rc < 0) {
 		return rc;
 	}
+
+#if defined(CONFIG_BLOB_DB_LARGE_PAYLOADS)
+	/* Tombstone first, then the segments: after the commit no live index
+	 * names them, so a crash here leaves work the sweep already knows how
+	 * to finish. */
+	if (old_k > 0) {
+		seg_release(g_seg_a, old_k);
+		rc = persist_seg_owner(0);
+		if (rc < 0) {
+			return rc;
+		}
+	}
+#endif
 
 	LOG_DBG("delete id=%llu bid=%u off=0x%lx",
 		(unsigned long long)id, bid,
@@ -1510,7 +2190,15 @@ static int for_each_live_slot(const uint8_t *buf,
 			scan += future.total_size;
 		}
 
-		if (!superseded && !(sv.flags & BLOB_DB_SLOT_F_TOMBSTONE)) {
+		/* A SEGMENT slot is a chunk of another object, not an object.
+		 * Reporting it would make count() and iterate() describe storage
+		 * rather than content, and hand fsck bytes it cannot interpret. */
+		const bool internal =
+			IS_ENABLED(CONFIG_BLOB_DB_LARGE_PAYLOADS) &&
+			(sv.flags & BLOB_DB_SLOT_F_SEGMENT);
+
+		if (!superseded && !internal &&
+		    !(sv.flags & BLOB_DB_SLOT_F_TOMBSTONE)) {
 			const uint8_t *payload = buf + cursor +
 						 sizeof(struct blob_db_slot_hdr) +
 						 sizeof(uint64_t);
@@ -1595,6 +2283,144 @@ int blob_db_iterate(blob_db_iter_cb_t cb, void *user)
 	return 0;
 }
 
+int blob_db_size(uint64_t id, size_t *out_size)
+{
+	if (!st.mounted) {
+		return -ENODEV;
+	}
+	if (!out_size) {
+		return -EINVAL;
+	}
+	if (id == 0) {
+		return -ENOENT;
+	}
+
+	const uint16_t bid = id_to_bucket(id);
+	bool formatted;
+	int rc = read_bucket_hdr(bid, &formatted);
+
+	if (rc < 0) {
+		return rc;
+	}
+	if (!formatted) {
+		return -ENOENT;
+	}
+
+	struct bucket_scan sc;
+
+	rc = find_live_slot(bid, id, &sc, g_bbuf);
+	if (rc < 0) {
+		return rc;
+	}
+#if defined(CONFIG_BLOB_DB_LARGE_PAYLOADS)
+	if (sc.target.hdr.flags & BLOB_DB_SLOT_F_INDEXED) {
+		struct blob_db_index_hdr h;
+
+		memcpy(&h, g_bbuf, sizeof(h));
+		*out_size = h.total_len;
+		return 0;
+	}
+#endif
+	*out_size = sc.target.hdr.val_len;
+	return 0;
+}
+
+int blob_db_read(uint64_t id, size_t offset, void *out, size_t len,
+		 size_t *out_read)
+{
+	if (!st.mounted) {
+		return -ENODEV;
+	}
+	if (len > 0 && !out) {
+		return -EINVAL;
+	}
+	if (id == 0) {
+		return -ENOENT;
+	}
+
+	const uint16_t bid = id_to_bucket(id);
+	bool formatted;
+	int rc = read_bucket_hdr(bid, &formatted);
+
+	if (rc < 0) {
+		return rc;
+	}
+	if (!formatted) {
+		return -ENOENT;
+	}
+
+	struct bucket_scan sc;
+
+	rc = find_live_slot(bid, id, &sc, g_bbuf);
+	if (rc < 0) {
+		return rc;
+	}
+
+#if defined(CONFIG_BLOB_DB_LARGE_PAYLOADS)
+	if (sc.target.hdr.flags & BLOB_DB_SLOT_F_INDEXED) {
+		struct blob_db_index_hdr h;
+		int k = index_load(id, g_seg_a, &h);
+
+		if (k < 0) {
+			return k;
+		}
+		if (offset >= h.total_len) {
+			if (out_read) {
+				*out_read = 0;
+			}
+			return 0;
+		}
+		if (len > h.total_len - offset) {
+			len = h.total_len - offset;
+		}
+
+		uint8_t *dst = out;
+		size_t done = 0;
+
+		while (done < len) {
+			const size_t pos  = offset + done;
+			const uint16_t seq = (uint16_t)(pos / h.seg_len);
+			const size_t skip = pos % h.seg_len;
+			size_t n = h.seg_len - skip;
+
+			if (n > len - done) {
+				n = len - done;
+			}
+			rc = seg_chunk_read(id, seg_id_at(g_seg_a, seq), seq,
+					    skip, dst + done, n);
+			if (rc < 0) {
+				return rc;
+			}
+			done += n;
+		}
+		if (out_read) {
+			*out_read = done;
+		}
+		return 0;
+	}
+#endif
+
+	/* Inline payload: it is already staged, so this is a bounded copy. */
+	const uint16_t have = sc.target.hdr.val_len;
+
+	if (offset >= have) {
+		if (out_read) {
+			*out_read = 0;
+		}
+		return 0;
+	}
+	if (len > (size_t)have - offset) {
+		len = (size_t)have - offset;
+	}
+	if (len > 0) {
+		memcpy(out, g_bbuf + offset, len);
+	}
+	if (out_read) {
+		*out_read = len;
+	}
+	return 0;
+}
+
 int blob_db_format(void)
 {
 	if (!st.mounted) {
@@ -1617,6 +2443,7 @@ int blob_db_format(void)
 	st.master_gen    = 1;
 	st.next_id       = 2;
 	st.next_id_hint  = 2;
+	st.seg_owner     = 0;
 
 	rc = bind_root_empty();
 	if (rc < 0) {

@@ -44,6 +44,29 @@ write path with master intent, segmented delete, and the orphan sweep.
 
 So Stage 2 is **+2.3 KB `.text`, +34 % on `blob_db`'s code size.**
 
+> **Correction, from shipping it.** The +2.3 KB above was low. Measured on the
+> real implementation, at `MAX_SEGMENTS=128` on 4 KB sectors:
+>
+> | Build | `.text` | `.rodata` | `.bss` |
+> |---|---|---|---|
+> | before segmentation (PRs 1–2) | 8 081 | 2 303 | 8 256 |
+> | `BLOB_DB_LARGE_PAYLOADS=n` | 8 569 | 2 309 | 8 264 |
+> | `BLOB_DB_LARGE_PAYLOADS=y` | **11 721** | 2 946 | **10 316** |
+>
+> The feature costs **+3.15 KB `.text` and +2.05 KB `.bss`**, against the
+> +2.3 KB / +2.0 KB projected. The sketch under-counted the parts it stubbed:
+> the real sweep is more defensive, chunk placement retries across buckets, and
+> the geometry is validated at mount with diagnostics naming the shortfall.
+>
+> The `.bss` figure lands exactly on the prediction — 16 B per segment,
+> 2 048 B for 128 segments plus 4 B of resolved geometry — so §1.1's "RAM
+> scales with segment count, not object size" holds as stated.
+>
+> The `=n` build also grew, by 488 B, and that is not dead weight:
+> `blob_db_size()` and `blob_db_read()` are compiled unconditionally because
+> they work on inline payloads too, so a build with the feature off still gains
+> pread and cheap sizing.
+
 Two results worth noting:
 
 - **`.text` is independent of the maximum payload size** — 1 883 B at every
@@ -344,12 +367,18 @@ Decisions this adds to the six in the base proposal §11:
 - **D9 — Rank the streaming slot walk ahead of Stage 2.** It removes the
   read-amplification tax from every point operation and is not coupled to
   segmentation. (Its RAM claim was overstated — see the §3 correction.)
-- **D10 — Inside L1, or a shared chunking helper above it (§3.2).** This is
-  the layering question and it should be settled before any code. Inside L1
-  is recommended, on orphan reclaim and chunk invisibility; the fallback if
-  L1 must stay minimal is one shared L1½ module, **not** per-client chunking.
-  Either way it reverses contract D4, which currently sends large data to an
-  L2 `seq` chain.
+- **D10 — Inside L1, or a shared chunking helper above it (§3.2).**
+  **RESOLVED: inside L1.** Decided on orphan reclaim above all — chunks written
+  above L1 carry no owner tag, so a crash mid-write leaks blobs no generic
+  sweep can identify, making mark-and-sweep a per-client obligation. Chunk
+  invisibility to `count`/`iterate` and a single implementation follow. Two
+  findings from implementing PRs 1–2 reinforced it: the torn-scratch data-loss
+  bug showed that "did this complete?" is easy to get wrong even once inside
+  the core library, let alone in every client; and the format-major gate PR 1
+  added means older software now *refuses* a segmented store instead of
+  misreading an index record as data — a safety net that has no equivalent
+  above L1. This reverses contract D4, which sent large data to an L2 `seq`
+  chain.
 
 ---
 

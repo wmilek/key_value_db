@@ -38,7 +38,18 @@
  * ignores the tail. A minor bump must keep hdr_len <= BLOB_DB_MASTER_HDR_MAX;
  * exceeding that is a major change.
  */
+/* A build that can write segmented objects declares major 2, because a slot
+ * flag changes what a payload *means* and older software would misread an
+ * index record as data. A build without the feature keeps writing major 1 and
+ * stays interchangeable with software that predates it. Either build reads
+ * anything up to its own major, so enabling the feature adopts an existing
+ * store rather than refusing it — and upgrades it to major 2 on the next
+ * master write. */
+#ifdef CONFIG_BLOB_DB_LARGE_PAYLOADS
+#define BLOB_DB_FORMAT_MAJOR      2
+#else
 #define BLOB_DB_FORMAT_MAJOR      1
+#endif
 #define BLOB_DB_FORMAT_MINOR      0
 
 /* Largest master header any version may declare. Bounds the read buffer that
@@ -61,6 +72,12 @@
  */
 #define BLOB_DB_SLOT_F_SEALED     (1u << 0)
 #define BLOB_DB_SLOT_F_TOMBSTONE  (1u << 1)
+/* Large objects (CONFIG_BLOB_DB_LARGE_PAYLOADS). INDEXED marks the slot at the
+ * object's own id whose payload is a segment table; SEGMENT marks a slot
+ * holding one chunk of another object. Both change what a payload means, so
+ * introducing them is a MAJOR format change. */
+#define BLOB_DB_SLOT_F_INDEXED    (1u << 2)
+#define BLOB_DB_SLOT_F_SEGMENT    (1u << 3)
 
 /* Every flag bit this version understands. A slot carrying a bit outside this
  * mask was written by software we do not understand, and its payload must not
@@ -71,8 +88,14 @@
  * refuses the store before any slot is read (§ format version above). The mask
  * covers the case where that discipline is broken.
  */
+#ifdef CONFIG_BLOB_DB_LARGE_PAYLOADS
+#define BLOB_DB_SLOT_F_KNOWN                                                   \
+	(BLOB_DB_SLOT_F_SEALED | BLOB_DB_SLOT_F_TOMBSTONE |                    \
+	 BLOB_DB_SLOT_F_INDEXED | BLOB_DB_SLOT_F_SEGMENT)
+#else
 #define BLOB_DB_SLOT_F_KNOWN                                                   \
 	(BLOB_DB_SLOT_F_SEALED | BLOB_DB_SLOT_F_TOMBSTONE)
+#endif
 
 /* Frozen compatibility prefix (12 B).
  *
@@ -116,7 +139,8 @@ struct __packed blob_db_master_hdr {
 	uint16_t compacting_bid;  /* 17..18  meaningful only when COMPACTING    */
 	uint8_t  reserved0;       /* 19                                         */
 	uint64_t next_id_hint;    /* 20..27  leading id ceiling                 */
-	uint8_t  reserved1[32];   /* 28..59  future MINOR revisions             */
+	uint64_t seg_owner;       /* 28..35  segment sweep intent; 0 = none     */
+	uint8_t  reserved1[24];   /* 36..59  future MINOR revisions             */
 	uint32_t hdr_crc32;       /* 60..63  CRC32-IEEE over bytes [0, 60)      */
 };
 BUILD_ASSERT(sizeof(struct blob_db_master_hdr) == 64,
@@ -182,5 +206,40 @@ BUILD_ASSERT(sizeof(struct blob_db_scratch_seal) == 16,
 	     "blob_db_scratch_seal layout drift");
 
 #define BLOB_DB_SCRATCH_MAGIC     "BDSL"
+
+/* Large-object records (CONFIG_BLOB_DB_LARGE_PAYLOADS) -------------------- */
+
+/* Payload of an INDEXED slot: this header, then seg_count u64 segment ids.
+ * The whole thing is an ordinary single-slot payload, which is what bounds how
+ * large an object can be — see BLOB_DB_LARGE_PAYLOADS in Kconfig. */
+struct __packed blob_db_index_hdr {
+	uint8_t  magic[2];        /* 'B','X'                                    */
+	uint8_t  version;         /* 1                                          */
+	uint8_t  flags;           /* reserved, 0                                */
+	uint32_t total_len;       /* logical object length                      */
+	uint32_t payload_crc32;   /* CRC32-IEEE over the reassembled object     */
+	uint16_t seg_count;       /* K                                          */
+	uint16_t seg_len;         /* chunk size; the last segment may be short  */
+};
+BUILD_ASSERT(sizeof(struct blob_db_index_hdr) == 16,
+	     "blob_db_index_hdr layout drift");
+
+#define BLOB_DB_INDEX_MAGIC       "BX"
+#define BLOB_DB_INDEX_VERSION     1
+
+/* Prefix of a SEGMENT slot's payload, ahead of the chunk bytes.
+ *
+ * owner_id is what makes orphan reclaim possible with no RAM index: any
+ * segment whose owner's live index does not list it is garbage, and that rule
+ * alone covers every crash point in a segmented write (see the sweep). It
+ * lives in the payload rather than the slot header so the header stays 4 bytes
+ * for the millions of small slots that will never be segments. */
+struct __packed blob_db_seg_hdr {
+	uint64_t owner_id;        /* the user-visible id this chunk belongs to  */
+	uint16_t seq;             /* chunk index, 0..K-1                        */
+	uint16_t reserved;
+};
+BUILD_ASSERT(sizeof(struct blob_db_seg_hdr) == 12,
+	     "blob_db_seg_hdr layout drift");
 
 #endif /* LIB_BLOB_DB_INTERNAL_H_ */

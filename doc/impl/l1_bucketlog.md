@@ -159,6 +159,45 @@ bucket until compaction.) Readers verify the CRC of the one slot they actually
 want, and fall back to the newest intact slot below it — so the visible value is
 always a committed one.
 
+### 3.5 Large objects — segments and an index record
+
+With `CONFIG_BLOB_DB_LARGE_PAYLOADS`, a payload too big for one slot is stored
+as K **segment** slots plus one **index** slot at the object's own id. Both are
+ordinary slots, so latest-wins, tombstones, `id mod N` addressing and per-bucket
+compaction apply to them unchanged; only four call sites know the difference.
+
+```
+index slot   flags = SEALED|INDEXED, at the object's id
+  payload:   magic 'BX', version, flags, total_len[4], payload_crc32[4],
+             seg_count[2], seg_len[2], then seg_id[seg_count] (u64 each)
+
+segment slot flags = SEALED|SEGMENT, at an internal id
+  payload:   owner_id[8], seq[2], reserved[2], then the chunk bytes
+```
+
+`owner_id` is what makes reclaim possible with no RAM index, and it sits in the
+payload rather than the slot header so the header stays 4 bytes for the millions
+of small slots that will never be segments.
+
+Introducing these flags is a **MAJOR** format change (§3.1): older software
+would read an index record as though it were the object's payload. A build
+without the feature keeps writing major 1; a build with it writes major 2 and
+reads either.
+
+**Capacity is bounded by the index record**, which is itself a single-slot
+payload: `seg_count <= (MAX_PAYLOAD_LEN - 16) / 8`, and the reachable object
+size is that times `seg_len`. This is why enabling the feature raises the
+default `MAX_PAYLOAD_LEN`, and why mount validates the chain and refuses a
+configuration that cannot reach `MAX_OBJECT_LEN` — naming the shortfall rather
+than silently capping. `seg_len` defaults to `sector/4` clamped to what a slot
+can hold, which leaves several segments plus rebind headroom per bucket.
+
+**Segment placement is a probe sequence.** A segment's id is internal and
+arbitrary, and `bucket = id mod N`, so when the bucket a fresh id lands in has
+no room the writer simply allocates another id and lands elsewhere. A
+user-visible id cannot do this — its bucket is fixed — but segments are never
+user-visible.
+
 ## 4. Slot semantics — latest wins
 
 A bucket is an append-only log of operations on the ids hashing to it.
@@ -236,6 +275,36 @@ write master A  (gen+2, CLEAN)                    ─┘
 
 The window is bracketed by master writes; any crash inside is recovered at
 mount (§6.1).
+
+### 5.6a Segmented `update` / `delete`, and the sweep
+
+```
+update(id, payload, len) with len > MAX_PAYLOAD_LEN:
+  0. capture the outgoing index's seg_id[] (if the id holds one)
+  1. master: seg_owner = id                      ── enters the sweep window
+  2. for j in 0..K-1: alloc an internal id, append a SEGMENT slot
+  3. append the INDEXED slot at id                ── ATOMIC COMMIT
+  4. tombstone the outgoing segments
+  5. master: seg_owner = 0                        ── leaves the sweep window
+
+delete(id) holding an index: same window, tombstone the index at step 3.
+```
+
+Step 3 is one slot append — the primitive that already makes a small write
+atomic. Before it the new segments are unreferenced; after it the old ones are.
+So contract §2 "atomicity" and "no partial reads" hold with nothing new.
+
+**One rule reclaims every crash point:** *a SEGMENT slot whose owner's live
+index does not list it is garbage.* Crash in step 2 → the new segments are not
+listed. Crash inside step 3 → the slot fails its CRC, so the old index is still
+live and the *new* segments are unlisted. Crash in step 4 → the old segments are
+not listed. In each case the losing generation is exactly the unlisted set.
+
+Mount runs the sweep only when the master carries a non-zero `seg_owner`, so the
+clean path pays nothing. The sweep walks every bucket by slot header, and for
+each live SEGMENT slot owned by that id checks the owner's index — O(N) sector
+reads, O(1) RAM beyond the segment tables, idempotent, and restartable after a
+crash during the sweep itself.
 
 ### 5.7 `iterate` / `count`
 
@@ -319,6 +388,10 @@ BLOB_DB_PARTITION_LABEL        string, default "storage"
 BLOB_DB_MAX_PAYLOAD_LEN        int, default 256, range 1 65535  # geometry checked at mount
 BLOB_DB_SECTOR_BUF_SIZE        int, default 4096
 BLOB_DB_AUTOFORMAT_ON_CORRUPT  bool, default y   # see §3.1
+BLOB_DB_LARGE_PAYLOADS         bool, default n   # segmented objects (§3.5)
+BLOB_DB_MAX_OBJECT_LEN         int, default 131072   # validated at mount
+BLOB_DB_MAX_SEGMENTS           int, default 128      # 16 B of .bss each
+BLOB_DB_SEGMENT_LEN            int, default 0        # 0 = sector/4, clamped
 BLOB_DB_MULTI                  bool, default n   # batch ops (§5.8, contract D6)
 module = BLOB_DB (standard LOG pattern)
 ```
@@ -352,6 +425,8 @@ for headers), `<zephyr/logging/log.h>`.
 | Partition full | `update` returns `-ENOSPC` after attempting compaction of the target bucket |
 | One bucket overflows | as above, per-bucket; round-robin allocation keeps fill uniform, so buckets fill together |
 | Id space exhaustion | 2⁶⁴ allocations ≈ 5800 years at 100 M/s — not reachable |
+| Crash during a segmented write | one rule — an unlisted segment is garbage — covers all three points; mount sweeps when the master carries `seg_owner` (§5.6a) |
+| Segment missing or mislabelled on read | `-EIO`; the segment header's `owner_id`/`seq` are checked against what the index claimed, so a stale or foreign slot cannot be served as content |
 
 ## 11. Unit-test plan (draft)
 
