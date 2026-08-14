@@ -886,6 +886,81 @@ ZTEST(blob_db, test_foreign_magic_is_refused)
 	masters_erase();
 }
 
+/* Refusing to mount is only half a contract: the escape hatch that refusal
+ * names has to be reachable. It was not — blob_db_format() opened with
+ * `if (!st.mounted) return -ENODEV;`, so the single store that needs
+ * discarding, the one that cannot be mounted, was the one store it rejected.
+ * Found by downgrading a real DK across the format-major bump
+ * (app_perf/RESULTS.md, "Downgrading"), where the only way out was to reach
+ * under the library and erase the partition through flash_area directly. */
+ZTEST(blob_db, test_format_discards_an_unmountable_store)
+{
+	put_blob("DOOMED", 6);
+	zassert_ok(blob_db_unmount());
+
+	struct master_img m;
+
+	master_read_raw(0, &m);
+	zassert_equal(m.format_major, TEST_FORMAT_MAJOR);
+
+	struct master_img future = m;
+
+	future.format_major = TEST_FORMAT_MAJOR + 1;
+	master_seal(&future);
+	/* Both slots, so there is no understood master to fall back to. */
+	master_write_raw(0, &future);
+	master_write_raw(1, &future);
+
+	zassert_equal(blob_db_mount(), -ENOTSUP,
+		      "precondition: the store must be unmountable");
+
+	/* The property: discard works without a mount. Clean up before
+	 * asserting, because a zassert here aborts the test — and leaving an
+	 * unmountable partition behind fails every following fixture, turning
+	 * one regression into 70-odd failures that bury their own cause. */
+	int rc = blob_db_format();
+
+	if (rc != 0) {
+		masters_erase();
+	}
+	zassert_ok(rc, "format must discard a store that cannot be mounted");
+
+	/* And it must leave a *usable* store, not merely an erased partition —
+	 * a caller that formats expects to carry on without mounting again. */
+	zassert_true(blob_db_exists(BLOB_DB_ROOT_ID),
+		     "root must be live after formatting an unmountable store");
+	zassert_equal(blob_db_count(), 1, "want root only, got %zu",
+		      blob_db_count());
+
+	uint64_t fresh = put_blob("FRESH", 5);
+	uint8_t buf[8];
+	size_t got = 0;
+
+	zassert_ok(blob_db_get(fresh, buf, sizeof(buf), &got));
+	zassert_equal(got, 5);
+	zassert_mem_equal(buf, "FRESH", 5);
+
+	/* The foreign major is gone: an older build could mount this again. */
+	struct master_img after;
+
+	master_read_raw(0, &after);
+	zassert_equal(after.format_major, TEST_FORMAT_MAJOR,
+		      "format must rewrite the major it understands");
+}
+
+/* The mounted case must be untouched by the above: format on a mounted store
+ * still formats it and leaves it mounted. */
+ZTEST(blob_db, test_format_on_a_mounted_store_stays_mounted)
+{
+	put_blob("GONE", 4);
+	zassert_ok(blob_db_format());
+
+	/* Still mounted, so this works without a mount call. */
+	zassert_equal(blob_db_count(), 1, "want root only, got %zu",
+		      blob_db_count());
+	zassert_not_equal(blob_db_alloc_id(), 0, "store must still be mounted");
+}
+
 /* An interrupted upgrade: our major on one slot, a newer one with a higher
  * generation on the other. Falling back to the older slot would silently
  * mount a stale view, so the whole store must be refused. */

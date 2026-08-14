@@ -103,7 +103,8 @@ extern "C" {
  * An **unrecognized** store is never destroyed. If a master sector parses but
  * declares a format this build does not understand — a newer version, or
  * another allocator's magic — mount returns `-ENOTSUP` and writes nothing;
- * discarding it is the caller's decision, via `blob_db_format()`. Only a
+ * discarding it is the caller's decision, via `blob_db_format()`, which for
+ * that reason does not itself require a mount. Only a
  * partition whose master sectors read as erased is treated as virgin and
  * formatted automatically. (If both masters are unreadable but *not* erased —
  * bit rot, or a power loss during the first format —
@@ -361,8 +362,23 @@ int blob_db_iterate(blob_db_iter_cb_t cb, void *user);
  * re-initialized, and `BLOB_DB_ROOT_ID` is bound to an empty payload
  * (see @ref blob_db_root). The id space is reset.
  *
+ * **Does not require a mount.** This is the deliberate-discard path
+ * `blob_db_mount()`'s `-ENOTSUP` refers to, so it must work on precisely the
+ * store that cannot be mounted — an unrecognized format, or one whose masters
+ * are both unreadable under `CONFIG_BLOB_DB_AUTOFORMAT_ON_CORRUPT=n`. Called
+ * while unmounted it opens the partition itself, applies the same geometry
+ * checks a mount does, and on success leaves the DB **mounted** and usable, in
+ * the state a virgin mount would have produced. Called while mounted it
+ * behaves as it always has, and a failure leaves the DB mounted.
+ *
+ * Note the geometry checks still apply: a partition whose sector exceeds
+ * `CONFIG_BLOB_DB_SECTOR_BUF_SIZE`, or a build whose
+ * `CONFIG_BLOB_DB_MAX_PAYLOAD_LEN` the geometry cannot rebind, is refused with
+ * `-ENOTSUP` here too. Those are properties of the build, not of the store, so
+ * discarding the store would not help.
+ *
  * @retval 0        success
- * @retval -ENODEV  not mounted
+ * @retval -ENOTSUP the geometry or the build configuration is unsupported
  * @retval -EIO     flash I/O error
  */
 int blob_db_format(void);

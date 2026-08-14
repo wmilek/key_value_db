@@ -427,14 +427,16 @@ static int format_masters_fresh(void)
 	return bind_root_empty();
 }
 
-int blob_db_mount(void)
+/* Open the store and derive/validate the geometry-dependent state, leaving
+ * the store closed if anything is rejected. Shared by mount and by the
+ * format-an-unmountable-store path, which needs exactly the same checks:
+ * every buffer and bucket-arithmetic assumption below rests on them, and a
+ * format writes through the same primitives a mount does. */
+static int store_open_and_validate(void)
 {
-	if (st.mounted) {
-		return -EALREADY;
-	}
-
 	struct blob_db_store_geom geom;
 	int rc = blob_db_store_open(&geom);
+
 	if (rc < 0) {
 		LOG_ERR("store open: %d", rc);
 		return rc;
@@ -491,6 +493,25 @@ int blob_db_mount(void)
 			rc = -ENOTSUP;
 			goto err_close;
 		}
+	}
+
+	return 0;
+
+err_close:
+	blob_db_store_close();
+	return rc;
+}
+
+int blob_db_mount(void)
+{
+	if (st.mounted) {
+		return -EALREADY;
+	}
+
+	int rc = store_open_and_validate();
+
+	if (rc < 0) {
+		return rc;
 	}
 
 	/* Pick the authoritative master. */
@@ -2711,20 +2732,33 @@ int blob_db_write(uint64_t id, size_t offset, const void *buf, size_t len)
 
 int blob_db_format(void)
 {
+	bool opened_here = false;
+	int rc;
+
+	/* Formatting is the deliberate-discard path, so it must also work on a
+	 * store this build cannot mount — that is the escape hatch mount's
+	 * -ENOTSUP names, and it was unreachable while this required a mount:
+	 * the one store needing discard is the one that cannot be mounted.
+	 * Nothing above blob_db can open the substrate on our behalf, so open
+	 * it here, with the same geometry checks a mount applies. */
 	if (!st.mounted) {
-		return -ENODEV;
+		rc = store_open_and_validate();
+		if (rc < 0) {
+			return rc;
+		}
+		opened_here = true;
 	}
 
-	int rc = blob_db_store_erase(0, st.fa_size);
+	rc = blob_db_store_erase(0, st.fa_size);
 	if (rc < 0) {
 		LOG_ERR("format: erase: %d", rc);
-		return rc;
+		goto err;
 	}
 
 	/* Root id (=1) is consumed at format time — see bind_root_empty(). */
 	rc = write_master(BLOB_DB_MASTER_A_SECTOR, 1, BLOB_DB_STATE_CLEAN, 0, 2);
 	if (rc < 0) {
-		return rc;
+		goto err;
 	}
 
 	st.active_master = BLOB_DB_MASTER_A_SECTOR;
@@ -2735,12 +2769,34 @@ int blob_db_format(void)
 
 	rc = bind_root_empty();
 	if (rc < 0) {
-		return rc;
+		goto err;
+	}
+
+	if (opened_here) {
+		/* The store is now in exactly the state a virgin mount would
+		 * have produced, so leave it mounted rather than making the
+		 * caller mount a store we just built. */
+		st.mounted = true;
+#if defined(CONFIG_BLOB_DB_LARGE_PAYLOADS)
+		rc = seg_geometry_init();
+		if (rc < 0) {
+			st.mounted = false;
+			goto err;
+		}
+#endif
 	}
 
 	LOG_INF("format: complete; next_id=%llu",
 		(unsigned long long)st.next_id);
 	return 0;
+
+err:
+	/* Only unwind what this call set up: a format that fails on an already
+	 * mounted store leaves it mounted, as it always has. */
+	if (opened_here) {
+		blob_db_store_close();
+	}
+	return rc;
 }
 
 /* Format the root bucket (erase + write header) and append an empty slot
