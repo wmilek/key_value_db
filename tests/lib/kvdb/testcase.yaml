@@ -3,3 +3,10 @@ common:
   platform_allow: native_sim
 tests:
   lib.kvdb: {}
+  # L3 over the UBI-backed L1. Exercises the full kvdb -> container -> blob_db
+  # -> UBI stack, which is what the app builds when BLOB_DB_BACKEND_UBI is on.
+  lib.kvdb.ubi:
+    tags: storage kvdb containers kvhash ubi
+    extra_configs:
+      - CONFIG_BLOB_DB_BACKEND_UBI=y
+      - CONFIG_UBI_MAX_NR_OF_DATA_PEBS=2046

@@ -3,3 +3,12 @@ common:
   platform_allow: native_sim
 tests:
   lib.blob_db: {}
+  # Same suite on the UBI volume backend. blob_db's PEBs map 1:1 onto UBI
+  # LEBs, so the whole contract must hold unchanged; the two cases that poke
+  # raw partition offsets skip themselves here (see src/main.c). The 8 MB /
+  # 4 KB native_sim partition yields ~2046 usable PEBs.
+  lib.blob_db.ubi:
+    tags: storage blob_db ubi
+    extra_configs:
+      - CONFIG_BLOB_DB_BACKEND_UBI=y
+      - CONFIG_UBI_MAX_NR_OF_DATA_PEBS=2046

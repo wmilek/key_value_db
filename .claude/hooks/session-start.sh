@@ -45,12 +45,12 @@ PY="$(command -v python3.12 || command -v python3)"
 if [ ! -x "$VENV/bin/west" ]; then
 	echo "[session-start] creating venv with west ($PY)"
 	"$PY" -m venv "$VENV"
-	"$VENV/bin/pip" install -q --upgrade pip
-	# west pulls in docopt, which ships no wheel and fails to build under
-	# setuptools >= 66 ("[wheel] section is deprecated"). Pin an older
-	# setuptools and skip build isolation so that pinned version is used.
-	"$VENV/bin/pip" install -q "setuptools<66" wheel
-	"$VENV/bin/pip" install -q --no-build-isolation west
+	# Current west has no docopt dependency, so the old "setuptools<66" pin
+	# that worked around docopt's missing wheel is no longer needed — and is
+	# fatal here: that setuptools imports pkgutil.ImpImporter, removed in
+	# Python 3.12, which broke every subsequent install in the venv.
+	"$VENV/bin/pip" install -q --upgrade pip setuptools wheel
+	"$VENV/bin/pip" install -q west
 fi
 # shellcheck disable=SC1091
 . "$VENV/bin/activate"

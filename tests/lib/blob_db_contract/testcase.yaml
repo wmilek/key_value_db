@@ -3,3 +3,10 @@ common:
   platform_allow: native_sim
 tests:
   lib.blob_db_contract: {}
+  # The L1 contract is backend-agnostic by definition — the model container
+  # never sees the substrate — so the same differential run must pass on UBI.
+  lib.blob_db_contract.ubi:
+    tags: storage blob_db contract model_container ubi
+    extra_configs:
+      - CONFIG_BLOB_DB_BACKEND_UBI=y
+      - CONFIG_UBI_MAX_NR_OF_DATA_PEBS=2046

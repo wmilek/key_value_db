@@ -3,3 +3,10 @@ common:
   platform_allow: native_sim
 tests:
   lib.rootreg: {}
+  # rootreg sits directly on blob_db, so it must behave identically on the
+  # UBI backend. See tests/lib/blob_db/testcase.yaml for the PEB sizing.
+  lib.rootreg.ubi:
+    tags: storage blob_db rootreg ubi
+    extra_configs:
+      - CONFIG_BLOB_DB_BACKEND_UBI=y
+      - CONFIG_UBI_MAX_NR_OF_DATA_PEBS=2046

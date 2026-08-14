@@ -1,4 +1,4 @@
-name: Build
+name: Build & test
 
 # Runs entirely inside the official Zephyr CI Docker image
 # (ghcr.io/zephyrproject-rtos/ci) — it ships west, the Zephyr SDK, and the
@@ -28,7 +28,7 @@ permissions:
 
 jobs:
   native-sim:
-    name: native_sim (twister + UBI backend)
+    name: native_sim tests (twister, both backends)
     runs-on: ubuntu-latest
     container:
       image: ghcr.io/zephyrproject-rtos/ci:latest
@@ -48,9 +48,32 @@ jobs:
           west init -l key_value_db
           west update --narrow -o=--depth=1
 
-      - name: Twister — apps & tests (native_sim, flash_area backend)
+      # Twister builds every sample and *runs* every ztest suite on the host.
+      # Each storage suite has two configurations (see tests/lib/*/testcase.yaml):
+      # the default flash_area backend and a `.ubi` variant, so both backends
+      # are exercised at runtime, not just compiled.
+      - name: Twister — build & run tests (native_sim, both backends)
         run: |
           west twister -T key_value_db -p native_sim -v --inline-logs
+
+      - name: Test summary
+        if: always()
+        run: |
+          python3 key_value_db/scripts/twister_summary.py \
+            twister-out/twister.json >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload twister reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: twister-native_sim
+          path: |
+            twister-out/twister.json
+            twister-out/twister.xml
+            twister-out/twister.log
+            twister-out/**/handler.log
+          if-no-files-found: warn
+          retention-days: 14
 
       - name: Build app on the UBI backend (native_sim)
         run: |

@@ -212,6 +212,13 @@ ZTEST(blob_db, test_boundary_payload_len)
  *     different bucket is unaffected. */
 ZTEST(blob_db, test_corrupted_slot_truncates_bucket)
 {
+	/* Reaches into the partition at offsets derived from the flash_area
+	 * layout. UBI interposes EC/VID headers and maps LEBs onto arbitrary
+	 * PEBs, so those offsets address unrelated bytes there. */
+	if (!IS_ENABLED(CONFIG_BLOB_DB_BACKEND_FLASH_AREA)) {
+		ztest_test_skip();
+	}
+
 	uint64_t a = put_blob("AAA", 3);
 	uint64_t b = put_blob("BBB", 3);
 
@@ -353,6 +360,12 @@ ZTEST(blob_db, test_compaction_preserves_ids)
 /* 14. Injected COMPACTING(bid) at a higher master gen is recovered cleanly. */
 ZTEST(blob_db, test_mid_compaction_crash_recovery)
 {
+	/* Injects a master header at a fixed partition offset — flash_area
+	 * layout only, same reason as test_corrupted_slot_truncates_bucket. */
+	if (!IS_ENABLED(CONFIG_BLOB_DB_BACKEND_FLASH_AREA)) {
+		ztest_test_skip();
+	}
+
 	uint64_t a = put_blob("AA", 2);
 	uint64_t b = put_blob("BB", 2);
 
