@@ -66,6 +66,13 @@ static int seg_geometry_init(void);
 static int seg_sweep(uint64_t owner);
 static int pwrite_segmented(uint64_t id, size_t offset, const void *buf,
 			    size_t len);
+static inline void idx_invalidate(void);
+
+/* Drop the cached index. Spelled as a macro so the call sites — which sit in
+ * code compiled with and without segmentation — need no #ifdef of their own. */
+#define IDX_INVALIDATE()  idx_invalidate()
+#else
+#define IDX_INVALIDATE()  do { } while (0)
 #endif
 
 /* Upper bound on the sector size we can hold in RAM. mount refuses larger
@@ -508,6 +515,8 @@ int blob_db_mount(void)
 		return -EALREADY;
 	}
 
+	IDX_INVALIDATE();
+
 	int rc = store_open_and_validate();
 
 	if (rc < 0) {
@@ -692,6 +701,7 @@ int blob_db_unmount(void)
 	}
 	blob_db_store_close();
 	st.mounted = false;
+	IDX_INVALIDATE();
 	LOG_INF("unmounted");
 	return 0;
 }
@@ -1026,6 +1036,11 @@ static int append_slot2(uint16_t bid, off_t write_cursor, uint64_t id,
 	 * — blob_db_update()/blob_db_delete() call compact_bucket() and only
 	 * then append_slot(), never the other way round. The assert pins that. */
 	__ASSERT(!g_bbuf_new_busy, "append_slot re-entered compaction scratch");
+
+	/* Every mutation in the library funnels through here, so this one line
+	 * is the whole invalidation story for the index cache: an append can
+	 * change what an id's index record says, and no read appends. */
+	IDX_INVALIDATE();
 
 	uint8_t *buf = g_bbuf_new;
 
@@ -1518,6 +1533,63 @@ static int index_load(uint64_t id, uint8_t *ids, struct blob_db_index_hdr *h)
 	return h->seg_count;
 }
 
+/* --- index cache ---------------------------------------------------------
+ *
+ * A windowed sequential read pays for the index record on every call, twice
+ * over: blob_db_read() scans the bucket to test the INDEXED flag, and
+ * index_load() scans it again to fetch the record. For a 64 B window that is
+ * most of the work, and it is repeated for every window of the same object.
+ *
+ * One entry is enough, because the workload that hurts is repeated access to
+ * the *same* object; a second entry would cost RAM to serve a pattern the
+ * layers above do not generate.
+ *
+ * The cache owns g_seg_a: whenever g_idx_id is non-zero, g_seg_a holds that
+ * id's segment table. That is sound because index_load() is the only writer
+ * of g_seg_a anywhere in the file, so nothing can desynchronise the two — and
+ * it is what keeps the feature at ~24 B of .bss instead of a second table.
+ *
+ * Correctness rests on invalidation, not on cleverness. Any slot append can
+ * change what an index says, so append_slot2() — the single write primitive
+ * every mutation funnels through — drops the cache. Reads never append, so
+ * the cache survives exactly the run of reads it exists to serve.
+ *
+ * Three more sites invalidate for reasons append_slot2() does not cover:
+ * format (erases under us), erase_all (zeroes bucket magics in place, and can
+ * return before its closing append), and mount/unmount. The last is defensive
+ * and the test suite cannot falsify it — a store's bytes do not change while
+ * this process has it unmounted, so a surviving entry would still be accurate.
+ * It is kept because that is a property of today's single-instance usage, not
+ * a guarantee the cache should depend on.
+ */
+static uint64_t g_idx_id;                     /* cached owner; 0 = empty */
+static struct blob_db_index_hdr g_idx_hdr;
+static uint16_t g_idx_k;
+
+static inline void idx_invalidate(void)
+{
+	g_idx_id = 0;
+}
+
+/* index_load() with the cache in front. Same contract: >0 segment count for a
+ * segmented object, 0 for an inline blob, negative errno on failure. */
+static int index_load_cached(uint64_t id, struct blob_db_index_hdr *h)
+{
+	if (g_idx_id == id) {
+		*h = g_idx_hdr;
+		return g_idx_k;
+	}
+
+	int k = index_load(id, g_seg_a, h);
+
+	if (k > 0) {
+		g_idx_id  = id;
+		g_idx_hdr = *h;
+		g_idx_k   = (uint16_t)k;
+	}
+	return k;
+}
+
 static inline uint64_t seg_id_at(const uint8_t *ids, uint16_t seq)
 {
 	uint64_t v;
@@ -1695,7 +1767,7 @@ static int seg_sweep(uint64_t owner)
 {
 	struct blob_db_index_hdr h;
 	uint16_t k = 0;
-	int rc = index_load(owner, g_seg_a, &h);
+	int rc = index_load_cached(owner, &h);
 
 	if (rc > 0) {
 		k = (uint16_t)rc;
@@ -1909,7 +1981,7 @@ static int pwrite_segmented(uint64_t id, size_t offset, const void *buf,
 			    size_t len)
 {
 	struct blob_db_index_hdr h;
-	int k = index_load(id, g_seg_a, &h);
+	int k = index_load_cached(id, &h);
 
 	if (k < 0) {
 		return k;
@@ -2138,7 +2210,7 @@ int blob_db_get(uint64_t id, void *out, size_t out_sz, size_t *out_len)
 #if defined(CONFIG_BLOB_DB_LARGE_PAYLOADS)
 	if (sc.target.hdr.flags & BLOB_DB_SLOT_F_INDEXED) {
 		struct blob_db_index_hdr h;
-		int k = index_load(id, g_seg_a, &h);
+		int k = index_load_cached(id, &h);
 
 		if (k < 0) {
 			return k;
@@ -2228,7 +2300,7 @@ int blob_db_update(uint64_t id, const void *payload, size_t len)
 		if (sc.target_off >= 0 &&
 		    (sc.target.hdr.flags & BLOB_DB_SLOT_F_INDEXED)) {
 			struct blob_db_index_hdr oh;
-			int k = index_load(id, g_seg_a, &oh);
+			int k = index_load_cached(id, &oh);
 
 			if (k > 0) {
 				old_k = (uint16_t)k;
@@ -2349,7 +2421,7 @@ int blob_db_delete(uint64_t id)
 
 	if (sc.target.hdr.flags & BLOB_DB_SLOT_F_INDEXED) {
 		struct blob_db_index_hdr oh;
-		int k = index_load(id, g_seg_a, &oh);
+		int k = index_load_cached(id, &oh);
 
 		if (k > 0) {
 			old_k = (uint16_t)k;
@@ -2581,6 +2653,53 @@ int blob_db_size(uint64_t id, size_t *out_size)
 	return 0;
 }
 
+#if defined(CONFIG_BLOB_DB_LARGE_PAYLOADS)
+/* Copy [offset, offset+len) of a segmented object into `out`, clamped to its
+ * length. Split out of blob_db_read() so the cache fast path below can reach
+ * it without repeating the bucket scan that proved the object segmented.
+ * Requires g_seg_a to hold `h`'s segment table — the index-cache invariant. */
+static int seg_read_range(uint64_t id, const struct blob_db_index_hdr *h,
+			  size_t offset, void *out, size_t len,
+			  size_t *out_read)
+{
+	if (offset >= h->total_len) {
+		if (out_read) {
+			*out_read = 0;
+		}
+		return 0;
+	}
+	if (len > h->total_len - offset) {
+		len = h->total_len - offset;
+	}
+
+	uint8_t *dst = out;
+	size_t done = 0;
+
+	while (done < len) {
+		const size_t pos   = offset + done;
+		const uint16_t seq = (uint16_t)(pos / h->seg_len);
+		const size_t skip  = pos % h->seg_len;
+		size_t n = h->seg_len - skip;
+
+		if (n > len - done) {
+			n = len - done;
+		}
+
+		int rc = seg_chunk_read(id, seg_id_at(g_seg_a, seq), seq,
+					skip, dst + done, n);
+
+		if (rc < 0) {
+			return rc;
+		}
+		done += n;
+	}
+	if (out_read) {
+		*out_read = done;
+	}
+	return 0;
+}
+#endif
+
 int blob_db_read(uint64_t id, size_t offset, void *out, size_t len,
 		 size_t *out_read)
 {
@@ -2593,6 +2712,17 @@ int blob_db_read(uint64_t id, size_t offset, void *out, size_t len,
 	if (id == 0) {
 		return -ENOENT;
 	}
+
+#if defined(CONFIG_BLOB_DB_LARGE_PAYLOADS)
+	/* A cache hit already proves this id is segmented and already holds its
+	 * index, so both bucket scans below — the flag test and the index fetch
+	 * — would only re-derive what is in RAM. This is the path a windowed
+	 * sequential read takes on every call after the first. */
+	if (g_idx_id == id) {
+		return seg_read_range(id, &g_idx_hdr, offset, out, len,
+				      out_read);
+	}
+#endif
 
 	const uint16_t bid = id_to_bucket(id);
 	bool formatted;
@@ -2615,44 +2745,12 @@ int blob_db_read(uint64_t id, size_t offset, void *out, size_t len,
 #if defined(CONFIG_BLOB_DB_LARGE_PAYLOADS)
 	if (sc.target.hdr.flags & BLOB_DB_SLOT_F_INDEXED) {
 		struct blob_db_index_hdr h;
-		int k = index_load(id, g_seg_a, &h);
+		int k = index_load_cached(id, &h);
 
 		if (k < 0) {
 			return k;
 		}
-		if (offset >= h.total_len) {
-			if (out_read) {
-				*out_read = 0;
-			}
-			return 0;
-		}
-		if (len > h.total_len - offset) {
-			len = h.total_len - offset;
-		}
-
-		uint8_t *dst = out;
-		size_t done = 0;
-
-		while (done < len) {
-			const size_t pos  = offset + done;
-			const uint16_t seq = (uint16_t)(pos / h.seg_len);
-			const size_t skip = pos % h.seg_len;
-			size_t n = h.seg_len - skip;
-
-			if (n > len - done) {
-				n = len - done;
-			}
-			rc = seg_chunk_read(id, seg_id_at(g_seg_a, seq), seq,
-					    skip, dst + done, n);
-			if (rc < 0) {
-				return rc;
-			}
-			done += n;
-		}
-		if (out_read) {
-			*out_read = done;
-		}
-		return 0;
+		return seg_read_range(id, &h, offset, out, len, out_read);
 	}
 #endif
 
@@ -2781,6 +2879,8 @@ int blob_db_format(void)
 		opened_here = true;
 	}
 
+	IDX_INVALIDATE();
+
 	rc = blob_db_store_erase(0, st.fa_size);
 	if (rc < 0) {
 		LOG_ERR("format: erase: %d", rc);
@@ -2856,6 +2956,12 @@ int blob_db_erase_all(void)
 	if (!st.mounted) {
 		return -ENODEV;
 	}
+
+	/* Not redundant, despite the bind_root_empty() append at the end: the
+	 * bucket magics below are zeroed *in place*, and every error path
+	 * between here and that append returns without one — leaving the cache
+	 * naming an object whose bucket has just been invalidated. */
+	IDX_INVALIDATE();
 
 	const uint16_t root_bid = (uint16_t)(BLOB_DB_ROOT_ID % st.n_buckets);
 	uint8_t zeros[BLOB_DB_MAX_WRITE_ALIGN];

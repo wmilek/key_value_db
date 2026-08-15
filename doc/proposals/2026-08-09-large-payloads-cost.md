@@ -195,6 +195,32 @@ Three mitigations, in increasing order of value:
 1. **Cache the last-read index** (one entry: owner id + the already-allocated
    `g_idx_a` table + an invalidate-on-mutation counter). Halves sequential
    read cost. O(1) RAM, ~free — the buffer already exists.
+
+   > **Delivered, and measured.** On `native_sim` at 4 KB sectors, 1024
+   > sequential 64 B windows over a 64 KB object:
+   >
+   > | | reads | bytes | amplification |
+   > |---|--:|--:|--:|
+   > | before | 17 408 | 2 295 808 | 35.03× |
+   > | after | 5 132 | 1 105 036 | **16.86×** |
+   >
+   > Bytes halve (2.08×), as predicted; transactions do better than that
+   > (3.39×), because the estimate missed that `blob_db_read()` scanned the
+   > index bucket **twice** per call — once to test the `INDEXED` flag and
+   > again inside `index_load()` — and `blob_db_get()` a third time. A cache
+   > hit now skips both scans, so the win is partly de-duplication rather
+   > than caching.
+   >
+   > Cost was `~16 B` of `.bss` in the estimate; measured **+26 B `.bss` and
+   > +291 B `.text`** (x86-64; ARM will differ). The RAM figure holds because
+   > the cache owns `g_seg_a` rather than allocating a second table —
+   > sound only because `index_load()` is the sole writer of that buffer.
+   >
+   > No DK number yet. Since bytes dominate on that part (§3.0), the
+   > expectation is a ~2× improvement on `lg read`, from 3254 µs/op to
+   > roughly 1600 — but the DK's chunk is 2004 B against `native_sim`'s
+   > 1024, so the ratio will not transfer exactly. It is a prediction, not
+   > a result.
 2. **Skip the cursor-finding read for prepared buckets** (§2). Removes ~40 %
    of a warm large write.
 3. **Walk the slot log by streaming reads instead of whole-sector reads** —

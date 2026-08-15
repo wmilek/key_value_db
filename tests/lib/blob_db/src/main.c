@@ -1753,6 +1753,201 @@ ZTEST(blob_db, test_pwrite_survives_remount_and_sweep)
 	zassert_mem_equal(big_dst, big_src, BIG_LEN, "content after sweep");
 }
 
+/* --- index cache invalidation -------------------------------------------
+ *
+ * The cache holds one object's index record and, implicitly, g_seg_a. Every
+ * test here warms it with a read and then does something that must drop it.
+ * A stale hit is silent — it returns plausible, wrong bytes — so these assert
+ * content, not just success.
+ */
+
+/* Warm the cache: any read of a segmented object leaves it holding that id. */
+static void warm_cache(uint64_t id)
+{
+	size_t got = 0;
+
+	zassert_ok(blob_db_read(id, 0, big_dst, 64, &got));
+	zassert_equal(got, 64);
+}
+
+ZTEST(blob_db, test_index_cache_sees_an_update)
+{
+	fill_pattern(big_src, BIG_LEN, 0x11);
+
+	uint64_t id = put_blob(big_src, BIG_LEN);
+
+	warm_cache(id);
+
+	fill_pattern(big_src, BIG_LEN, 0x77);
+	zassert_ok(blob_db_update(id, big_src, BIG_LEN));
+
+	size_t got = 0;
+
+	memset(big_dst, 0, BIG_LEN);
+	zassert_ok(blob_db_read(id, 0, big_dst, BIG_LEN, &got));
+	zassert_equal(got, BIG_LEN);
+	zassert_mem_equal(big_dst, big_src, BIG_LEN,
+			  "read served a stale cached index after update");
+}
+
+ZTEST(blob_db, test_index_cache_sees_a_partial_write)
+{
+	fill_pattern(big_src, BIG_LEN, 0x11);
+
+	uint64_t id = put_blob(big_src, BIG_LEN);
+
+	warm_cache(id);
+
+	/* Land the write deliberately far from offset 0, in a later segment. */
+	const size_t off = BIG_LEN - 1000;
+	uint8_t patch[64];
+
+	memset(patch, 0x5c, sizeof(patch));
+	zassert_ok(blob_db_write(id, off, patch, sizeof(patch)));
+	memcpy(big_src + off, patch, sizeof(patch));
+
+	size_t got = 0;
+
+	memset(big_dst, 0, BIG_LEN);
+	zassert_ok(blob_db_read(id, 0, big_dst, BIG_LEN, &got));
+	zassert_mem_equal(big_dst, big_src, BIG_LEN,
+			  "read served a stale cached index after pwrite");
+}
+
+ZTEST(blob_db, test_index_cache_sees_a_delete)
+{
+	fill_pattern(big_src, BIG_LEN, 0x11);
+
+	uint64_t id = put_blob(big_src, BIG_LEN);
+
+	warm_cache(id);
+	zassert_ok(blob_db_delete(id));
+
+	size_t got = 0;
+
+	zassert_equal(blob_db_read(id, 0, big_dst, 64, &got), -ENOENT,
+		      "a deleted object was still readable from cache");
+	zassert_false(blob_db_exists(id));
+}
+
+/* Shrinking a segmented object to an inline one is the case a cache keyed on
+ * "this id is segmented" gets wrong: the index record is gone, but a stale
+ * entry would still route the read through segments that no longer exist. */
+ZTEST(blob_db, test_index_cache_survives_segmented_to_inline)
+{
+	fill_pattern(big_src, BIG_LEN, 0x11);
+
+	uint64_t id = put_blob(big_src, BIG_LEN);
+
+	warm_cache(id);
+
+	zassert_ok(blob_db_update(id, "small", 5));
+
+	uint8_t buf[16];
+	size_t got = 0;
+
+	zassert_ok(blob_db_get(id, buf, sizeof(buf), &got));
+	zassert_equal(got, 5, "want the inline payload, got %zu B", got);
+	zassert_mem_equal(buf, "small", 5);
+
+	/* blob_db_read() is the path with the cache fast path in front of it,
+	 * so this is where a stale "id is segmented" entry does damage: it
+	 * would route the read through segments that no longer exist and hand
+	 * back plausible garbage. get() above cannot catch that. */
+	memset(buf, 0, sizeof(buf));
+	got = 0;
+	zassert_ok(blob_db_read(id, 0, buf, sizeof(buf), &got));
+	zassert_equal(got, 5, "read returned %zu B for a 5 B inline blob", got);
+	zassert_mem_equal(buf, "small", 5, "read served a stale segmented index");
+
+	zassert_equal(live_segment_slots(), 0,
+		      "segments outlived the object that named them");
+}
+
+/* And the reverse: an inline blob the cache has never seen, grown past the
+ * inline limit, must be read as segmented. */
+ZTEST(blob_db, test_index_cache_survives_inline_to_segmented)
+{
+	uint64_t id = put_blob("small", 5);
+	uint8_t buf[16];
+	size_t got = 0;
+
+	zassert_ok(blob_db_get(id, buf, sizeof(buf), &got));
+
+	fill_pattern(big_src, BIG_LEN, 0x33);
+	zassert_ok(blob_db_update(id, big_src, BIG_LEN));
+
+	memset(big_dst, 0, BIG_LEN);
+	zassert_ok(blob_db_read(id, 0, big_dst, BIG_LEN, &got));
+	zassert_equal(got, BIG_LEN);
+	zassert_mem_equal(big_dst, big_src, BIG_LEN, "grown object misread");
+}
+
+/* Two objects alternating: a one-entry cache must evict rather than answer
+ * for the wrong id. */
+ZTEST(blob_db, test_index_cache_alternating_objects)
+{
+	const size_t half = BIG_LEN / 2;
+
+	fill_pattern(big_src, half, 0x11);
+
+	uint64_t a = put_blob(big_src, half);
+
+	fill_pattern(big_src, half, 0x99);
+
+	uint64_t b = put_blob(big_src, half);
+
+	for (int i = 0; i < 3; i++) {
+		size_t got = 0;
+
+		memset(big_dst, 0, half);
+		zassert_ok(blob_db_read(a, 0, big_dst, half, &got));
+		fill_pattern(big_src, half, 0x11);
+		zassert_mem_equal(big_dst, big_src, half, "A misread on pass %d", i);
+
+		memset(big_dst, 0, half);
+		zassert_ok(blob_db_read(b, 0, big_dst, half, &got));
+		fill_pattern(big_src, half, 0x99);
+		zassert_mem_equal(big_dst, big_src, half, "B misread on pass %d", i);
+	}
+}
+
+/* A remount must not let a cache entry survive into a store that may have
+ * been rewritten underneath it. */
+ZTEST(blob_db, test_index_cache_dropped_across_remount)
+{
+	fill_pattern(big_src, BIG_LEN, 0x11);
+
+	uint64_t id = put_blob(big_src, BIG_LEN);
+
+	warm_cache(id);
+	zassert_ok(blob_db_unmount());
+	zassert_ok(blob_db_mount());
+
+	size_t got = 0;
+
+	memset(big_dst, 0, BIG_LEN);
+	zassert_ok(blob_db_read(id, 0, big_dst, BIG_LEN, &got));
+	zassert_mem_equal(big_dst, big_src, BIG_LEN, "content after remount");
+}
+
+/* erase_all() invalidates bucket headers in place rather than by appending,
+ * so it is the one mutation append_slot2() does not cover. */
+ZTEST(blob_db, test_index_cache_dropped_by_erase_all)
+{
+	fill_pattern(big_src, BIG_LEN, 0x11);
+
+	uint64_t id = put_blob(big_src, BIG_LEN);
+
+	warm_cache(id);
+	zassert_ok(blob_db_erase_all());
+
+	size_t got = 0;
+
+	zassert_equal(blob_db_read(id, 0, big_dst, 64, &got), -ENOENT,
+		      "erase_all left a readable object in the cache");
+}
+
 #if defined(CONFIG_BLOB_DB_TEST_CRASH_HOOKS)
 /* --- the §6.4 crash table -----------------------------------------------
  *
