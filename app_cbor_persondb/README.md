@@ -1,8 +1,15 @@
 # `app_cbor_persondb` — good practices for building on this stack
 
-A worked example: a CBOR-serialized person/credential database holding ~10 000
-people in ~4 MiB — about half the nRF5340-DK's external flash — with the access
-decision, crash safety and capacity planning a real product would need.
+A worked example: a CBOR-serialized person/credential database holding 10 000
+people, with the access decision, crash safety and capacity planning a real
+product would need.
+
+**What it measures is time per operation** — 44 µs to resolve a credential and
+decide, on `native_sim`; 114.2 ms on the DK. The ~4 MiB of data it carries
+(about half the board's external flash) is *ballast*: it exists so those numbers
+are taken against a realistically-loaded store, not an empty one. It earns its
+place — the same operation costs 38 % more at half-full than at 2.5 %
+(`RESULTS.md` §3b).
 
 It is also a probe. Everything it ran into is in **[`FINDINGS.md`](FINDINGS.md)**;
 the design and the decisions behind it are in **[`DESIGN.md`](DESIGN.md)**;

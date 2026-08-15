@@ -12,6 +12,28 @@ where they appear. A full-scale DK run remains outstanding for `A4`.
 
 ---
 
+## 0. What this benchmark measures
+
+**The result is time per operation, and operations per second.** Everything
+else here is context for those two numbers.
+
+The dataset is **ballast**. Its only job is to put the store into a state where
+the per-operation numbers mean something: deep enough buckets, a realistic hash
+spread, and enough write history that compaction is part of the picture. Its
+size, its byte count and the fill percentage are *properties of the ballast* —
+reported so a reader knows what state the measurement was taken in, never
+results in themselves (`DESIGN.md` §6.3).
+
+§3b shows the ballast earning its place: the same operation costs **38 % more**
+at half-full than on a near-empty store, so measuring on a small store would
+report a number no product would ever see.
+
+| Headline, `native_sim`, 10 000 persons | |
+|---|--:|
+| `check` — resolve a credential and decide (**R-D**) | **44 µs/op · 21 510 ops/s** |
+| `byid` — fetch a person record | **23 µs/op · 39 666 ops/s** |
+| Same on the nRF5340-DK, pre-merge (§5) | **114.2 ms/op · 8.8 ops/s** |
+
 ## 1. What `native_sim` can and cannot tell you
 
 | | |
@@ -37,7 +59,7 @@ Two things worth knowing before reading any duration below:
 - **Config**: 10 000 persons, 16 person maps + 1 credential map, 511 buckets
   each, `CONFIG_BLOB_DB_MAX_PAYLOAD_LEN=4096`, zcbor canonical
 
-## 3. What the store holds
+## 3. The ballast — what the store holds during a measurement
 
 | | |
 |---|---|
@@ -63,11 +85,12 @@ tracks it.
 reported**, because no layer exposes it (`FINDINGS.md` B3). Everything above is
 logical content, computed by the application from its own generator.
 
-## 3a. Fill history — the regression indicator
+## 3a. Fill history — a *ballast* indicator, not a performance one
 
-Same 10 000 persons, same record shape, every time. Only the stack underneath
-changes, so a movement here is the stack's per-record overhead moving. **Down is
-better.**
+Not a performance metric — it describes the ballast. Same 10 000 persons and
+same record shape every time, so movement here is the stack's *storage density*
+changing, which is a different axis from the throughput in §0. **Down is
+better,** and a drop does not by itself imply a faster store.
 
 | Commit | Live content | Fill | What changed |
 |---|--:|--:|---|
@@ -81,6 +104,44 @@ changed how the store is read, not how densely it is packed. Two different
 things, and this table separates them. A change to `kvhash`'s per-entry framing
 or to `blob_db`'s slot overhead would move this column; a faster read path never
 will.
+
+## 3b. Does the ballast earn its place?
+
+Yes, and this is the measurement that justifies carrying 4 MiB around. Same
+build, same 16 maps, 200 samples, only the dataset size varied — so the store
+is the same product at five points in its life:
+
+| persons | fill | `check` µs/op | `check` ops/s | flash ops/op | `byid` µs/op | `byid` ops/s |
+|--:|--:|--:|--:|--:|--:|--:|
+| 500 | 2.5 % | 32 | 30 907 | 70 | 20 | 50 543 |
+| 1 000 | 5.1 % | 33 | 28 930 | 112 | 19 | 48 461 |
+| 2 500 | 12.9 % | 40 | 24 603 | 264 | 23 | 46 061 |
+| 5 000 | 25.8 % | 42 | 22 891 | 351 | 23 | 41 963 |
+| **10 000** | **51.6 %** | **44** | **21 510** | 261 | **23** | **39 666** |
+
+An access decision costs **38 % more** at half-full than on a near-empty store,
+and throughput falls **30 %**. Benchmark a nearly-empty store and you publish a
+number the product never sees.
+
+Note the flash-operation column is **not monotonic** — it peaks at 5 000 and
+falls again at 10 000. Per-operation cost tracks how much superseded data sits
+in the sectors being walked, and that is a function of *write history and when
+compaction last ran*, not of live fill. "Half full" is a convenient label for
+the ballast, not the variable that actually drives the cost.
+
+### Repeatability — which numbers to trust
+
+Same store, same fill, three consecutive runs:
+
+| | run 1 | run 2 | run 3 | spread |
+|---|--:|--:|--:|--:|
+| `check` µs/op | 44 | 43 | 45 | **±2 %** |
+| `put` µs/op | 1 112 | 786 | 1 125 | **±20 %** |
+
+The read path is repeatable and can be compared run to run. The write path is
+dominated by whether a compaction lands inside the sample window, so a single
+200-sample `put` figure is an estimate, not a measurement — treat a change
+under ~30 % as noise, or raise `BENCH_SAMPLES` until it settles.
 
 ## 4. Measured — `native_sim`
 

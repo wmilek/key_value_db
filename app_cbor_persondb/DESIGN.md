@@ -228,7 +228,29 @@ Two things worth stating plainly:
   only because its dataset is a pure function of an index (F6). One whose data
   arrives from outside could not.
 
-### 6.3 The fill percentage is a result, not a target
+### 6.3 The dataset is ballast; the result is time per operation
+
+**What this application measures is time per operation and operations per
+second.** The data volume is ballast: it exists to put the store into a state
+where those numbers are representative — deep buckets, a realistic hash spread,
+enough write history that compaction is in the picture — and is not itself a
+result.
+
+That is measurable, and measured (`RESULTS.md` §3b). Holding the build fixed
+and varying only the dataset, an access decision costs 32 µs on a 2.5 %-full
+store and **44 µs at 51.6 % — 38 % more**, with throughput down 30 %. A
+benchmark run against a nearly-empty store would publish a number no deployed
+product ever sees. That is what the ballast buys, and why it is worth the
+minutes it takes to lay down.
+
+One caveat the same measurement produced: the flash-operation count is *not*
+monotonic in fill. It peaks at 5 000 persons and falls again at 10 000, because
+per-operation cost tracks how much superseded data sits in the sectors being
+walked — a function of write history and of when compaction last ran, not of
+live fill. **"Half full" is a convenient, reproducible label for the ballast,
+not the variable that drives the cost.**
+
+### 6.4 The fill percentage is a result, not a target
 
 Worth stating plainly, because the earlier drafts of this document had it
 backwards.
