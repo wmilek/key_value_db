@@ -2109,6 +2109,113 @@ ZTEST(blob_db, test_crash_during_delete_is_all_or_nothing)
 }
 #endif /* CONFIG_BLOB_DB_TEST_CRASH_HOOKS */
 
+/* Slot header as it sits on flash: 12 B, then the payload, then a 2 B CRC. */
+struct __packed test_slot_head {
+	uint8_t  flags;
+	uint8_t  reserved;
+	uint16_t val_len;
+	uint64_t id;
+};
+
+/* Walk a bucket's slot log the way blob_db does, and return the append
+ * cursor — where the next slot would land. */
+static off_t bucket_write_cursor(uint16_t bid)
+{
+	const struct flash_area *fa;
+
+	zassert_ok(flash_area_open(BLOB_DB_TEST_PARTITION_ID, &fa));
+
+	const size_t align = flash_area_align(fa);
+	const off_t base = (off_t)(3 + bid) * TEST_SECTOR_SZ;
+	off_t cursor = 16;
+
+	for (;;) {
+		struct test_slot_head head;
+
+		if (cursor + 14 > TEST_SECTOR_SZ) {
+			break;
+		}
+		zassert_ok(flash_area_read(fa, base + cursor, &head,
+					   sizeof(head)));
+		if (head.flags == 0xff || !(head.flags & TEST_SEALED) ||
+		    head.val_len > CONFIG_BLOB_DB_MAX_PAYLOAD_LEN) {
+			break;
+		}
+
+		size_t ssz = 14 + head.val_len;
+
+		ssz = (ssz + align - 1) & ~(align - 1);
+		if (cursor + (off_t)ssz > TEST_SECTOR_SZ) {
+			break;
+		}
+		cursor += ssz;
+	}
+
+	flash_area_close(fa);
+	return cursor;
+}
+
+/* Forge exactly what a power cut mid-append leaves: the 12 B header and id
+ * programmed, the payload and CRC still erased. blob_db must treat this slot
+ * as torn and keep the previous one live. */
+static void forge_torn_append(uint16_t bid, uint64_t id, uint16_t val_len)
+{
+	const struct flash_area *fa;
+	struct test_slot_head head = {
+		.flags = TEST_SEALED,
+		.reserved = 0,
+		.val_len = val_len,
+		.id = id,
+	};
+	const off_t at = bucket_write_cursor(bid);
+
+	zassert_ok(flash_area_open(BLOB_DB_TEST_PARTITION_ID, &fa));
+	zassert_ok(flash_area_write(fa,
+				    (off_t)(3 + bid) * TEST_SECTOR_SZ + at,
+				    &head, sizeof(head)));
+	flash_area_close(fa);
+}
+
+/* === REVIEW FINDING 3 ===
+ * blob_db_update() decided "is the outgoing slot INDEXED?" from
+ * scan_bucket_for(), which accepts a target on header sanity alone. A torn
+ * append presents itself as that target carrying its own flags, so an inline
+ * rebind after one torn write read "not indexed" over a live index record and
+ * leaked the object's entire segment generation — nothing names it afterwards,
+ * so no sweep or delete ever reclaims it. delete() and write() already used
+ * the CRC-verified lookup; update() was the outlier. */
+ZTEST(blob_db, test_update_after_a_torn_append_releases_old_segments)
+{
+	fill_pattern(big_src, BIG_LEN, 0x2b);
+
+	uint64_t id = put_blob(big_src, BIG_LEN);
+	const int segs = live_segment_slots();
+
+	zassert_true(segs > 1, "precondition: object must be segmented");
+
+	forge_torn_append((uint16_t)(id % TEST_N_BUCKETS), id, 5);
+
+	/* The torn slot must not hide the object: the index is still live. */
+	size_t got = 0;
+
+	memset(big_dst, 0, BIG_LEN);
+	zassert_ok(blob_db_read(id, 0, big_dst, BIG_LEN, &got));
+	zassert_mem_equal(big_dst, big_src, BIG_LEN,
+			  "a torn append must leave the previous slot live");
+
+	/* Rebind inline — the outgoing segment generation must be released. */
+	zassert_ok(blob_db_update(id, "small", 5));
+
+	uint8_t buf[8];
+
+	zassert_ok(blob_db_get(id, buf, sizeof(buf), &got));
+	zassert_equal(got, 5, "want the inline payload, got %zu B", got);
+
+	zassert_equal(live_segment_slots(), 0,
+		      "update after a torn append leaked %d segment(s)",
+		      live_segment_slots());
+}
+
 /* Every large-object length in this suite — 4096 and BIG_LEN=102400 — is an
  * exact multiple of the 1024 B chunk stride, so until the review found it, no
  * test had ever produced a short final chunk. That is what let the extend bug

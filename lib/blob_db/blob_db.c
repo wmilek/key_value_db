@@ -2348,18 +2348,43 @@ int blob_db_update(uint64_t id, const void *payload, size_t len)
 		}
 		write_cursor = BLOB_DB_BUCKET_DATA_OFF;
 	} else {
-		/* Only the append cursor is needed: latest-wins (§4) makes the
-		 * new slot live without consulting the old one. */
 		struct bucket_scan sc;
 
+#if defined(CONFIG_BLOB_DB_LARGE_PAYLOADS)
+		/* The CRC-verified lookup, not the bare cursor scan. Deciding
+		 * "was the outgoing slot INDEXED?" from scan_bucket_for() is
+		 * unsound: it accepts a target on header sanity alone, so a
+		 * torn append — header and id programmed, payload and CRC still
+		 * erased — presents itself as the target carrying its own
+		 * flags. Reading those as "not indexed" over a live index
+		 * record loses the whole outgoing segment generation: no index
+		 * names it afterwards, so no delete and no sweep ever reclaims
+		 * it. delete() and write() already take this path; update() was
+		 * the outlier.
+		 *
+		 * -ENOENT is ordinary — a first bind, or a rebind after delete.
+		 * There is no outgoing generation then, and write_cursor is
+		 * still the append point either way.
+		 */
+		rc = find_live_slot(bid, id, &sc, g_bbuf);
+		if (rc < 0 && rc != -ENOENT) {
+			return rc;
+		}
+
+		const bool indexed =
+			(rc == 0) &&
+			(sc.target.hdr.flags & BLOB_DB_SLOT_F_INDEXED) != 0;
+#else
+		/* Only the append cursor is needed: latest-wins (§4) makes the
+		 * new slot live without consulting the old one. */
 		rc = scan_bucket_for(bid, id, (off_t)st.peb_size, &sc);
 		if (rc < 0) {
 			return rc;
 		}
+#endif
 		write_cursor = sc.write_cursor;
 #if defined(CONFIG_BLOB_DB_LARGE_PAYLOADS)
-		if (sc.target_off >= 0 &&
-		    (sc.target.hdr.flags & BLOB_DB_SLOT_F_INDEXED)) {
+		if (indexed) {
 			struct blob_db_index_hdr oh;
 			int k = index_load_cached(id, &oh);
 
