@@ -1,10 +1,19 @@
 # Findings — limitations of the stack, as seen from an application
 
-Status: **v0.5 — re-measured against `main` after the large-payload work
+Status: **v0.6 — re-measured against `main` after the large-payload work
 landed, and on the nRF5340-DK at 1 000 persons (2026-08-15).** Numbers below
-are from `RESULTS.md`. Hardware measurement is no longer outstanding: N1 is
-closed by the board, and a full-scale 10 000-person DK run remains the only
-open measurement (`A4`).
+are from `RESULTS.md`. N1 is closed by the board; a full-scale 10 000-person DK
+run remains the only open measurement (`A4`), and until it happens the DK
+figures here are a tenth-scale store — see N1 for what that costs the headline.
+
+One finding was added by a code review of the application itself: **B12**,
+where `blob_db`'s compaction lowers the durable id ceiling it is supposed to
+raise. The same review found four consistency defects in *this application*
+(a replace that left withdrawn credentials granting access, an assign whose
+redo did not converge, an unchecked card reassignment, and silent truncation of
+over-long ids). Those are fixed, and deliberately not recorded here: this
+register is for limitations of the stack, and an application's own bugs do not
+belong in it.
 
 **Five findings are now closed by `main`.** B1, B9 and B10 are fixed outright,
 B5 loses two of its five jobs, and B3 is half-answered by the new
@@ -16,8 +25,8 @@ remaining open ones are listed in the summary below.
 | | |
 |---|---|
 | **Closed by `main`** | B1, B5 (partly), B9, B10, B3 (partly) |
-| **Still open** | B2, B4, B6, B7, B8, K1–K11, V1–V4 |
-| **Newly observed** | N1 — transaction count rose sharply as byte count fell (now closed on hardware: ~65 µs per transaction) |
+| **Still open** | B2, B4, B6, B7, B8, B11, B12, K1–K11, V1–V4, R1, X1 |
+| **Newly observed** | N1 — transaction count rose sharply as byte count fell (closed on hardware: ~65 µs per transaction) · B12 — compaction lowers the durable id ceiling ([issue #14](https://github.com/wmilek/key_value_db/issues/14)) |
 
 This is the *probe* output of `app_cbor_persondb` (see `DESIGN.md` §1). Every
 drawback the app trips over on its way to a working 4 MiB person database is
@@ -66,7 +75,7 @@ The B1 prediction was right, and larger than claimed: 19× fewer bytes, not
 | **B6** 128 KB `.bss` | **Fixed** by the same change — "`.bss` on the QSPI board from 128 KB to ~1 KB". |
 | **B5** one symbol, five jobs | **Partly.** Fixes job 3 (`append_slot` staged in `.bss`, not a `MAX_PAYLOAD` stack frame) and job 1 (mount-time bound instead of a Kconfig `range`). Deliberately does **not** touch job 4 — `MAX_PAYLOAD → MAX_BUCKETS` is left alone, and the companion note says so explicitly. |
 | **B9** no payload-vs-sector check | **Fixed** — Stage 1 item 3, and §1.1 sharpens it (see B10). |
-| **B8** permanent orphan leak | **Partly.** Introduces exactly the machinery B8 asks for — an owner-tagged segment plus a mount-time sweep — but only for L1's own segments. Application-level orphans (this app's nine map roots) are still uncollectable. Its §3.2 argues the general case cannot be solved above L1, which is the same conclusion from the other side. |
+| **B8** permanent orphan leak | **Partly.** Introduces exactly the machinery B8 asks for — an owner-tagged segment plus a mount-time sweep — but only for L1's own segments. Application-level orphans (this app's seventeen map roots) are still uncollectable. Its §3.2 argues the general case cannot be solved above L1, which is the same conclusion from the other side. |
 | **K1** `MAX_BUCKETS` cap | **Partly**, as an explicit non-goal followed by a follow-up sketch: a pread directory lifts the cap. See the caveat below. |
 | **K5** directory rewrite | **Partly**, same sketch — and only when the directory is large enough to segment. |
 | **K7** shared scratch buffers | **Halved** — `dir_buf` disappears under the pread directory. |
@@ -103,7 +112,7 @@ author as an alternative to the pread-directory sketch.
 
 **Sequencing.** Stage 1 is a deliberate, breaking on-flash format change. If it
 lands after this app, existing stores — including a completed 10 000-person
-fill — are unreadable and must be repopulated, at ≈ 2.5 h. Landing Stage 1
+fill — are unreadable and must be repopulated, at ≈ 2.2 h. Landing Stage 1
 first is worth ~130 KB of RAM and ~2× on every read to this app, and would move
 the numbers in `RESULTS.md` substantially, so **the measurements should be
 taken after it, not before.**
@@ -125,9 +134,10 @@ the payload is 5 bytes or 4 KB. It is the single cause of every latency figure
 here: the measured 16.9 ms `blob_db` read (`app_perf/RESULTS.md`) is 64 KB at
 ~4 MB/s, not a seek or an erase.
 
-**Measured.** Resolving a credential and checking a permission is 2 map gets =
-**4 sector reads = 256 KB of flash to answer a question about 365 B** — read
-amplification of **711×**. A negative lookup is worse in relative terms: 128 KB
+**Measured, pre-merge** (every figure in this paragraph is the *before* half of
+the comparison below). Resolving a credential and checking a permission is 2 map
+gets = **4 sector reads = 256 KB of flash to answer a question about 365 B** —
+read amplification of **711×**. A negative lookup is worse in relative terms: 128 KB
 to learn that a card does not exist, **26 214×**. A write is 9.98 blob
 operations and 638 KB (1 799×), because the credential index is maintained per
 card. See `RESULTS.md` §4.
@@ -166,7 +176,7 @@ DK.
 > 1.097 s per bucket)
 
 Impact: the ~37 MB appended during the fill drives ~1 250 compactions — about
-2 h of the ≈ 2.5 h one-time population.
+2 h of the ≈ 2.2 h one-time population.
 
 Direction: two of the five are the double-buffered master; one is a post-hoc
 scratch erase that could be deferred into the next compaction's
@@ -229,8 +239,9 @@ Costs, in increasing order of severity:
 
 - **RAM (B6).** `kvhash`'s two static buffers go 8 KB → **80 KB**; with
   `blob_db`'s 128 KB that is 208 KB of the nRF5340's 512 KB.
-- **Stack.** `append_slot`'s frame goes ~4.1 KB → **~41 KB**. The existing
-  `CONFIG_MAIN_STACK_SIZE=32768` no longer holds a single call.
+- **Stack.** `append_slot`'s frame goes ~4.1 KB → **~41 KB**, which no
+  plausible `CONFIG_MAIN_STACK_SIZE` holds for a single call — this app now
+  runs on 12 288 B, sized by measurement (`RESULTS.md` §4c).
 - **K5 explodes if the extra buckets are used.** `MAX_BUCKETS` becomes 5 119, so
   a directory is **40 KB**, rewritten on every bucket creation (K5). ~4 400
   creations × 40 KB ≈ **176 MB**, against 15 MB today — and since a 40 KB blob
@@ -308,10 +319,16 @@ writes a large enough blob, after compacting a bucket for nothing.
 
 **Fixed**: `blob_db.c` now refuses at mount when
 `CONFIG_BLOB_DB_MAX_PAYLOAD_LEN` exceeds what the geometry can sustain, and it
-uses B10's *rewrite* bound rather than the weaker write-once one. The
-application keeps its own `BUILD_ASSERT` on the same inequality — failing at
-compile time beats failing at mount — but the runtime check in
-`persondb_open()` is now belt-and-braces behind the library's.
+uses B10's *rewrite* bound rather than the weaker write-once one.
+
+The application's own `BUILD_ASSERT` and runtime check are **gone**, and that is
+the point of the fix rather than a loss. Restating the inequality app-side meant
+restating `blob_db`'s slot overhead, its bucket header and the formula, and
+using `CONFIG_BLOB_DB_SECTOR_BUF_SIZE` as a proxy for a sector size the app had
+no way to obtain. The library's version checks the same thing against the *real*
+geometry, so it is not merely equivalent — it is correct where the app's could
+pass and then fail at mount anyway. Three private constants left the application
+with it (X1 rows 1–4). `persondb_open()` now forwards `-ENOTSUP`.
 
 ### B10 — A payload above half a sector can be written once but never rewritten — **CLOSED by `main`** (was major)
 
@@ -355,10 +372,11 @@ an application must derive for itself.
 **Consequence for this application:** built on plain `native_sim` (4 KB
 sectors) with `MAX_PAYLOAD_LEN=4096`, `kvhash` bucket blobs above 2026 B would
 become unrewritable and the fill would fail confusingly. The app's `native_sim`
-overlay sets a 64 KB erase-block size to mirror the DK, which avoids it — but
-that is a silent dependency, so the app carries a `BUILD_ASSERT` on
-`CONFIG_BLOB_DB_MAX_PAYLOAD_LEN` and a mount-time check of the same inequality
-against the real geometry.
+overlay sets a 64 KB erase-block size to mirror the DK, which avoids it — and
+that was a silent dependency until `main` made `blob_db_mount()` check the
+inequality itself against the real geometry. The app carried a `BUILD_ASSERT`
+and a mount-time check of its own; both are now deleted, because the layer that
+owns the constants answers the question (see B9).
 
 ### B6 — 128 KB of `.bss` for sector buffers (major, **`measured`** — still open)
 
@@ -413,8 +431,9 @@ bucket count is not exposed (B3). `app_perf_kvdb` passes `N_KEYS * 2` as a guess
 
 Building a structure out of several blobs and publishing it with one final
 atomic write is the prescribed pattern — `kvdb` uses it (`kvdb.c:118`: "a crash
-before this commit leaves `struct_root` orphaned"), and `access_open` uses it for
-nine map roots plus a superblock (`DESIGN.md` §9).
+before this commit leaves `struct_root` orphaned"), and this app's
+`create_store()` uses it for seventeen map roots plus a superblock
+(`DESIGN.md` §12).
 
 The comment says such blobs are "reclaimed by a later format". That is the
 whole story: **there is no reachability GC**. Compaction reclaims tombstones and
@@ -487,7 +506,7 @@ because `MAX_BUCKETS` cannot rise to compensate (K3: it cannot rise at all).
 This is the table an application actually needs, and no layer provides it.
 
 **Impact here.** 10 000 person records cannot live in one map, or in two, or in
-four. The app shards across eight and writes its own fan-out; naming, hashing
+four. The app shards across sixteen and writes its own fan-out; naming, hashing
 and per-shard capacity accounting are all its problem (V4).
 
 **Direction — stop storing bucket ids.** The directory exists only because each
@@ -544,7 +563,7 @@ The model was not badly built. It was fed a mean entry size that later grew by
 intuition behind "5.5 σ". Both are ordinary mistakes — and **neither is
 detectable at run time**, because there is no per-bucket occupancy query (K10)
 and the bucket count cannot change after create (K3). The failure arrives 92 %
-of the way through a fill that is a projected 2.5 h on hardware, and the only
+of the way through a fill that is a projected 2.2 h on hardware, and the only
 repair is a reformat.
 
 Sizing therefore had to move to **enumeration**: `tools/sizing.py` replays the
@@ -607,7 +626,7 @@ of an index, but a deployment with externally-sourced keys cannot.
 `dir_buf` and `bkt_buf` (2 × `MAX_PAYLOAD` = 8 KB) are static and shared by
 every `kvhash` map in the image. Two *different* map roots are therefore not
 independent — a stronger coupling than C7's "the caller serializes", and one a
-caller holding nine separate roots would not expect from the header.
+caller holding seventeen separate roots would not expect from the header.
 
 > `kvhash.c:54-55`
 
@@ -736,7 +755,7 @@ not. But the tension is narrower than it looks: the directory is 4 KB, is
 immutable except when a bucket is *created*, and there are only as many of them
 as there are open maps. `kvdb_t` already keeps `{root, ops}` in RAM across
 calls, so keeping the directory beside it is the same pattern at a larger
-constant — 4 KB per map, 36 KB for this app's nine.
+constant — 4 KB per map, 68 KB for this app's seventeen.
 
 The derived-bucket-id design in K1 makes the argument moot instead of winning
 it: with `bucket_id = base_id + hash % n_buckets` the per-map state is
@@ -756,7 +775,7 @@ decision — storing bucket ids that could have been computed.
 ### R1 — `ROOTREG_MAX_ROOTS` defaults to 8 (minor, `read`)
 
 Eight registered roots is below what a sharded dataset needs if each shard is a
-named `kvdb` instance — the nine-instance L3 variant in `DESIGN.md` §9 does not
+named `kvdb` instance — the seventeen-instance L3 variant in `DESIGN.md` §12 does not
 fit the default. The app's L2 layout uses one entry, so it never trips this, but
 it is a sharp edge for the L3 route: the failure is `-ENOSPC` from
 `kvdb_open`, at a layer that says nothing about registry capacity.
@@ -774,7 +793,7 @@ current reach.
 K1 makes sharding mandatory past ~2.09 MB, and `kvdb` offers no help: the
 application invents instance naming, the key→shard hash, read fan-out and
 per-shard capacity accounting regardless. What `kvdb` still charges for that is
-nine registry entries, nine meta blobs, eighteen sector reads at boot, and a
+seventeen registry entries, seventeen meta blobs, thirty-four sector reads at boot, and a
 collision with R1's default — in exchange for a naming feature a sharded app
 does not need, because it has one superblock and knows its own shards.
 
@@ -839,6 +858,50 @@ answer.
 
 Direction: honour it, or delete it. Either is fine; documenting it while
 ignoring it is not.
+
+### B12 — Compaction lowers the durable id ceiling (moderate, **`measured`** — filed as [issue #14](https://github.com/wmilek/key_value_db/issues/14))
+
+Every boot after the first prints:
+
+```
+<wrn> blob_db: bucket scan out-ran ceiling (545 >= 539); raising
+```
+
+Four consecutive boots of this app's store, `native_sim`, 200 persons:
+no warning, then `545 >= 539`, `568 >= 567`, `590 >= 581`. It is the steady
+state, not an anomaly — and it reproduces with this application's changes
+stashed, so it is not ours.
+
+`next_id_hint` in the master header is written by two paths that disagree about
+what it means. `alloc_id()` writes `next_id + 1 + 256` — a ceiling running ahead
+of the allocation pointer, so master writes can be batched. The compaction
+commit writes `st.next_id` — the pointer itself — which *lowers* the durable
+ceiling and does not refresh `st.next_id_hint` in RAM. Allocation then compares
+against the stale higher RAM copy and never re-persists, so ids get handed out
+above the durable ceiling until the next mount notices.
+
+That contradicts `doc/impl/l1_bucketlog.md` §13.1 ("an exclusive upper bound on
+every id ever returned by `alloc_id` … the bucket scan only ever *raises* it,
+never lowers it") and `blob_db.c`'s own comment at `alloc_id` ("the id we hand
+out must be strictly below a persisted ceiling"). In the run above, id 545 was
+bound while the persisted ceiling was 539.
+
+**Why it is not corrupting anything, and why it still matters.** Mount's
+defensive scan finds the true maximum *bound* id and raises the ceiling. But
+§13.1 says the ceiling exists to protect *allocated-but-unbound* ids across a
+crash — exactly what a scan of bound ids cannot see. Latent today only because
+`kvhash` binds a bucket blob before publishing the directory entry that
+references it.
+
+Two smaller costs: every mount after a compaction pays an extra master write,
+which erases a whole 64 KB PEB to write 64 bytes (~1.1 s on the DK by
+`RESULTS.md` §5's measured erase — not confirmed on hardware, the DK captures do
+not show the warning). And a detector written for "a corrupt or rolled-back
+master" now fires on every ordinary boot, so a real one would be
+indistinguishable.
+
+Recorded, not fixed: `blob_db` is not this application's layer (`DESIGN.md` §2),
+the same rule that parks B2. The direction is in the issue.
 
 ## X1 — An application cannot ask the stack anything, so it restates it (major, `hit`)
 
@@ -1013,10 +1076,25 @@ suggested. A part with smaller sectors moves fewer bytes per transaction and
 would shift the balance further, so **a transaction-count budget is worth
 carrying forward into any v2 read path**, not just a byte budget.
 
-The 261 → 112 drop is itself worth noting: the transaction count fell after this
-finding was written, largely from the one-entry index cache
-(`app_perf/RESULTS.md`, "The index cache"). Had the count stayed at 261, `check`
-would sit nearer 24 ms.
+**One caveat on the headline number, and it matters.** The 14.605 ms was
+measured at **1 000 persons**, not the benchmark's 10 000 (`RESULTS.md` §5).
+Transaction count scales with the dataset: `RESULTS.md` §3b measures 112
+transactions per `check` at 1 000 persons and **261** at 10 000, on the same
+build. Apply the 65 µs established above to 261 and full-scale `check` lands
+near **24 ms**, not 14.6.
+
+So the 7.8× improvement over the pre-merge board is real and measured at equal
+scale; the absolute figure is not yet the benchmark's figure. A4 stays open
+until a 10 000-person board run says otherwise.
+
+An earlier version of this paragraph explained the 261 → 112 difference as the
+effect of `blob_db`'s one-entry index cache. That was wrong twice over: the
+cache is compiled only under `CONFIG_BLOB_DB_LARGE_PAYLOADS`, which this app
+does not enable, and the difference needed no mechanism at all — it is two
+dataset sizes. The correction is worth keeping visible, because the wrong
+version made a scale artefact look like a resolved improvement, which is
+exactly the error that would have let a 1 000-person number stand in for a
+10 000-person one.
 
 ## Not yet exercised
 
@@ -1025,9 +1103,9 @@ Findings that need the running app before they can be stated honestly:
 - whether the §6.1 sizing rule holds — a single `-ENOSPC` during a full fill
   means it did not, and the margin needed is larger still (F11 counts them,
   A8 asserts zero);
-- whether the fill matches the ≈ 2.5 h estimate, and how much of it is B2;
+- whether the fill matches the ≈ 2.2 h estimate, and how much of it is B2;
 - compaction behaviour and latency spikes at ~50 % occupancy;
 - whether CBOR encode/decode is measurable at all next to B1 (expected: no);
-- whether K7's shared scratch buffers cause any surprise with nine live maps;
+- whether K7's shared scratch buffers cause any surprise with seventeen live maps;
 - `native_sim` versus DK divergence, which would be a finding about the
   `native_sim` model rather than about the stack.

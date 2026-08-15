@@ -6,7 +6,8 @@
  * sector end, so on native_sim's default 4 KB sectors the sustainable payload
  * is 2026 B — below the 4096 this app configures, which would leave a full
  * kvhash bucket writable once and never updatable (FINDINGS.md B10).
- * persondb_open() checks the same inequality at runtime.
+ * blob_db_mount() checks the same inequality against the real geometry
+ * (FINDINGS.md B9/B10 — findings this app raised).
  */
 
 &flashcontroller0 {

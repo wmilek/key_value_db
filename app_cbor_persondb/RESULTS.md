@@ -153,13 +153,28 @@ Steady-state run (store already filled), 200 samples per benchmark. Flash
 figures come from `blob_db_iostats_get()` — **measured at the storage seam, not
 modelled** (`CONFIG_BLOB_DB_IOSTATS=y`):
 
-| Phase | µs/op | map ops/op | flash ops/op | flash bytes/op | payload | **amplification** |
+| Phase | µs/op | store ops/op | flash ops/op | flash bytes/op | payload | **amplification** |
 |---|--:|--:|--:|--:|--:|--:|
-| `check` — card → person → permission (**R-D**) | **42** | 2 | 261 | 13.3 KB | 402 B | **33×** |
-| `byid` — person id → record | 23 | 1 | 128 | 6.5 KB | 388 B | 17× |
-| `miss` — unknown card | 21 | 1 | 132 | 6.8 KB | 23 B | 294× |
-| `put` — rewrite a record + its index entries | 1 020 | 3.3 | 675 | 87 KB | 431 B | 202× |
-| `cbor` — encode + decode, no flash | **6** | 0 | 0 | 0 | 388 B | — |
+| `check` — card → person → permission (**R-D**) | **44** | 2 | 274 | 13.4 KB | 402 B | **33×** |
+| `byid` — person id → record | 23 | 1 | 131 | 6.5 KB | 388 B | 17× |
+| `miss` — unknown card | 22 | 1 | 144 | 6.9 KB | 23 B | 300× |
+| `put` — rewrite a record + its index entries | 1 127 | 4.3 | 815 | 98 KB | 431 B | 228× |
+| `cbor` — encode + decode, no flash | **5** | 0 | 0 | 0 | 388 B | — |
+
+Two rows moved when the consistency defects were fixed, and the movement is the
+cost of the fix rather than noise:
+
+- **`put` went from 3.3 to 4.3 store operations**, 1 020 → 1 127 µs. That is the
+  extra map get `persondb_person_put()` now performs to find which cards the
+  stored version listed, so that a replace can unindex the ones it drops. Before
+  the fix a replace left them resolving to a person who no longer listed them —
+  a grant on a withdrawn credential. **10 % on the write path is what that
+  correctness costs**, and the read path is untouched.
+- **Flash operations per `check` read 274 here against 261 in earlier runs.**
+  Not a regression and not the fix: per §3b, per-operation flash cost tracks how
+  much superseded data sits in the sectors being walked — write history and
+  compaction timing — and this store has one more mutation round in its past.
+  The byte column moved 0.8 %, and the amplification factor not at all.
 
 ### Before and after the large-payload merge
 
@@ -183,11 +198,20 @@ hardware question this platform cannot answer.**
 
 **The board has since answered it (§5): they do, by 7.8×** — but a transaction
 costs ~65 µs, which is 54% of the remaining decision cost, so the trade is
-narrower than the byte column suggests. Note also that the DK measures **112**
-transactions per `check` rather than the 261 here: this `native_sim` column was
-taken at `f5b062e`, before the one-entry index cache landed, and the counters
-are otherwise platform-independent because the overlay mirrors the DK's
-geometry.
+narrower than the byte column suggests.
+
+Note that the DK measures **112** transactions per `check` against the 261 here.
+That is **the dataset size, not the platform**: the DK run is 1 000 persons and
+this table is 10 000, and §3b measures exactly 112 at 1 000 on `native_sim`. The
+counters agreeing across the two platforms at equal scale is evidence *for* the
+overlay mirroring the DK's geometry, not a discrepancy needing an explanation.
+
+An earlier version of this paragraph blamed the gap on `blob_db`'s one-entry
+index cache. That cache is compiled only under
+`CONFIG_BLOB_DB_LARGE_PAYLOADS`, which this app does not enable — §9 says so
+four hundred lines further down. Two numbers that differed for a boring reason
+got an interesting explanation, and the check that would have caught it was
+already in this file.
 
 Whole-run phases:
 
@@ -523,7 +547,7 @@ is why `check` is two gets and not three. Nothing above this header can beat
 
 | operation | cost | how known |
 |---|--:|---|
-| `persondb_person_put`, rewriting into a settled bucket | **83.920 ms** | measured (`put`) |
+| `persondb_person_put`, rewriting into a settled bucket | **83.920 ms** | measured (`put`) — see note below |
 | `persondb_person_put`, when the write grows a bucket into compaction | **807.7 ms** | measured (fill, per person) |
 | `persondb_card_assign` | **44.5 ms** | measured (mutate, 64 assigns) |
 | `persondb_prepare` | **1 100 ms per bucket** | measured (prepare, 106 buckets) |
@@ -541,6 +565,14 @@ gap is erase, not extra work.
 A caller that needs a bounded `put` therefore cannot get one from this API; the
 cost depends on the target bucket's fill state, which is not observable
 (`FINDINGS.md` B3, K10).
+
+**These write-side figures predate the replace fix.** `persondb_person_put()`
+now performs one additional map get, to find which cards the stored version
+listed so a replace can unindex the ones it drops (`README.md` practice 5). On
+`native_sim` that measured +10 % (§4); on the DK a map get is ~7 ms, so expect
+`person_put` nearer **91 ms** and `card_assign` unchanged. The read side is
+untouched. A board re-run would settle it; the numbers above are marked rather
+than adjusted, because an estimate in a measured table is how §5a went wrong.
 
 ### Not measured
 
@@ -563,31 +595,35 @@ API as a whole.
 
 ## 6. What the numbers say
 
-**The serialization format is not the cost.** `cbor` is 6 µs against `check`'s
-599 µs on `native_sim` — **1.0 %**. On hardware it is 955 µs against 114.2 ms —
-**0.84 %** (§5, measured). Note that this section previously projected 0.009 %
-by carrying the host's 6 µs onto the target; the real figure is ~93× that, and
-the conclusion survives only because 955 µs is still noise against four sector
-reads. Choosing CBOR over anything else costs nothing measurable, and the
-denormalized permission bitmask this app deliberately did not build
-(`DESIGN.md` D2) would have optimized away half of a cost that is 99 %
-elsewhere.
+*Rewritten after the large-payload merge. The previous version of this section
+is preserved in the pre-merge captures of §8 — it described whole-sector reads
+in the present tense long after they had stopped happening, and every figure in
+it (711×, 256 KB, 26 214×) was modelled rather than measured.*
 
-**The cost is that every blob operation reads a whole sector.** An access
-decision moves **256 KB of flash to answer a question about 365 bytes** — 711×
-amplification — and half of that is `kvhash` re-reading its bucket directory
-before it can locate anything (`FINDINGS.md` B1, K11). The streaming slot walk
-proposed on `claude/blob-db-max-payload-increase-6qobv5` addresses the first;
-derived bucket ids would remove the second.
+**The serialization format is not the cost.** `cbor` is 5 µs against `check`'s
+44 µs on `native_sim` — 11 % there, where there is no real flash to wait for. On
+hardware it is 950 µs against 14.605 ms: **6.5 %** (§5a, measured). It was the
+second-largest term after flash even before the merge, and the merge made flash
+cheaper, so its share grew. It is still not the thing to optimize.
 
-**Negative lookups are the worst case.** 128 KB read to learn that a card does
-not exist: 26 214× amplification. A reader presented with an unknown badge pays
-the same flash traffic as one presented with a valid one.
+**The cost is the lookups, and the transactions inside them.** An access
+decision is two map gets, ~7 ms each on the DK (§5b), and a map get is two
+`blob_db` calls (`FINDINGS.md` K11). Underneath, ~65 µs of fixed per-transaction
+cost accounts for over half the remaining time (N1). Flash *bytes* are no longer
+the interesting axis: 13.4 KB moved to answer a question about 402 B is 33×
+amplification, down from the 656× this section used to quote.
 
-**Writes cost ten blob operations, not three.** A person plus its 2.49
-credentials is 9.98 blob operations, because the credential index is maintained
-per card. That is the price of the secondary index that makes R-D possible at
-all, and it is paid on every enrollment.
+**Negative lookups are still the worst case in relative terms** — 6.9 KB to
+learn that a card does not exist, 300× — but in absolute terms a miss is now
+*cheaper* than a hit (7.165 ms against 14.605 ms), because it stops after one
+lookup instead of two. The pre-merge framing had it the other way round.
+
+**Writes cost about four store operations, not three.** A person plus its ~2.49
+credentials is one read-old, one record write and one index write per card. The
+read-old is what makes a replace unindex the cards it drops; without it, a
+dropped card kept granting access (`README.md` practice 5). That is the price of
+the secondary index that makes R-D possible at all, plus the price of keeping it
+truthful, and both are paid on every enrollment.
 
 ## 7. Cross-reboot persistence
 

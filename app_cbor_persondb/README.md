@@ -5,7 +5,9 @@ people, with the access decision, crash safety and capacity planning a real
 product would need.
 
 **What it measures is time per operation** — 44 µs to resolve a credential and
-decide, on `native_sim`; 14.605 ms on the DK (`RESULTS.md` §5). The ~4 MiB of
+decide, on `native_sim` at the full 10 000 persons; 14.605 ms on the DK, where
+the largest run so far is 1 000 persons and the full-scale figure is expected
+near 24 ms (`RESULTS.md` §5, `FINDINGS.md` N1). The ~4 MiB of
 data it carries (about half the board's external flash) is *ballast*: it exists
 so those numbers are taken against a realistically-loaded store, not an empty
 one. It earns its place — the same operation costs 38 % more at half-full than
@@ -40,10 +42,11 @@ above it. Acceptance criterion **A7** checks this rather than trusting it.
 ### 2. Use the highest layer whose *shape* matches — then drop down
 
 `kvdb` (L3) is the ergonomic interface and it does not fit a sharded dataset:
-one instance per name means nine registry entries, nine meta blobs and eighteen
-sector reads at boot, and it overruns `CONFIG_ROOTREG_MAX_ROOTS` (default 8).
-Dropping to the L2 Map shape — one registry key, one app-owned superblock,
-seventeen map roots — costs **two** sector reads at boot.
+one instance per name means **seventeen** registry entries, seventeen meta blobs
+and thirty-four sector reads at boot, and it overruns
+`CONFIG_ROOTREG_MAX_ROOTS` (default 8) twice over. Dropping to the L2 Map shape
+— one registry key, one app-owned superblock, seventeen map roots — costs
+**two** sector reads at boot.
 
 *What it prevents:* paying for an abstraction whose shape you are fighting. The
 comparison is tabulated in `DESIGN.md` §12; the decision is not "L2 is faster",
@@ -82,34 +85,70 @@ index cannot be updated together. Pick the order deliberately:
 | assign a card | **person, then index** | a card the person lists that resolves to nothing → **deny** |
 | revoke a card | **index, then person** | a card already resolving to nothing → **deny** |
 | delete a person | **credentials, then record** | credentials gone, record orphaned → **deny** |
+| **replace a record** | **unindex dropped cards, then record, then index added ones** | either a card not yet listed or one already unindexed → **deny** |
 
 The reverse order in row 1 would leave a credential granting access on behalf
 of a person who does not list it — a crash that fails **open**. Same two
 writes, same cost, opposite security posture.
 
-*See* `persondb_card_assign()` / `persondb_card_revoke()` in `persondb/persondb.c`.
+**Row 4 is the one that gets forgotten.** An update that *drops* an indexed
+attribute is two orderings at once, and this app shipped without it: a replace
+that removed a card left the card's index entry live, so it kept resolving to a
+person who no longer listed it — the fail-open outcome of row 1, reached with no
+crash at all, by two ordinary calls. If a record has indexed attributes, "insert
+or replace" means read the old one and diff it. Costs a get; see `RESULTS.md` §4
+for what that is worth (10 % of the write path).
+
+**Fail-safe is not the same property as repairable.** Ordering buys you the
+first: every crash point denies. It does not buy the second, and the two get
+conflated. `persondb_card_assign()` used to return early when the record already
+listed the card, on the reasoning that a redo had nothing to write — but the
+state where the record lists a card the index does not is exactly what a crash
+between its two writes leaves, so the redo had to *finish* it, not skip it. The
+index write is now unconditional. Then note what cannot be fixed the same way:
+`persondb_card_revoke(card)` deletes the very index entry it needs to find the
+person again, so its redo returns `-ENOENT` and stops. That is why
+`persondb_card_revoke_from(person, card)` exists for callers that can name the
+holder — and why the card-only form documents the limitation instead of hiding
+it.
+
+*See* `persondb_person_put()`, `persondb_card_assign()`,
+`persondb_card_revoke_from()` in `persondb/persondb.c`.
 
 ### 6. Don't denormalize until you have measured the thing you'd be avoiding
 
 The tempting optimization is a permission bitmask cached in the credential
 index, turning the access decision into one lookup instead of two. This app
-refuses it, and measures what the refusal costs (`RESULTS.md`): the decision is
-2 map gets, and the CBOR encode/decode inside it is **6.5 %** of the time —
-950 µs against a 14.605 ms decision, measured on the DK. Still not the
-bottleneck, and now the second-largest term after flash.
+refuses it — and the honest price of refusing is **the second lookup**:
+`persondb_check` is `card_owner` + `person_get`, 6.77 ms + 7.77 ms on the DK, so
+**53 %** of every decision is the work a bitmask would have removed
+(`RESULTS.md` §5b). That is the number the argument should be about.
 
-That number was wrong twice before it was right. This file once claimed "a
+What the 53 % buys is one copy of the truth. `persondb_permission_grant()` is a
+*single atomic write* with no ordering to get right, whereas a cached bitmask
+lands squarely in practice 5 — and it would have to cache the validity window
+too, or the shortcut could grant on an expired badge. Refusing is a defensible
+trade at this cost; it would not be at any cost, which is why the cost is
+measured.
+
+A separate question, routinely confused with that one: is the *serialization*
+the problem? No. CBOR encode and decode together are **6.5 %** of a decision —
+950 µs against 14.605 ms, measured on the DK. Leaner bytes would buy almost
+nothing.
+
+That 6.5 % was wrong twice before it was right. This file once claimed "a
 projected 0.01 % on hardware" — a `native_sim` compute figure carried onto a
 Cortex-M33, wrong by 159×. The correction then over-predicted at 9–14 %,
 because the storage term it divided by was itself a guess. Only the board
-settled it (`RESULTS.md` §5a). The practice survived both corrections; neither
-number did.
+settled it (`RESULTS.md` §5a). And for a while this practice quoted that 6.5 %
+as *the cost of refusing to denormalize*, which it never was — it is the cost
+of the codec, an order of magnitude below the lookup the refusal actually pays
+for. The practice survived every correction; none of the numbers did.
 
 *What it prevents:* buying a second copy of the truth — and the consistency
 problem in practice 5 — before knowing whether the first copy was the problem.
-Note what falls out for free: because permissions live only in the person
-record, `persondb_permission_grant()` is a *single atomic write* with no
-ordering to get right.
+And, on the evidence above, quoting a number that answers a neighbouring
+question as though it settled this one.
 
 ### 7. Make your data a pure function of a key, so you can verify without a journal
 
@@ -134,8 +173,9 @@ schema grows.
 
 `scenario_fill()` writes a batch and then commits a counter to the superblock.
 Replaying a partial batch rewrites identical values, so an interrupted fill
-resumes rather than restarting — which matters when the fill is **≈ 2.7 h on
-the DK**, extrapolated from a measured 16.4 min at a tenth of the scale.
+resumes rather than restarting — which matters when the fill is **≈ 2.2 h on
+the DK**, extrapolated from a measured 13.5 min at a tenth of the scale
+(`RESULTS.md` §5).
 
 *What it prevents:* long provisioning runs that cannot survive a power cut, and
 the resume logic that gets written badly under time pressure when they do.
@@ -155,9 +195,12 @@ the population size or `CONFIG_BLOB_DB_MAX_PAYLOAD_LEN` changes.**
 *What it prevents:* discovering your capacity plan was wrong several hours into
 a provisioning run, with no repair path short of a reformat.
 
-**Then freeze the number.** Sizing is a one-time act: `tools/sizing.py` picked
-10 000 persons, and from that point it is a constant of the benchmark, because
-two runs are only comparable if they used the same one. The *fill percentage*
+**Then freeze the number.** Sizing is a one-time act. 10 000 persons was chosen
+to put the store near half the board's flash; `tools/sizing.py` takes that as
+its input and answers the question that follows from it — how many map shards
+the population needs. From that point the person count is a constant of the
+benchmark, because two runs are only comparable if they used the same one. The
+*fill percentage*
 that results is an output — and if a future stack stores the same 10 000 people
 in 40 % of the flash instead of 51.6 %, that is the improvement being measured,
 not a target to restore by growing the dataset (`RESULTS.md` §3a).
@@ -191,7 +234,14 @@ did. It used to *model* it — "map operations × sector size" — which was rig
 until `main` taught `blob_db` to walk buckets by slot header, and then wrong by
 20×. Measure, do not model: that is where every amplification figure in
 `RESULTS.md` comes from — including the one that says an access decision moves
-**256 KB of flash to answer a question about 365 bytes**.
+**13.4 KB of flash to answer a question about 402 bytes**, an amplification of
+33×.
+
+This paragraph used to quote 256 KB and 711× there. Those were the *modelled*
+figures, from exactly the arithmetic the practice is warning about — kept as an
+illustration long after measurement had replaced them. Worth stating plainly:
+the model was wrong in the direction that flatters the storage layer's critics,
+and the measurement is 19× kinder.
 
 *What it prevents:* optimizing the part you can see instead of the part that
 costs.
@@ -268,6 +318,27 @@ persondb grant|revoke <id> <perm>
 persondb assign <id> <card> | unassign <card>
 persondb reset                    erase and start over
 ```
+
+## What this app does *not* show you
+
+Worth stating, because a practices guide is read as a checklist:
+
+- **Concurrency.** The whole stack is single-threaded — `blob_db`'s v1 contract,
+  and `kvhash`'s scratch buffers are shared by every map in the image
+  (`FINDINGS.md` K7). `persondb.h` says so; nothing *enforces* it. A second
+  caller would corrupt the store silently, and this app never tries, so it
+  demonstrates nothing about what a real product's locking should look like.
+- **Recovery from a corrupt store.** A bad superblock or an unreadable registry
+  entry surfaces as `-EIO` or `-ENOTSUP` from `persondb_open()`, and both
+  frontends print the errno and stop. That is honest but not a recovery story:
+  the only repair on offer is `persondb reset` (or `--flash_erase`), which
+  discards everything. What a product should do instead — a second superblock,
+  a rebuild from a durable source — is out of scope here.
+- **Corrupt *records*, on the other hand, are handled**: a record that fails to
+  decode returns `-EILSEQ` and is counted as a bad record by `verify` rather
+  than crashing the run.
+- **The full-scale board run.** `RESULTS.md` §5 is 1 000 persons. Acceptance
+  criterion **A4** is not met until the 10 000-person run exists.
 
 ## Rerunning
 

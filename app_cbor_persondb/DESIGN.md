@@ -1,7 +1,9 @@
 # `app_cbor_persondb` — CBOR person/credential database
 
-Status: **v0.5 — implemented and measured on `native_sim`.**
-Hardware measurement on the nRF5340-DK is outstanding (A4).
+Status: **v0.6 — implemented, measured on `native_sim` at full scale and on
+the nRF5340-DK at 1 000 persons.** A4 remains open: the 10 000-person board run
+has not been done, and the DK figures in `RESULTS.md` §5 are a tenth-scale
+store, not the benchmark's (`FINDINGS.md` N1).
 
 The design document for this test application, kept beside the code it
 describes. Governed by `doc/principles.md` · consumes the stack in
@@ -103,7 +105,7 @@ Read out of the tree and the existing hardware captures, not assumed.
 | **C1** | `kvhash` is the only implemented Map provider and `kvdb` the only L3 interface. No ordered iteration, no `foreach`, at either layer. | `lib/kvdb/kvdb.c`, `doc/layers/l3_interfaces.md` §3 |
 | **C2** | A `kvhash` map holds at most `(MAX_PAYLOAD−8)/8` buckets of `MAX_PAYLOAD` bytes. `CONFIG_BLOB_DB_MAX_PAYLOAD_LEN` is capped at 4096 → **511 buckets × 4 KB ≈ 2.09 MB per map**, and a *single bucket* is the real limit: it overflows at 4 KB of packed entries regardless of how empty the store is. | `kvhash.c:45-50,291`, `lib/blob_db/Kconfig` |
 | **C3** | One `kvhash` entry costs `4 + klen + vlen` and must fit a single payload. | `kvhash.c:291` |
-| **C4** | Every `blob_db` operation reads a **whole sector** — 64 KB on the DK — so per-op cost is essentially independent of payload size. Measured: 16.9 ms/read; a map get ≈ **34.9 ms**, a map set ≈ **55.9 ms**. | `blob_db.c:870,928,990,1052`; `app_perf*/RESULTS.md` |
+| **C4** | ~~Every `blob_db` operation reads a whole sector.~~ **No longer true** — `main`'s slot-header walk reads only the slots it needs (this app's finding B1). A read is now many small transactions rather than one large one: measured on the DK, a map get ≈ **7 ms**, a map set ≈ **42 ms**, and a transaction costs ~65 µs (`RESULTS.md` §5b, `FINDINGS.md` N1). | `blob_db.c` slot walk; `RESULTS.md` §4, §5b |
 | **C5** | A `blob_db` bucket is one sector; a blob lands in `id % n_buckets`. 8 MiB / 64 KB = 128 − 3 reserved = **125 buckets**. | `blob_db_internal.h` |
 | **C6** | Compacting one bucket costs **five 64 KB erases**; one erase measured at ~1.1 s. | `compact_commit()`; `app_perf_kvdb/RESULTS.md` |
 | **C7** | Single-threaded: the caller serializes every call across every open map — including across *different* roots, since `kvhash` scratch buffers are file-scope. | `blob_db.h`; `kvhash.c:54-55` |
@@ -286,7 +288,9 @@ independently and mean different things:
 ### 6.2 Cost of the fill
 
 35 000 map writes at ~55.9 ms ≈ 33 min, plus ~37 MB of appended bytes driving
-~1 250 compactions at ~5.7 s ≈ 2 h. **One-time population on the DK is ≈ 2.5 h.**
+~1 250 compactions at ~5.7 s ≈ 2 h. **One-time population on the DK is ≈ 2.2 h** — the post-merge floor measured
+in `RESULTS.md` §5 (13.5 min at a tenth of the scale); this section's estimate
+of 2.5 h predates that measurement.
 Not designed around; it is findings **B1/B2/K4/K5**, and it is why F8 exists.
 
 ---
@@ -348,7 +352,7 @@ encoding touches `person_cbor` only; swapping the storage layout touches
 
 ## 8. The person management API (R-H)
 
-`src/persondb.h`. Domain operations only — no storage vocabulary escapes it.
+`persondb/persondb.h`. Domain operations only — no storage vocabulary escapes it.
 
 ```c
 struct persondb_person {                 /* fixed capacity, no heap (P2/P3) */
@@ -409,7 +413,7 @@ is recorded as an unimplemented mitigation.
 
 ## 9. The scenario layer (R-I)
 
-`src/scenario.h`. Everything a caller does *with a population*, so no frontend
+`scenario/scenario.h`. Everything a caller does *with a population*, so no frontend
 reimplements it and both measure the same thing.
 
 ```c
@@ -493,7 +497,7 @@ because §9 exists.
 
 | Scenario | Config | Runs? |
 |---|---|---|
-| `app.cbor_persondb.bench` | `FRONTEND_BENCH`, 10 000 persons | build only — a full fill is ~2.5 h on hardware |
+| `app.cbor_persondb.bench` | `FRONTEND_BENCH`, 10 000 persons | build only — a full fill is ~2.2 h on hardware |
 | `app.cbor_persondb.shell` | `FRONTEND_SHELL` | build only |
 | `app.cbor_persondb.smoke` | `FRONTEND_BENCH`, `N_PERSONS=200` | **runs on `native_sim`**, console harness on `VERIFY PASS` |
 
@@ -508,12 +512,14 @@ paths are regression-tested even though the headline configuration is not.
 | `check` | card → person id → record → permission compare (**2 map gets**) | R-D, the headline |
 | `byid` | person id → record (1 map get) | the index's share of `check` |
 | `miss` | unknown card (1 map get, `-ENOENT`) | negative-lookup cost |
-| `grant` | read-modify-write one record (1 get + 1 set) | mutation cost |
+| `put` | rewrite one record and its index entries (read-old + 1 set + index) | mutation cost |
 | `cbor` | encode + decode in RAM, no flash | isolates the codec |
-| `fill` | the whole population, compaction visible | R-E |
+
+The fill is timed as a whole-run phase rather than a benchmark kind (R-E), and
+`scenario_bench_kind` is exactly `check`, `byid`, `miss`, `put`, `cbor`.
 
 Every phase also reports **amplification**: bytes moved on flash ÷ bytes the
-application asked for. For `check` that is 4 × 64 KB of sector reads to answer a
+application asked for. For `check` that is 13.4 KB moved to answer a
 question about ~365 B — the number that makes finding **B1** concrete.
 
 `cbor` answers "is CBOR the bottleneck?" in advance. Expected answer: no, by
@@ -522,12 +528,12 @@ nothing.
 
 ## 12. Storage layout — and why L2 rather than L3
 
-**The layout.** One registry key, one app-owned superblock, nine maps:
+**The layout.** One registry key, one app-owned superblock, seventeen maps:
 
 ```
 rootreg[ ROOTREG_KEY('PADB', 1) ] ──► superblock blob   (CBOR, app-owned)
                                         1 version
-                                        2 [ root_id ]×8   people maps
+                                        2 [ root_id ]×16  people maps
                                         3 root_id         credential index
                                         4 n_persons, populated, rev
                                             │
@@ -535,30 +541,32 @@ rootreg[ ROOTREG_KEY('PADB', 1) ] ──► superblock blob   (CBOR, app-owned)
 ```
 
 Everything is reachable from the integer 1 (P5): `rootreg_get` → superblock id
-→ `blob_db_get` → nine map roots. Boot costs **two** sector reads. Person key
-`"p%08X"`, credential key the 14-hex-char UID verbatim, map `index % 8`.
+→ `blob_db_get` → seventeen map roots. Boot costs **two** sector reads. Person
+key `"p%08X"`, credential key the 14-hex-char UID verbatim, shard
+`fnv1a32(id) % 16` — a hash of the id rather than the id itself, so persondb
+stays independent of how the caller numbers people (§6.1).
 
 **Why not L3.** `kvdb` was the obvious starting point and does not fit:
 
-| | L3 — nine `kvdb` instances | L2 — superblock + nine roots |
+| | L3 — seventeen `kvdb` instances | L2 — superblock + seventeen roots |
 |---|---|---|
-| Boot | 9 × (registry read + meta-blob read) = **18 sector reads** | registry + superblock = **2** |
-| Persistent overhead | 9 registry entries + 9 × 32 B meta blobs | 1 entry + 1 superblock |
-| Registry capacity | 9 of `ROOTREG_MAX_ROOTS`, default **8** (C10) — does not fit | 1 |
+| Boot | 17 × (registry read + meta-blob read) = **34 sector reads** | registry + superblock = **2** |
+| Persistent overhead | 17 registry entries + 17 × 32 B meta blobs | 1 entry + 1 superblock |
+| Registry capacity | 17 of `ROOTREG_MAX_ROOTS`, default **8** (C10) — does not fit, twice over | 1 |
 | Progress commit | `kvdb_set` = 2 reads + 1 write | `blob_db_update` = 1 read + 1 write |
 | Per-operation cost | identical — `kvdb_get` is `strlen` + `ops->get` | identical |
 | Fan-out, naming, capacity accounting | the app's problem | the app's problem |
 | What it buys | named instances; backend recorded per instance | direct control of the root graph |
 
-L3 costs nine times the boot I/O and overruns the default registry, to buy a
-naming feature this app does not need. This is R-H's "may use L2", and the
+L3 costs seventeen times the boot I/O and overruns the default registry twice
+over, to buy a naming feature this app does not need. This is R-H's "may use L2", and the
 practice worth teaching: **use the highest layer whose shape matches; drop down
 when it doesn't.** It is finding **V4** from the other side — once you shard,
 `kvdb` stops paying for itself.
 
 **Creation and the crash window.** `rootreg_get_or_create` may return an
 allocated-but-unbound id (its contract). `persondb_open` detects the virgin case
-with `blob_db_get(sb_id) == -ENOENT`, allocates nine ids, calls
+with `blob_db_get(sb_id) == -ENOENT`, allocates seventeen ids, calls
 `kvhash_map_ops.create` on each, and binds the superblock **last** — the single
 atomic write that publishes the structure. A crash before it leaves the maps
 unreferenced, and `blob_db` has no reachability GC: finding **B8**, the same

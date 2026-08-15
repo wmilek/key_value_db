@@ -113,9 +113,10 @@ struct persondb;
  *        it if this is a virgin device.
  *
  * This module owns the whole storage stack, so nothing above it ever calls
- * blob_db or rootreg. Verifies that the configured payload size is actually
- * usable on this flash geometry before touching anything
- * (FINDINGS.md B9/B10).
+ * blob_db or rootreg. The check that the configured payload size is actually
+ * usable on this flash geometry now belongs to blob_db's mount — this app
+ * raised B9/B10 and the fix took the question away from callers rather than
+ * exporting the constants to them; -ENOTSUP below is that check reporting.
  *
  * @param db          (out) handle
  * @param n_persons   dataset size to record when creating; ignored when
@@ -253,8 +254,9 @@ int persondb_permission_revoke(struct persondb *db, uint32_t person_id,
  * person, check the validity window, compare permission strings. It does not
  * shortcut the decode, and the credential index holds nothing but a person id
  * — no cached permission bitmask (DESIGN.md D2). The cost of that honesty is
- * measured rather than avoided: two map gets, which by B1/K11 is four
- * whole-sector reads.
+ * measured rather than avoided: two map gets, each ~7 ms on the DK, so the
+ * second lookup is roughly half of every decision (RESULTS.md §5b). A map get
+ * is two blob_db calls, not one (K11).
  *
  * @param who (optional) receives the person on any decision but UNKNOWN_CARD
  *
