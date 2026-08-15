@@ -173,7 +173,7 @@ sector first. **Five 64 KB erases** to compact one bucket, at ~1.1 s each on the
 DK.
 
 > `compact_commit()`; erase cost from `app_perf_kvdb/RESULTS.md` (`prepare`:
-> 1.097 s per bucket)
+> 1.102 s per bucket, re-measured on main hardware)
 
 Impact: the ~37 MB appended during the fill drives ~1 250 compactions — about
 2 h of the ≈ 2.2 h one-time population.
