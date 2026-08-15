@@ -146,19 +146,27 @@ the population size or `CONFIG_BLOB_DB_MAX_PAYLOAD_LEN` changes.**
 *What it prevents:* discovering your capacity plan was wrong several hours into
 a provisioning run, with no repair path short of a reformat.
 
-### 11. Assert the geometry your configuration assumes
+### 11. Let the layer below answer its own questions — delete the copy
 
-`CONFIG_BLOB_DB_MAX_PAYLOAD_LEN` must fit *twice* inside a sector or a full
-bucket can be written once and never rewritten (**B10**). `persondb/persondb.c`
-carries a `BUILD_ASSERT` for the configured geometry and re-checks the real one
-in `persondb_open()`.
+`CONFIG_BLOB_DB_MAX_PAYLOAD_LEN` must fit *twice* inside a sector, or a full
+bucket can be written once and never rewritten (**B10**). This app used to
+assert that itself, which meant restating blob_db's slot overhead, its bucket
+header size, the formula, and using `CONFIG_BLOB_DB_SECTOR_BUF_SIZE` as a proxy
+for the sector size it could not otherwise obtain.
 
-`blob_db` now checks the same inequality at mount — B9 and B10 were findings
-this app raised, and `main` closed them. The app keeps its own assert anyway:
-failing at compile time beats failing at mount.
+All four are now **deleted**. `blob_db` checks the same inequality at mount
+against the real geometry — B9 and B10 were findings this app raised, and the
+fix took the question away from callers rather than exporting the constants to
+them.
 
-*What it prevents:* an app that works on 64 KB-sector QSPI and fails
-mysteriously partway through a fill on 4 KB-sector internal flash.
+*What it prevents:* four private constants drifting out of step with the layer
+that owns them, silently. They were still correct when `main` changed that
+layer — but nothing checked, and nothing could have.
+
+*What is left:* the app still restates kvhash's capacity formula and per-entry
+framing, and still reads the partition geometry behind blob_db's back, because
+those questions have no API either. `FINDINGS.md` **X1** inventories all seven
+and sketches the two read-only calls that would close the rest.
 
 ### 12. Count your own flash traffic
 

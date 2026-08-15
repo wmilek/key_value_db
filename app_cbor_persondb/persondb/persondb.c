@@ -58,19 +58,20 @@ LOG_MODULE_REGISTER(persondb, CONFIG_APP_CBOR_PERSONDB_LOG_LEVEL);
 #define KVHASH_MAX_BUCKETS ((CONFIG_BLOB_DB_MAX_PAYLOAD_LEN - KVHASH_DIR_HDR_LEN) / 8u)
 
 /*
- * A payload must fit twice between the bucket header and the sector end, or
- * it can be written once and never rewritten (FINDINGS.md B10). Nothing in
- * blob_db checks this (B9), so the app does — at build time against the
- * geometry it expects, and again at open() against the geometry it got.
+ * This app used to restate blob_db's slot and bucket-header sizes here, to
+ * assert that CONFIG_BLOB_DB_MAX_PAYLOAD_LEN could actually be *rewritten* on
+ * the target geometry (FINDINGS.md B9/B10, which this app raised).
+ *
+ * That is gone. blob_db now performs the same check at mount, against the real
+ * peb_size instead of the CONFIG_BLOB_DB_SECTOR_BUF_SIZE upper bound the app
+ * had to use as a proxy — so the library's version is not merely equivalent,
+ * it is strictly correct where the app's could pass and then fail at mount
+ * anyway. Three private constants (slot overhead, bucket header, the
+ * sustainable-payload formula) left the application with it.
+ *
+ * What is left below is the same problem unsolved one layer up: kvhash's
+ * capacity formula is still private, so the app still restates it.
  */
-#define SLOT_OVERHEAD    14u
-#define BUCKET_HDR_LEN   16u
-#define MIN_SECTOR_FOR_PAYLOAD \
-	(((CONFIG_BLOB_DB_MAX_PAYLOAD_LEN + SLOT_OVERHEAD) * 2u) + BUCKET_HDR_LEN)
-
-BUILD_ASSERT(CONFIG_BLOB_DB_SECTOR_BUF_SIZE >= MIN_SECTOR_FOR_PAYLOAD,
-	     "CONFIG_BLOB_DB_MAX_PAYLOAD_LEN cannot be rewritten in a sector "
-	     "this size — see FINDINGS.md B10");
 BUILD_ASSERT(KVHASH_MAX_BUCKETS >= 2, "payload too small for a bucket directory");
 
 struct persondb {
@@ -295,17 +296,6 @@ int persondb_open(struct persondb **out, uint32_t n_persons)
 	if (rc != 0) {
 		LOG_ERR("cannot read partition geometry: %d", rc);
 		return rc;
-	}
-
-	/* The build-time assert used CONFIG_BLOB_DB_SECTOR_BUF_SIZE, which is
-	 * only an upper bound. This is the real geometry. */
-	if (MIN_SECTOR_FOR_PAYLOAD > sector_bytes) {
-		LOG_ERR("payload %u needs a sector of at least %u B, this "
-			"flash has %zu B — a full bucket could be written once "
-			"and never rewritten (FINDINGS.md B10)",
-			(unsigned)CONFIG_BLOB_DB_MAX_PAYLOAD_LEN,
-			(unsigned)MIN_SECTOR_FOR_PAYLOAD, sector_bytes);
-		return -ENOTSUP;
 	}
 
 	db->st.partition_bytes = partition_bytes;

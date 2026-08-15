@@ -811,6 +811,65 @@ lacks.
 
 ---
 
+## X1 — An application cannot ask the stack anything, so it restates it (major, `hit`)
+
+Not a new defect — it is B3, K9 and K10 seen together, from the position of
+someone writing a client. Every question this application legitimately needed
+to ask has no API, so the answer had to be copied out of a `.c` file and kept
+in step by hand.
+
+The full inventory, and what closes each:
+
+| # | What the app must know | Where it really lives | Status |
+|---|---|---|---|
+| 1 | slot overhead = 14 B | `blob_db_internal.h` | **removed** — `main` checks it at mount |
+| 2 | bucket header = 16 B | `blob_db_internal.h` | **removed** — same |
+| 3 | sustainable payload = `(peb−16)/2 − 14` | `blob_db.c` | **removed** — same |
+| 4 | `CONFIG_BLOB_DB_SECTOR_BUF_SIZE` as a proxy for sector size | Kconfig | **removed** — same |
+| 5 | `MAX_BUCKETS = (MAX_PAYLOAD−8)/8` | `kvhash.c:47` (private) | **still restated** — K9(c) |
+| 6 | per-entry framing = 4 B, and the key length | `kvhash.c:291` | **still restated** |
+| 7 | partition and sector size | `blob_db`'s `struct st` | **still fetched behind its back**, via `flash_area` — B3 |
+
+Four of seven left the application the moment `blob_db` grew a mount-time check
+— and note *how*: not by exporting the constants, but by **taking the question
+away from the caller entirely**. The library did the check itself, so nobody
+above needed the numbers. That is the shape of the fix for the rest.
+
+**What would close 5–7.** Two small, read-only calls, neither of which requires
+an on-flash format change:
+
+```c
+/* L1 — what blob_db already knows in struct st, and nobody can see. */
+struct blob_db_info {
+        size_t partition_bytes, sector_bytes;
+        uint16_t n_buckets;
+        size_t max_payload;      /* what this geometry can actually rebind */
+};
+void blob_db_get_info(struct blob_db_info *out);
+
+/* L2 — what a map actually got, versus what was asked for. */
+struct map_info {
+        uint16_t n_buckets;      /* after the silent clamp of K9(b) */
+        size_t   entry_overhead; /* the 4 B of framing per entry */
+        size_t   max_value;      /* largest value this map can hold */
+        size_t   fullest_bucket; /* how close K2's cliff is — needs a walk */
+};
+int (*info)(uint64_t root, struct map_info *out);   /* new op on map_ops */
+```
+
+`blob_db_get_info()` is pure accessor work over state `mount()` has already
+computed; it deletes rows 7 and, with `max_payload`, any future reappearance of
+rows 1–4. `map_ops.info()` deletes rows 5 and 6, closes K9 and K10, and would
+have let `tools/sizing.py` be a runtime assertion instead of an offline script
+the build cannot check.
+
+**Why it matters beyond tidiness.** A restated constant is not merely ugly — it
+is a silent-divergence bug waiting for the layer below to change. This app
+restated four of them and `main` then changed the layer below; nothing warned,
+because nothing could. They happened to still be right. The fifth (row 5) is
+one Kconfig edit away from being wrong by 8×, and would surface as `-ENOSPC`
+hours into a fill (K9).
+
 ## N1 — Fewer bytes, far more transactions (moderate, `measured`)
 
 `main`'s slot-header walk cut the bytes an access decision moves by 19× (B1).
