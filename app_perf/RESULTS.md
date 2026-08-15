@@ -9,10 +9,12 @@ Every wall-clock figure here comes from the board. On `native_sim` they
 are all `0 ms`, because the flash simulator models no latency; only the
 `io …` counters are meaningful there.
 
-Three commits were measured on the same board, so both changes under
-review can be read straight off the tables:
+Four commits were measured on the same board, so each change under review
+can be read straight off the tables:
 
-- **`12df53b`** — branch tip, run 2. Contains PR 5's one-entry index
+- **`e80f404`** — main, after PR 10 merged. The current reference. Only
+  `update` moved; see "Run 3 on main" below.
+- **`12df53b`** — PR branch tip, run 2. Contains PR 5's one-entry index
   cache (`8f5b16b`); nothing after that commit touches the read path, so
   these numbers describe `8f5b16b` as well. See
   "The index cache" below.
@@ -51,13 +53,17 @@ itself a single-slot payload. Every number below depends on this.
 
 ## Small-blob point operations — the PR 2 result
 
-| workload  |                `255ce7a` |                 `8428e35` |     Δ |
-| --------- | -----------------------: | ------------------------: | ----: |
-| `prepend` |  11.944 ops/s (83720 µs) |   47.169 ops/s (21200 µs) |  ×3.9 |
-| `append`  |  11.960 ops/s (83610 µs) |   64.641 ops/s (15470 µs) |  ×5.4 |
-| `read`    |  43.140 ops/s (23180 µs) | 2173.913 ops/s **(460 µs)** | **×50** |
-| `update`  |  20.995 ops/s (47630 µs) |  425.531 ops/s (2350 µs)  | **×20** |
-| `prepare` | 0.908 ops/s (1100940 µs) |  0.981 ops/s (1018620 µs) |     — |
+| workload  |                `255ce7a` |                 `8428e35` |     Δ | main `e80f404` |
+| --------- | -----------------------: | ------------------------: | ----: | -------------: |
+| `prepend` |  11.944 ops/s (83720 µs) |   47.169 ops/s (21200 µs) |  ×3.9 |      21230 µs |
+| `append`  |  11.960 ops/s (83610 µs) |   64.641 ops/s (15470 µs) |  ×5.4 |      15520 µs |
+| `read`    |  43.140 ops/s (23180 µs) | 2173.913 ops/s **(460 µs)** | **×50** | **460 µs** |
+| `update`  |  20.995 ops/s (47630 µs) |  425.531 ops/s (2350 µs)  | **×20** | **2510 µs** ⚠ |
+| `prepare` | 0.908 ops/s (1100940 µs) |  0.981 ops/s (1018620 µs) |     — |    1096500 µs |
+
+The last column is the current reference. ⚠ `update` is 6.4% slower on
+main than at `8428e35` — a deliberate correctness cost, quantified in
+"Run 3 on main" below.
 
 Both runs are the **warm** configuration (the harness calls
 `blob_db_prepare()` after each `erase_all()`), and both produced
@@ -240,6 +246,79 @@ between runs, and all three checksums match (`0xee3fa466`,
 `0x50f65666`, `lg read 0xca1e0000`). Wall-clock differences on the
 untouched phases are ≤1%. Contract R2 still holds: 3218 / 3281 / 3656 /
 3281 µs, flat and not rising.
+
+## Run 3 on main (`e80f404`) — the cost of the `update` correctness fix
+
+Three blob_db commits landed after run 2 — `8d54e7b` (data corruption on
+extend, permanent segment leak), `b4ee453` (decide INDEXED from a
+CRC-verified slot in `update()`), `b695bde` (five review findings) — 282
+lines of `blob_db.c`. Exactly one benchmark line moved.
+
+| line          |   `12df53b` |   `e80f404` | change            |
+| ------------- | ----------: | ----------: | ----------------- |
+| `io update` reads | 800 ops / 11400 B | **1000 ops / 14800 B** | **+2 reads, +34 B per op** |
+| `io update` ampl  | rd 3.56×    | **rd 4.62×** | |
+| `bench update`    | 2360 µs/op  | **2510 µs/op** | **+150 µs (+6.4%)** |
+
+Everything else is unchanged: `io read` byte-identical at 605 ops / 8650 B
+and 460 µs/op, `io lg read` byte-identical at 30755 ops / 8742276 B,
+`io lg write` (er 133), `io lg rewrite` (er 9) and `io lg pwrite` (er 64)
+all identical, all three checksums match, and R2 stays flat at 3187 /
+3250 / 3625 / 3281 µs. Untouched wall-clock figures differ by ≤1.3%.
+
+**The cost is exactly what the fix implies, and the fitted constants
+predict it.** `b4ee453` makes `update()` re-read a slot and verify its CRC
+before deciding the INDEXED flag, which is 2 extra read transactions and
+34 extra bytes per op. At the ~65 µs/transaction and ~0.63 µs/B measured
+in run 2, that predicts 2 × 65.5 + 34 × 0.63 = **152 µs** against **150 µs
+measured** — a 1% error on an independent prediction. This is a
+correctness fix being paid for in reads, at a price the cost model
+anticipates rather than a surprise regression.
+
+The second `update` phase shows the same shift (998 → 1198 reads,
+2490 → 2650 µs), so it is systematic and not a one-phase artifact.
+
+## Raw UART capture — `e80f404` (run 3, main)
+
+```
+*** Booting Zephyr OS build 4a405846193f ***
+blob_db perf 1.0.0  (N_OPS=100  VAL_LEN=24  node=32 B)
+bench prepare :  100 ops in  109650 ms  ->    0.911 ops/s  (  1096500 us/op)
+bench prepend :  100 ops in    2123 ms  ->   47.103 ops/s  (    21230 us/op)
+bench read   :  100 ops in      46 ms  -> 2173.913 ops/s  (      460 us/op)
+   io read      : rd    605 ops/    8650 B   wr     0 ops/       0 B   er    0   ampl rd 2.70x wr 0.00x
+bench update :  100 ops in     251 ms  ->  398.406 ops/s  (     2510 us/op)
+   io update    : rd   1000 ops/   14800 B   wr   100 ops/    4800 B   er    0   ampl rd 4.62x wr 1.50x
+prepend checksum: 0xee3fa466
+bench prepare :  100 ops in  110064 ms  ->    0.908 ops/s  (  1100640 us/op)
+bench append :  100 ops in    1552 ms  ->   64.432 ops/s  (    15520 us/op)
+bench read   :  100 ops in      46 ms  -> 2173.913 ops/s  (      460 us/op)
+   io read      : rd    605 ops/    8650 B   wr     0 ops/       0 B   er    0   ampl rd 2.70x wr 0.00x
+bench update :  100 ops in     265 ms  ->  377.358 ops/s  (     2650 us/op)
+   io update    : rd   1198 ops/   17176 B   wr   100 ops/    4800 B   er    0   ampl rd 5.36x wr 1.50x
+append checksum:  0x50f65666
+
+-- large objects (OBJ_LEN=65536  N_LARGE=4  N_PART=32  PART_LEN=64) --
+bench lg write  :    4 ops in  154408 ms  ->      1 KB/s  ( 38602000 us/op)
+   io lg write  : rd    168 ops/    2576 B   wr   269 ops/  269584 B   er  133   ampl rd 0.00x wr 1.02x
+bench lg rewrite:    4 ops in   17918 ms  ->     14 KB/s  (  4479500 us/op)
+   io lg rewrite: rd   1048 ops/   15744 B   wr   277 ops/  269712 B   er    9   ampl rd 0.06x wr 1.02x
+bench lg read   : 4096 ops in    7458 ms  ->     34 KB/s  (     1820 us/op)
+   io lg read   : rd  30755 ops/ 8742276 B   wr     0 ops/       0 B   er    0   ampl rd 33.34x wr 0.00x
+lg read checksum: 0xca1e0000
+bench lg pread q0:   32 ops in     102 ms  ->     19 KB/s  (     3187 us/op)
+   io lg pread q0: rd    710 ops/   89224 B   wr     0 ops/       0 B   er    0   ampl rd 43.56x wr 0.00x
+bench lg pread q1:   32 ops in     104 ms  ->     19 KB/s  (     3250 us/op)
+   io lg pread q1: rd    714 ops/   91270 B   wr     0 ops/       0 B   er    0   ampl rd 44.56x wr 0.00x
+bench lg pread q2:   32 ops in     116 ms  ->     17 KB/s  (     3625 us/op)
+   io lg pread q2: rd    727 ops/   91426 B   wr     0 ops/       0 B   er    0   ampl rd 44.64x wr 0.00x
+bench lg pread q3:   32 ops in     105 ms  ->     19 KB/s  (     3281 us/op)
+   io lg pread q3: rd    727 ops/   91040 B   wr     0 ops/       0 B   er    0   ampl rd 44.45x wr 0.00x
+bench lg pwrite :   32 ops in   72708 ms  ->      0 KB/s  (  2272125 us/op)
+   io lg pwrite : rd   1651 ops/   99708 B   wr   160 ops/   77912 B   er   64   ampl rd 48.68x wr 38.04x
+partial vs whole-object write: 2272125 us vs 4479500 us/op  (1.97x)
+lg objects intact (65536 B each)
+```
 
 ## Raw UART capture — `12df53b` (run 2, with the index cache)
 
