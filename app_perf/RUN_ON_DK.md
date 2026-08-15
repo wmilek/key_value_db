@@ -1,9 +1,46 @@
 # Running `app_perf` on the nRF5340-DK
 
-**The measurements are done** — see `RESULTS.md` for the numbers, the raw
-captures, and the exact `nrfutil` / console commands. This file is the
-operator's guide for *re-running* it: what to expect while it runs, and what
-tends to go wrong.
+`RESULTS.md` holds the numbers from the first board run, the raw captures, and
+the exact `nrfutil` / console commands. This file is the operator's guide:
+what to expect while it runs, and what tends to go wrong.
+
+> ## Run 2 is wanted — one flash, no A/B
+>
+> **Commit:** `8f5b16b` (branch tip) · **Board:** `nrf5340dk/nrf5340/cpuapp`
+>
+> PR 5 added a one-entry index cache. Its effect is measured on `native_sim`
+> but **not on hardware**, and the `native_sim` ratio is known not to
+> transfer — the DK's chunk is 2004 B against 1024, so its index record is
+> half the size while its 64 KB buckets make the scan in front of that record
+> far more expensive.
+>
+> **No second flash is needed.** The pre-cache numbers are already recorded at
+> `8428e35`, and nothing between the two commits touches the read path (a
+> format fix, a `printk`, and a test-only Kconfig that is off by default). So
+> run `8f5b16b` once and compare against the table in `RESULTS.md`.
+>
+> ### What is predicted, and what would falsify it
+>
+> | line | recorded at `8428e35` | predicted at `8f5b16b` |
+> |---|--:|--:|
+> | `io lg read` ops | 92 135 | **~30 700** (~3×) |
+> | `io lg read` bytes | 11 623 044 | **~3 285 000** (~3.5×) |
+> | `io lg read` ampl | 44.33× | **~12.5×** |
+> | `bench lg read` | 3254 µs/op | **~920 µs/op** |
+> | `io lg pread q0..q3` ops | ~710–727 each | **~240 each**, still flat |
+>
+> The reasoning is that a windowed read does three bucket lookups and the
+> cache removes two of them; that model reproduces the `native_sim` result
+> exactly. **If the ops drop by ~3× but the bytes barely move**, the model is
+> wrong about where the bytes go and the write-up in
+> `doc/proposals/2026-08-09-large-payloads-cost.md` §3 needs revisiting — say
+> so, that is a useful result, not a failed run.
+>
+> Also worth a glance: `partial vs whole-object write` now prints two
+> decimals and should read **~1.95x** where it previously printed `1x`.
+>
+> Everything else in the run is unchanged and mainly serves as a
+> regression check against the recorded table.
 
 Re-run it when the shape of the benchmark changes, when `blob_db`'s I/O paths
 change, or on different hardware. `RESULTS.md` is the file to update

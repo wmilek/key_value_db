@@ -216,11 +216,31 @@ Three mitigations, in increasing order of value:
    > the cache owns `g_seg_a` rather than allocating a second table —
    > sound only because `index_load()` is the sole writer of that buffer.
    >
-   > No DK number yet. Since bytes dominate on that part (§3.0), the
-   > expectation is a ~2× improvement on `lg read`, from 3254 µs/op to
-   > roughly 1600 — but the DK's chunk is 2004 B against `native_sim`'s
-   > 1024, so the ratio will not transfer exactly. It is a prediction, not
-   > a result.
+   > No DK number yet, and the ratio does **not** transfer: the DK's chunk
+   > is 2004 B against `native_sim`'s 1024, so its index record is 280 B
+   > where `native_sim`'s is 528 B. Two effects pull opposite ways — a
+   > smaller index saves less, but a 64 KB bucket makes the slot-header
+   > scan that precedes it much more expensive.
+   >
+   > Which dominates is answerable from the recorded counters, because the
+   > cache removes exactly two of the three bucket lookups a windowed read
+   > performs. On `native_sim` that model is exact: the measured saving of
+   > 1163 B/op is 2 × (528 B index + 53 B scan). Applying it to the DK's
+   > 2838 B/op and 280 B index leaves **~738 B of scan per lookup** — the
+   > scan, not the index, is the bulk of it there. Predicted:
+   >
+   > | | recorded (`8428e35`) | predicted (`8f5b16b`) |
+   > |---|--:|--:|
+   > | reads | 22.5 /op | ~7.5 /op (**~3×**) |
+   > | bytes | 2838 /op | ~802 /op (**~3.5×**) |
+   > | `lg read` | 3254 µs/op | **~920 µs/op** |
+   >
+   > This supersedes an earlier estimate of ~2× / ~1600 µs in this file,
+   > which assumed the smaller index would make the DK gain *less* than
+   > `native_sim`'s. It reasoned from the index payload alone and ignored
+   > the scan, which on 64 KB buckets is the larger term. Still a
+   > prediction — the point of stating it this precisely is that the board
+   > can falsify it.
 2. **Skip the cursor-finding read for prepared buckets** (§2). Removes ~40 %
    of a warm large write.
 3. **Walk the slot log by streaming reads instead of whole-sector reads** —
