@@ -49,12 +49,38 @@ Two things worth knowing before reading any duration below:
 | Bucket overflows during the fill | **0** |
 | Fullest `kvhash` bucket (from `tools/sizing.py`) | 2 711 B = 66 % of the 4 KB ceiling |
 
-R-E asked for a database at ~50 % of the DK's external flash. The realistic
-record shape lands at 51.6 % without padding.
+**Read the last row as an output, not a score.** 51.6 % is where a *fixed*
+10 000-person dataset happens to land against this stack at this commit. The
+50 % figure in R-E was the heuristic that chose 10 000 once — big enough to be
+representative, small enough to leave the board usable and to avoid a reformat
+before every run (`DESIGN.md` §6.3). Nothing in the app is scaled from it.
+
+So if this number **falls**, the stack got better at storing the same data, and
+that is the result — not something to correct by enlarging the dataset. §3a
+tracks it.
 
 *Physical* occupancy — live bytes plus not-yet-compacted garbage — is **not
 reported**, because no layer exposes it (`FINDINGS.md` B3). Everything above is
 logical content, computed by the application from its own generator.
+
+## 3a. Fill history — the regression indicator
+
+Same 10 000 persons, same record shape, every time. Only the stack underneath
+changes, so a movement here is the stack's per-record overhead moving. **Down is
+better.**
+
+| Commit | Live content | Fill | What changed |
+|---|--:|--:|---|
+| first working fill | 3 847 589 B | 45.8 % | permission vocabulary was ~11-char names |
+| `2c58710` | 4 336 158 B | **51.6 %** | qualified permission names (~14 chars) — a *dataset* change, so not a stack result |
+| post-merge (`f5b062e`) | 4 336 158 B | **51.6 %** | main's slot-header walk: 19× less flash *moved*, but the same bytes *stored* |
+
+The third row is the interesting one. The large-payload merge cut the flash
+traffic of a decision by 19× and changed occupancy by **nothing** — because it
+changed how the store is read, not how densely it is packed. Two different
+things, and this table separates them. A change to `kvhash`'s per-entry framing
+or to `blob_db`'s slot overhead would move this column; a faster read path never
+will.
 
 ## 4. Measured — `native_sim`
 

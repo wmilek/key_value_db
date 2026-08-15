@@ -146,6 +146,13 @@ the population size or `CONFIG_BLOB_DB_MAX_PAYLOAD_LEN` changes.**
 *What it prevents:* discovering your capacity plan was wrong several hours into
 a provisioning run, with no repair path short of a reformat.
 
+**Then freeze the number.** Sizing is a one-time act: `tools/sizing.py` picked
+10 000 persons, and from that point it is a constant of the benchmark, because
+two runs are only comparable if they used the same one. The *fill percentage*
+that results is an output — and if a future stack stores the same 10 000 people
+in 40 % of the flash instead of 51.6 %, that is the improvement being measured,
+not a target to restore by growing the dataset (`RESULTS.md` §3a).
+
 ### 11. Let the layer below answer its own questions — delete the copy
 
 `CONFIG_BLOB_DB_MAX_PAYLOAD_LEN` must fit *twice* inside a sector, or a full

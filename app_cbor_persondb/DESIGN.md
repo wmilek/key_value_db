@@ -87,7 +87,7 @@ Out of scope:
 | **R-C2** | A person carries **permissions, as an array of strings**. |
 | **R-C3** | A person has **credential card IDs (strings)** assigned to them. |
 | **R-D** | Given a credential, it must be possible to get the person and check a permission **quickly**. |
-| **R-E** | Demonstrate performance with the database at **~50 % of the external flash on the DK** — 4 MiB of an 8 MiB MX25R6435F. |
+| **R-E** | Demonstrate performance at a **representative** database size. "~50 % of the DK's 8 MiB external flash" is the *heuristic used once to choose that size*, not a level to hold — see §6.3. |
 | **R-F** | Delivered as a **set of good practices** for using the system. |
 | **R-G** | Any drawback visible in a lower layer is **recorded as a finding**. |
 | **R-H** | The person-management functionality is an **API internal to the application**. It may build on **L2** rather than being confined to L3. |
@@ -132,7 +132,8 @@ Consequences that drive the design:
 | **F4** | The person record is the single authoritative copy of permissions. | correctness |
 | **F5** | Card assignment writes the person record **first**, the index **second**; revocation deletes the index **first**, the person **second**. Either crash point leaves a *deny*. | C8, P7 |
 | **F6** | Every record is a pure function of its index, so any record is re-derivable and verifiable without shadow state. | C1, P3 |
-| **F7** | Scale is 10 000 persons (Kconfig), spread over enough maps that no bucket approaches C2's ceiling. | R-E, R-J |
+| **F7** | Scale is **fixed at 10 000 persons**, spread over enough maps that no bucket approaches C2's ceiling. The count is a constant of the benchmark, never re-derived from geometry. | R-E, R-J |
+| **F7a** | Fill percentage is an **output**, never an input. Nothing in the app is computed from the partition size. | R-E (§6.3) |
 | **F8** | Population is batched and **resumable across reboots** with committed progress; replay of an interrupted batch is idempotent. | R-E fill time, P7 |
 | **F9** | A run verifies a deterministic sample against the generator, mutates a bounded subset, and re-verifies — proving what the *previous boot* wrote. | P8 |
 | **F10** | Per-phase timings, achieved size in bytes and per cent, and **read/write amplification** are reported. | R-E, R-G |
@@ -226,6 +227,39 @@ Two things worth stating plainly:
   measurement, not a workaround — and this application can size by enumeration
   only because its dataset is a pure function of an index (F6). One whose data
   arrives from outside could not.
+
+### 6.3 The fill percentage is a result, not a target
+
+Worth stating plainly, because the earlier drafts of this document had it
+backwards.
+
+**"50 % of the external flash" was a sizing heuristic, used once.** It answered
+"how big should the dataset be?" with three constraints in mind: large enough
+that the storage layer's real costs show up; small enough to leave the board
+usable for other things; and small enough that a benchmark run does not demand
+the whole partition and a reformat before every run. Half the medium satisfies
+all three. It was never a level the app must maintain.
+
+**The person count is therefore frozen.** `tools/sizing.py` chose 10 000 once,
+against the record shape and the hash; from that point it is a constant of the
+benchmark. Reruns use it unchanged, which is the only way two runs are
+comparable at all. It is *not* recomputed from the geometry at build or boot —
+nothing in the app reads the partition size except the reporting path (F7a).
+
+**A falling fill percentage is a good result.** If a component shrinks its
+overhead and the same 10 000 persons come to occupy 40 % instead of 51.6 %,
+that is the implementation improving, and the benchmark has just measured it.
+Holding the percentage constant would mean silently growing the dataset to
+absorb the gain — hiding exactly the improvement the app exists to detect.
+
+So the percentage is tracked over time as a **regression indicator**
+(`RESULTS.md` §3a), in the direction where down is better. The two numbers move
+independently and mean different things:
+
+| | what it is | changes when |
+|---|---|---|
+| person count | **fixed input** — 10 000 | someone deliberately re-sizes the benchmark |
+| fill percentage | **output** | the stack's per-record overhead changes |
 
 ### 6.2 Cost of the fill
 
@@ -542,6 +576,7 @@ Settled during review; recorded so they are not relitigated.
 | D8 | The app is **both** probe and showcase; §1 states the rule that keeps the two compatible. |
 | D9 | The person management functionality is an **internal application API** (§8), not proposed for `lib/`. |
 | D10 | It is implemented on **L2 `map_ops` + `rootreg` + `blob_db`**, not L3 `kvdb` (§12). `kvdb` is not linked into the image. |
+| D14 | **The dataset size is frozen; the fill percentage is an observation.** 50 % was the heuristic that picked 10 000 persons once (§6.3), leaving the board room for other uses and avoiding a reformat before each run. Nothing is scaled from geometry at run time, and a fill percentage that *falls* is a better implementation, not a regression. |
 | D11 | **Size to fit, do not fight C2** (R-J): sixteen person maps put the fullest bucket at 66 % of the ceiling, a number obtained by enumerating the population rather than by modelling its tail — the model was tried, and was wrong (§6.1). `-ENOSPC` is not an expected path, and the app does not provoke it; the over-provisioning it forces *is* the visible cost. |
 | D12 | A **scenario layer** (§9) holds every operation on a population, and never prints. |
 | D13 | **Two frontends** — automatic benchmark and interactive shell — selected by Kconfig, shipped as separate `sample.yaml` scenarios, plus a small `smoke` scenario that actually runs in CI. |
