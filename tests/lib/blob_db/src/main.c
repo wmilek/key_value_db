@@ -2108,4 +2108,133 @@ ZTEST(blob_db, test_crash_during_delete_is_all_or_nothing)
 		      live_segment_slots());
 }
 #endif /* CONFIG_BLOB_DB_TEST_CRASH_HOOKS */
+
+/* Every large-object length in this suite — 4096 and BIG_LEN=102400 — is an
+ * exact multiple of the 1024 B chunk stride, so until the review found it, no
+ * test had ever produced a short final chunk. That is what let the extend bug
+ * ship. This exercises the ragged-tail case across the ordinary operations,
+ * not just the extend that exposed it. */
+ZTEST(blob_db, test_large_object_with_a_ragged_tail)
+{
+	const size_t len = BIG_LEN - 7;   /* deliberately not a chunk multiple */
+
+	fill_pattern(big_src, len, 0x5a);
+
+	uint64_t id = put_blob(big_src, len);
+	size_t got = 0;
+
+	memset(big_dst, 0, BIG_LEN);
+	zassert_ok(blob_db_read(id, 0, big_dst, len, &got));
+	zassert_equal(got, len, "read %zu of %zu", got, len);
+	zassert_mem_equal(big_dst, big_src, len, "ragged round-trip");
+
+	zassert_ok(blob_db_size(id, &got));
+	zassert_equal(got, len, "size %zu, want %zu", got, len);
+
+	/* A partial write landing inside the short final chunk. */
+	uint8_t patch[16];
+
+	memset(patch, 0xc3, sizeof(patch));
+
+	const size_t tail_off = len - sizeof(patch);
+
+	zassert_ok(blob_db_write(id, tail_off, patch, sizeof(patch)));
+	memcpy(big_src + tail_off, patch, sizeof(patch));
+
+	/* And one spanning the boundary into it. */
+	const size_t span_off = (len / 1024) * 1024 - 8;
+
+	memset(patch, 0x7e, sizeof(patch));
+	zassert_ok(blob_db_write(id, span_off, patch, sizeof(patch)));
+	memcpy(big_src + span_off, patch, sizeof(patch));
+
+	memset(big_dst, 0, BIG_LEN);
+	zassert_ok(blob_db_read(id, 0, big_dst, len, &got));
+	zassert_equal(got, len);
+	zassert_mem_equal(big_dst, big_src, len, "ragged tail after pwrite");
+
+	/* Survives a remount, and leaves nothing behind when deleted. */
+	zassert_ok(blob_db_unmount());
+	zassert_ok(blob_db_mount());
+	memset(big_dst, 0, BIG_LEN);
+	zassert_ok(blob_db_read(id, 0, big_dst, len, &got));
+	zassert_mem_equal(big_dst, big_src, len, "ragged tail after remount");
+
+	zassert_ok(blob_db_delete(id));
+	zassert_equal(live_segment_slots(), 0,
+		      "delete left %d segments of a ragged object",
+		      live_segment_slots());
+}
+
+/* === REVIEW REPRO 1: extend-past-end when the old last chunk is short ===
+ * Same shape as test_pwrite_extends_with_zero_fill, but the object's length
+ * is NOT a multiple of seg_len (1024 in this config), so the old last chunk
+ * is short (4 bytes). The extending write does not touch that chunk, so
+ * pwrite_segmented leaves it short — while the new index claims the object
+ * now extends far past it. Every read crossing that chunk then fails. */
+ZTEST(blob_db, test_review_pwrite_extend_short_last_chunk)
+{
+	const size_t start = 4100;   /* 4 full 1 KB chunks + 4 bytes */
+
+	fill_pattern(big_src, start, 0x95);
+
+	uint64_t id = put_blob(big_src, start);
+	const uint8_t tail[4] = { 0xde, 0xad, 0xbe, 0xef };
+	const size_t at = 20000;
+
+	zassert_ok(blob_db_write(id, at, tail, sizeof(tail)));
+
+	size_t n = 0;
+
+	zassert_ok(blob_db_size(id, &n));
+	zassert_equal(n, at + sizeof(tail), "extend did not grow the object");
+
+	memset(big_dst, 0xaa, BIG_LEN);
+	zassert_ok(blob_db_read(id, 0, big_dst, at + sizeof(tail), &n),
+		   "extended object must be readable in full");
+	zassert_equal(n, at + sizeof(tail));
+	zassert_mem_equal(big_dst, big_src, start, "original bytes changed");
+	for (size_t i = start; i < at; i++) {
+		zassert_equal(big_dst[i], 0, "gap byte %zu not zero", i);
+	}
+	zassert_mem_equal(big_dst + at, tail, sizeof(tail), "tail bytes");
+}
+
+#if defined(CONFIG_BLOB_DB_TEST_CRASH_HOOKS)
+/* === REVIEW REPRO 2: a failed segmented write leaks its segments for good ===
+ * A segmented write that fails mid-flight (injected cut here; a real
+ * -ENOSPC/-EIO mid-write takes the identical early-return path) leaves
+ * orphan segments and seg_owner set. If the session then continues and any
+ * later segmented op succeeds, seg_owner is overwritten and finally cleared,
+ * so no mount ever sweeps the earlier orphans. Deleting both objects and
+ * remounting twice must leave zero live segments; the orphan survives. */
+ZTEST(blob_db, test_review_failed_write_orphans_never_swept)
+{
+	int segs;
+	uint64_t id = seeded_object(&segs);
+
+	/* Mid-write failure: one new segment written, then the op aborts. */
+	rewrite_cut_at(id, BLOB_DB_CUT_MID_SEGMENTS);
+	zassert_equal(live_segment_slots(), segs + 1,
+		      "expected exactly one orphan segment");
+
+	/* Session continues; an unrelated segmented write succeeds and clears
+	 * the sweep intent. */
+	fill_pattern(big_src, BIG_LEN, 0x77);
+
+	uint64_t other = put_blob(big_src, BIG_LEN);
+
+	/* Drop both objects, then remount (twice) so any sweep that is ever
+	 * going to run has run. */
+	zassert_ok(blob_db_delete(id));
+	zassert_ok(blob_db_delete(other));
+	zassert_ok(blob_db_unmount());
+	zassert_ok(blob_db_mount());
+	zassert_ok(blob_db_unmount());
+	zassert_ok(blob_db_mount());
+
+	zassert_equal(live_segment_slots(), 0,
+		      "orphan segment from the failed write was never swept");
+}
+#endif /* CONFIG_BLOB_DB_TEST_CRASH_HOOKS */
 #endif /* CONFIG_BLOB_DB_LARGE_PAYLOADS */

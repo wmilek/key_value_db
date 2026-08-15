@@ -1488,6 +1488,38 @@ static int persist_seg_owner(uint64_t owner)
 	return 0;
 }
 
+/* Finish the cleanup a previous segmented op left behind, before this one
+ * takes the intent marker over.
+ *
+ * A segmented write that fails mid-flight — -ENOSPC after the placement probes
+ * exhaust, or any I/O error — returns with its half-written segments on flash
+ * and seg_owner still naming it, on the reasoning that the sweep tidies up.
+ * But the sweep runs only at mount, and if the session simply carries on, the
+ * next segmented op's persist_seg_owner() overwrites that name. The master
+ * then names nobody who needs sweeping, so no future mount ever reclaims those
+ * segments: they are the live latest slot for their id, so compaction
+ * preserves them, count()/iterate() cannot see them, and delete() releases
+ * only the generation the live index lists. That is a permanent leak, which
+ * P7 lists as a must-not.
+ *
+ * Sweeping here closes it for the non-crash case; mount still covers the crash
+ * case. Note this must run before the caller loads any index, because
+ * seg_sweep() stages its owner's table in g_seg_a and would otherwise scribble
+ * over an old-segment list the caller is about to release.
+ */
+static int seg_finish_pending(void)
+{
+	if (st.seg_owner == 0) {
+		return 0;
+	}
+
+	LOG_WRN("a segmented op for id %llu left its intent behind; sweeping "
+		"before starting another",
+		(unsigned long long)st.seg_owner);
+
+	return seg_sweep(st.seg_owner);   /* clears seg_owner on success */
+}
+
 /* Load the index record for `id`. Returns K (> 0) with the segment ids copied
  * into `ids` and the header into `h`; 0 when the id holds an inline payload;
  * -ENOENT when it holds nothing live; -EIO for a malformed record. */
@@ -2023,7 +2055,24 @@ static int pwrite_segmented(uint64_t id, size_t offset, const void *buf,
 		const bool touched = (offset < cend) && (offset + len > cstart);
 		const bool fresh = (j >= (size_t)k);
 
-		if (!touched && !fresh) {
+		/* A chunk whose *length* changes must be rewritten even if the
+		 * caller's range never reaches it. Growing an object whose last
+		 * chunk was short — total_len not a multiple of seg_len — makes
+		 * that chunk a full-stride interior chunk, and leaving it at its
+		 * old length while the committed index says otherwise corrupts
+		 * the object: every later read of that region fails the segment
+		 * bound check with -EIO, and so does any repair attempt.
+		 *
+		 * Only the old final chunk can be affected (new_total never
+		 * shrinks), but the condition is written generally so it stays
+		 * true if that ever changes. */
+		const size_t old_clen =
+			fresh ? 0
+			      : MIN(cstart + seg_len, (size_t)h.total_len) -
+					cstart;
+		const bool resized = !fresh && (old_clen != clen);
+
+		if (!touched && !fresh && !resized) {
 			continue;
 		}
 
@@ -2265,6 +2314,18 @@ int blob_db_update(uint64_t id, const void *payload, size_t len)
 	 * write the new slot; latest-wins (§4) makes it the live one. We do
 	 * NOT verify prior state — a first bind has no prior slot, and writing
 	 * to a dead id is UB (decision D3), not our job to catch here. */
+#if defined(CONFIG_BLOB_DB_LARGE_PAYLOADS)
+	{
+		/* Must precede any index load: seg_sweep() stages its owner's
+		 * segment table in g_seg_a. */
+		int prc = seg_finish_pending();
+
+		if (prc < 0) {
+			return prc;
+		}
+	}
+#endif
+
 	const uint16_t bid = id_to_bucket(id);
 	bool formatted;
 
@@ -2375,6 +2436,18 @@ int blob_db_delete(uint64_t id)
 	if (id == 0) {
 		return -ENOENT;
 	}
+
+#if defined(CONFIG_BLOB_DB_LARGE_PAYLOADS)
+	{
+		/* Must precede any index load: seg_sweep() stages its owner's
+		 * segment table in g_seg_a. */
+		int prc = seg_finish_pending();
+
+		if (prc < 0) {
+			return prc;
+		}
+	}
+#endif
 
 	const uint16_t bid = id_to_bucket(id);
 	bool formatted;
@@ -2792,6 +2865,18 @@ int blob_db_write(uint64_t id, size_t offset, const void *buf, size_t len)
 	if (len == 0) {
 		return 0;
 	}
+
+#if defined(CONFIG_BLOB_DB_LARGE_PAYLOADS)
+	{
+		/* Must precede any index load: seg_sweep() stages its owner's
+		 * segment table in g_seg_a. */
+		int prc = seg_finish_pending();
+
+		if (prc < 0) {
+			return prc;
+		}
+	}
+#endif
 
 	const uint16_t bid = id_to_bucket(id);
 	bool formatted;
