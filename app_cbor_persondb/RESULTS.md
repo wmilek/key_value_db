@@ -3,12 +3,15 @@
 Keep this file honest: update it when the shape of the app changes or when
 regenerating on new hardware.
 
-**Status: `native_sim` measured at 10 000 persons; nRF5340-DK measured on the
-board at 1 000 persons (§5).** The DK timings are no longer projections. They
-were taken at a tenth of the target scale, so §5's per-operation numbers are
-directly comparable to the rest of this file, while its whole-run numbers
-(fill duration, occupancy) are *not* the 10 000-person figures and are marked
-where they appear. A full-scale DK run remains outstanding for `A4`.
+**Status: `native_sim` measured at 10 000 persons; nRF5340-DK re-measured on
+post-merge code at 1 000 persons (§5).** The DK timings are no longer
+projections, and they no longer predate the large-payload merge — §5 was
+re-taken at `338ec24` (which contains all of `e80f404`). They were taken at a
+tenth of the target scale, so §5's per-operation numbers are directly
+comparable to the rest of this file, while its whole-run numbers (fill
+duration, occupancy) are *not* the 10 000-person figures and are marked where
+they appear. A full-scale DK run remains outstanding for `A4`; §5 gives a
+revised floor of ≈2.2 h for it.
 
 ---
 
@@ -174,9 +177,16 @@ the "after" column is measured:
 
 Fewer bytes, far more transactions. On `native_sim` a transaction is a
 `memcpy` and the trade is pure win; on a serial part each carries a fixed
-command-and-address cost, so **whether 261 small reads beat 4 large ones is a
-hardware question this platform cannot answer.** It is the most valuable thing
-the pending DK run can settle.
+command-and-address cost, so **whether many small reads beat 4 large ones is a
+hardware question this platform cannot answer.**
+
+**The board has since answered it (§5): they do, by 7.8×** — but a transaction
+costs ~65 µs, which is 54% of the remaining decision cost, so the trade is
+narrower than the byte column suggests. Note also that the DK measures **112**
+transactions per `check` rather than the 261 here: this `native_sim` column was
+taken at `f5b062e`, before the one-entry index cache landed, and the counters
+are otherwise platform-independent because the overlay mirrors the DK's
+geometry.
 
 Whole-run phases:
 
@@ -277,54 +287,97 @@ above were taken with a local SDK 1.0.1 install, which gives identical results.
 
 ## 5. Measured timings — nRF5340-DK
 
-> **These numbers predate the large-payload merge.** They were taken on the
-> branch before `main`'s slot-header walk (`7f10295`) landed — which is visible
-> in the amplification column: 701× / 355× / 26 214× are the whole-sector-read
-> figures. On `native_sim` the same merge cut bytes-per-decision 19× and time
-> 14× (§4). **The board numbers below are therefore an upper bound on today's
-> code and need re-taking.** §5a works out what to expect.
-
 Board 960115021 (PCA10095), Zephyr build `4a405846193f`, SDK 1.0.1, console on
 VCOM 2 at 115200. **`CONFIG_APP_CBOR_PERSONDB_N_PERSONS=1000`** with
 `FRESH_START=y`, 200 samples per benchmark phase. Raw capture in §8a.
 
-The previous edition of this section was a projection built from
-`app_perf_kvdb/RESULTS.md` — a `blob_db` read at 17.45 ms and a write at
-~21 ms — and it is kept in the "projected" column so the error is visible.
+Re-taken at `338ec24`, which contains the whole large-payload merge. The
+pre-merge board column is kept so the effect of the merge — and the error in
+the projection that preceded it — stay visible. The pre-merge run's own
+"projected" column came from `app_perf_kvdb/RESULTS.md` when a `blob_db` read
+cost 17.45 ms; it is folded into the prose below rather than carried as a third
+column.
 
 ### Per-operation
 
-| Phase | Projected | **Measured** | Ratio | blob ops | amplification |
+| Phase | Pre-merge board | §5a predicted | **Post-merge** | Δ | amp before → now |
 |---|--:|--:|--:|--:|--:|
-| `check` (**R-D**) | ≈ 70 ms | **114.2 ms** | 1.63× | 4.00 | 701× |
-| `byid` | ≈ 35 ms | **57.6 ms** | 1.65× | 2.00 | 355× |
-| `miss` | ≈ 35 ms | **56.6 ms** | 1.62× | 2.00 | 26 214× |
-| `put` | ≈ 184 ms | **313.8 ms** | 1.71× | 9.96 | 1 770× |
-| `cbor` | 6 µs | **955 µs** | **159×** | 0 | — |
+| `check` (**R-D**) | 114.2 ms | 7–11 ms | **14.605 ms** | ×7.8 | 701× → **24×** |
+| `byid` | 57.6 ms | — | **7.770 ms** | ×7.4 | 355× → **13×** |
+| `miss` | 56.6 ms | — | **7.165 ms** | ×7.9 | 26 214× → **210×** |
+| `put` | 313.8 ms | — | **83.920 ms** | ×3.7 | 1 770× → **47×** |
+| `cbor` | 955 µs | 955 µs | **950 µs** | — | — |
 
-The four flash-bound phases are consistently **~1.65× slower** than projected:
-`byid`'s two reads take 57.6 ms, so a `blob_db` read on this board is 28.8 ms,
-not the 17.45 ms the projection assumed.
+`cbor` is unchanged to within 0.5%, exactly as it must be: it touches no flash.
+That it did not move is the control that makes the other four rows credible.
 
-`cbor` is the outlier. The projection carried the `native_sim` figure across
-unchanged on the grounds that it touches no flash — but 6 µs was a host x86
-number, and the same encode/decode pair costs 955 µs on a 128 MHz Cortex-M33.
-Assuming compute transfers between platforms was wrong by two orders of
-magnitude; only the flash model transferred.
+**§5a's prediction was too optimistic, and the reason is the constant it
+guessed.** It estimated 7–11 ms from "261 transactions at a plausible 5–20 µs"
+of fixed per-transaction cost. Measured: **14.605 ms**. The transaction count
+was in fact 112 per `check` (22 415 flash ops over 200), not 261, so the
+estimate was wrong in both terms and they partly cancelled — but the dominant
+error is the per-transaction cost, which is far above 20 µs.
+
+### This settles `FINDINGS.md` N1: a flash transaction costs ~65 µs
+
+`app_perf/RESULTS.md` fits two constants from the DK's `lg read` phases:
+**~65 µs per flash read transaction and ~0.63 µs/B.** Applying them to this
+app's own counters, with no refitting:
+
+| | per `check` |
+|---|--:|
+| flash ops | 112.1 |
+| bytes | 10 030 B |
+| predicted 112.1 × 65.5 µs + 10 030 × 0.63 µs | **13.66 ms** |
+| measured, less the 0.95 ms of CBOR | **13.66 ms** |
+
+The constants fitted on `app_perf` predict a different application's decision
+cost to within a fraction of a percent. That is a single test point and two
+free parameters, so it is a cross-check rather than a proof — but it is a
+cross-check across two apps, two payload configurations and two access
+patterns, which is the strongest evidence in this file that the cost model is
+real. **Transactions are expensive: at 112 per decision they are 54% of
+`check`, against the 12–36% the 5–20 µs guess implied.**
 
 ### Whole-run phases (**1 000 persons — not the 10 000-person figures**)
 
-| Phase | Measured | Work |
-|---|--:|---|
-| open | 24 478 ms | **includes the `FRESH_START` 8 MiB erase** — not the steady-state open cost |
-| prepare | 113 685 ms | 106 buckets formatted = **1 072 ms per bucket** |
-| fill | 983 833 ms (16.4 min) | 1 000 persons + 2 479 credentials, 4 progress commits |
-| verify | 48 023 ms | 256 persons, 602 credential resolutions |
-| mutate | 14 712 ms | rev 0 → 1, 64 cards assigned (nothing to revoke on a first run) |
-| re-verify | 49 758 ms | 256 persons, 618 credential resolutions |
+| Phase | Pre-merge | **Post-merge** | Δ | Work |
+|---|--:|--:|--:|---|
+| open | 24 478 ms | **25 837 ms** | — | **includes the `FRESH_START` 8 MiB erase** — not the steady-state open cost |
+| prepare | 113 685 ms | **116 564 ms** | — | 106 buckets formatted = **1 100 ms per bucket** |
+| fill | 983 833 ms (16.4 min) | **807 681 ms (13.5 min)** | ×1.22 | 1 000 persons + 2 479 credentials, 4 progress commits |
+| verify | 48 023 ms | **6 064 ms** | ×7.9 | 256 persons, 602 credential resolutions |
+| mutate | 14 712 ms | **2 850 ms** | ×5.2 | rev 0 → 1, 64 cards assigned (nothing to revoke on a first run) |
+| re-verify | 49 758 ms | **6 291 ms** | ×7.9 | 256 persons, 618 credential resolutions |
 
 Both verification passes reported `VERIFY PASS`, and the fill hit **0 bucket
 overflows** — the `tools/sizing.py` geometry holds on hardware.
+
+`open` and `prepare` did not move, and could not have: both are pure 64 KB
+sector erase, a property of the MX25R6435F. The 1 100 ms per bucket here
+matches `app_perf`'s independently measured 1.06–1.09 s per sector.
+
+**Fill gained only ×1.22 while the read-bound phases gained ×7.9.** That is
+the sharpest confirmation of §5's finding that fill is dominated by erase and
+compaction rather than by the operations it performs: making reads eight times
+faster barely moved it. The erase share of fill is therefore now *higher* than
+the ~80% estimated pre-merge, and it is the only remaining lever on
+fill time.
+
+Extrapolating fill linearly to 10 000 persons gives **≈2.2 h** (down from
+≈2.7 h), still a floor for the same reason as before: occupancy and compaction
+both worsen with scale.
+
+### A counter was renamed — do not diff it against the old table
+
+The pre-merge edition printed a single `blob ops` figure (4.00 per `check`).
+This edition prints **`map ops` plus `flash ops` and bytes** — 2.00 map ops and
+112 flash ops per `check`. Those are different counters, not a halving of work;
+the physically meaningful quantity is `flash ops`, which the old edition did
+not report at all. Structural results are unchanged where they are comparable:
+2 479 credentials, mean entry 432 B, 0 overflows, live content 432 759 B
+(5.1% of the partition at a tenth scale, consistent with §3's 51.6% at full
+scale).
 
 ### The projection's real defect: there is no erase term
 
@@ -368,6 +421,20 @@ improvement, and the spread between those two estimates is exactly the
 transaction-cost question in `FINDINGS.md` N1. **Measuring it is the one thing
 that settles N1**, and only the board can.
 
+> **Measured: 14.605 ms, and N1 is settled — a transaction costs ~65 µs.** The
+> estimate above was wrong in both of its terms. The real transaction count is
+> **112** per `check`, not 261, which should have made it *faster* than
+> predicted; but the fixed cost is **~65 µs**, not 5–20 µs, which more than
+> cancels that out. Fixed transaction cost is 54% of the decision, so the
+> "plausible" range was low by 3–13×.
+>
+> The honest reading is that the *shape* of the estimate was right — data bytes
+> and transaction count are the two terms that matter — and the arithmetic was
+> defensible from what was known. What it lacked was the one constant only the
+> board could give, which is precisely why N1 was raised. With that constant in
+> hand, `app_perf`'s independently fitted model reproduces this app's `check`
+> cost to a fraction of a percent (§5).
+
 **The CBOR conclusion has to be restated.** This document previously said the
 codec was "a projected 0.009 % of the decision on hardware". That was the
 `native_sim` 6 µs carried across unchanged. Measured, it is **955 µs on a
@@ -377,7 +444,8 @@ codec was "a projected 0.009 % of the decision on hardware". That was the
 |---|--:|--:|--:|
 | `native_sim`, pre-merge | 6 µs | 580 µs | 1.0 % |
 | **DK, pre-merge** | **955 µs** | **114.2 ms** | **0.84 %** |
-| DK, post-merge (predicted) | 955 µs | ≈ 7–11 ms | **9–14 %** |
+| DK, post-merge (predicted) | 955 µs | ≈ 7–11 ms | 9–14 % |
+| **DK, post-merge (measured)** | **950 µs** | **14.605 ms** | **6.5 %** |
 
 The headline conclusion survives — **the serialization format is not the
 bottleneck**, and refusing to denormalize (D2) remains right. But the margin is
@@ -480,6 +548,44 @@ Board 960115021, `N_PERSONS=1000`, `FRESH_START=y`. This is a *first* run, so
 `open` carries the partition erase and `mutate` has nothing to revoke — neither
 is a steady-state number.
 
+Post-merge, at `338ec24`:
+
+```
+*** Booting Zephyr OS build 4a405846193f ***
+
+persondb 1.0.0 — CBOR person/credential database
+[00:00:24.986,358] <inf> persondb: created store: 16 people maps + 1 credential map, max buckets each, 1000 persons planned
+open         :  25837 ms
+prepare      : 116564 ms (106 buckets formatted)
+fill         : 807681 ms  1000 written, 1000/1000 total, 4 commits
+verify       :   6064 ms  256 persons, 602 cards
+VERIFY PASS
+mutate       :   2850 ms  rev 0 -> 1  (0 revoked, 64 assigned)
+re-verify    :   6291 ms  256 persons, 618 cards
+VERIFY PASS
+
+bench check :   200 ops in  2921000 us ->      68 ops/s    14605 us/op   400 map ops  22415 flash ops   2006077 B  amp 24x
+             : 200 granted, 0 denied, 0 unknown, 0 expired
+bench byid  :   200 ops in  1554000 us ->     128 ops/s     7770 us/op   200 map ops  10753 flash ops   1026970 B  amp 13x
+bench miss  :   200 ops in  1433000 us ->     139 ops/s     7165 us/op   200 map ops  11368 flash ops    969175 B  amp 210x
+bench put   :   200 ops in 16784000 us ->      11 ops/s    83920 us/op   664 map ops  63679 flash ops   4174041 B  amp 47x
+bench cbor  :   200 ops in   190000 us ->    1052 ops/s      950 us/op     0 map ops      0 flash ops         0 B  amp 0x
+
+store
+  partition   : 8388608 B (8192 KiB)
+  maps        : 16 person + 1 credential (bucket count not observable — FINDINGS.md K10)
+  persons     : 1000 of 1000   credentials: 2479
+  mean entry  : 432 B
+  live content: 432759 B = 5.1 % of the partition
+  bucket overflows: 0
+  NOTE: physical occupancy (live + uncompacted garbage) is not
+        observable through the API — see FINDINGS.md B3.
+
+persondb: done — store at rev 1; rerun to prove persistence
+```
+
+Pre-merge, kept for comparison:
+
 ```
 [00:00:23.614,959] <inf> persondb: created store: 16 people maps + 1 credential map, 511 buckets each, 1000 persons planned
 open         :  24478 ms
@@ -511,8 +617,22 @@ store
 persondb: done — store at rev 1; rerun to prove persistence
 ```
 
-No `expired` results here: at 1 000 persons the generator's validity windows
-land differently than at 10 000, so the sample happens to miss that case.
+No `expired` results in either run: at 1 000 persons the generator's validity
+windows land differently than at 10 000, so the sample happens to miss that
+case.
+
+Note the store report also changed between editions — it no longer claims "511
+buckets each" or restates the sector size, because neither is observable through
+the API (`FINDINGS.md` K10). That is a reporting-honesty change, not a
+geometry change.
+
+### A note on running this after `app_perf`
+
+This app does not enable `CONFIG_BLOB_DB_LARGE_PAYLOADS`, so it reads format
+major 1 only. `app_perf` does enable it and leaves a major-2 store, which this
+app refuses to mount with `-ENOTSUP` — and `FRESH_START` cannot save it, because
+mount runs first. Erase the partition before the run; see the "Downgrading"
+section of `app_perf/RESULTS.md`.
 
 ### Reproducing
 
