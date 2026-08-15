@@ -1,8 +1,10 @@
 # Findings — limitations of the stack, as seen from an application
 
-Status: **v0.4 — re-measured against `main` after the large-payload work
-landed (2026-08-09).** Numbers below are from `RESULTS.md`; hardware
-measurement on the nRF5340-DK is outstanding.
+Status: **v0.5 — re-measured against `main` after the large-payload work
+landed, and on the nRF5340-DK at 1 000 persons (2026-08-15).** Numbers below
+are from `RESULTS.md`. Hardware measurement is no longer outstanding: N1 is
+closed by the board, and a full-scale 10 000-person DK run remains the only
+open measurement (`A4`).
 
 **Five findings are now closed by `main`.** B1, B9 and B10 are fixed outright,
 B5 loses two of its five jobs, and B3 is half-answered by the new
@@ -15,7 +17,7 @@ remaining open ones are listed in the summary below.
 |---|---|
 | **Closed by `main`** | B1, B5 (partly), B9, B10, B3 (partly) |
 | **Still open** | B2, B4, B6, B7, B8, K1–K11, V1–V4 |
-| **Newly observed** | N1 — transaction count rose sharply as byte count fell |
+| **Newly observed** | N1 — transaction count rose sharply as byte count fell (now closed on hardware: ~65 µs per transaction) |
 
 This is the *probe* output of `app_cbor_persondb` (see `DESIGN.md` §1). Every
 drawback the app trips over on its way to a working 4 MiB person database is
@@ -985,9 +987,36 @@ fixed cost add 1.3–5 ms. **`check` should land at 7–11 ms against 114.2 ms
 measured pre-merge** — but the width of that range *is* the finding, and only
 the board closes it.
 
-Not a defect: it is the expected shape of the fix, and bytes dominate at 64 KB
-sectors. It is recorded because a smaller-sector part, or a slower bus, could
-land on the other side of it.
+### Closed by the board: a transaction costs ~65 µs
+
+Measured post-merge at `338ec24` (`RESULTS.md` §5): **`check` = 14.605 ms**,
+with **112** flash transactions and 10 030 B per decision.
+
+| | assumed | measured |
+|---|--:|--:|
+| transactions per `check` | 261 | **112** |
+| fixed cost per transaction | 5–20 µs | **~65 µs** |
+| `check` | 7–11 ms | **14.605 ms** |
+
+**The trade is a clear net win on hardware** — 114.2 ms → 14.6 ms, a 7.8×
+improvement — so the slot-header walk was right and B1's fix stands. But the
+caution this finding recorded was justified in substance: fixed transaction cost
+is **54% of the remaining decision cost** (112 × 65 µs = 7.3 ms of 13.7 ms
+non-CBOR), against the 12–36% the 5–20 µs guess implied. Bytes no longer
+dominate; the two terms are comparable, and transactions are the larger.
+
+That sharpens rather than retires the finding. The original concern was that a
+smaller-sector part or a slower bus could land on the other side of the trade.
+With transactions already the majority term on *this* part — 64 KB sectors on a
+comparatively fast Quad-SPI — that margin is thinner than the pre-merge numbers
+suggested. A part with smaller sectors moves fewer bytes per transaction and
+would shift the balance further, so **a transaction-count budget is worth
+carrying forward into any v2 read path**, not just a byte budget.
+
+The 261 → 112 drop is itself worth noting: the transaction count fell after this
+finding was written, largely from the one-entry index cache
+(`app_perf/RESULTS.md`, "The index cache"). Had the count stayed at 261, `check`
+would sit nearer 24 ms.
 
 ## Not yet exercised
 
