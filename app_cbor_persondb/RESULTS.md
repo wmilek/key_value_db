@@ -57,15 +57,38 @@ logical content, computed by the application from its own generator.
 
 ## 4. Measured — `native_sim`
 
-Steady-state run (store already filled), 200 samples per benchmark:
+Steady-state run (store already filled), 200 samples per benchmark. Flash
+figures come from `blob_db_iostats_get()` — **measured at the storage seam, not
+modelled** (`CONFIG_BLOB_DB_IOSTATS=y`):
 
-| Phase | µs/op | blob ops/op | flash moved/op | payload | **amplification** |
-|---|--:|--:|--:|--:|--:|
-| `check` — card → person → permission (**R-D**) | 599 | 4 | 256 KB | 365 B | **711×** |
-| `byid` — person id → record | 297 | 2 | 128 KB | 364 B | 360× |
-| `miss` — unknown card | 327 | 2 | 128 KB | — | 26 214× |
-| `put` — rewrite a record + its index entries | 2 485 | 9.98 | 638 KB | 364 B | 1 799× |
-| `cbor` — encode + decode, no flash | **6** | 0 | 0 | 364 B | — |
+| Phase | µs/op | map ops/op | flash ops/op | flash bytes/op | payload | **amplification** |
+|---|--:|--:|--:|--:|--:|--:|
+| `check` — card → person → permission (**R-D**) | **42** | 2 | 261 | 13.3 KB | 402 B | **33×** |
+| `byid` — person id → record | 23 | 1 | 128 | 6.5 KB | 388 B | 17× |
+| `miss` — unknown card | 21 | 1 | 132 | 6.8 KB | 23 B | 294× |
+| `put` — rewrite a record + its index entries | 1 020 | 3.3 | 675 | 87 KB | 431 B | 202× |
+| `cbor` — encode + decode, no flash | **6** | 0 | 0 | 0 | 388 B | — |
+
+### Before and after the large-payload merge
+
+The same benchmark, same host, across `main`'s slot-header walk
+(`7f10295`). The "before" byte column was modelled as
+`map operations × sector size` — accurate for code that read whole sectors;
+the "after" column is measured:
+
+| bench | before | after | change |
+|---|--:|--:|--:|
+| `check` µs/op | 580 | **42** | **14× faster** |
+| `check` flash/op | 256 KB (656×) | **13.3 KB (33×)** | **19× less** |
+| `check` flash *operations*/op | 4 | **261** | **65× more** — see `FINDINGS.md` N1 |
+| `put` µs/op | 2 406 | 1 020 | 2.4× faster |
+| RAM on the DK | 157 584 B | 157 688 B | unchanged — B6 still open |
+
+Fewer bytes, far more transactions. On `native_sim` a transaction is a
+`memcpy` and the trade is pure win; on a serial part each carries a fixed
+command-and-address cost, so **whether 261 small reads beat 4 large ones is a
+hardware question this platform cannot answer.** It is the most valuable thing
+the pending DK run can settle.
 
 Whole-run phases:
 

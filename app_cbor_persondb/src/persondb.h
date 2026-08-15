@@ -80,13 +80,24 @@ struct persondb_stat {
 
 	uint32_t enospc_hits;        /* F11: bucket overflows, never expected */
 
-	/* Flash traffic, counted here because nothing else counts it. Every
-	 * map operation is at least two blob_db operations (K11), and every
-	 * blob_db operation moves a whole sector (B1). */
+	/* Map-level work this module performed. */
 	uint64_t map_gets;
 	uint64_t map_sets;
 	uint64_t map_dels;
-	uint64_t blob_ops;
+
+	/* Flash actually touched underneath, read from blob_db's own counters
+	 * when CONFIG_BLOB_DB_IOSTATS is on. Before those existed this had to
+	 * be modelled as "map operations x sector size", which stopped being
+	 * true the moment blob_db learned to walk buckets by slot header — a
+	 * good reason to measure rather than model (FINDINGS.md B3). Zero when
+	 * the counters are not compiled in. */
+	uint64_t flash_reads;
+	uint64_t flash_writes;
+	uint64_t flash_erases;
+	uint64_t bytes_read;
+	uint64_t bytes_written;
+	uint64_t bytes_erased;
+	bool     io_measured;
 };
 
 /** Opaque handle; the instance is owned by persondb.c (one store per image). */
@@ -95,11 +106,13 @@ struct persondb;
 /* -- lifecycle ---------------------------------------------------------- */
 
 /**
- * @brief Attach to the store, building it if this is a virgin device.
+ * @brief Bring the store up: mount, bootstrap the registry, attach — building
+ *        it if this is a virgin device.
  *
- * Requires blob_db_mount() and rootreg_init() to have run. Verifies that the
- * configured payload size is actually usable on this flash geometry before
- * touching anything (FINDINGS.md B9/B10).
+ * This module owns the whole storage stack, so nothing above it ever calls
+ * blob_db or rootreg. Verifies that the configured payload size is actually
+ * usable on this flash geometry before touching anything
+ * (FINDINGS.md B9/B10).
  *
  * @param db          (out) handle
  * @param n_persons   dataset size to record when creating; ignored when
@@ -111,8 +124,17 @@ struct persondb;
  */
 int persondb_open(struct persondb **db, uint32_t n_persons);
 
-/** Detach. The store is untouched. */
+/** Detach and unmount. The store's contents are untouched. */
 int persondb_close(struct persondb *db);
+
+/** Drop every record and rebuild an empty store. Reattaches @p db. */
+int persondb_erase(struct persondb **db, uint32_t n_persons);
+
+/**
+ * @brief Pre-format flash erase blocks so first-touch erases leave the hot
+ *        path (~1.1 s each on the DK — FINDINGS.md B7).
+ */
+int persondb_prepare(int *buckets_formatted);
 
 /* -- enrollment --------------------------------------------------------- */
 
@@ -212,6 +234,39 @@ int persondb_progress_get(struct persondb *db, uint32_t *populated,
 /** Commit fill progress and revision. Atomic. */
 int persondb_progress_set(struct persondb *db, uint32_t populated,
 			  uint32_t rev);
+
+/* -- record helpers ----------------------------------------------------- */
+
+/*
+ * These exist so callers can compare and account for persons without knowing
+ * how one is serialized. Every one of them is a question about *storage* — are
+ * these the same stored record, how much room does it take — so the answer
+ * belongs here rather than in whatever is asking.
+ */
+
+/**
+ * @brief True iff @p a and @p b are the same stored record.
+ *
+ * Compares canonical encodings, so equal means every field matched — including
+ * fields added to the schema after this function was written.
+ */
+bool persondb_person_equal(const struct persondb_person *a,
+			   const struct persondb_person *b);
+
+/** Bytes the person's own entry occupies: framing + key + encoded record. */
+size_t persondb_person_record_bytes(const struct persondb_person *p);
+
+/** Bytes this person's credential index entries occupy, in total. */
+size_t persondb_person_credential_bytes(const struct persondb_person *p);
+
+/**
+ * @brief Encode then decode a person, touching no storage.
+ *
+ * The control for the codec benchmark: it isolates serialization cost from
+ * everything the storage stack does around it.
+ */
+int persondb_person_roundtrip(const struct persondb_person *p,
+			      size_t *encoded_len);
 
 /* -- introspection ------------------------------------------------------ */
 

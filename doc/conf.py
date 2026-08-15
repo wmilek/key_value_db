@@ -6,9 +6,9 @@
 # -- Project information -----------------------------------------------------
 # https://www.sphinx-doc.org/en/master/usage/configuration.html#project-information
 
-project = 'Example Application'
-copyright = '2024, The Zephyr Community'
-author = 'The Zephyr Community'
+project = 'Zephyr Key-Value DB'
+copyright = '2026, key_value_db contributors'
+author = 'key_value_db contributors'
 release = '1.0.0'
 
 # -- General configuration ---------------------------------------------------
@@ -21,7 +21,9 @@ myst_enable_extensions = []
 suppress_warnings = ['myst.header', 'myst.xref_missing']
 
 templates_path = ['_templates']
-exclude_patterns = ['_build_sphinx', '_doxygen', 'Thumbs.db', '.DS_Store']
+# proposals/sizing is a measurement harness (see its README), not a doc page.
+exclude_patterns = ['_build_sphinx', '_doxygen', 'proposals/sizing',
+                    'Thumbs.db', '.DS_Store']
 
 # -- Options for HTML output -------------------------------------------------
 # https://www.sphinx-doc.org/en/master/usage/configuration.html#options-for-html-output

@@ -174,9 +174,9 @@ static int cmd_bench(const struct shell *sh, size_t argc, char **argv)
 			return rc;
 		}
 		shell_print(sh, "%-6s %5u ops  %6lld ms  %7u us/op  "
-				"%6llu blob ops  amp %ux",
+				"%6llu flash ops  amp %ux",
 			    b.name, b.ops, (long long)b.ms, b.us_per_op,
-			    (unsigned long long)b.blob_ops, b.amplification);
+			    (unsigned long long)b.flash_ops, b.amplification);
 	}
 	return 0;
 }

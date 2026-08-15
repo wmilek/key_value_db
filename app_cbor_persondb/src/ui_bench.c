@@ -45,8 +45,10 @@ static void print_bench(const struct bench_result *b)
 				     : 0;
 
 	printk("bench %-6s: %5u ops in %8" PRId64 " us -> %7" PRIu64 " ops/s  "
-	       "%7u us/op  %6" PRIu64 " blob ops  amp %ux\n",
-	       b->name, b->ops, b->us, ops_per_s, b->us_per_op, b->blob_ops,
+	       "%7u us/op  %4" PRIu64 " map ops  %5" PRIu64 " flash ops  "
+	       "%8" PRIu64 " B%s  amp %ux\n",
+	       b->name, b->ops, b->us, ops_per_s, b->us_per_op, b->map_ops,
+	       b->flash_ops, b->flash_bytes, b->measured ? "" : "?",
 	       b->amplification);
 }
 

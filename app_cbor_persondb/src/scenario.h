@@ -137,10 +137,12 @@ struct bench_result {
 	int64_t     us;             /* total; the fast phases are sub-millisecond */
 	int64_t     ms;
 	uint32_t    us_per_op;
-	uint64_t    blob_ops;       /* blob_db operations underneath */
-	uint64_t    flash_bytes;    /* blob_ops x sector size — see B1 */
-	uint64_t    payload_bytes;  /* what the application actually wanted */
+	uint64_t    map_ops;        /* map get/set/del this phase performed */
+	uint64_t    flash_ops;      /* flash reads + writes + erases underneath */
+	uint64_t    flash_bytes;    /* bytes actually moved, from blob_db iostats */
+	uint64_t    payload_bytes;  /* what the application actually asked for */
 	uint32_t    amplification;  /* flash_bytes / payload_bytes */
+	bool        measured;       /* false if CONFIG_BLOB_DB_IOSTATS is off */
 	uint32_t    granted, denied, unknown, expired;  /* CHECK only */
 };
 

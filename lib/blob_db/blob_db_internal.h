@@ -29,6 +29,33 @@
 #define BLOB_DB_STATE_CLEAN       0x00
 #define BLOB_DB_STATE_COMPACTING  0x01
 
+/* On-flash format version.
+ *
+ * MAJOR marks an incompatible change: software that does not know a major
+ * refuses the store with -ENOTSUP rather than touching it. MINOR marks an
+ * additive one: fields are appended to the master body and hdr_len grows, so
+ * older software validates and reads the prefix of the header it knows and
+ * ignores the tail. A minor bump must keep hdr_len <= BLOB_DB_MASTER_HDR_MAX;
+ * exceeding that is a major change.
+ */
+/* A build that can write segmented objects declares major 2, because a slot
+ * flag changes what a payload *means* and older software would misread an
+ * index record as data. A build without the feature keeps writing major 1 and
+ * stays interchangeable with software that predates it. Either build reads
+ * anything up to its own major, so enabling the feature adopts an existing
+ * store rather than refusing it — and upgrades it to major 2 on the next
+ * master write. */
+#ifdef CONFIG_BLOB_DB_LARGE_PAYLOADS
+#define BLOB_DB_FORMAT_MAJOR      2
+#else
+#define BLOB_DB_FORMAT_MAJOR      1
+#endif
+#define BLOB_DB_FORMAT_MINOR      0
+
+/* Largest master header any version may declare. Bounds the read buffer that
+ * older software must be able to stage a foreign header in. */
+#define BLOB_DB_MASTER_HDR_MAX    128
+
 /* Durable id allocation (contract §2 "no reuse", impl design §13.1).
  *
  * next_id_hint on the master is a LEADING ceiling: an exclusive upper bound
@@ -45,20 +72,81 @@
  */
 #define BLOB_DB_SLOT_F_SEALED     (1u << 0)
 #define BLOB_DB_SLOT_F_TOMBSTONE  (1u << 1)
+/* Large objects (CONFIG_BLOB_DB_LARGE_PAYLOADS). INDEXED marks the slot at the
+ * object's own id whose payload is a segment table; SEGMENT marks a slot
+ * holding one chunk of another object. Both change what a payload means, so
+ * introducing them is a MAJOR format change. */
+#define BLOB_DB_SLOT_F_INDEXED    (1u << 2)
+#define BLOB_DB_SLOT_F_SEGMENT    (1u << 3)
 
-/* Master sector header (24 B). Lives at offset 0 of sectors 0 and 1; the
- * sector with the higher valid generation is authoritative. */
-struct __packed blob_db_master_hdr {
-	uint8_t  magic[4];        /* 'B','D','M','S' */
-	uint32_t generation;      /* monotonic LE */
-	uint8_t  state;           /* BLOB_DB_STATE_* */
-	uint16_t compacting_bid;  /* meaningful only when state == COMPACTING */
-	uint8_t  reserved;
-	uint64_t next_id_hint;    /* high-water mark for next id; refined at mount */
-	uint32_t hdr_crc32;       /* CRC32-IEEE over the preceding 20 bytes */
+/* Every flag bit this version understands. A slot carrying a bit outside this
+ * mask was written by software we do not understand, and its payload must not
+ * be handed out as data — see slot_view_at().
+ *
+ * This is defense in depth, not the primary guard: introducing a slot flag
+ * changes what a payload *means*, so it is a MAJOR format change and mount
+ * refuses the store before any slot is read (§ format version above). The mask
+ * covers the case where that discipline is broken.
+ */
+#ifdef CONFIG_BLOB_DB_LARGE_PAYLOADS
+#define BLOB_DB_SLOT_F_KNOWN                                                   \
+	(BLOB_DB_SLOT_F_SEALED | BLOB_DB_SLOT_F_TOMBSTONE |                    \
+	 BLOB_DB_SLOT_F_INDEXED | BLOB_DB_SLOT_F_SEGMENT)
+#else
+#define BLOB_DB_SLOT_F_KNOWN                                                   \
+	(BLOB_DB_SLOT_F_SEALED | BLOB_DB_SLOT_F_TOMBSTONE)
+#endif
+
+/* Frozen compatibility prefix (12 B).
+ *
+ * THIS LAYOUT MUST NEVER CHANGE. It is what lets blob_db of any vintage read
+ * format_major out of a store written by any other vintage and decide whether
+ * it understands the rest — including a store written by software that did not
+ * exist when it was compiled.
+ *
+ * It carries its own CRC, separate from the body's, and that separation is the
+ * point: a *newer* writer still produces a prefix whose CRC verifies, so its
+ * format_major can be trusted and the store deliberately refused; bit rot
+ * produces a prefix whose CRC fails, which is a different (recoverable)
+ * situation. Sharing one CRC with the body would conflate them, and — worse —
+ * would move with the body, so older software could not even locate it.
+ */
+struct __packed blob_db_compat_hdr {
+	uint8_t  magic[4];        /* 'B','D','M','S' — allocator identity      */
+	uint8_t  format_major;    /* incompatible; refuse what you don't know  */
+	uint8_t  format_minor;    /* additive within a major; safe to ignore   */
+	uint16_t hdr_len;         /* total master header length, incl. prefix  */
+	uint16_t reserved;
+	uint16_t prefix_crc16;    /* CRC16-CCITT(0xffff) over the leading 10 B */
 };
-BUILD_ASSERT(sizeof(struct blob_db_master_hdr) == 24,
+BUILD_ASSERT(sizeof(struct blob_db_compat_hdr) == 12,
+	     "blob_db_compat_hdr is frozen; changing it breaks every reader");
+
+/* Master sector header (64 B). Lives at offset 0 of sectors 0 and 1; the
+ * sector with the higher valid generation is authoritative.
+ *
+ * Fixed size with reserved padding, deliberately: hdr_crc32 stays at a
+ * constant offset over a constant span, so a later MINOR revision that
+ * consumes reserved space does not move anything an older reader depends on.
+ * A change that cannot fit here — or that older software would misread rather
+ * than merely miss — is a MAJOR change instead. The sector is >= 4 KB, so the
+ * padding is free.
+ */
+struct __packed blob_db_master_hdr {
+	struct blob_db_compat_hdr compat;  /*  0..11                            */
+	uint32_t generation;      /* 12..15  monotonic LE                       */
+	uint8_t  state;           /* 16      BLOB_DB_STATE_*                    */
+	uint16_t compacting_bid;  /* 17..18  meaningful only when COMPACTING    */
+	uint8_t  reserved0;       /* 19                                         */
+	uint64_t next_id_hint;    /* 20..27  leading id ceiling                 */
+	uint64_t seg_owner;       /* 28..35  segment sweep intent; 0 = none     */
+	uint8_t  reserved1[24];   /* 36..59  future MINOR revisions             */
+	uint32_t hdr_crc32;       /* 60..63  CRC32-IEEE over bytes [0, 60)      */
+};
+BUILD_ASSERT(sizeof(struct blob_db_master_hdr) == 64,
 	     "blob_db_master_hdr layout drift");
+BUILD_ASSERT(sizeof(struct blob_db_master_hdr) <= BLOB_DB_MASTER_HDR_MAX,
+	     "master header exceeds the bound older readers can stage");
 
 /* Bucket sector header (16 B). Lives at offset 0 of every bucket sector,
  * written once after that sector is erased. */
@@ -93,5 +181,76 @@ BUILD_ASSERT(BLOB_DB_SLOT_OVERHEAD == 14, "slot overhead drift");
 
 /* Data area within a bucket starts immediately after its header. */
 #define BLOB_DB_BUCKET_DATA_OFF   (sizeof(struct blob_db_bucket_hdr))
+
+/* Compaction scratch seal (16 B), written at the tail of the scratch sector
+ * AFTER the compacted image, and therefore the only trustworthy answer to
+ * "did the whole image land?".
+ *
+ * The bucket header cannot answer that question: it sits at offset 0 of the
+ * image, so it is the FIRST thing written, and a write torn anywhere after it
+ * leaves a perfectly valid header over a truncated slot stream. Recovery that
+ * trusted the header would copy that truncation over an intact bucket and lose
+ * every blob past the tear.
+ *
+ * Sealing at the tail keeps every write forward-only (offsets only increase),
+ * which the UBI backend's ubi_leb_write_at() mapping relies on — the reason
+ * the header is not simply written last instead.
+ */
+struct __packed blob_db_scratch_seal {
+	uint8_t  magic[4];        /* 'B','D','S','L'                          */
+	uint32_t image_len;       /* bytes of compacted image at offset 0      */
+	uint32_t image_crc32;     /* CRC32-IEEE over those image_len bytes     */
+	uint32_t seal_crc32;      /* CRC32-IEEE over the preceding 12 bytes    */
+};
+BUILD_ASSERT(sizeof(struct blob_db_scratch_seal) == 16,
+	     "blob_db_scratch_seal layout drift");
+
+#define BLOB_DB_SCRATCH_MAGIC     "BDSL"
+
+/* Large-object records (CONFIG_BLOB_DB_LARGE_PAYLOADS) -------------------- */
+
+/* Payload of an INDEXED slot: this header, then seg_count u64 segment ids.
+ * The whole thing is an ordinary single-slot payload, which is what bounds how
+ * large an object can be — see BLOB_DB_LARGE_PAYLOADS in Kconfig. */
+struct __packed blob_db_index_hdr {
+	uint8_t  magic[2];        /* 'B','X'                                    */
+	uint8_t  version;         /* 1                                          */
+	uint8_t  flags;           /* reserved, 0                                */
+	uint32_t total_len;       /* logical object length                      */
+	uint32_t payload_crc32;   /* CRC32-IEEE over the reassembled object     */
+	uint16_t seg_count;       /* K                                          */
+	uint16_t seg_len;         /* chunk size; the last segment may be short  */
+};
+BUILD_ASSERT(sizeof(struct blob_db_index_hdr) == 16,
+	     "blob_db_index_hdr layout drift");
+
+#define BLOB_DB_INDEX_MAGIC       "BX"
+#define BLOB_DB_INDEX_VERSION     1
+
+/* Set when payload_crc32 covers the object as it stands. A partial write
+ * (blob_db_write) clears it rather than pay a full-object read to recompute a
+ * whole-object checksum — which would defeat the point of writing one segment.
+ * Every byte is still covered by its slot's CRC16; what lapses is only the
+ * end-to-end check across the gather.
+ *
+ * Nothing verifies payload_crc32 today: it is stored for a future fsck. The
+ * flag exists so that verifier can tell "mismatch" from "not maintained"
+ * instead of rejecting every object that was ever partially written. */
+#define BLOB_DB_INDEX_F_CRC32     (1u << 0)
+
+/* Prefix of a SEGMENT slot's payload, ahead of the chunk bytes.
+ *
+ * owner_id is what makes orphan reclaim possible with no RAM index: any
+ * segment whose owner's live index does not list it is garbage, and that rule
+ * alone covers every crash point in a segmented write (see the sweep). It
+ * lives in the payload rather than the slot header so the header stays 4 bytes
+ * for the millions of small slots that will never be segments. */
+struct __packed blob_db_seg_hdr {
+	uint64_t owner_id;        /* the user-visible id this chunk belongs to  */
+	uint16_t seq;             /* chunk index, 0..K-1                        */
+	uint16_t reserved;
+};
+BUILD_ASSERT(sizeof(struct blob_db_seg_hdr) == 12,
+	     "blob_db_seg_hdr layout drift");
 
 #endif /* LIB_BLOB_DB_INTERNAL_H_ */

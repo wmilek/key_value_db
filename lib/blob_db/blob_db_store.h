@@ -54,4 +54,18 @@ int blob_db_store_write(off_t off, const void *buf, size_t len);
  */
 int blob_db_store_erase(off_t off, size_t len);
 
+/* I/O accounting, counted here so it covers both backends and every caller
+ * uniformly (CONFIG_BLOB_DB_IOSTATS; compiles to nothing when disabled). */
+#if defined(CONFIG_BLOB_DB_IOSTATS)
+enum blob_db_io_op {
+	BLOB_DB_IO_READ,
+	BLOB_DB_IO_WRITE,
+	BLOB_DB_IO_ERASE,
+};
+void blob_db_io_note(enum blob_db_io_op op, size_t bytes);
+#define BLOB_DB_IO_NOTE(op, bytes) blob_db_io_note((op), (bytes))
+#else
+#define BLOB_DB_IO_NOTE(op, bytes) ((void)0)
+#endif
+
 #endif /* LIB_BLOB_DB_STORE_H_ */

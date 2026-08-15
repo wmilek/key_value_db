@@ -44,12 +44,126 @@ config BLOB_DB_PARTITION_LABEL
 	  refer to a fixed-partitions child node in the device tree.
 
 config BLOB_DB_MAX_PAYLOAD_LEN
-	int "Max payload length in bytes"
+	int "Max single-slot payload length in bytes"
+	default 2016 if BLOB_DB_LARGE_PAYLOADS
 	default 256
-	range 1 4096
+	range 1 65535
 	help
 	  Maximum payload size accepted by blob_db_update. Slot size on flash
 	  is bounded by this plus a 14-byte header.
+
+	  The upper bound here is only the on-flash field width (val_len is
+	  16-bit). The binding limit is the erase-block geometry, which is a
+	  runtime property: a bucket is an append-only log, so a rebind needs
+	  two slots to fit before compaction can reclaim the first. Mount
+	  therefore refuses a build whose cap exceeds
+	  (sector_size - 16) / 2 - 14 — about 2026 B on 4 KB sectors and
+	  32746 B on 64 KB sectors.
+
+config BLOB_DB_LARGE_PAYLOADS
+	bool "Objects larger than one slot (segmented)"
+	help
+	  Store an object too large for one slot as K segment slots plus an index
+	  slot at the object's id, committed by writing the index last. Adds
+	  blob_db_size() and blob_db_read() and bumps the on-flash format major,
+	  so software without this option refuses such a store rather than
+	  misreading an index record as data.
+
+	  Off (default) is today's implementation byte for byte: no segmented
+	  writes, no new code, the format major older builds already understand.
+
+	  Note the index record is itself a single-slot payload, so the reachable
+	  object size is bounded by BLOB_DB_MAX_PAYLOAD_LEN — which is why
+	  enabling this raises that default from 256 to 2016. Mount reports the
+	  achievable maximum and refuses a configuration that cannot reach
+	  BLOB_DB_MAX_OBJECT_LEN.
+
+if BLOB_DB_LARGE_PAYLOADS
+
+config BLOB_DB_MAX_OBJECT_LEN
+	int "Max logical object length in bytes"
+	default 131072
+	range BLOB_DB_MAX_PAYLOAD_LEN 16777216
+	help
+	  Largest payload blob_db_update() will accept. Reachability depends on
+	  the geometry and on MAX_SEGMENTS; mount refuses a build that cannot
+	  reach this and names the shortfall.
+
+config BLOB_DB_MAX_SEGMENTS
+	int "Max segments per object"
+	default 128
+	range 2 8192
+	help
+	  Sets the RAM cost of the feature: two segment-id tables of 8 bytes per
+	  segment, so 16 B each. This is the knob that converts "how large an
+	  object do I need" into bytes of .bss.
+
+config BLOB_DB_SEGMENT_LEN
+	int "Segment size in bytes (0 = derive from the geometry)"
+	default 0
+	range 0 65535
+	help
+	  0 picks sector_size / 4, clamped to what a slot can hold, which leaves
+	  room for several segments plus rebind headroom in each bucket. Chunk
+	  sizes that divide a bucket evenly maximise capacity but leave a full
+	  bucket with no headroom, so the partition hits -ENOSPC abruptly instead
+	  of degrading.
+
+config BLOB_DB_TEST_CRASH_HOOKS
+	bool "Test-only: allow a segmented write to be cut mid-sequence"
+	help
+	  Compiles in a stop point after each step of the segmented write and
+	  delete sequences (doc/proposals/2026-08-09-large-payloads.md §6.4), so
+	  a test can stop the operation dead at a chosen step and then remount —
+	  the faithful equivalent of a power cut, since everything blob_db knows
+	  lives on flash.
+
+	  This exists because segmentation's crash-safety claim is that step 3
+	  (writing the index record) is the single commit point: before it the
+	  new object is invisible, after it the old one is unreachable, and a
+	  crash anywhere leaves unreferenced segments rather than wrong data.
+	  That claim is only worth as much as the test that tries to break it.
+
+	  For tests only. Leave off in production builds — it adds a comparison
+	  on the write path and exports a symbol that can corrupt a store.
+
+endif # BLOB_DB_LARGE_PAYLOADS
+
+config BLOB_DB_IOSTATS
+	bool "Count flash operations and bytes"
+	help
+	  Count reads, writes and erases — operations and bytes — at the
+	  storage seam, and expose them through blob_db_iostats_get(). Both
+	  counts are kept because they can disagree: a change that moves fewer
+	  bytes may issue more transactions, and on a serial part each
+	  transaction carries a fixed command-and-address cost.
+
+	  Intended for benchmarks and regression guards. Unlike wall-clock,
+	  these numbers are deterministic, so they are meaningful on native_sim
+	  — where the flash simulator models no latency at all unless
+	  FLASH_SIMULATOR_SIMULATE_TIMING is set, and even then charges per
+	  call rather than per byte.
+
+	  A handful of counters and one call per store operation; leave it off
+	  in production builds.
+
+config BLOB_DB_AUTOFORMAT_ON_CORRUPT
+	bool "Format when both master sectors are unreadable"
+	default y
+	help
+	  Controls what mount does when neither master can be parsed AND the
+	  sectors are not erased — bit rot, or a power loss during the very
+	  first format.
+
+	  y (development): format and carry on, so a bad first boot is not a
+	  device needing manual intervention.
+
+	  n (production): return -EIO and leave the partition untouched, so the
+	  caller decides whether to discard it with blob_db_format().
+
+	  This does NOT apply to a store written in a format this build does not
+	  understand. That is always refused with -ENOTSUP and never formatted,
+	  regardless of this option.
 
 config BLOB_DB_SECTOR_BUF_SIZE
 	int "Max flash sector size in bytes"

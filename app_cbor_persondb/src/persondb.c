@@ -43,6 +43,10 @@ LOG_MODULE_REGISTER(persondb, CONFIG_APP_CBOR_PERSONDB_LOG_LEVEL);
  * entry-size arithmetic in DESIGN.md §6 has no variance from key length. */
 #define PERSON_KEY_SZ 10
 
+/* kvhash charges 4 bytes of framing per entry, on top of key and value. */
+#define ENTRY_OVERHEAD 4u
+#define PERSON_KEY_LEN 9u
+
 /*
  * kvhash's capacity formula is private to kvhash.c, so an application that
  * wants a full-size map has to restate it — FINDINGS.md K9(c). Worse, the
@@ -109,15 +113,14 @@ static void person_key(char *buf, uint32_t id)
 	snprintf(buf, PERSON_KEY_SZ, "p%08X", (unsigned)id);
 }
 
-/* Every map operation is counted here because no layer below counts anything
- * (FINDINGS.md B3). A get is two blob_db operations — directory then bucket
- * (K11) — and a set or delete is three; each of those moves a whole sector
- * (B1). That is the entire basis of the amplification figures. */
+/* Map-level counters. The flash bytes underneath come from blob_db's own
+ * iostats (see persondb_stat) rather than from a model of what a map operation
+ * ought to cost — the model was "two blob_db ops per get, each a whole sector",
+ * and slot-header walking made it wrong. */
 static int map_get(struct persondb *db, uint64_t root, const char *key,
 		   void *out, size_t out_sz, size_t *out_len)
 {
 	db->st.map_gets++;
-	db->st.blob_ops += 2;
 	return db->ops->get(root, key, strlen(key), out, out_sz, out_len);
 }
 
@@ -127,7 +130,6 @@ static int map_set(struct persondb *db, uint64_t root, const char *key,
 	int rc;
 
 	db->st.map_sets++;
-	db->st.blob_ops += 3;
 	rc = db->ops->set(root, key, strlen(key), val, len);
 	if (rc == -ENOSPC) {
 		/* A single bucket overflowed while the medium is nearly empty
@@ -142,7 +144,6 @@ static int map_set(struct persondb *db, uint64_t root, const char *key,
 static int map_del(struct persondb *db, uint64_t root, const char *key)
 {
 	db->st.map_dels++;
-	db->st.blob_ops += 3;
 	return db->ops->del(root, key, strlen(key));
 }
 
@@ -167,7 +168,6 @@ static int sb_commit(struct persondb *db)
 	if (rc != 0) {
 		return rc;
 	}
-	db->st.blob_ops++;
 	return blob_db_update(db->sb_id, buf, len);
 }
 
@@ -269,6 +269,28 @@ int persondb_open(struct persondb **out, uint32_t n_persons)
 	memset(&db->st, 0, sizeof(db->st));
 	db->ops = &kvhash_map_ops;
 
+	/* This module owns the storage stack end to end, so nothing above it
+	 * ever names blob_db or rootreg (DESIGN.md F12, checked by A7). */
+	rc = blob_db_mount();
+	if (rc != 0 && rc != -EALREADY) {
+		LOG_ERR("blob_db_mount: %d", rc);
+		return rc;
+	}
+
+	if (IS_ENABLED(CONFIG_APP_CBOR_PERSONDB_FRESH_START)) {
+		rc = blob_db_erase_all();
+		if (rc != 0) {
+			LOG_ERR("erase_all: %d", rc);
+			return rc;
+		}
+	}
+
+	rc = rootreg_init();
+	if (rc != 0) {
+		LOG_ERR("rootreg_init: %d", rc);
+		return rc;
+	}
+
 	rc = geometry(&partition_bytes, &sector_bytes);
 	if (rc != 0) {
 		LOG_ERR("cannot read partition geometry: %d", rc);
@@ -298,7 +320,6 @@ int persondb_open(struct persondb **out, uint32_t n_persons)
 	uint8_t buf[SUPERBLOCK_CBOR_MAX];
 	size_t got = 0;
 
-	db->st.blob_ops++;
 	rc = blob_db_get(db->sb_id, buf, sizeof(buf), &got);
 	if (rc == -ENOENT || (rc == 0 && got == 0)) {
 		/* Virgin, or a crash before a previous create's commit. */
@@ -337,7 +358,43 @@ int persondb_close(struct persondb *db)
 	if (db) {
 		db->open = false;
 	}
+	blob_db_unmount();
 	return 0;
+}
+
+int persondb_erase(struct persondb **db, uint32_t n_persons)
+{
+	int rc;
+
+	if (db && *db) {
+		(*db)->open = false;
+		*db = NULL;
+	}
+
+	/* Logical wipe: one master write, rather than the tens of seconds a
+	 * full-partition erase costs on an 8 MiB QSPI part. */
+	rc = blob_db_erase_all();
+	if (rc != 0) {
+		return rc;
+	}
+	rc = rootreg_init();
+	if (rc != 0) {
+		return rc;
+	}
+	return persondb_open(db, n_persons);
+}
+
+int persondb_prepare(int *buckets_formatted)
+{
+	/* How many buckets to ask for is a guess: blob_db reports neither its
+	 * bucket count nor which are already formatted (FINDINGS.md B3/B7).
+	 * Asking for more than exist is harmless — the call caps at the total. */
+	int n = blob_db_prepare((size_t)-1);
+
+	if (buckets_formatted) {
+		*buckets_formatted = (n < 0) ? 0 : n;
+	}
+	return n < 0 ? n : 0;
 }
 
 /* -- enrollment --------------------------------------------------------- */
@@ -669,11 +726,89 @@ int persondb_progress_set(struct persondb *db, uint32_t populated, uint32_t rev)
 	return sb_commit(db);
 }
 
+/* -- record helpers ----------------------------------------------------- */
+
+bool persondb_person_equal(const struct persondb_person *a,
+			   const struct persondb_person *b)
+{
+	uint8_t ba[PERSON_CBOR_MAX], bb[PERSON_CBOR_MAX];
+	size_t la, lb;
+
+	if (person_cbor_encode(a, ba, sizeof(ba), &la) != 0 ||
+	    person_cbor_encode(b, bb, sizeof(bb), &lb) != 0) {
+		return false;
+	}
+	return la == lb && memcmp(ba, bb, la) == 0;
+}
+
+size_t persondb_person_record_bytes(const struct persondb_person *p)
+{
+	uint8_t buf[PERSON_CBOR_MAX];
+	size_t len = 0;
+
+	if (person_cbor_encode(p, buf, sizeof(buf), &len) != 0) {
+		return 0;
+	}
+	return ENTRY_OVERHEAD + PERSON_KEY_LEN + len;
+}
+
+size_t persondb_person_credential_bytes(const struct persondb_person *p)
+{
+	uint8_t buf[CRED_CBOR_MAX];
+	size_t total = 0;
+
+	for (uint8_t i = 0; i < p->n_cards; i++) {
+		size_t len = 0;
+
+		if (cred_cbor_encode(p->id, buf, sizeof(buf), &len) != 0) {
+			return 0;
+		}
+		total += ENTRY_OVERHEAD + PERSONDB_CARD_LEN + len;
+	}
+	return total;
+}
+
+int persondb_person_roundtrip(const struct persondb_person *p,
+			      size_t *encoded_len)
+{
+	uint8_t buf[PERSON_CBOR_MAX];
+	struct persondb_person tmp;
+	size_t len = 0;
+	int rc = person_cbor_encode(p, buf, sizeof(buf), &len);
+
+	if (rc != 0) {
+		return rc;
+	}
+	rc = person_cbor_decode(buf, len, &tmp);
+	if (rc != 0) {
+		return rc;
+	}
+	if (encoded_len) {
+		*encoded_len = len;
+	}
+	return 0;
+}
+
 /* -- introspection ------------------------------------------------------ */
 
 int persondb_stat(struct persondb *db, struct persondb_stat *out)
 {
 	*out = db->st;
+
+#ifdef CONFIG_BLOB_DB_IOSTATS
+	{
+		struct blob_db_iostats io;
+
+		blob_db_iostats_get(&io);
+		out->flash_reads = io.reads;
+		out->flash_writes = io.writes;
+		out->flash_erases = io.erases;
+		out->bytes_read = io.bytes_read;
+		out->bytes_written = io.bytes_written;
+		out->bytes_erased = io.bytes_erased;
+		out->io_measured = true;
+	}
+#endif
 	out->n_persons = db->sb.n_persons;
 	out->populated = db->sb.populated;
 	out->rev = db->sb.rev;
@@ -686,5 +821,7 @@ void persondb_counters_reset(struct persondb *db)
 	db->st.map_gets = 0;
 	db->st.map_sets = 0;
 	db->st.map_dels = 0;
-	db->st.blob_ops = 0;
+#ifdef CONFIG_BLOB_DB_IOSTATS
+	blob_db_iostats_reset();
+#endif
 }

@@ -11,11 +11,7 @@
 #include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
 
-#include <app/lib/blob_db.h>
-#include <app/lib/rootreg.h>
-
 #include "dataset.h"
-#include "person_cbor.h"
 #include "scenario.h"
 
 LOG_MODULE_DECLARE(persondb, CONFIG_APP_CBOR_PERSONDB_LOG_LEVEL);
@@ -23,10 +19,6 @@ LOG_MODULE_DECLARE(persondb, CONFIG_APP_CBOR_PERSONDB_LOG_LEVEL);
 #define N_PERSONS     CONFIG_APP_CBOR_PERSONDB_N_PERSONS
 #define FILL_BATCH    CONFIG_APP_CBOR_PERSONDB_FILL_BATCH
 #define MUTATE_COUNT  CONFIG_APP_CBOR_PERSONDB_MUTATE_COUNT
-
-/* kvhash charges 4 bytes of framing per entry on top of key and value. */
-#define ENTRY_OVERHEAD 4u
-#define PERSON_KEY_LEN 9u
 
 
 /* -- clock -------------------------------------------------------------- */
@@ -57,28 +49,7 @@ int64_t scenario_since_us(int64_t since_us)
 
 int scenario_open(struct scenario *s)
 {
-	int rc = blob_db_mount();
-
-	if (rc != 0 && rc != -EALREADY) {
-		LOG_ERR("blob_db_mount: %d", rc);
-		return rc;
-	}
-
-	if (IS_ENABLED(CONFIG_APP_CBOR_PERSONDB_FRESH_START)) {
-		rc = blob_db_erase_all();
-		if (rc != 0) {
-			LOG_ERR("erase_all: %d", rc);
-			return rc;
-		}
-	}
-
-	rc = rootreg_init();
-	if (rc != 0) {
-		LOG_ERR("rootreg_init: %d", rc);
-		return rc;
-	}
-
-	rc = persondb_open(&s->db, N_PERSONS);
+	int rc = persondb_open(&s->db, N_PERSONS);
 	if (rc != 0) {
 		return rc;
 	}
@@ -96,29 +67,13 @@ int scenario_close(struct scenario *s)
 		persondb_close(s->db);
 		s->db = NULL;
 	}
-	blob_db_unmount();
 	return 0;
 }
 
 int scenario_erase(struct scenario *s)
 {
-	int rc;
+	int rc = persondb_erase(&s->db, N_PERSONS);
 
-	if (s->db) {
-		persondb_close(s->db);
-		s->db = NULL;
-	}
-	/* Logical wipe: O(one master write) rather than the tens of seconds a
-	 * full-partition erase costs on an 8 MiB QSPI part. */
-	rc = blob_db_erase_all();
-	if (rc != 0) {
-		return rc;
-	}
-	rc = rootreg_init();
-	if (rc != 0) {
-		return rc;
-	}
-	rc = persondb_open(&s->db, N_PERSONS);
 	if (rc == 0) {
 		s->n_persons = N_PERSONS;
 	}
@@ -128,20 +83,13 @@ int scenario_erase(struct scenario *s)
 int scenario_prepare(struct scenario *s, int *buckets_formatted, int64_t *ms)
 {
 	int64_t t = scenario_now_us();
-
-	/* How many buckets to ask for is a guess: blob_db does not report its
-	 * bucket count (FINDINGS.md B3/B7). Asking for more than exist is
-	 * harmless — the call caps at the total. */
-	int n = blob_db_prepare((size_t)-1);
+	int rc = persondb_prepare(buckets_formatted);
 
 	ARG_UNUSED(s);
 	if (ms) {
 		*ms = scenario_since_us(t) / 1000;
 	}
-	if (buckets_formatted) {
-		*buckets_formatted = n;
-	}
-	return n < 0 ? n : 0;
+	return rc;
 }
 
 /* -- population --------------------------------------------------------- */
@@ -208,25 +156,6 @@ done:
 
 /* -- verification ------------------------------------------------------- */
 
-/*
- * Compare by canonical encoding rather than field by field. With
- * CONFIG_ZCBOR_CANONICAL a record's bytes are a pure function of its content,
- * so equal encodings prove every field matched — including ones a hand-written
- * comparison would forget to check when the schema grows.
- */
-static bool same_person(const struct persondb_person *a,
-			const struct persondb_person *b)
-{
-	uint8_t ba[PERSON_CBOR_MAX], bb[PERSON_CBOR_MAX];
-	size_t la, lb;
-
-	if (person_cbor_encode(a, ba, sizeof(ba), &la) != 0 ||
-	    person_cbor_encode(b, bb, sizeof(bb), &lb) != 0) {
-		return false;
-	}
-	return la == lb && memcmp(ba, bb, la) == 0;
-}
-
 int scenario_verify(struct scenario *s, uint32_t samples,
 		    struct scenario_verify_report *out)
 {
@@ -261,7 +190,7 @@ int scenario_verify(struct scenario *s, uint32_t samples,
 			out->bad_records++;
 			continue;
 		}
-		if (!same_person(&want, &got)) {
+		if (!persondb_person_equal(&want, &got)) {
 			LOG_ERR("verify: person %u differs from the generator",
 				want.id);
 			out->bad_records++;
@@ -376,7 +305,6 @@ int scenario_bench(struct scenario *s, enum scenario_bench_kind which,
 	struct persondb_person want, got;
 	struct persondb_stat st0, st1;
 	char card[PERSONDB_CARD_LEN + 1];
-	uint8_t buf[PERSON_CBOR_MAX];
 	uint32_t populated, rev;
 	int64_t t;
 
@@ -418,10 +346,13 @@ int scenario_bench(struct scenario *s, enum scenario_bench_kind which,
 			case PERSONDB_UNKNOWN_CARD: out->unknown++; break;
 			case PERSONDB_EXPIRED:      out->expired++; break;
 			}
-			/* What the application asked for: one record and one
-			 * index entry. What it moved is counted below. */
-			(void)person_cbor_encode(&want, buf, sizeof(buf), &len);
-			out->payload_bytes += len + 5;
+			/* What the application asked for: one record plus the
+			 * one index entry that found it. What it moved to get
+			 * there is counted below. */
+			out->payload_bytes +=
+				persondb_person_record_bytes(&want) +
+				persondb_person_credential_bytes(&want) /
+					want.n_cards;
 			break;
 		}
 		case SCENARIO_BENCH_BYID:
@@ -429,8 +360,7 @@ int scenario_bench(struct scenario *s, enum scenario_bench_kind which,
 			if (rc != 0) {
 				return rc;
 			}
-			(void)person_cbor_encode(&want, buf, sizeof(buf), &len);
-			out->payload_bytes += len;
+			out->payload_bytes += persondb_person_record_bytes(&want);
 			break;
 
 		case SCENARIO_BENCH_MISS:
@@ -447,7 +377,11 @@ int scenario_bench(struct scenario *s, enum scenario_bench_kind which,
 					return rc == 0 ? -EILSEQ : rc;
 				}
 			}
-			out->payload_bytes += 5;
+			/* Nothing comes back, so the payload is the index entry
+			 * the lookup would have returned had the card existed. */
+			out->payload_bytes +=
+				persondb_person_credential_bytes(&want) /
+				want.n_cards;
 			break;
 
 		case SCENARIO_BENCH_PUT:
@@ -459,22 +393,20 @@ int scenario_bench(struct scenario *s, enum scenario_bench_kind which,
 			if (rc != 0) {
 				return rc;
 			}
-			(void)person_cbor_encode(&want, buf, sizeof(buf), &len);
-			out->payload_bytes += len;
+			out->payload_bytes +=
+				persondb_person_record_bytes(&want) +
+				persondb_person_credential_bytes(&want);
 			break;
 
-		case SCENARIO_BENCH_CBOR: {
+		case SCENARIO_BENCH_CBOR:
 			/* No flash at all: the control that says whether the
 			 * serialization choice is worth arguing about. */
-			int e = person_cbor_encode(&want, buf, sizeof(buf), &len);
-			int d = person_cbor_decode(buf, len, &got);
-
-			if (e != 0 || d != 0) {
-				return e ? e : d;
+			rc = persondb_person_roundtrip(&want, &len);
+			if (rc != 0) {
+				return rc;
 			}
 			out->payload_bytes += len;
 			break;
-		}
 		default:
 			return -EINVAL;
 		}
@@ -485,8 +417,10 @@ int scenario_bench(struct scenario *s, enum scenario_bench_kind which,
 	out->ms = out->us / 1000;
 	persondb_stat(s->db, &st1);
 
-	out->blob_ops = st1.blob_ops;
-	out->flash_bytes = st1.blob_ops * (uint64_t)st1.sector_bytes;
+	out->map_ops = st1.map_gets + st1.map_sets + st1.map_dels;
+	out->flash_ops = st1.flash_reads + st1.flash_writes + st1.flash_erases;
+	out->flash_bytes = st1.bytes_read + st1.bytes_written + st1.bytes_erased;
+	out->measured = st1.io_measured;
 	/* Microseconds, not milliseconds/ops: `cbor` runs in a few hundred
 	 * microseconds in total, and rounding that to whole milliseconds is
 	 * exactly the comparison this benchmark exists to make. */
@@ -503,7 +437,6 @@ int scenario_bench(struct scenario *s, enum scenario_bench_kind which,
 int scenario_report_get(struct scenario *s, struct scenario_report *out)
 {
 	struct persondb_person p;
-	uint8_t buf[PERSON_CBOR_MAX];
 	uint32_t populated, rev;
 	uint64_t person_bytes = 0;
 	uint32_t creds = 0;
@@ -517,23 +450,10 @@ int scenario_report_get(struct scenario *s, struct scenario_report *out)
 	 * only because the dataset is a pure function of its index. A real
 	 * deployment, whose data comes from outside, could not do this at all. */
 	for (uint32_t i = 0; i < populated; i++) {
-		size_t len = 0;
-
 		dataset_person(i, rev, s->n_persons, &p);
-		if (person_cbor_encode(&p, buf, sizeof(buf), &len) != 0) {
-			return -EILSEQ;
-		}
-		person_bytes += ENTRY_OVERHEAD + PERSON_KEY_LEN + len;
-
-		for (uint8_t c = 0; c < p.n_cards; c++) {
-			size_t cl = 0;
-
-			if (cred_cbor_encode(p.id, buf, sizeof(buf), &cl) != 0) {
-				return -EILSEQ;
-			}
-			person_bytes += ENTRY_OVERHEAD + PERSONDB_CARD_LEN + cl;
-			creds++;
-		}
+		person_bytes += persondb_person_record_bytes(&p) +
+				persondb_person_credential_bytes(&p);
+		creds += p.n_cards;
 	}
 
 	/* Peak stack, when the build can measure it. Enable with

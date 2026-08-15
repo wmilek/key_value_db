@@ -1,17 +1,18 @@
 /**
- * @defgroup drivers Custom driver classes
+ * @defgroup drivers Out-of-tree driver classes
  * @{
  *
- * @brief Custom driver classes
+ * @brief Out-of-tree driver classes
  *
  * @}
  */
 
 /**
- * @defgroup lib Custom libraries
+ * @defgroup lib Libraries
  * @{
  *
- * @brief Custom libraries
+ * @brief The storage stack (L1 blob_db, L1.5 rootreg, L2 container shapes,
+ *        L3 interfaces) and the out-of-tree library example
  *
  * @}
  */

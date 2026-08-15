@@ -1,8 +1,21 @@
 # Findings — limitations of the stack, as seen from an application
 
-Status: **v0.3 — the app is implemented and measured on `native_sim`
-(2026-08-09).** Numbers below are from `RESULTS.md`; hardware measurement on
-the nRF5340-DK is outstanding.
+Status: **v0.4 — re-measured against `main` after the large-payload work
+landed (2026-08-09).** Numbers below are from `RESULTS.md`; hardware
+measurement on the nRF5340-DK is outstanding.
+
+**Five findings are now closed by `main`.** B1, B9 and B10 are fixed outright,
+B5 loses two of its five jobs, and B3 is half-answered by the new
+`blob_db_iostats_get()`. What follows marks them `closed` rather than deleting
+them: the register is the record of what an application hit, and a fixed
+finding with its before/after numbers is more use than a silent gap. The
+remaining open ones are listed in the summary below.
+
+| | |
+|---|---|
+| **Closed by `main`** | B1, B5 (partly), B9, B10, B3 (partly) |
+| **Still open** | B2, B4, B6, B7, B8, K1–K11, V1–V4 |
+| **Newly observed** | N1 — transaction count rose sharply as byte count fell |
 
 This is the *probe* output of `app_cbor_persondb` (see `DESIGN.md` §1). Every
 drawback the app trips over on its way to a working 4 MiB person database is
@@ -25,11 +38,25 @@ friction.
 
 ---
 
-## Cross-reference — the large-payloads proposal
+## Cross-reference — the large-payloads work (**now merged**)
 
-Branch `claude/blob-db-max-payload-increase-6qobv5` proposes Stage 1
-(housekeeping) and Stage 2 (segmented payloads) for `blob_db`, plus a revised
-ordering in its cost addendum. Reviewed 2026-08-09 against this register.
+Reviewed against this register while it was still branch
+`claude/blob-db-max-payload-increase-6qobv5`; it has since landed on `main`
+(PR #10). The predictions below are kept as written, next to what actually
+happened, because two of them were wrong in instructive ways:
+
+- **B6 was predicted "fixed" and is not.** The streaming walk removed the
+  *reason* the read path needed a resident sector, but `g_bbuf`/`g_bbuf_new`
+  remain — compaction still needs a whole image. RAM after the merge:
+  157 688 B, unchanged. Predicting a RAM win from a read-path change skipped
+  the write path.
+- **The K11 disagreement stands.** The merged `kvhash` is untouched, so the
+  directory is still read on every operation and a map get is still two
+  `blob_db` calls. Nothing in the merge makes the pread-directory sketch
+  cheaper than derived bucket ids.
+
+The B1 prediction was right, and larger than claimed: 19× fewer bytes, not
+"~1× amplification", but with the transaction-count caveat now recorded as N1.
 
 | Finding | Proposal's effect |
 |---|---|
@@ -83,7 +110,7 @@ taken after it, not before.**
 
 ## L1 — `blob_db`
 
-### B1 — Every operation reads a whole sector (major, **`measured`**)
+### B1 — Every operation reads a whole sector — **CLOSED by `main`** (was major)
 
 `blob_db_get`, `update`, `delete` and `exists` all call `read_bucket()`, which
 issues `blob_db_store_read(bucket_offset(bid), buf, st.peb_size)` — the entire
@@ -108,10 +135,24 @@ decode is 6 µs against the decision's 599 µs on `native_sim` — **1.0 %** —
 projected **0.009 %** on hardware. The format is not the cost; the sector read
 is.
 
-Direction (not implemented): the format already stores per-slot lengths, so a
-get could read the bucket header, walk slot headers with short reads, and fetch
-only the matching payload. On NOR random reads are cheap; the whole-sector read
-buys simplicity and costs the entire performance envelope.
+**Fixed** by `7f10295 blob_db: walk buckets by slot header instead of reading
+whole sectors`, which is exactly the direction this finding proposed. Re-measured
+with the same benchmark on the same host:
+
+| bench | before — flash per op | after | speedup (native_sim µs/op) |
+|---|--:|--:|--:|
+| `check` (R-D) | 256 KB, **656×** | **13.3 KB, 33×** | 580 → **42 µs**, 14× |
+| `byid` | 128 KB, 348× | 6.5 KB, 17× | 293 → 23 µs |
+| `miss` | 128 KB, 5 698× | 6.8 KB, 294× | 285 → 21 µs |
+| `put` | 638 KB, 1 516× | 87 KB, 202× | 2 406 → 1 020 µs |
+
+An access decision moves **19× less flash**. (The "before" byte figures were
+modelled as `map operations × sector size`, which was accurate for code that
+read whole sectors; the "after" figures are measured through
+`blob_db_iostats_get()`. The µs column is measured identically on both sides.)
+
+See **N1** for what the same change did to the *transaction* count, which is
+the part still worth watching on a serial part.
 
 ### B2 — Compaction costs five sector erases (major, `read`)
 
@@ -249,7 +290,7 @@ from `CONFIG_BLOB_DB_SECTOR_BUF_SIZE` — 64 KB — making `kvhash` cost 128 KB 
 `.bss` on top of `blob_db`'s 128 KB. That is B6 doubled, to buy a payload size
 the append log cannot use anyway.
 
-### B9 — Nothing checks that a maximum-size payload fits a sector (moderate, `read`)
+### B9 — Nothing checks that a maximum-size payload fits a sector — **CLOSED by `main`** (was moderate)
 
 A slot needs `14 + val_len` bytes inside a sector whose usable space is
 `peb_size − 16`. `mount()` validates `peb_size ≤ CONFIG_BLOB_DB_SECTOR_BUF_SIZE`
@@ -264,10 +305,14 @@ writes a large enough blob, after compacting a bucket for nothing.
 
 > `blob_db_mount()` sector check at `blob_db.c:272`; the `-ENOSPC` at `:963`
 
-Direction: check it at mount, where `peb_size` is known, and fail with
-`-ENOTSUP` like the sector-size check immediately above it.
+**Fixed**: `blob_db.c` now refuses at mount when
+`CONFIG_BLOB_DB_MAX_PAYLOAD_LEN` exceeds what the geometry can sustain, and it
+uses B10's *rewrite* bound rather than the weaker write-once one. The
+application keeps its own `BUILD_ASSERT` on the same inequality — failing at
+compile time beats failing at mount — but the runtime check in
+`persondb_open()` is now belt-and-braces behind the library's.
 
-### B10 — A payload above half a sector can be written once but never rewritten (major, `read`)
+### B10 — A payload above half a sector can be written once but never rewritten — **CLOSED by `main`** (was major)
 
 *Found by `doc/proposals/2026-08-09-large-payloads.md` §1.1 on branch
 `claude/blob-db-max-payload-increase-6qobv5`; recorded here because it bounds
@@ -314,7 +359,7 @@ that is a silent dependency, so the app carries a `BUILD_ASSERT` on
 `CONFIG_BLOB_DB_MAX_PAYLOAD_LEN` and a mount-time check of the same inequality
 against the real geometry.
 
-### B6 — 128 KB of `.bss` for sector buffers (major, **`measured`**)
+### B6 — 128 KB of `.bss` for sector buffers (major, **`measured`** — still open)
 
 `g_bbuf` and `g_bbuf_new` are each `CONFIG_BLOB_DB_SECTOR_BUF_SIZE` — 64 KB on
 the DK, so **128 KB, a quarter of the nRF5340's 512 KB RAM**, permanently
@@ -343,10 +388,18 @@ app is 7 640 B, and `append_slot`'s `MAX_PAYLOAD + 46` byte frame is 4 200 of
 them — **55 % of the application's stack budget is one library function's local
 buffer** (B5, job 3).
 
-Direction: B1's short-read get removes the need for the buffers entirely — the
-image would drop from ~158 KB to roughly 28 KB — and staging the slot in
-existing scratch takes the stack requirement to ~3.5 KB. Together they are worth
-more RAM than everything else in this register combined.
+**Half of the direction landed, and the RAM did not move.** `main` staged the
+slot buffer off the stack (closing B5's job 3, which is why this app's stack
+dropped to 12 KB), and it added slot-header walking — but `g_bbuf` and
+`g_bbuf_new` are still two whole sectors of `.bss`, still allocated from
+`CONFIG_BLOB_DB_SECTOR_BUF_SIZE`, and compaction still needs a full image.
+Re-measured after the merge: **RAM 157 688 B, essentially unchanged**, still
+83 % sector buffers, against an application that owns 248 bytes.
+
+Reading by slot header removed the *reason* the read path needed a resident
+sector; retiring the buffers themselves needs the compaction path to stream
+too. That is the remaining work, and it is still worth more RAM than everything
+else in this register combined.
 
 ### B7 — First write to a fresh bucket stalls ~1.1 s (moderate, `read`)
 
@@ -758,6 +811,31 @@ Inherits B3, K3 and K10 unchanged. Nothing at L3 adds introspection that L2
 lacks.
 
 ---
+
+## N1 — Fewer bytes, far more transactions (moderate, `measured`)
+
+`main`'s slot-header walk cut the bytes an access decision moves by 19× (B1).
+It raised the number of flash *operations* sharply in the same move: **261 read
+transactions per access decision**, against 4 before.
+
+> `RESULTS.md` §4: `check` = 200 ops → 52 176 flash operations, 2 654 060 bytes
+
+On `native_sim` that is free — a transaction is a `memcpy`. On the DK it is
+not: each SPI transaction carries a fixed command-and-address cost before any
+data moves, so 261 small reads do not cost 1/19th of 4 large ones. `blob_db`'s
+own iostats documentation makes exactly this point — *"a change that reads fewer
+bytes may issue more transactions … judging such a change on bytes alone
+flatters it"* — and this application is now the workload that makes the caution
+concrete.
+
+Whether the trade is a net win on hardware is **the single most valuable thing
+the pending DK run can answer**, and it cannot be answered from `native_sim` at
+all. Both numbers are in `RESULTS.md` so the comparison is possible once the
+board numbers exist.
+
+Not a defect: it is the expected shape of the fix, and the bytes are what
+dominate at 64 KB sectors. It is recorded because a smaller-sector part, or a
+slower bus, could land on the other side of it.
 
 ## Not yet exercised
 
