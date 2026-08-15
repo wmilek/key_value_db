@@ -3,11 +3,12 @@
 Keep this file honest: update it when the shape of the app changes or when
 regenerating on new hardware.
 
-**Status: `native_sim` measured; nRF5340-DK cross-built and sized, but not
-yet run on the board.** Per `DESIGN.md` D6
-the DK numbers will be measured on the board, so the hardware column below is
-a *projection* from this repository's existing captures and is labelled as such
-everywhere it appears. It is not a substitute for `A4`.
+**Status: `native_sim` measured at 10 000 persons; nRF5340-DK measured on the
+board at 1 000 persons (§5).** The DK timings are no longer projections. They
+were taken at a tenth of the target scale, so §5's per-operation numbers are
+directly comparable to the rest of this file, while its whole-run numbers
+(fill duration, occupancy) are *not* the 10 000-person figures and are marked
+where they appear. A full-scale DK run remains outstanding for `A4`.
 
 ---
 
@@ -105,8 +106,8 @@ Whole-run phases:
 ## 4a. Footprint — nRF5340-DK (measured)
 
 Cross-built with Zephyr SDK 1.0.1 (`arm-zephyr-eabi`) for
-`nrf5340dk/nrf5340/cpuapp`. These are real target numbers; only the *timings*
-in §5 remain projections.
+`nrf5340dk/nrf5340/cpuapp`. These are real target numbers, as are the timings
+in §5.
 
 | | FLASH | of 1 MB | RAM | of 448 KB |
 |---|--:|--:|--:|--:|
@@ -187,33 +188,89 @@ docker run --rm -v "$PWD/..:/ws" -w /ws ghcr.io/zephyrproject-rtos/ci:latest bas
 Swap `ram_report` for `rom_report`, or drop `-t` for a plain build. The numbers
 above were taken with a local SDK 1.0.1 install, which gives identical results.
 
-## 5. Projected timings — nRF5340-DK (**not yet measured**)
+## 5. Measured timings — nRF5340-DK
 
-Derived from `app_perf_kvdb/RESULTS.md`: a `blob_db` read is 17.45 ms and a
-write ~21 ms on the MX25R6435F at 8 MHz Quad-SPI. Multiplying by this app's
-measured blob-op counts:
+Board 960115021 (PCA10095), Zephyr build `4a405846193f`, SDK 1.0.1, console on
+VCOM 2 at 115200. **`CONFIG_APP_CBOR_PERSONDB_N_PERSONS=1000`** with
+`FRESH_START=y`, 200 samples per benchmark phase. Raw capture in §8a.
 
-| Phase | Projected | Basis |
+The previous edition of this section was a projection built from
+`app_perf_kvdb/RESULTS.md` — a `blob_db` read at 17.45 ms and a write at
+~21 ms — and it is kept in the "projected" column so the error is visible.
+
+### Per-operation
+
+| Phase | Projected | **Measured** | Ratio | blob ops | amplification |
+|---|--:|--:|--:|--:|--:|
+| `check` (**R-D**) | ≈ 70 ms | **114.2 ms** | 1.63× | 4.00 | 701× |
+| `byid` | ≈ 35 ms | **57.6 ms** | 1.65× | 2.00 | 355× |
+| `miss` | ≈ 35 ms | **56.6 ms** | 1.62× | 2.00 | 26 214× |
+| `put` | ≈ 184 ms | **313.8 ms** | 1.71× | 9.96 | 1 770× |
+| `cbor` | 6 µs | **955 µs** | **159×** | 0 | — |
+
+The four flash-bound phases are consistently **~1.65× slower** than projected:
+`byid`'s two reads take 57.6 ms, so a `blob_db` read on this board is 28.8 ms,
+not the 17.45 ms the projection assumed.
+
+`cbor` is the outlier. The projection carried the `native_sim` figure across
+unchanged on the grounds that it touches no flash — but 6 µs was a host x86
+number, and the same encode/decode pair costs 955 µs on a 128 MHz Cortex-M33.
+Assuming compute transfers between platforms was wrong by two orders of
+magnitude; only the flash model transferred.
+
+### Whole-run phases (**1 000 persons — not the 10 000-person figures**)
+
+| Phase | Measured | Work |
 |---|--:|---|
-| `check` (**R-D**) | **≈ 70 ms** | 4 sector reads |
-| `byid` | ≈ 35 ms | 2 sector reads |
-| `miss` | ≈ 35 ms | 2 sector reads |
-| `put` | ≈ 184 ms | 6.96 reads + 2.97 writes |
-| `cbor` | 6 µs | unchanged — no flash |
-| fill, operations only | ≈ 33 min | 34 932 map writes × 55.9 ms |
-| fill, including compaction | **≈ 2.5 h** | estimate only; see `DESIGN.md` §6.2 |
+| open | 24 478 ms | **includes the `FRESH_START` 8 MiB erase** — not the steady-state open cost |
+| prepare | 113 685 ms | 106 buckets formatted = **1 072 ms per bucket** |
+| fill | 983 833 ms (16.4 min) | 1 000 persons + 2 479 credentials, 4 progress commits |
+| verify | 48 023 ms | 256 persons, 602 credential resolutions |
+| mutate | 14 712 ms | rev 0 → 1, 64 cards assigned (nothing to revoke on a first run) |
+| re-verify | 49 758 ms | 256 persons, 618 credential resolutions |
 
-The compaction component is the least certain number here and the one most
-worth measuring on the board.
+Both verification passes reported `VERIFY PASS`, and the fill hit **0 bucket
+overflows** — the `tools/sizing.py` geometry holds on hardware.
+
+### The projection's real defect: there is no erase term
+
+`prepare` formats 106 buckets in 113.7 s — **1 072 ms each**, ~51× the 21 ms
+write the model assumed. That is almost exactly one MX25R6435F 64 KB sector
+erase per bucket, and the projection had no erase term at all. The same
+omission drives the fill: 3 479 map writes in 983.8 s is **283 ms per map
+write** against 55.9 ms projected.
+
+Scaled to this run, the "operations only" line predicted 3.24 min; the fill
+took 16.4 min. **About 80 % of fill time is erase and compaction**, which is
+the component `DESIGN.md` §6.2 flagged as least certain — and it is the
+dominant term, not a correction to one.
+
+Extrapolating the fill linearly to 10 000 persons gives **≈ 2.7 h** against the
+≈ 2.5 h estimate. Treat that as a floor: bucket occupancy and compaction both
+worsen with scale, so the full-scale run should be expected to exceed it.
+
+### What did transfer
+
+Amplification and blob-op counts match `native_sim` closely — 701 / 355 /
+26 214 / 1 770× measured against 711 / 360 / 26 214 / 1 799× simulated, and
+9.96 blob ops per `put` against 9.98. Mean entry size is 432 B against 433 B.
+This is the §1 claim holding up: structure transfers, wall-clock does not.
+
+Store contents for this run: 1 000 persons, 2 479 credentials, 432 759 B live
+= **5.1 %** of the partition. The 51.6 % occupancy in §3 is a 10 000-person
+result and is not reproduced at this scale.
 
 ## 6. What the numbers say
 
 **The serialization format is not the cost.** `cbor` is 6 µs against `check`'s
-599 µs on `native_sim` — **1.0 %**. On hardware, where a blob op is 17.45 ms
-rather than ~150 µs, the same decode is a projected **0.009 %** of the decision.
-Choosing CBOR over anything else costs nothing measurable, and the denormalized
-permission bitmask this app deliberately did not build (`DESIGN.md` D2) would
-have optimized away half of a cost that is 99 % elsewhere.
+599 µs on `native_sim` — **1.0 %**. On hardware it is 955 µs against 114.2 ms —
+**0.84 %** (§5, measured). Note that this section previously projected 0.009 %
+by carrying the host's 6 µs onto the target; the real figure is ~93× that, and
+the conclusion survives only because 955 µs is still noise against four sector
+reads. Choosing CBOR over anything else costs nothing measurable, and the
+denormalized permission bitmask this app deliberately did not build
+(`DESIGN.md` D2) would have optimized away half of a cost that is 99 %
+elsewhere.
 
 **The cost is that every blob operation reads a whole sector.** An access
 decision moves **256 KB of flash to answer a question about 365 bytes** — 711×
@@ -281,6 +338,61 @@ persondb: done — store at rev 2; rerun to prove persistence
 The two `expired` results in `check` are persons whose generated badge validity
 window starts after the benchmark's reference time — a real case the decision
 path has to handle, left in rather than tuned away.
+
+## 8a. Raw capture — nRF5340-DK, first run
+
+Board 960115021, `N_PERSONS=1000`, `FRESH_START=y`. This is a *first* run, so
+`open` carries the partition erase and `mutate` has nothing to revoke — neither
+is a steady-state number.
+
+```
+[00:00:23.614,959] <inf> persondb: created store: 16 people maps + 1 credential map, 511 buckets each, 1000 persons planned
+open         :  24478 ms
+prepare      : 113685 ms (106 buckets formatted)
+fill         : 983833 ms  1000 written, 1000/1000 total, 4 commits
+verify       :  48023 ms  256 persons, 602 cards
+VERIFY PASS
+mutate       :  14712 ms  rev 0 -> 1  (0 revoked, 64 assigned)
+re-verify    :  49758 ms  256 persons, 618 cards
+VERIFY PASS
+
+bench check :   200 ops in 22833000 us ->       8 ops/s   114165 us/op     800 blob ops  amp 701x
+             : 200 granted, 0 denied, 0 unknown, 0 expired
+bench byid  :   200 ops in 11528000 us ->      17 ops/s    57640 us/op     400 blob ops  amp 355x
+bench miss  :   200 ops in 11327000 us ->      17 ops/s    56635 us/op     400 blob ops  amp 26214x
+bench put   :   200 ops in 62767000 us ->       3 ops/s   313835 us/op    1992 blob ops  amp 1770x
+bench cbor  :   200 ops in   191000 us ->    1047 ops/s      955 us/op       0 blob ops  amp 0x
+
+store
+  partition   : 8388608 B (8192 KiB), 65536 B sectors
+  maps        : 16 person + 1 credential, 511 buckets each
+  persons     : 1000 of 1000   credentials: 2479
+  mean entry  : 432 B
+  live content: 432759 B = 5.1 % of the partition
+  bucket overflows: 0
+  NOTE: physical occupancy (live + uncompacted garbage) is not
+        observable through the API — see FINDINGS.md B3.
+
+persondb: done — store at rev 1; rerun to prove persistence
+```
+
+No `expired` results here: at 1 000 persons the generator's validity windows
+land differently than at 10 000, so the sample happens to miss that case.
+
+### Reproducing
+
+```
+west build -p always -b nrf5340dk/nrf5340/cpuapp app_cbor_persondb \
+      -- -DCONFIG_APP_CBOR_PERSONDB_N_PERSONS=1000 \
+         -DCONFIG_APP_CBOR_PERSONDB_FRESH_START=y
+```
+
+Start the console capture *before* flashing and let `nrfutil device program
+--options reset=RESET_SYSTEM` start the run itself — a second reset issued
+while the app is mid-QSPI-erase can leave the MX25R6435F answering JEDEC id
+`00 00 00` on the next boot, needing `nrfutil device recover`. The console is
+VCOM 2; resolve its `/dev/ttyACM*` node with `nrfutil device list` rather than
+assuming, since it shifts with USB enumeration order.
 
 ## 9. Sizing history
 
