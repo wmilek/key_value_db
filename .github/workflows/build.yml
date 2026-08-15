@@ -105,3 +105,13 @@ jobs:
         run: |
           west build -p always -b nrf5340dk/nrf5340/cpuapp -d build/nrf_kvdb key_value_db/app -- \
             -DCONFIG_BLOBDB_KVDB=y
+
+      # app_perf is the binary that gets flashed to produce the numbers in
+      # app_perf/RESULTS.md, and it exercises paths `app` does not: segmented
+      # large objects, blob_db_write(), and the I/O counters. Until this step
+      # existed it was never compiled for the target in CI, so "ready to run
+      # on the DK" rested on someone's last successful local build.
+      - name: Build app_perf (ARM)
+        run: |
+          west build -p always -b nrf5340dk/nrf5340/cpuapp -d build/nrf_perf \
+            key_value_db/app_perf

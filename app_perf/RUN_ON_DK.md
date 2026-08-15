@@ -6,7 +6,12 @@ what to expect while it runs, and what tends to go wrong.
 
 > ## Run 2 is wanted — one flash, no A/B
 >
-> **Commit:** `8f5b16b` (branch tip) · **Board:** `nrf5340dk/nrf5340/cpuapp`
+> **Commit:** the branch tip of `claude/blob-db-max-payload-increase-6qobv5`
+> · **Board:** `nrf5340dk/nrf5340/cpuapp`
+>
+> The code under test is `8f5b16b`; commits after it on this branch change
+> only documentation and CI, so take the tip and record its hash in the
+> capture.
 >
 > PR 5 added a one-entry index cache. Its effect is measured on `native_sim`
 > but **not on hardware**, and the `native_sim` ratio is known not to
