@@ -479,6 +479,16 @@ enum blob_db_test_cut {
  * @brief Arm a cut. Cleared automatically when it fires, so it cuts once.
  */
 extern enum blob_db_test_cut blob_db_test_cut;
+
+/**
+ * @brief Put the store into the state a torn compaction leaves.
+ *
+ * Reaching that state for real needs an I/O error inside compaction's atomic
+ * window, which no test can provoke on a working flash simulator. This sets
+ * the same flag so the *consequences* — mutations refused with `-EIO`, reads
+ * still served, a remount clearing it — can be tested directly.
+ */
+void blob_db_test_wedge(void);
 #endif /* CONFIG_BLOB_DB_TEST_CRASH_HOOKS */
 
 /**

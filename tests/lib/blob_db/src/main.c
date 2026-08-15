@@ -2109,6 +2109,70 @@ ZTEST(blob_db, test_crash_during_delete_is_all_or_nothing)
 }
 #endif /* CONFIG_BLOB_DB_TEST_CRASH_HOOKS */
 
+#if defined(CONFIG_BLOB_DB_TEST_CRASH_HOOKS)
+/* A compaction that fails inside its atomic window leaves a sealed scratch
+ * image that a mount will restore over the bucket. Carrying on would let the
+ * caller's next append be acknowledged and then silently discarded by that
+ * restore, so the store refuses further mutation until a remount. Provoking
+ * the real I/O error needs a fault hook the store seam does not have; this
+ * covers the consequences, which is where the logic lives. */
+ZTEST(blob_db, test_wedged_store_refuses_writes_but_still_reads)
+{
+	uint64_t id = put_blob("BEFORE", 6);
+
+	blob_db_test_wedge();
+
+	/* Reads stay available — the data on flash is intact. */
+	uint8_t buf[16];
+	size_t got = 0;
+
+	zassert_ok(blob_db_get(id, buf, sizeof(buf), &got));
+	zassert_equal(got, 6);
+	zassert_mem_equal(buf, "BEFORE", 6);
+	zassert_true(blob_db_exists(id));
+
+	/* Every mutation is refused rather than acknowledged. */
+	zassert_equal(blob_db_update(id, "AFTER", 5), -EIO);
+	zassert_equal(blob_db_delete(id), -EIO);
+	zassert_equal(blob_db_write(id, 0, "X", 1), -EIO);
+	zassert_equal(blob_db_erase_all(), -EIO);
+	zassert_equal(blob_db_prepare(1), -EIO);
+
+	/* Nothing was written despite those calls. */
+	got = 0;
+	zassert_ok(blob_db_get(id, buf, sizeof(buf), &got));
+	zassert_mem_equal(buf, "BEFORE", 6, "a refused update still wrote");
+
+	/* A remount runs recovery and clears it. */
+	zassert_ok(blob_db_unmount());
+	zassert_ok(blob_db_mount());
+	zassert_ok(blob_db_update(id, "AFTER", 5),
+		   "remount must clear the wedge");
+
+	got = 0;
+	zassert_ok(blob_db_get(id, buf, sizeof(buf), &got));
+	zassert_equal(got, 5);
+	zassert_mem_equal(buf, "AFTER", 5);
+}
+
+/* format() is the deliberate-discard path and must stay reachable: it erases
+ * the scratch along with everything else, so it is exactly what resolves the
+ * state, not something to be blocked by it. */
+ZTEST(blob_db, test_wedged_store_can_still_be_formatted)
+{
+	put_blob("DOOMED", 6);
+	blob_db_test_wedge();
+
+	zassert_ok(blob_db_format(), "format must survive a wedged store");
+	zassert_equal(blob_db_count(), 1, "want root only, got %zu",
+		      blob_db_count());
+
+	/* And the store is usable again without a remount. */
+	zassert_not_equal(blob_db_alloc_id(), 0);
+	zassert_ok(blob_db_update(BLOB_DB_ROOT_ID, "ok", 2));
+}
+#endif /* CONFIG_BLOB_DB_TEST_CRASH_HOOKS */
+
 /* Slot header as it sits on flash: 12 B, then the payload, then a 2 B CRC. */
 struct __packed test_slot_head {
 	uint8_t  flags;
@@ -2174,6 +2238,112 @@ static void forge_torn_append(uint16_t bid, uint64_t id, uint16_t val_len)
 				    (off_t)(3 + bid) * TEST_SECTOR_SZ + at,
 				    &head, sizeof(head)));
 	flash_area_close(fa);
+}
+
+/* Find an internal segment id by walking the store the way the sweep does.
+ * These ids are consumed from the same counter as user ids but never returned
+ * by alloc_id(), so nothing above L1 should ever hold one. */
+static uint64_t first_segment_id(void)
+{
+	const struct flash_area *fa;
+
+	zassert_ok(flash_area_open(BLOB_DB_TEST_PARTITION_ID, &fa));
+
+	const size_t align = flash_area_align(fa);
+	uint64_t found = 0;
+
+	for (uint16_t bid = 0; bid < TEST_N_BUCKETS && !found; bid++) {
+		const off_t base = (off_t)(3 + bid) * TEST_SECTOR_SZ;
+		uint8_t bh[4];
+
+		zassert_ok(flash_area_read(fa, base, bh, sizeof(bh)));
+		if (memcmp(bh, "BDBH", 4) != 0) {
+			continue;
+		}
+
+		off_t cursor = 16;
+
+		for (;;) {
+			struct test_slot_head head;
+
+			if (cursor + 14 > TEST_SECTOR_SZ) {
+				break;
+			}
+			zassert_ok(flash_area_read(fa, base + cursor, &head,
+						   sizeof(head)));
+			if (head.flags == 0xff ||
+			    !(head.flags & TEST_SEALED) ||
+			    head.val_len > CONFIG_BLOB_DB_MAX_PAYLOAD_LEN) {
+				break;
+			}
+			if ((head.flags & TEST_SEG_FLAG) &&
+			    !(head.flags & TEST_TOMB_FLAG)) {
+				found = head.id;
+				break;
+			}
+
+			size_t ssz = 14 + head.val_len;
+
+			ssz = (ssz + align - 1) & ~(align - 1);
+			if (cursor + (off_t)ssz > TEST_SECTOR_SZ) {
+				break;
+			}
+			cursor += ssz;
+		}
+	}
+
+	flash_area_close(fa);
+	return found;
+}
+
+/* Proposal §6.6: the public API must not hand out, or act on, an internal
+ * segment id. Calling with one is already UB — the id was never returned by
+ * alloc_id — but "UB" that returns a raw seg_hdr plus chunk bytes as if it
+ * were the caller's payload is worse than an error. */
+ZTEST(blob_db, test_segment_ids_are_not_visible_through_the_api)
+{
+	fill_pattern(big_src, BIG_LEN, 0x6d);
+
+	uint64_t owner = put_blob(big_src, BIG_LEN);
+	uint64_t sid = first_segment_id();
+
+	zassert_not_equal(sid, 0, "no segment slot found");
+	zassert_not_equal(sid, owner, "helper picked the owner, not a segment");
+
+	uint8_t buf[64];
+	size_t got = 0;
+
+	zassert_equal(blob_db_get(sid, buf, sizeof(buf), &got), -ENOENT);
+	zassert_false(blob_db_exists(sid));
+	zassert_equal(blob_db_size(sid, &got), -ENOENT);
+	zassert_equal(blob_db_read(sid, 0, buf, sizeof(buf), &got), -ENOENT);
+	zassert_equal(blob_db_update(sid, "x", 1), -EINVAL);
+	zassert_equal(blob_db_write(sid, 0, "x", 1), -EINVAL);
+	zassert_equal(blob_db_delete(sid), -EINVAL);
+
+	/* And none of that disturbed the object those segments belong to. */
+	memset(big_dst, 0, BIG_LEN);
+	zassert_ok(blob_db_read(owner, 0, big_dst, BIG_LEN, &got));
+	zassert_mem_equal(big_dst, big_src, BIG_LEN, "owner damaged");
+}
+
+/* A zero-length write is a no-op, but only on something that exists. It was
+ * the one accessor answering 0 where read() and size() answer -ENOENT. */
+ZTEST(blob_db, test_zero_length_write_still_reports_a_missing_id)
+{
+	uint64_t id = put_blob("HERE", 4);
+
+	zassert_ok(blob_db_write(id, 0, NULL, 0), "no-op on a live id");
+
+	zassert_ok(blob_db_delete(id));
+	zassert_equal(blob_db_write(id, 0, NULL, 0), -ENOENT,
+		      "zero-length write reported success for a dead id");
+
+	uint64_t never = blob_db_alloc_id();
+
+	zassert_not_equal(never, 0);
+	zassert_equal(blob_db_write(never, 0, NULL, 0), -ENOENT,
+		      "zero-length write reported success for an unbound id");
 }
 
 /* === REVIEW FINDING 3 ===

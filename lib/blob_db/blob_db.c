@@ -104,6 +104,7 @@ static struct {
 	uint64_t  next_id;         /* RAM: next id alloc_id will hand out */
 	uint64_t  next_id_hint;    /* durable leading ceiling (see internal.h) */
 	uint64_t  seg_owner;       /* segmented write in flight; 0 = none */
+	bool      wedged;          /* a torn compaction makes further writes unsafe */
 } st;
 
 static inline off_t peb_offset(uint16_t peb)
@@ -516,6 +517,7 @@ int blob_db_mount(void)
 	}
 
 	IDX_INVALIDATE();
+	st.wedged = false;   /* recovery below re-establishes a safe state */
 
 	int rc = store_open_and_validate();
 
@@ -1251,29 +1253,39 @@ static int compact_commit(uint16_t bid, const uint8_t *new_buf, size_t new_len)
 		return rc;
 	}
 
+	/* From here to step 4 the sealed scratch is authoritative: a mount now
+	 * would restore it over this bucket. So an I/O error in this window
+	 * cannot simply be reported and shrugged off — the caller would carry
+	 * on, its next append into this bucket would be acknowledged, and a
+	 * crash before the window closes would discard that acknowledged write
+	 * when recovery restores the image. Losing a write we said we had done
+	 * is worse than refusing to do more, so the store wedges: mutations
+	 * fail with -EIO until a remount runs recovery, or a format discards
+	 * the store outright. */
+#define COMPACT_OR_WEDGE(expr)					\
+	do {							\
+		rc = (expr);					\
+		if (rc < 0) {					\
+			LOG_ERR("compact bid=%u: failed inside the atomic "\
+				"window (%d); refusing further writes "	\
+				"until remount", bid, rc);		\
+			st.wedged = true;			\
+			return rc;				\
+		}						\
+	} while (0)
+
 	/* Step 3: bucket. */
-	rc = blob_db_store_erase(bucket_off, st.peb_size);
-	if (rc < 0) {
-		return rc;
-	}
-	rc = blob_db_store_write(bucket_off, new_buf, new_len);
-	if (rc < 0) {
-		return rc;
-	}
+	COMPACT_OR_WEDGE(blob_db_store_erase(bucket_off, st.peb_size));
+	COMPACT_OR_WEDGE(blob_db_store_write(bucket_off, new_buf, new_len));
 
 	/* Step 4: erase scratch. */
-	rc = blob_db_store_erase(scratch_off, st.peb_size);
-	if (rc < 0) {
-		return rc;
-	}
+	COMPACT_OR_WEDGE(blob_db_store_erase(scratch_off, st.peb_size));
 
 	/* Step 5: leave atomic window. */
 	inactive = !st.active_master;
-	rc = write_master(inactive, st.master_gen + 1,
-			  BLOB_DB_STATE_CLEAN, 0, st.next_id);
-	if (rc < 0) {
-		return rc;
-	}
+	COMPACT_OR_WEDGE(write_master(inactive, st.master_gen + 1,
+				      BLOB_DB_STATE_CLEAN, 0, st.next_id));
+#undef COMPACT_OR_WEDGE
 	st.active_master = inactive;
 	st.master_gen++;
 
@@ -1449,6 +1461,11 @@ static int seg_geometry_init(void)
 #if defined(CONFIG_BLOB_DB_TEST_CRASH_HOOKS)
 enum blob_db_test_cut blob_db_test_cut;
 
+void blob_db_test_wedge(void)
+{
+	st.wedged = true;
+}
+
 /* Stop dead at a chosen step of §6.4, leaving flash exactly as a power cut
  * there would. Disarms itself, so one armed cut fires once and the recovery
  * path that follows runs unhooked. */
@@ -1520,6 +1537,43 @@ static int seg_finish_pending(void)
 	return seg_sweep(st.seg_owner);   /* clears seg_owner on success */
 }
 
+/* Is this index record self-consistent? The slot CRC only proves the bytes are
+ * the ones that were written; it says nothing about whether they make sense —
+ * a record rotted in RAM before the write, or produced by a buggy build, still
+ * carries a good CRC.
+ *
+ * The total_len check is the one with teeth. seg_read_range() derives a
+ * segment index as `(uint16_t)(pos / seg_len)`, so a total_len that overruns
+ * what seg_count segments can hold lets that division truncate and silently
+ * return some other segment's bytes as if they were the object's. Bounding
+ * total_len to (seg_count-1, seg_count] strides makes that unrepresentable,
+ * and turns a corrupt record into -EIO where it is read rather than into
+ * plausible wrong data handed to the caller.
+ */
+static bool index_hdr_valid(const struct blob_db_index_hdr *h, uint16_t val_len)
+{
+	if (memcmp(h->magic, BLOB_DB_INDEX_MAGIC, 2) != 0 ||
+	    h->version != BLOB_DB_INDEX_VERSION) {
+		return false;
+	}
+	if (h->seg_count == 0 || h->seg_count > g_seg_max || h->seg_len == 0) {
+		return false;
+	}
+	if ((size_t)val_len <
+	    sizeof(*h) + (size_t)h->seg_count * sizeof(uint64_t)) {
+		return false;
+	}
+
+	/* seg_count must be exactly ceil(total_len / seg_len). */
+	const uint64_t span = (uint64_t)h->seg_count * h->seg_len;
+
+	if (h->total_len == 0 || h->total_len > span ||
+	    h->total_len <= span - h->seg_len) {
+		return false;
+	}
+	return true;
+}
+
 /* Load the index record for `id`. Returns K (> 0) with the segment ids copied
  * into `ids` and the header into `h`; 0 when the id holds an inline payload;
  * -ENOENT when it holds nothing live; -EIO for a malformed record. */
@@ -1551,13 +1605,7 @@ static int index_load(uint64_t id, uint8_t *ids, struct blob_db_index_hdr *h)
 	}
 
 	memcpy(h, g_bbuf, sizeof(*h));
-	if (memcmp(h->magic, BLOB_DB_INDEX_MAGIC, 2) != 0 ||
-	    h->version != BLOB_DB_INDEX_VERSION) {
-		return -EIO;
-	}
-	if (h->seg_count == 0 || h->seg_count > g_seg_max || h->seg_len == 0 ||
-	    sc.target.hdr.val_len <
-		    sizeof(*h) + (size_t)h->seg_count * sizeof(uint64_t)) {
+	if (!index_hdr_valid(h, sc.target.hdr.val_len)) {
 		return -EIO;
 	}
 	memcpy(ids, g_bbuf + sizeof(*h),
@@ -2257,6 +2305,9 @@ int blob_db_get(uint64_t id, void *out, size_t out_sz, size_t *out_len)
 		return rc;
 	}
 #if defined(CONFIG_BLOB_DB_LARGE_PAYLOADS)
+	if (sc.target.hdr.flags & BLOB_DB_SLOT_F_SEGMENT) {
+		return -ENOENT;   /* an internal id — see §6.6 */
+	}
 	if (sc.target.hdr.flags & BLOB_DB_SLOT_F_INDEXED) {
 		struct blob_db_index_hdr h;
 		int k = index_load_cached(id, &h);
@@ -2290,6 +2341,9 @@ int blob_db_update(uint64_t id, const void *payload, size_t len)
 {
 	if (!st.mounted) {
 		return -ENODEV;
+	}
+	if (st.wedged) {
+		return -EIO;   /* torn compaction; see compact_commit() */
 	}
 	/* An id is valid iff alloc_id has handed it out (0 < id < next_id).
 	 * Anything else was never allocated — contract §2 makes this UB, and
@@ -2369,6 +2423,11 @@ int blob_db_update(uint64_t id, const void *payload, size_t len)
 		rc = find_live_slot(bid, id, &sc, g_bbuf);
 		if (rc < 0 && rc != -ENOENT) {
 			return rc;
+		}
+
+		if (rc == 0 &&
+		    (sc.target.hdr.flags & BLOB_DB_SLOT_F_SEGMENT)) {
+			return -EINVAL;   /* an internal id — see §6.6 */
 		}
 
 		const bool indexed =
@@ -2458,6 +2517,9 @@ int blob_db_delete(uint64_t id)
 	if (!st.mounted) {
 		return -ENODEV;
 	}
+	if (st.wedged) {
+		return -EIO;   /* torn compaction; see compact_commit() */
+	}
 	if (id == 0) {
 		return -ENOENT;
 	}
@@ -2491,6 +2553,11 @@ int blob_db_delete(uint64_t id)
 	if (rc < 0) {
 		return rc;
 	}
+#if defined(CONFIG_BLOB_DB_LARGE_PAYLOADS)
+	if (sc.target.hdr.flags & BLOB_DB_SLOT_F_SEGMENT) {
+		return -EINVAL;   /* an internal id — see §6.6 */
+	}
+#endif
 
 	const size_t ssz = slot_size_for(0);
 	off_t write_cursor = sc.write_cursor;
@@ -2576,7 +2643,15 @@ bool blob_db_exists(uint64_t id)
 
 	struct bucket_scan sc;
 
-	return find_live_slot(bid, id, &sc, g_bbuf) == 0;
+	if (find_live_slot(bid, id, &sc, g_bbuf) != 0) {
+		return false;
+	}
+#if defined(CONFIG_BLOB_DB_LARGE_PAYLOADS)
+	if (sc.target.hdr.flags & BLOB_DB_SLOT_F_SEGMENT) {
+		return false;   /* an internal id — see §6.6 */
+	}
+#endif
+	return true;
 }
 
 /* Stage 6 — format / count / iterate ------------------------------------ */
@@ -2739,10 +2814,22 @@ int blob_db_size(uint64_t id, size_t *out_size)
 		return rc;
 	}
 #if defined(CONFIG_BLOB_DB_LARGE_PAYLOADS)
+	if (sc.target.hdr.flags & BLOB_DB_SLOT_F_SEGMENT) {
+		return -ENOENT;   /* an internal id — see §6.6 */
+	}
 	if (sc.target.hdr.flags & BLOB_DB_SLOT_F_INDEXED) {
 		struct blob_db_index_hdr h;
 
+		/* Same validation index_load() applies: reporting a size taken
+		 * from an unchecked record would have the caller allocate
+		 * against a number a subsequent read then refuses to honour. */
+		if (sc.target.hdr.val_len < sizeof(h)) {
+			return -EIO;
+		}
 		memcpy(&h, g_bbuf, sizeof(h));
+		if (!index_hdr_valid(&h, sc.target.hdr.val_len)) {
+			return -EIO;
+		}
 		*out_size = h.total_len;
 		return 0;
 	}
@@ -2841,6 +2928,9 @@ int blob_db_read(uint64_t id, size_t offset, void *out, size_t len,
 	}
 
 #if defined(CONFIG_BLOB_DB_LARGE_PAYLOADS)
+	if (sc.target.hdr.flags & BLOB_DB_SLOT_F_SEGMENT) {
+		return -ENOENT;   /* an internal id — see §6.6 */
+	}
 	if (sc.target.hdr.flags & BLOB_DB_SLOT_F_INDEXED) {
 		struct blob_db_index_hdr h;
 		int k = index_load_cached(id, &h);
@@ -2878,6 +2968,9 @@ int blob_db_write(uint64_t id, size_t offset, const void *buf, size_t len)
 	if (!st.mounted) {
 		return -ENODEV;
 	}
+	if (st.wedged) {
+		return -EIO;   /* torn compaction; see compact_commit() */
+	}
 	if (len > 0 && !buf) {
 		return -EINVAL;
 	}
@@ -2886,9 +2979,6 @@ int blob_db_write(uint64_t id, size_t offset, const void *buf, size_t len)
 	}
 	if (offset + len < offset) {
 		return -EINVAL;   /* range wraps */
-	}
-	if (len == 0) {
-		return 0;
 	}
 
 #if defined(CONFIG_BLOB_DB_LARGE_PAYLOADS)
@@ -2919,6 +3009,17 @@ int blob_db_write(uint64_t id, size_t offset, const void *buf, size_t len)
 	rc = find_live_slot(bid, id, &sc, g_bbuf);
 	if (rc < 0) {
 		return rc;
+	}
+	if (sc.target.hdr.flags & BLOB_DB_SLOT_F_SEGMENT) {
+		return -EINVAL;   /* an internal id — see §6.6 */
+	}
+
+	/* Only now: a zero-length write is a no-op on an object that exists,
+	 * but it must not report success for one that does not. Returning
+	 * early on len == 0 made write() the only accessor that answered 0
+	 * where read() and size() answer -ENOENT. */
+	if (len == 0) {
+		return 0;
 	}
 
 #if defined(CONFIG_BLOB_DB_LARGE_PAYLOADS)
@@ -2990,6 +3091,7 @@ int blob_db_format(void)
 	}
 
 	IDX_INVALIDATE();
+	st.wedged = false;   /* the whole store, scratch included, goes away */
 
 	rc = blob_db_store_erase(0, st.fa_size);
 	if (rc < 0) {
@@ -3065,6 +3167,9 @@ int blob_db_erase_all(void)
 {
 	if (!st.mounted) {
 		return -ENODEV;
+	}
+	if (st.wedged) {
+		return -EIO;   /* torn compaction; see compact_commit() */
 	}
 
 	/* Not redundant, despite the bind_root_empty() append at the end: the
@@ -3148,6 +3253,9 @@ int blob_db_prepare(size_t n)
 {
 	if (!st.mounted) {
 		return -ENODEV;
+	}
+	if (st.wedged) {
+		return -EIO;   /* torn compaction; see compact_commit() */
 	}
 	if (n == 0) {
 		return 0;
