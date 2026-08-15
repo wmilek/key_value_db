@@ -308,6 +308,32 @@ item, and it now has a measured target rather than an argument: 44.33×
 amplification on windowed sequential reads, roughly half of it re-reading the
 index record on every call.
 
+> **Measured, and the "roughly half" is wrong.** Run 2 (`12df53b`) shipped
+> that cache. It removes exactly the two bucket lookups predicted — 22.5 → 7.5
+> reads per windowed read, within 0.2% of the estimate — but saves only
+> **704 B/op of 2838**, not the ~2036 B the model assumed. Each removed lookup
+> cost ~352 B, so the slot-header scan in front of the index record is ~72 B,
+> not ~738 B. **The scan is cheap, and it was the entire basis of the
+> estimate.**
+>
+> What remains is irreducible: 2134 B/op is one whole **2004 B chunk** read to
+> serve a 64 B window, plus ~130 B of headers. That is an amplification floor
+> of 2004 / 64 = **31.3×**, so the measured 33.34× is within 7% of the best
+> achievable, and the ~12.5× this section projected was **below the floor and
+> therefore unreachable at any hit rate.** Windowed-read amplification is set
+> by chunk granularity, not by index re-reads; only sub-chunk reads or a chunk
+> size matched to the window would move it. Time improved ×1.78 (3254 →
+> 1831 µs/op) rather than the ×3.5 projected.
+>
+> The board also calibrates the two constants this section guessed at:
+> **~65 µs per read transaction and ~0.63 µs/B** for small reads, fitted from
+> the two `lg read` points and independently accurate to 4% on the small-blob
+> `read` phase. Transactions are not free — which is why removing two-thirds of
+> them still bought ×1.78 — they are simply not where the bytes are.
+>
+> Full numbers, the `pread` phase's 0% hit rate, and the raw captures are in
+> `app_perf/RESULTS.md`.
+
 Two things this section did **not** predict, both from `app_perf/RESULTS.md`:
 
 - **Segment write amplification is 1.02×** — the layout is near-optimal in
