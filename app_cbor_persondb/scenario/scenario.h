@@ -78,7 +78,10 @@ struct scenario_fill_report {
 int scenario_fill(struct scenario *s, uint32_t budget,
 		  struct scenario_fill_report *out);
 
-/** Pre-erase blob_db buckets so first-touch erases leave the timed loops. */
+/** Pre-erase the store's flash blocks so first-touch erases leave the timed
+ *  loops — and so their cost shows up as its own line rather than inside the
+ *  fill. Reports how many were formatted.
+ */
 int scenario_prepare(struct scenario *s, int *buckets_formatted, int64_t *ms);
 
 /* -- verification ------------------------------------------------------- */
@@ -122,6 +125,24 @@ int scenario_mutate(struct scenario *s, struct scenario_mutate_report *out);
 
 /* -- measurement -------------------------------------------------------- */
 
+/*
+ * The instant an access decision is evaluated at, shared by the benchmark and
+ * the shell so the two cannot drift into asking different questions.
+ *
+ * It sits inside the validity window of ~99.5 % of generated persons, not all
+ * of them: dataset.c issues badges across a two-year span ending at
+ * 1 830 297 599, so the last ~0.47 % are not yet valid here and their decision
+ * short-circuits on EXPIRED before the permission compare. The benchmark
+ * reports those separately — RESULTS.md §8's 10 000-person capture records 2 of
+ * 200 samples, and the 1 000- and 200-person runs record none, because which
+ * indices a sample lands on decides whether it meets one.
+ *
+ * They are left alone rather than tuned away. A decision path that never takes
+ * its cheap exit is not the one a product sees either, and moving this constant
+ * would silently redefine the benchmark.
+ */
+#define SCENARIO_BENCH_NOW 1830000000u
+
 enum scenario_bench_kind {
 	SCENARIO_BENCH_CHECK = 0, /* card -> person -> permission (R-D) */
 	SCENARIO_BENCH_BYID,      /* person id -> record */
@@ -137,9 +158,9 @@ struct bench_result {
 	int64_t     us;             /* total; the fast phases are sub-millisecond */
 	int64_t     ms;
 	uint32_t    us_per_op;
-	uint64_t    map_ops;        /* map get/set/del this phase performed */
+	uint64_t    store_ops;      /* persondb get/set/delete this phase performed */
 	uint64_t    flash_ops;      /* flash reads + writes + erases underneath */
-	uint64_t    flash_bytes;    /* bytes actually moved, from blob_db iostats */
+	uint64_t    flash_bytes;    /* bytes actually moved, measured underneath */
 	uint64_t    payload_bytes;  /* what the application actually asked for */
 	uint32_t    amplification;  /* flash_bytes / payload_bytes */
 	bool        measured;       /* false if CONFIG_BLOB_DB_IOSTATS is off */

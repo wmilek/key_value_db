@@ -45,9 +45,9 @@ static void print_bench(const struct bench_result *b)
 				     : 0;
 
 	printk("bench %-6s: %5u ops in %8" PRId64 " us -> %7" PRIu64 " ops/s  "
-	       "%7u us/op  %4" PRIu64 " map ops  %5" PRIu64 " flash ops  "
+	       "%7u us/op  %4" PRIu64 " store ops  %5" PRIu64 " flash ops  "
 	       "%8" PRIu64 " B%s  amp %ux\n",
-	       b->name, b->ops, b->us, ops_per_s, b->us_per_op, b->map_ops,
+	       b->name, b->ops, b->us, ops_per_s, b->us_per_op, b->store_ops,
 	       b->flash_ops, b->flash_bytes, b->measured ? "" : "?",
 	       b->amplification);
 }
@@ -83,14 +83,17 @@ int ui_main(void)
 	printk("\npersondb %s — CBOR person/credential database\n",
 	       APP_VERSION_STRING);
 
-	int64_t t = k_uptime_get();
+	/* Every other phase is timed through scenario_now_us(); this one used
+	 * k_uptime_get(), which on native_sim never advances (see scenario.c),
+	 * so `open` reported 0 ms whatever it cost. */
+	int64_t t = scenario_now_us();
 
 	rc = scenario_open(&s);
 	if (rc != 0) {
 		printk("open failed: %d\n", rc);
 		goto out;
 	}
-	printk("open         : %6" PRId64 " ms\n", k_uptime_delta(&t));
+	printk("open         : %6" PRId64 " ms\n", scenario_since_us(t) / 1000);
 
 	/* Take the one-off sector erases out of the timed loops so the fill
 	 * measures the warm write path (and so their cost is visible). */

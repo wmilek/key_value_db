@@ -577,8 +577,16 @@ window `kvdb` itself has (`kvdb.c:118`).
   measurement that quantifies it.
 - **A6** `README.md` states each practice, points at the code, and names the
   failure it prevents.
-- **A7** No frontend contains a key string, shard index, blob id or CBOR call,
-  and neither does `scenario.c` — the check that F12/F15 held.
+- **A7** Nothing outside `persondb/` includes a storage or codec header, calls a
+  `blob_db_*` / `rootreg_*` / `map_ops` entry point, encodes or decodes CBOR, or
+  contains a key string, shard index or blob id — the check that F12/F15 held.
+
+  The criterion is about *dependencies*, not vocabulary. A comment elsewhere may
+  name a lower layer when the point being made is about that layer — the stack
+  reserved for `blob_db`'s slot builder (B5/B6) is recorded where it is
+  observed. What it may not do is depend on it. The distinction matters because
+  this application is also a probe: scrubbing every mention would delete the
+  findings, and a criterion satisfied by deleting evidence is the wrong one.
 - **A8** No `-ENOSPC` occurs during a full fill. If one does, §6.1's sizing rule
   is wrong and that becomes the finding.
 

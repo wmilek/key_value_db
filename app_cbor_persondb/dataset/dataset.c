@@ -105,9 +105,11 @@ uint32_t dataset_mutate_index(uint32_t nth, uint32_t rev, uint32_t n_persons,
 			      uint32_t mutate_count)
 {
 	/* Stride the subset across the whole population so consecutive
-	 * revisions touch disjoint persons and the writes land in different
-	 * kvhash buckets — a contiguous run would concentrate every write of
-	 * a round into a handful of blob_db sectors and mismeasure the cost. */
+	 * revisions touch disjoint persons and their writes scatter. A
+	 * contiguous run would concentrate a whole round into whatever few
+	 * places the store happens to keep neighbouring ids, and measure that
+	 * instead of the write path. What those places are is not this
+	 * module's business — scattering is correct against any of them. */
 	uint32_t stride = (mutate_count && n_persons / mutate_count)
 				  ? n_persons / mutate_count
 				  : 1u;

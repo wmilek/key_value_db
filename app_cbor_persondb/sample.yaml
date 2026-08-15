@@ -31,4 +31,8 @@ tests:
       ordered: true
       regex:
         - "VERIFY PASS"
+        # A8: the sizing rule of DESIGN.md §6.1 holds for this configuration.
+        # Without this line a fill that overflows a bucket still prints both
+        # of the others, and CI calls it a pass.
+        - "bucket overflows: 0"
         - "persondb: done"

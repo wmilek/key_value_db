@@ -15,6 +15,7 @@
  */
 
 #include <stdlib.h>
+#include <string.h>
 
 #include <zephyr/kernel.h>
 #include <zephyr/shell/shell.h>
@@ -266,14 +267,19 @@ static int cmd_check(const struct shell *sh, size_t argc, char **argv)
 		return -EINVAL;
 	}
 
-	t = k_uptime_get();
-	rc = persondb_check(g_s.db, argv[1], argv[2], 1830000000u, &d, &p);
+	/* scenario_now_us(), not k_uptime_get(): on native_sim the simulated
+	 * clock only advances when a modelled event fires, and a RAM-backed
+	 * flash model fires none — so the millisecond clock reported "0 ms" for
+	 * every decision here, which is the one number this command exists to
+	 * show. Microseconds, for the same reason. */
+	t = scenario_now_us();
+	rc = persondb_check(g_s.db, argv[1], argv[2], SCENARIO_BENCH_NOW, &d, &p);
 	if (rc != 0) {
 		shell_error(sh, "check: %d", rc);
 		return rc;
 	}
-	shell_print(sh, "%s in %lld ms", persondb_decision_str(d),
-		    (long long)k_uptime_delta(&t));
+	shell_print(sh, "%s in %lld us", persondb_decision_str(d),
+		    (long long)scenario_since_us(t));
 	if (d != PERSONDB_UNKNOWN_CARD) {
 		shell_print(sh, "  %s (%u), %s / %s", p.name, p.id, p.dept,
 			    p.title);

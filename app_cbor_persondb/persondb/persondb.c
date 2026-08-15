@@ -868,6 +868,11 @@ bool persondb_person_equal(const struct persondb_person *a,
 	uint8_t ba[PERSON_CBOR_MAX], bb[PERSON_CBOR_MAX];
 	size_t la, lb;
 
+	/* An unencodable person is reported unequal even to an identical one.
+	 * That is deliberate: this function answers "are these the same *stored*
+	 * record", and something that cannot be encoded was never stored. The
+	 * safe direction is also the useful one — verification flags it instead
+	 * of passing on a record neither side could have written. */
 	if (person_cbor_encode(a, ba, sizeof(ba), &la) != 0 ||
 	    person_cbor_encode(b, bb, sizeof(bb), &lb) != 0) {
 		return false;

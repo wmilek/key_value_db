@@ -226,6 +226,13 @@ int scenario_mutate(struct scenario *s, struct scenario_mutate_report *out)
 	int64_t t = scenario_now_us();
 	int rc;
 
+	/* Never ask for more distinct persons than exist: the generator strides
+	 * the subset across the population, and a stride that rounds to zero
+	 * would hand back the same index repeatedly — a round that reports 64
+	 * mutations having touched one person. Kconfig permits the combination
+	 * (MUTATE_COUNT up to 4096, N_PERSONS down to 8), so clamp it here. */
+	const uint32_t count = MIN((uint32_t)MUTATE_COUNT, s->n_persons);
+
 	memset(out, 0, sizeof(*out));
 	persondb_progress_get(s->db, &populated, &rev);
 	out->rev_from = rev;
@@ -238,9 +245,9 @@ int scenario_mutate(struct scenario *s, struct scenario_mutate_report *out)
 
 	/* Revoke the outgoing subset. Index first, then the record (F5). */
 	if (rev > 0) {
-		for (uint32_t n = 0; n < MUTATE_COUNT; n++) {
-			uint32_t idx = dataset_mutate_index(n, rev, s->n_persons,
-							    MUTATE_COUNT);
+		for (uint32_t n = 0; n < count; n++) {
+			uint32_t idx = dataset_mutate_index(n, rev,
+							    s->n_persons, count);
 
 			if (idx >= populated) {
 				out->skipped++;
@@ -264,9 +271,9 @@ int scenario_mutate(struct scenario *s, struct scenario_mutate_report *out)
 	}
 
 	/* Grant the incoming subset. Record first, then the index (F5). */
-	for (uint32_t n = 0; n < MUTATE_COUNT; n++) {
+	for (uint32_t n = 0; n < count; n++) {
 		uint32_t idx = dataset_mutate_index(n, rev + 1, s->n_persons,
-						    MUTATE_COUNT);
+						    count);
 
 		if (idx >= populated) {
 			out->skipped++;
@@ -301,28 +308,11 @@ const char *scenario_bench_name(enum scenario_bench_kind which)
 	return which < SCENARIO_BENCH_KINDS ? bench_names[which] : "?";
 }
 
-/*
- * The instant the access decision is benchmarked at.
- *
- * It sits inside the validity window of ~99.5 % of generated persons, not all
- * of them: dataset.c issues badges across a two-year span ending at
- * 1 830 297 599, so the last ~0.47 % are not yet valid here and their `check`
- * short-circuits on EXPIRED before the permission compare. The benchmark
- * reports those separately: RESULTS.md §8's 10 000-person capture records 2 of
- * 200 samples, and the 1 000- and 200-person runs record none, because which
- * indices a sample lands on decides whether it meets one.
- *
- * They are left alone rather than tuned away. A decision path that never takes
- * its cheap exit is not the one a product sees either, and moving this constant
- * would silently redefine the benchmark.
- */
-#define BENCH_NOW 1830000000u
-
 int scenario_bench(struct scenario *s, enum scenario_bench_kind which,
 		   uint32_t samples, struct bench_result *out)
 {
 	struct persondb_person want, got;
-	struct persondb_stat st0, st1;
+	struct persondb_stat st1;
 	char card[PERSONDB_CARD_LEN + 1];
 	uint32_t populated, rev;
 	int64_t t;
@@ -338,8 +328,9 @@ int scenario_bench(struct scenario *s, enum scenario_bench_kind which,
 		samples = populated;
 	}
 
+	/* Reset rather than subtract a baseline: the counters start at zero for
+	 * this phase, so the reading taken at the end *is* the delta. */
 	persondb_counters_reset(s->db);
-	persondb_stat(s->db, &st0);
 	t = scenario_now_us();
 
 	for (uint32_t n = 0; n < samples; n++) {
@@ -355,7 +346,7 @@ int scenario_bench(struct scenario *s, enum scenario_bench_kind which,
 
 			rc = persondb_check(s->db, want.card[0],
 					    want.perm[n % want.n_perms],
-					    BENCH_NOW, &d, NULL);
+					    SCENARIO_BENCH_NOW, &d, NULL);
 			if (rc != 0) {
 				return rc;
 			}
@@ -436,7 +427,7 @@ int scenario_bench(struct scenario *s, enum scenario_bench_kind which,
 	out->ms = out->us / 1000;
 	persondb_stat(s->db, &st1);
 
-	out->map_ops = st1.map_gets + st1.map_sets + st1.map_dels;
+	out->store_ops = st1.map_gets + st1.map_sets + st1.map_dels;
 	out->flash_ops = st1.flash_reads + st1.flash_writes + st1.flash_erases;
 	out->flash_bytes = st1.bytes_read + st1.bytes_written + st1.bytes_erased;
 	out->measured = st1.io_measured;

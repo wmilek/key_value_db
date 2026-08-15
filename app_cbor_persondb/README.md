@@ -242,9 +242,15 @@ layers means editing a `CMakeLists.txt`, not just typing an `#include`:
 | `persondb/` | `person_cbor.h` |
 | `dataset/` | `persondb.h` (the record type only) |
 
-`persondb/` is the only directory that names `blob_db`, `rootreg` or
-`map_ops`, and the only one that encodes or decodes CBOR. That is checkable
-with a grep, and acceptance criterion **A7** is exactly that grep.
+`persondb/` is the only directory that *calls* `blob_db`, `rootreg` or
+`map_ops`, and the only one that encodes or decodes CBOR — acceptance criterion
+**A7**, checkable by grepping for those includes and call sites.
+
+It is a claim about dependencies, not about vocabulary. Comments elsewhere do
+name lower layers, where the observation being recorded is about them: the main
+stack this app must reserve is set by `blob_db`'s slot builder, not by its own
+call depth, and that belongs next to the number it explains. A7 would be easy to
+pass by deleting those sentences, and the app would be worse for it.
 
 ## Shell
 
