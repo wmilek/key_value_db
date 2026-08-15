@@ -48,16 +48,6 @@ LOG_MODULE_REGISTER(persondb, CONFIG_APP_CBOR_PERSONDB_LOG_LEVEL);
 #define PERSON_KEY_LEN 9u
 
 /*
- * kvhash's capacity formula is private to kvhash.c, so an application that
- * wants a full-size map has to restate it — FINDINGS.md K9(c). Worse, the
- * request is silently clamped: ask for more than this and `create` returns 0
- * having given you fewer buckets, with no way to read back what you got
- * (K9(b), K10). Restating it here at least makes the assumption checkable.
- */
-#define KVHASH_DIR_HDR_LEN 8u
-#define KVHASH_MAX_BUCKETS ((CONFIG_BLOB_DB_MAX_PAYLOAD_LEN - KVHASH_DIR_HDR_LEN) / 8u)
-
-/*
  * This app used to restate blob_db's slot and bucket-header sizes here, to
  * assert that CONFIG_BLOB_DB_MAX_PAYLOAD_LEN could actually be *rewritten* on
  * the target geometry (FINDINGS.md B9/B10, which this app raised).
@@ -72,8 +62,6 @@ LOG_MODULE_REGISTER(persondb, CONFIG_APP_CBOR_PERSONDB_LOG_LEVEL);
  * What is left below is the same problem unsolved one layer up: kvhash's
  * capacity formula is still private, so the app still restates it.
  */
-BUILD_ASSERT(KVHASH_MAX_BUCKETS >= 2, "payload too small for a bucket directory");
-
 struct persondb {
 	bool                  open;
 	uint64_t              sb_id;
@@ -225,7 +213,25 @@ static int create_store(struct persondb *db, uint32_t n_persons)
 	sb->n_people_maps = N_PEOPLE_MAPS;
 	sb->n_persons = n_persons;
 
-	const struct map_config cfg = { .initial_capacity = KVHASH_MAX_BUCKETS };
+	/*
+	 * "Give me the largest map you can build."
+	 *
+	 * This app wants every bucket it can get — more buckets means a lower
+	 * load factor and more distance from K2's per-bucket cliff — and there
+	 * is no way to *ask* for the maximum. But kvhash clamps any request
+	 * above its capacity down to it, so asking for more than could possibly
+	 * fit expresses the intent exactly, and the application never learns the
+	 * formula.
+	 *
+	 * This used to restate `(MAX_PAYLOAD - 8) / 8` here. That was a private
+	 * constant from another layer, wrong by 8x after one Kconfig edit, and
+	 * it bought nothing: the number was only ever passed straight back down.
+	 *
+	 * Note what this does to K9. The silent clamp is a defect when you ask
+	 * for a specific size and quietly get less — and it is the very thing
+	 * that makes "as much as possible" expressible. Both are true.
+	 */
+	const struct map_config cfg = { .initial_capacity = SIZE_MAX };
 
 	for (uint8_t i = 0; i < sb->n_people_maps; i++) {
 		sb->people_root[i] = blob_db_alloc_id();
@@ -251,8 +257,8 @@ static int create_store(struct persondb *db, uint32_t n_persons)
 	}
 
 	LOG_INF("created store: %u people maps + 1 credential map, "
-		"%u buckets each, %u persons planned",
-		sb->n_people_maps, (unsigned)KVHASH_MAX_BUCKETS, n_persons);
+		"max buckets each, %u persons planned",
+		sb->n_people_maps, n_persons);
 
 	return sb_commit(db);   /* the commit point */
 }
@@ -337,7 +343,6 @@ int persondb_open(struct persondb **out, uint32_t n_persons)
 		return rc;
 	}
 
-	db->st.buckets_per_map = KVHASH_MAX_BUCKETS;
 	db->open = true;
 	*out = db;
 	return 0;

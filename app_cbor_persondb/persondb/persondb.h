@@ -73,7 +73,10 @@ struct persondb_stat {
 	uint32_t populated;          /* persons written so far */
 	uint32_t rev;                /* mutation revision */
 	uint8_t  n_people_maps;
-	uint16_t buckets_per_map;    /* what kvhash actually gave us (K9) */
+	/* The bucket count is deliberately absent: the app asks for the largest
+	 * map kvhash can build and there is no way to read back what it got
+	 * (FINDINGS.md K9(c), K10). Reporting a number the firmware cannot
+	 * observe would be inventing one — tools/sizing.py models it instead. */
 
 	size_t   partition_bytes;    /* from devicetree — see B3 */
 	size_t   sector_bytes;       /* erase-block size, ditto */

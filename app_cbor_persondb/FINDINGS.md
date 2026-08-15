@@ -690,10 +690,12 @@ map that overflows at roughly ninety person-sized entries. For `kvdb` that is
 reached by `kvdb_open(db, name, NULL)`, which the header presents as the
 ordinary way to accept defaults.
 
-**What this app can do about it:** only a `BUILD_ASSERT` on
-`CONFIG_BLOB_DB_MAX_PAYLOAD_LEN`, replicating kvhash's private formula in
-application source. That defence is worth having, and having to write it is
-itself part of the finding.
+**What this app did about it:** originally, a `BUILD_ASSERT` replicating
+kvhash's private formula in application source. That is now **deleted** — the
+app passes `initial_capacity = SIZE_MAX` to mean "as large as you can build",
+which is what it wanted all along, and the clamp in (b) is what makes that
+expressible. See X1 row 5. The formula never needed to be in the application;
+only the *intent* did, and the API had no word for it.
 
 Direction, cheapest first: return `-ENOSPC` (or at minimum `LOG_WRN`) instead of
 clamping; export the capacity formula from `kvhash.h`; add the `map_ops.stat()`
@@ -826,42 +828,62 @@ The full inventory, and what closes each:
 | 2 | bucket header = 16 B | `blob_db_internal.h` | **removed** — same |
 | 3 | sustainable payload = `(peb−16)/2 − 14` | `blob_db.c` | **removed** — same |
 | 4 | `CONFIG_BLOB_DB_SECTOR_BUF_SIZE` as a proxy for sector size | Kconfig | **removed** — same |
-| 5 | `MAX_BUCKETS = (MAX_PAYLOAD−8)/8` | `kvhash.c:47` (private) | **still restated** — K9(c) |
+| 5 | `MAX_BUCKETS = (MAX_PAYLOAD−8)/8` | `kvhash.c:47` (private) | **removed** — see below |
 | 6 | per-entry framing = 4 B, and the key length | `kvhash.c:291` | **still restated** |
 | 7 | partition and sector size | `blob_db`'s `struct st` | **still fetched behind its back**, via `flash_area` — B3 |
 
-Four of seven left the application the moment `blob_db` grew a mount-time check
-— and note *how*: not by exporting the constants, but by **taking the question
-away from the caller entirely**. The library did the check itself, so nobody
-above needed the numbers. That is the shape of the fix for the rest.
+Five of seven have now left the application — and note *how* each went: not by
+exporting the constants, but by **removing the caller's need to ask**.
 
-**What would close 5–7.** Two small, read-only calls, neither of which requires
-an on-flash format change:
+**Row 5 was never needed at all.** The app restated the bucket-count formula
+for exactly one purpose: to pass `initial_capacity` at create time, so that
+each map would be as large as possible. But the intent is "give me the largest
+map you can build", and `buckets_for()` clamps any over-large request down to
+capacity — so `initial_capacity = SIZE_MAX` expresses it precisely, and the
+application never learns the formula. Same 511 buckets, same 51.6 % fill, same
+zero overflows, one fewer private constant.
+
+That reframes **K9(b)**. A silent clamp is a defect when you ask for a specific
+size and quietly get less. It is also the mechanism that makes "as much as
+possible" expressible, at a layer offering no other way to say it. Both are
+true, and the second is worth keeping if the first is ever fixed: an explicit
+`MAP_CAPACITY_MAX` sentinel would preserve it while letting a *specific*
+over-large request fail loudly.
+
+The same idiom already covers `blob_db_prepare()`, which caps at the bucket
+total — the app passes `(size_t)-1` and never needs blob_db's bucket count
+either. **So neither proposed `info` struct should carry `n_buckets`: nothing
+above needs it, and offering it would invite exactly the restating this finding
+is about.**
+
+**What would close 6 and 7.** Two small, read-only calls, neither requiring an
+on-flash format change, and both narrower than the sketch this finding
+originally carried:
 
 ```c
-/* L1 — what blob_db already knows in struct st, and nobody can see. */
+/* L1 — what blob_db already computed in struct st, and nobody can see. */
 struct blob_db_info {
-        size_t partition_bytes, sector_bytes;
-        uint16_t n_buckets;
+        size_t partition_bytes;  /* for "how full am I, as a fraction?" */
+        size_t sector_bytes;
         size_t max_payload;      /* what this geometry can actually rebind */
 };
 void blob_db_get_info(struct blob_db_info *out);
 
-/* L2 — what a map actually got, versus what was asked for. */
+/* L2 — what a map holds, not how it is built. */
 struct map_info {
-        uint16_t n_buckets;      /* after the silent clamp of K9(b) */
-        size_t   entry_overhead; /* the 4 B of framing per entry */
-        size_t   max_value;      /* largest value this map can hold */
-        size_t   fullest_bucket; /* how close K2's cliff is — needs a walk */
+        size_t entries;          /* K10 */
+        size_t entry_overhead;   /* the 4 B of framing — row 6 */
+        size_t max_value;
+        size_t fullest_bucket;   /* how close K2's cliff is */
 };
 int (*info)(uint64_t root, struct map_info *out);   /* new op on map_ops */
 ```
 
-`blob_db_get_info()` is pure accessor work over state `mount()` has already
-computed; it deletes rows 7 and, with `max_payload`, any future reappearance of
-rows 1–4. `map_ops.info()` deletes rows 5 and 6, closes K9 and K10, and would
-have let `tools/sizing.py` be a runtime assertion instead of an offline script
-the build cannot check.
+Both describe *what the store contains or can hold*, never how it is
+structured. `blob_db_get_info()` is pure accessor work over state `mount()` has
+already computed and deletes row 7. `map_ops.info()` deletes row 6, closes K9
+and K10, and would turn `tools/sizing.py` from an offline script the build
+cannot check into a runtime assertion.
 
 **Why it matters beyond tidiness.** A restated constant is not merely ugly — it
 is a silent-divergence bug waiting for the layer below to change. This app

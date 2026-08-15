@@ -58,8 +58,9 @@ static void print_report(const struct scenario_report *r)
 	printk("  partition   : %zu B (%zu KiB), %zu B sectors\n",
 	       r->st.partition_bytes, r->st.partition_bytes / 1024,
 	       r->st.sector_bytes);
-	printk("  maps        : %u person + 1 credential, %u buckets each\n",
-	       r->st.n_people_maps, r->st.buckets_per_map);
+	printk("  maps        : %u person + 1 credential "
+	       "(bucket count not observable — FINDINGS.md K10)\n",
+	       r->st.n_people_maps);
 	printk("  persons     : %u of %u   credentials: %u\n",
 	       r->st.populated, r->st.n_persons, r->credentials);
 	printk("  mean entry  : %u B\n", r->mean_record);
