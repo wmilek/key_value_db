@@ -24,10 +24,10 @@ Costs achieved by this design (satisfying contract §3):
 |---|---|---|---|
 | `mount` | 2 (master A + B) + 2045 (bucket scan)¹ | 0 (or format if first ever) | O(1) |
 | `alloc_id()` | 0 | 0 (occasional id-hint persist) | O(1) |
-| `get(id)` | **1** (one bucket sector) | 0 | 4 KB stack |
-| `update(id, …)` | 0² | 1 (slot; on rebind the old slot becomes garbage) + occasional compact | 4 KB stack |
-| `delete(id)` | 1 (verify presence) | 1 (tombstone) | 4 KB stack |
-| `exists(id)` | 1 | 0 | 4 KB stack |
+| `get(id)` | 1 bucket header + 12 B per slot + 1 payload | 0 | O(1) |
+| `update(id, …)` | 1 bucket header + 12 B per slot² | 1 (slot; on rebind the old slot becomes garbage) + occasional compact | O(1) |
+| `delete(id)` | as `get` (verify presence) | 1 (tombstone) | O(1) |
+| `exists(id)` | as `get` | 0 | O(1) |
 | `count` / `iterate` | 2045 (full scan) | 0 | O(1) |
 | `compact_bucket` | 1 + master writes | 1 scratch + 1 bucket restore + 2 master | O(1) |
 
@@ -56,21 +56,65 @@ Per-bucket mean at 100 k blobs: 49 entries.
 
 ## 3. On-flash format
 
-### 3.1 Master sector (24 B header; rest of the sector reserved)
+### 3.1 Master sector (64 B header; rest of the sector reserved)
+
+Two parts: a frozen compatibility prefix that any version can parse, and a
+body that belongs to the current format major.
 
 ```
-magic[4]        = 'B','D','M','S'
-generation[4]   = monotonic LE              /* latest valid gen wins        */
-state[1]        = CLEAN | COMPACTING
+/* --- frozen prefix (12 B) — this layout never changes ------------------- */
+magic[4]         = 'B','D','M','S'          /* allocator identity (D1)      */
+format_major[1]  = 1                        /* incompatible; refuse unknown */
+format_minor[1]  = 0                        /* additive; safe to ignore     */
+hdr_len[2]       = 64                       /* total header length          */
+reserved[2]
+prefix_crc16[2]  = CRC16-CCITT(0xffff) over the preceding 10 B
+
+/* --- body (format major 1) ---------------------------------------------- */
+generation[4]    = monotonic LE             /* latest valid gen wins        */
+state[1]         = CLEAN | COMPACTING
 compacting_bid[2]
-reserved[1]
-next_id_hint[8] = id-counter persistence    /* see §5.1 and §13.1           */
-hdr_crc32[4]    = CRC32-IEEE over preceding 20 B
+reserved0[1]
+next_id_hint[8]  = id-counter persistence   /* see §5.1 and §13.1           */
+reserved1[32]                               /* future MINOR revisions       */
+hdr_crc32[4]     = CRC32-IEEE over bytes [0, 60)
 ```
 
 Double-buffered: writes alternate between sectors 0/1 with incrementing
 generation; a torn master write loses the new generation and the previous
 master still wins.
+
+**Two CRCs, and the split is load-bearing.** A *newer* writer still produces a
+prefix whose CRC verifies, so an older reader can trust `format_major` and
+refuse the store deliberately. Bit rot produces a prefix whose CRC fails —
+a different situation, in which the other master may still be good. One
+combined CRC would conflate them, and worse, would move as the header grows,
+so an older reader could not even locate it.
+
+The body is a fixed 64 B with reserved padding so `hdr_crc32` stays at a
+constant offset over a constant span. A MINOR revision consumes reserved space
+and moves nothing; older software validates the same span and reads the fields
+it knows. Anything that does not fit — or that older software would *misread*
+rather than merely miss, such as a new slot flag — is a MAJOR change instead.
+
+**Mount classifies each master sector**, and only one of the four outcomes may
+write to flash:
+
+| Sector reads as | Class | Mount |
+|---|---|---|
+| all `0xff` across the header window | erased | virgin — format |
+| prefix CRC fails | corrupt | ignore it; the other master may be good |
+| prefix verifies, foreign magic or unknown major | **foreign** | `-ENOTSUP`, touch nothing |
+| prefix and body verify | ok | candidate; highest generation wins |
+
+A foreign sector on *either* slot refuses the whole store, before generation
+is considered: an interrupted upgrade can leave the old format on one slot and
+a newer one on the other, and falling back to the older would silently mount a
+stale view. When neither master is usable and neither is erased,
+`BLOB_DB_AUTOFORMAT_ON_CORRUPT` decides between reformatting (development) and
+`-EIO` (production). Recovering that way rewrites the masters but does not
+erase buckets, so surviving blobs stay readable and mount's defensive scan
+(§5.1) re-raises the id ceiling past them.
 
 ### 3.2 Bucket layout (one sector)
 
@@ -101,9 +145,58 @@ slot_size(val_len) = round_up(14 + val_len, W)
 
 ### 3.4 End-of-log detection
 
-The slot stream ends at the first offset where the slot would cross the
-sector end, `val_len > MAX_PAYLOAD_LEN`, `flags == 0xff` (erased), or the CRC
-fails. The bucket's write cursor is that offset.
+The slot stream ends at the first offset whose **header** cannot be trusted to
+size its own slot: `flags == 0xff` (erased), SEALED clear, a flag bit this
+version does not know, `val_len > MAX_PAYLOAD_LEN`, or a slot that would cross
+the sector end. The bucket's write cursor is that offset.
+
+A failed **CRC** deliberately does *not* end the log. The header alone gives the
+stride to the next slot, so a rotten slot is stepped over and the slots after it
+stay reachable; only the rotten slot itself is invisible, and the next
+compaction drops it. (The earlier resident-buffer walk verified every CRC as it
+went and treated a failure as end-of-log, which hid every later slot in that
+bucket until compaction.) Readers verify the CRC of the one slot they actually
+want, and fall back to the newest intact slot below it — so the visible value is
+always a committed one.
+
+### 3.5 Large objects — segments and an index record
+
+With `CONFIG_BLOB_DB_LARGE_PAYLOADS`, a payload too big for one slot is stored
+as K **segment** slots plus one **index** slot at the object's own id. Both are
+ordinary slots, so latest-wins, tombstones, `id mod N` addressing and per-bucket
+compaction apply to them unchanged; only four call sites know the difference.
+
+```
+index slot   flags = SEALED|INDEXED, at the object's id
+  payload:   magic 'BX', version, flags, total_len[4], payload_crc32[4],
+             seg_count[2], seg_len[2], then seg_id[seg_count] (u64 each)
+
+segment slot flags = SEALED|SEGMENT, at an internal id
+  payload:   owner_id[8], seq[2], reserved[2], then the chunk bytes
+```
+
+`owner_id` is what makes reclaim possible with no RAM index, and it sits in the
+payload rather than the slot header so the header stays 4 bytes for the millions
+of small slots that will never be segments.
+
+Introducing these flags is a **MAJOR** format change (§3.1): older software
+would read an index record as though it were the object's payload. A build
+without the feature keeps writing major 1; a build with it writes major 2 and
+reads either.
+
+**Capacity is bounded by the index record**, which is itself a single-slot
+payload: `seg_count <= (MAX_PAYLOAD_LEN - 16) / 8`, and the reachable object
+size is that times `seg_len`. This is why enabling the feature raises the
+default `MAX_PAYLOAD_LEN`, and why mount validates the chain and refuses a
+configuration that cannot reach `MAX_OBJECT_LEN` — naming the shortfall rather
+than silently capping. `seg_len` defaults to `sector/4` clamped to what a slot
+can hold, which leaves several segments plus rebind headroom per bucket.
+
+**Segment placement is a probe sequence.** A segment's id is internal and
+arbitrary, and `bucket = id mod N`, so when the bucket a fresh id lands in has
+no room the writer simply allocates another id and lands elsewhere. A
+user-visible id cannot do this — its bucket is fixed — but segments are never
+user-visible.
 
 ## 4. Slot semantics — latest wins
 
@@ -151,8 +244,17 @@ bound or freshly allocated (§13.5).
 
 ### 5.4 `get`
 
-Read the id's bucket sector into a 4 KB stack buffer (the only flash I/O),
-walk slots tracking the latest match, apply latest-wins (§4).
+Walk the bucket by slot header (12 B per slot: header + id), tracking the
+latest match, apply latest-wins (§4); then read and CRC-verify just that slot's
+payload. No whole-sector read — the point of the header-driven walk is that
+answering one lookup costs O(slots) small reads instead of one erase-block read,
+which on 64 KB sectors is the difference between ~12 B per slot and 64 KB.
+
+`count` / `iterate` and compaction keep working on a resident sector image:
+their liveness test is "does a later slot share this id?", which is O(n²) in
+slots, and turning each comparison into a flash read would cost far more than
+the sector read it replaced. They are diagnostics and maintenance, not the hot
+path (contract D5).
 
 ### 5.5 `delete`
 
@@ -165,13 +267,72 @@ Build the compacted image (live slots only) in RAM, then:
 ```
 write master B  (gen+1, COMPACTING, bid, hint↑)  ─┐   hint↑: cover the highest
 erase scratch; write new image to scratch          │   id being dropped, so an
-erase bucket;  write new image to bucket           │   erased tombstone cannot
-erase scratch                                      │   unprotect its id
-write master A  (gen+2, CLEAN)                    ─┘   (subsumed by §13.1)
+seal scratch (trailer, written last — §6.1)        │   erased tombstone cannot
+erase bucket;  write new image to bucket           │   unprotect its id
+erase scratch                                      │   (subsumed by §13.1)
+write master A  (gen+2, CLEAN)                    ─┘
 ```
 
 The window is bracketed by master writes; any crash inside is recovered at
 mount (§6.1).
+
+### 5.6a Segmented `update` / `delete`, and the sweep
+
+```
+update(id, payload, len) with len > MAX_PAYLOAD_LEN:
+  0. capture the outgoing index's seg_id[] (if the id holds one)
+  1. master: seg_owner = id                      ── enters the sweep window
+  2. for j in 0..K-1: alloc an internal id, append a SEGMENT slot
+  3. append the INDEXED slot at id                ── ATOMIC COMMIT
+  4. tombstone the outgoing segments
+  5. master: seg_owner = 0                        ── leaves the sweep window
+
+delete(id) holding an index: same window, tombstone the index at step 3.
+```
+
+Step 3 is one slot append — the primitive that already makes a small write
+atomic. Before it the new segments are unreferenced; after it the old ones are.
+So contract §2 "atomicity" and "no partial reads" hold with nothing new.
+
+**One rule reclaims every crash point:** *a SEGMENT slot whose owner's live
+index does not list it is garbage.* Crash in step 2 → the new segments are not
+listed. Crash inside step 3 → the slot fails its CRC, so the old index is still
+live and the *new* segments are unlisted. Crash in step 4 → the old segments are
+not listed. In each case the losing generation is exactly the unlisted set.
+
+**Partial write** (`blob_db_write`) reuses the same window and the same commit,
+rewriting only the segments the range covers:
+
+```
+pwrite(id, offset, buf, len) on a segmented object:
+  new_total = max(total_len, offset + len);  new_K = ceil(new_total / seg_len)
+  1. master: seg_owner = id
+  2. new table := old table
+  3. for each segment the range touches, or beyond the old count:
+       materialise the chunk (old bytes, caller's bytes overlaid, zeros past
+       the old end) and append it under a FRESH id; new table[j] = that id
+  4. append the INDEXED slot                      ── ATOMIC COMMIT
+  5. tombstone only the ids where old table != new table
+  6. master: seg_owner = 0
+```
+
+`seg_len` is inherited from the existing index and never recomputed: the
+surviving segments are already cut at that stride, so changing it would
+misplace every byte they hold. Untouched segments keep their ids and their
+slots, which is the whole saving — a four-byte write replaces one segment, not
+K. Writing past the end extends sparsely, because a read of the gap between the
+old end and the new bytes is served as zeros.
+
+Growing an *inline* payload past one slot returns `-EFBIG` rather than promoting
+it to segmented in place. Such a payload still fits the caller's RAM, so
+`get` + `update` promotes it, and keeping that out of the library avoids a
+second whole-object staging buffer inside it.
+
+Mount runs the sweep only when the master carries a non-zero `seg_owner`, so the
+clean path pays nothing. The sweep walks every bucket by slot header, and for
+each live SEGMENT slot owned by that id checks the owner's index — O(N) sector
+reads, O(1) RAM beyond the segment tables, idempotent, and restartable after a
+crash during the sweep itself.
 
 ### 5.7 `iterate` / `count`
 
@@ -215,9 +376,31 @@ wins). Compaction composes them.
 |---|---|---|
 | before any write | both masters CLEAN | nothing |
 | during master-B write | B invalid, A CLEAN | not-yet-compacting |
-| during scratch erase/write | B = COMPACTING, scratch invalid | discard scratch; bucket untouched; write CLEAN |
-| during bucket erase/restore | B = COMPACTING, scratch valid | copy scratch → bucket; erase scratch; write CLEAN |
+| during scratch erase/write | B = COMPACTING, scratch **unsealed** | discard scratch; bucket untouched; write CLEAN |
+| during the scratch seal write | B = COMPACTING, seal partial → unsealed | as above; the bucket was never touched |
+| during bucket erase/restore | B = COMPACTING, scratch **sealed** | copy scratch → bucket; erase scratch; write CLEAN |
 | during final master-A write | B still COMPACTING | re-run recovery (idempotent); write CLEAN |
+
+**"Scratch valid" must mean "the whole image landed", and the bucket header
+cannot say that.** The header sits at offset 0 of the image, so it is written
+*first*; a write torn anywhere after it leaves a valid header over a truncated
+slot stream. Recovery that keyed off the header therefore restored the
+truncation over an intact bucket and lost every blob past the tear — a real
+data-loss path, fixed by sealing scratch with a trailer written *after* the
+image:
+
+```
+seal (16 B, at the tail of the scratch sector, written last)
+  magic[4]       = 'B','D','S','L'
+  image_len[4]   = bytes of compacted image at offset 0
+  image_crc32[4] = CRC32-IEEE over those bytes
+  seal_crc32[4]  = CRC32-IEEE over the preceding 12 B
+```
+
+The seal is at the tail rather than the header being written last so that every
+write stays forward-only, which the UBI backend's `ubi_leb_write_at()` mapping
+relies on. `compact_commit` refuses an image with no room to seal (`-ENOSPC`),
+which is the answer the caller reaches anyway when compaction reclaims nothing.
 
 ### 6.2 Torn slot
 
@@ -228,10 +411,16 @@ the next compaction.
 ## 7. Kconfig
 
 ```
-BLOB_DB                    bool, select FLASH, FLASH_MAP, CRC
-BLOB_DB_PARTITION_LABEL    string, default "storage"
-BLOB_DB_MAX_PAYLOAD_LEN    int, default 256, range 1 4096
-BLOB_DB_MULTI              bool, default n   # batch ops (§5.8, contract D6)
+BLOB_DB                        bool, select FLASH, FLASH_MAP, CRC
+BLOB_DB_PARTITION_LABEL        string, default "storage"
+BLOB_DB_MAX_PAYLOAD_LEN        int, default 256, range 1 65535  # geometry checked at mount
+BLOB_DB_SECTOR_BUF_SIZE        int, default 4096
+BLOB_DB_AUTOFORMAT_ON_CORRUPT  bool, default y   # see §3.1
+BLOB_DB_LARGE_PAYLOADS         bool, default n   # segmented objects (§3.5)
+BLOB_DB_MAX_OBJECT_LEN         int, default 131072   # validated at mount
+BLOB_DB_MAX_SEGMENTS           int, default 128      # 16 B of .bss each
+BLOB_DB_SEGMENT_LEN            int, default 0        # 0 = sector/4, clamped
+BLOB_DB_MULTI                  bool, default n   # batch ops (§5.8, contract D6)
 module = BLOB_DB (standard LOG pattern)
 ```
 
@@ -260,10 +449,12 @@ for headers), `<zephyr/logging/log.h>`.
 | Crash mid-slot write | CRC/erased-flags → end-of-log; committed slots intact |
 | Crash mid-compaction | master state machine + scratch (§6.1); ids unaffected |
 | Crash mid-master write | older valid master wins |
-| Bit corruption in a slot | CRC catches it; everything after it in that bucket is unreachable until next compaction |
+| Bit corruption in a slot | CRC catches it; **only that slot** is unreachable — the header-driven walk steps over it (§3.4) and the next compaction drops it. Readers fall back to the newest intact slot for the id |
 | Partition full | `update` returns `-ENOSPC` after attempting compaction of the target bucket |
 | One bucket overflows | as above, per-bucket; round-robin allocation keeps fill uniform, so buckets fill together |
 | Id space exhaustion | 2⁶⁴ allocations ≈ 5800 years at 100 M/s — not reachable |
+| Crash during a segmented write | one rule — an unlisted segment is garbage — covers all three points; mount sweeps when the master carries `seg_owner` (§5.6a) |
+| Segment missing or mislabelled on read | `-EIO`; the segment header's `owner_id`/`seq` are checked against what the index claimed, so a stale or foreign slot cannot be served as content |
 
 ## 11. Unit-test plan (draft)
 
@@ -324,11 +515,17 @@ draft implementation and will be reworked against the final API; the
    keeps **no** `write_cursor[N]` array; each write re-walks the target
    bucket (`walk_bucket`) to find the append cursor (+1 read on
    `update`/`delete`), honoring contract R1 (O(1) steady-state RAM).
-3. **Sector-size portability.** 4 KB stack buffers assume ≤ 4 KB erase
-   sectors; parts with larger erase blocks need either a Kconfig'd buffer or
-   an explicit supported-geometry statement.
-4. **Master format version field** — add alongside the magic for bucket-log
-   format evolution.
+3. **Sector-size portability.** *(Resolved.)* The sector buffers are sized by
+   `BLOB_DB_SECTOR_BUF_SIZE` and mount refuses a partition whose sector is
+   larger. Slot staging moved off the stack into the compaction scratch, so
+   the payload cap no longer drives stack depth (contract R7). The cap itself
+   is checked against the geometry at mount: a bucket is an append-only log,
+   so a rebind needs two slots to coexist, bounding the payload at
+   `(sector − 16) / 2 − 14` — about 2026 B on 4 KB sectors, 32 746 B on 64 KB.
+4. **Master format version field.** *(Resolved.)* Superseded by the frozen
+   compatibility prefix (§3.1): `format_major` / `format_minor` / `hdr_len`
+   under their own CRC, so software of any vintage can classify a store it did
+   not write and refuse it rather than reformat it.
 5. **Debug bound-check for UB `update`** — optional Kconfig
    (`BLOB_DB_ASSERT_BOUND`): get-shaped scan + `__ASSERT` in debug builds,
    nothing in release.

@@ -41,6 +41,16 @@ instructions live in the repository ``README.md``.
 
 .. toctree::
    :maxdepth: 1
+   :caption: Design — proposals
+
+   proposals/2026-08-09-large-payloads
+   proposals/2026-08-09-large-payloads-cost
+   proposals/2026-08-09-kvhash-impact
+   proposals/2026-08-09-rootreg-kvdb-impact
+   proposals/2026-08-09-implementation-plan
+
+.. toctree::
+   :maxdepth: 1
    :caption: Design — reviews
 
    reviews/2026-07-26-design-doc-review

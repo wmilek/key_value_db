@@ -4,9 +4,18 @@ name: Build
 # (ghcr.io/zephyrproject-rtos/ci) — it ships west, the Zephyr SDK, and the
 # native_sim host tools, so no per-run toolchain setup is needed.
 
+# Two triggers, two jobs:
+#   push (any branch)  -> build the BRANCH HEAD. Developer feedback, and the
+#                         only CI that still runs while a PR is conflicted —
+#                         a pull_request build needs a merge ref GitHub cannot
+#                         create for a conflicted PR, so it produces no runs
+#                         at all.
+#   pull_request       -> build the MERGE RESULT (refs/pull/N/merge). The gate:
+#                         what will actually land, semantic conflicts included.
+# native_sim carries the tests and runs on both. The cross-builds are
+# compile-only, so they run at the gate and on main, not on every branch push.
 on:
   push:
-    branches: [main]
     paths-ignore:
       - 'doc/**'
       - '**.md'
@@ -60,6 +69,9 @@ jobs:
 
   cross-build:
     name: nrf5340dk cross-build (both backends)
+    # Compile-only, and cheap to fix late: run it where it gates a merge or
+    # protects main, not on every feature-branch push.
+    if: github.event_name == 'pull_request' || github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     container:
       image: ghcr.io/zephyrproject-rtos/ci:latest
@@ -93,3 +105,13 @@ jobs:
         run: |
           west build -p always -b nrf5340dk/nrf5340/cpuapp -d build/nrf_kvdb key_value_db/app -- \
             -DCONFIG_BLOBDB_KVDB=y
+
+      # app_perf is the binary that gets flashed to produce the numbers in
+      # app_perf/RESULTS.md, and it exercises paths `app` does not: segmented
+      # large objects, blob_db_write(), and the I/O counters. Until this step
+      # existed it was never compiled for the target in CI, so "ready to run
+      # on the DK" rested on someone's last successful local build.
+      - name: Build app_perf (ARM)
+        run: |
+          west build -p always -b nrf5340dk/nrf5340/cpuapp -d build/nrf_perf \
+            key_value_db/app_perf

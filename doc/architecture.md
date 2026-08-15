@@ -17,6 +17,7 @@ Status: v2 · Top-level document; per-layer detail lives in `doc/layers/`
 | `doc/layers/l2_containers.md` | L2 — containers: seq, kvlist, kvhash, kvtree |
 | `doc/layers/l3_interfaces.md` | L3 — access interfaces: kvdb, blobfs, settings |
 | `doc/impl/l1_bucketlog.md` | **Implementation design** (non-normative): the v1 bucket-log allocator — formats, algorithms, costs, open items |
+| `doc/proposals/` | **Change proposals** (non-normative until accepted): analysis + design for a change that spans a contract and its implementation |
 | `doc/reviews/*.md` | Dated reviews of this document set, with findings and their resolution |
 
 `doc/layers/` holds **requirements & contracts** — everything an upper layer
