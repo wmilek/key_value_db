@@ -21,12 +21,12 @@ Each one names the failure it prevents, and points at the code.
 
 ### 1. Put a domain API between your application and the storage stack
 
-`src/persondb.h` speaks persons, cards, permissions and decisions. It does not
+`persondb/persondb.h` speaks persons, cards, permissions and decisions. It does not
 export a key, a shard index, a blob id or a CBOR byte. Everything above it —
 the scenario layer, both frontends — is written against that vocabulary.
 
 *What it prevents:* storage decisions leaking into application code, where they
-become impossible to change. The layout in `persondb.c` was redesigned twice
+become impossible to change. The layout in `persondb/persondb.c` was redesigned twice
 during this work (L3 → L2, 8 shards → 16) and neither change touched a line
 above it. Acceptance criterion **A7** checks this rather than trusting it.
 
@@ -80,15 +80,21 @@ The reverse order in row 1 would leave a credential granting access on behalf
 of a person who does not list it — a crash that fails **open**. Same two
 writes, same cost, opposite security posture.
 
-*See* `persondb_card_assign()` / `persondb_card_revoke()` in `src/persondb.c`.
+*See* `persondb_card_assign()` / `persondb_card_revoke()` in `persondb/persondb.c`.
 
 ### 6. Don't denormalize until you have measured the thing you'd be avoiding
 
 The tempting optimization is a permission bitmask cached in the credential
 index, turning the access decision into one lookup instead of two. This app
 refuses it, and measures what the refusal costs (`RESULTS.md`): the decision is
-2 map gets, and the CBOR decode inside it is **1 %** of the time on `native_sim`
-and a projected **0.01 %** on hardware.
+2 map gets, and the CBOR encode/decode inside it is **0.84 %** of the time
+measured on the DK — and a predicted **9–14 %** once `main`'s faster storage
+path is re-measured there. Still not the bottleneck; no longer negligible.
+
+An earlier edition of this file claimed "a projected 0.01 % on hardware". That
+was a `native_sim` compute figure carried onto a Cortex-M33, and the board says
+it was wrong by 159× (`RESULTS.md` §5a). The practice survived the correction;
+the number did not.
 
 *What it prevents:* buying a second copy of the truth — and the consistency
 problem in practice 5 — before knowing whether the first copy was the problem.
@@ -98,7 +104,7 @@ ordering to get right.
 
 ### 7. Make your data a pure function of a key, so you can verify without a journal
 
-`src/dataset.c` derives every field of person *i* from *i*. Verification
+`dataset/dataset.c` derives every field of person *i* from *i*. Verification
 re-derives what the store should hold and compares; there is no shadow copy,
 no expected-value table, and no RAM proportional to the dataset.
 
@@ -110,7 +116,7 @@ the only reason `scenario_report_get()` can state how full the flash is.
 ### 8. Compare canonical encodings instead of hand-written field comparisons
 
 `CONFIG_ZCBOR_CANONICAL=y` makes a record's bytes a pure function of its
-content, so `same_person()` encodes both sides and `memcmp`s.
+content, so `persondb_person_equal()` encodes both sides and `memcmp`s.
 
 *What it prevents:* a comparison that silently stops covering a field when the
 schema grows.
@@ -119,8 +125,8 @@ schema grows.
 
 `scenario_fill()` writes a batch and then commits a counter to the superblock.
 Replaying a partial batch rewrites identical values, so an interrupted fill
-resumes rather than restarting — which matters when the fill is a projected
-~2.5 h on the DK.
+resumes rather than restarting — which matters when the fill is **≈ 2.7 h on
+the DK**, extrapolated from a measured 16.4 min at a tenth of the scale.
 
 *What it prevents:* long provisioning runs that cannot survive a power cut, and
 the resume logic that gets written badly under time pressure when they do.
@@ -143,18 +149,23 @@ a provisioning run, with no repair path short of a reformat.
 ### 11. Assert the geometry your configuration assumes
 
 `CONFIG_BLOB_DB_MAX_PAYLOAD_LEN` must fit *twice* inside a sector or a full
-bucket can be written once and never rewritten (**B10**), and nothing in the
-library checks it (**B9**). `src/persondb.c` carries a `BUILD_ASSERT` for the
-configured geometry and re-checks the real one in `persondb_open()`.
+bucket can be written once and never rewritten (**B10**). `persondb/persondb.c`
+carries a `BUILD_ASSERT` for the configured geometry and re-checks the real one
+in `persondb_open()`.
+
+`blob_db` now checks the same inequality at mount — B9 and B10 were findings
+this app raised, and `main` closed them. The app keeps its own assert anyway:
+failing at compile time beats failing at mount.
 
 *What it prevents:* an app that works on 64 KB-sector QSPI and fails
 mysteriously partway through a fill on 4 KB-sector internal flash.
 
 ### 12. Count your own flash traffic
 
-Nothing below reports occupancy, entry counts or I/O (**B3**, **K10**), so
-`persondb.c` counts map operations and converts them to bytes with the sector
-size it read from devicetree. That is where every amplification figure in
+`persondb.c` reads `blob_db_iostats_get()` and reports what the flash actually
+did. It used to *model* it — "map operations × sector size" — which was right
+until `main` taught `blob_db` to walk buckets by slot header, and then wrong by
+20×. Measure, do not model: that is where every amplification figure in
 `RESULTS.md` comes from — including the one that says an access decision moves
 **256 KB of flash to answer a question about 365 bytes**.
 
@@ -163,7 +174,7 @@ costs.
 
 ### 13. Separate "operations on the data" from "how they are invoked"
 
-`src/scenario.c` fills, verifies, mutates, benchmarks and reports — and never
+`scenario/scenario.c` fills, verifies, mutates, benchmarks and reports — and never
 prints. Both frontends are argument parsing and formatting over the same calls.
 
 *What it prevents:* a benchmark and an interactive tool that drift into
@@ -184,17 +195,32 @@ configuration takes hours.
 
 ## Layout
 
+**One directory per layer, one `CMakeLists.txt` each.** The tree is the
+architecture:
+
 ```
-src/dataset.c      pure generator: index -> person. No storage, no CBOR.
-src/person_cbor.c  the wire format (zcbor). No storage.
-src/persondb.c     the domain API, on kvhash map_ops + rootreg + blob_db.
-src/scenario.c     operations on a population. Returns structs, never prints.
-src/ui_bench.c     frontend: the unattended run.
-src/ui_shell.c     frontend: interactive commands.
-tools/sizing.py    offline capacity check — see practice 10.
+ui/         main.c, ui_bench.c, ui_shell.c   parse and print only
+scenario/   scenario.c                       fill, verify, mutate, measure
+persondb/   persondb.c                       the person management API
+            person_cbor.c                    the wire format — private here
+dataset/    dataset.c                        pure generator: index -> person
+tools/      sizing.py                        offline capacity check (not built)
 ```
 
-Dependencies point one way only, mirroring the stack's own P6.
+Dependencies point one way only, mirroring the stack's own P6 — and because
+each directory publishes its own header directory, adding an edge between
+layers means editing a `CMakeLists.txt`, not just typing an `#include`:
+
+| directory | may include |
+|---|---|
+| `ui/` | `scenario.h` |
+| `scenario/` | `persondb.h`, `dataset.h` |
+| `persondb/` | `person_cbor.h` |
+| `dataset/` | `persondb.h` (the record type only) |
+
+`persondb/` is the only directory that names `blob_db`, `rootreg` or
+`map_ops`, and the only one that encodes or decodes CBOR. That is checkable
+with a grep, and acceptance criterion **A7** is exactly that grep.
 
 ## Shell
 

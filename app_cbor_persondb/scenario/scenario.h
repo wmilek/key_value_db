@@ -187,6 +187,16 @@ int scenario_person_show(struct scenario *s, uint32_t index,
 int scenario_card_of(struct scenario *s, uint32_t index, uint8_t slot,
 		     char *out, size_t sz);
 
+/**
+ * @brief The dataset index a person id came from.
+ *
+ * Only the generator knows how ids are numbered. Exposing the inverse here
+ * keeps that knowledge below the frontends, which otherwise have to include
+ * dataset.h to print a person's index — a dependency from the top layer
+ * straight to the bottom one.
+ */
+uint32_t scenario_index_of(uint32_t person_id);
+
 #ifdef __cplusplus
 }
 #endif

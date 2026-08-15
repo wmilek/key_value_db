@@ -498,6 +498,11 @@ int scenario_person_show(struct scenario *s, uint32_t index,
 	return persondb_person_get(s->db, dataset_id_of(index), out);
 }
 
+uint32_t scenario_index_of(uint32_t person_id)
+{
+	return dataset_index_of(person_id);
+}
+
 int scenario_card_of(struct scenario *s, uint32_t index, uint8_t slot,
 		     char *out, size_t sz)
 {

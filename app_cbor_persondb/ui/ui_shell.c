@@ -19,7 +19,6 @@
 #include <zephyr/kernel.h>
 #include <zephyr/shell/shell.h>
 
-#include "dataset.h"
 #include "scenario.h"
 
 static struct scenario g_s;
@@ -224,7 +223,7 @@ static int cmd_card(const struct shell *sh, size_t argc, char **argv)
 		return rc;
 	}
 	shell_print(sh, "%s -> person %u (dataset index %u)", argv[1], owner,
-		    dataset_index_of(owner));
+		    scenario_index_of(owner));
 	return 0;
 }
 

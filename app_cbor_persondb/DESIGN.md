@@ -243,32 +243,47 @@ Not designed around; it is findings **B1/B2/K4/K5**, and it is why F8 exists.
 app_cbor_persondb/
 ├── DESIGN.md  FINDINGS.md  README.md  RESULTS.md
 ├── CMakeLists.txt  Kconfig  prj.conf  sample.yaml  VERSION
-├── boards/  native_sim.{conf,overlay}
-│            nrf5340dk_nrf5340_cpuapp.{conf,overlay}
-└── src/
-    ├── main.c            starts the selected frontend, nothing else
-    ├── ui_bench.c        frontend: automatic run          (FRONTEND_BENCH)
-    ├── ui_shell.c        frontend: interactive commands   (FRONTEND_SHELL)
-    ├── scenario.h/.c     §9 — operations on a whole population
-    ├── persondb.h/.c     §8 — the person management API
-    ├── person_cbor.h/.c  CBOR codec (zcbor). Knows nothing about storage.
-    └── dataset.h/.c      pure generator: index → person. Knows nothing about
-                          storage or CBOR.
+├── boards/   native_sim.{conf,overlay}
+│             nrf5340dk_nrf5340_cpuapp.{conf,overlay}
+├── tools/    sizing.py — offline capacity check (§6.1). Not built.
+│
+├── ui/           main.c, ui_bench.c, ui_shell.c
+│                 Frontends. Parse and print; include only scenario.h.
+├── scenario/     scenario.{c,h}
+│                 Operations on a population. Returns structs, never prints.
+├── persondb/     persondb.{c,h}     the person management API (§8)
+│                 person_cbor.{c,h}  the wire format — private to this layer
+│                 The only directory that names blob_db, rootreg or map_ops.
+└── dataset/      dataset.{c,h}
+                  The synthetic population, a pure function of an index.
 ```
+
+**One directory per layer, one `CMakeLists.txt` each.** Each contributes its
+own sources and publishes its own header directory, so the build file has the
+same shape as the design and a new edge between layers is a visible edit rather
+than an `#include` someone slipped in. The resulting include graph is exactly
+the diagram below — verified by inspection, not asserted:
+
+| directory | includes |
+|---|---|
+| `ui/` | `scenario.h` |
+| `scenario/` | `persondb.h`, `dataset.h` |
+| `persondb/` | `person_cbor.h` |
+| `dataset/` | `persondb.h` (the record type only) |
+
 
 Four layers inside the application, one dependency direction, mirroring P6:
 
 ```
-  ui_bench.c   ui_shell.c          frontends — parse and print only (F15)
-        └──────┬──────┘
-          scenario.h                populations: fill, verify, mutate, measure
-               │                                                        (F14)
-          persondb.h                domain: persons, cards, permissions,
-               │                    decisions                       (F12/R-H)
-    ┌──────────┴──────────┐
- person_cbor.h        dataset.h     codec            generator
-          │
-   kvhash map_ops ─► rootreg ─► blob_db               the stack
+  ui/         ui_bench.c   ui_shell.c     parse and print only        (F15)
+                    └──────┬──────┘
+  scenario/       scenario.h               fill, verify, mutate, measure
+                       │      └──────────────► dataset/  (pure generator, F6)
+  persondb/       persondb.h                persons, cards, permissions,
+                       │                     decisions          (F12 / R-H)
+                       ├──► person_cbor.h    the wire format (private)
+                       │
+              kvhash map_ops ─► rootreg ─► blob_db        the stack
 ```
 
 Each boundary is narrow enough to be replaceable: swapping CBOR for another
