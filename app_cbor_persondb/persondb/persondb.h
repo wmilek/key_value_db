@@ -144,7 +144,16 @@ int persondb_prepare(int *buckets_formatted);
 /**
  * @brief Insert or replace a person record, and index every card it lists.
  *
+ * Replace means replace: a card the stored version listed and @p p does not
+ * loses its index entry, because leaving it would let it keep resolving to a
+ * person who no longer lists it — a grant on a withdrawn credential.
+ *
+ * Costs one extra map get, paid on inserts too. Idempotent, and repairable:
+ * redoing an interrupted call finishes it.
+ *
  * @retval 0       stored
+ * @retval -EINVAL a card id is empty or longer than PERSONDB_CARD_LEN, or a
+ *                 count exceeds its cap — rejected before the first write
  * @retval -ENOSPC a kvhash bucket overflowed (K2) — counted in the stat block
  */
 int persondb_person_put(struct persondb *db, const struct persondb_person *p);
@@ -169,16 +178,46 @@ int persondb_person_delete(struct persondb *db, uint32_t id);
  * direction only: this order leaves a card the person lists but that resolves
  * to nothing, which *denies*. The reverse order would leave a credential
  * granting access on behalf of a person who does not list it.
+ *
+ * Repairable: redoing an interrupted call completes the index write rather
+ * than reporting the card as already assigned and stopping.
+ *
+ * @retval -EEXIST the card is currently held by a different person; revoke it
+ *                 first. A card is a physical object, so co-ownership is not a
+ *                 state this API will enter.
+ * @retval -EINVAL empty card id, or longer than PERSONDB_CARD_LEN
+ * @retval -ENOSPC the person already holds PERSONDB_CARDS_MAX cards
  */
 int persondb_card_assign(struct persondb *db, uint32_t person_id,
 			 const char *card);
 
 /**
- * @brief Revoke a card.
+ * @brief Revoke a card from a named person.
  *
  * Deletes the index entry first and rewrites the person second — the mirror
  * of assignment, and fail-safe for the same reason: after the first write the
  * card already resolves to nothing.
+ *
+ * Prefer this form wherever the caller knows the person. Because it does not
+ * need the index to find the record, redoing an interrupted call converges;
+ * the card-only form below cannot.
+ */
+int persondb_card_revoke_from(struct persondb *db, uint32_t person_id,
+			      const char *card);
+
+/**
+ * @brief Revoke a card, resolving its holder through the index.
+ *
+ * Convenience for callers holding nothing but a card id — a reader at a door,
+ * the shell. It is *not* repairable: the index entry it needs to find the
+ * person is the first thing it deletes, so a crash between the two writes
+ * leaves the card listed in a record this function can no longer identify,
+ * and the redo returns -ENOENT.
+ *
+ * That is the honest cost of one index and no multi-key transaction, not an
+ * omission — see persondb_card_revoke_from().
+ *
+ * @retval -ENOENT no such credential
  */
 int persondb_card_revoke(struct persondb *db, const char *card);
 
@@ -191,11 +230,17 @@ int persondb_card_owner(struct persondb *db, const char *card,
 
 /* -- permissions -------------------------------------------------------- */
 
-/** Add @p perm to a person, if not already held. */
+/**
+ * @brief Add @p perm to a person, if not already held.
+ *
+ * @retval -EINVAL empty, or longer than PERSONDB_PERM_MAX. Truncating instead
+ *                 would store a permission that cannot afterwards be revoked
+ *                 by the name it was granted under.
+ */
 int persondb_permission_grant(struct persondb *db, uint32_t person_id,
 			      const char *perm);
 
-/** Remove @p perm from a person. */
+/** Remove @p perm from a person. @retval -ENOENT not held. */
 int persondb_permission_revoke(struct persondb *db, uint32_t person_id,
 			       const char *perm);
 

@@ -148,6 +148,63 @@ static int cred_put(struct persondb *db, const char *card, uint32_t person_id)
 	return map_set(db, db->sb.cred_root, card, buf, len);
 }
 
+/* Encode a person and write it to its shard. One map set, so one atomic write:
+ * a crash either leaves the previous record or this one, never a blend. */
+static int person_store(struct persondb *db, const struct persondb_person *p)
+{
+	uint8_t buf[PERSON_CBOR_MAX];
+	char key[PERSON_KEY_SZ];
+	size_t len;
+	int rc = person_cbor_encode(p, buf, sizeof(buf), &len);
+
+	if (rc != 0) {
+		return rc;
+	}
+	person_key(key, p->id);
+	return map_set(db, people_root(db, p->id), key, buf, len);
+}
+
+static bool person_lists_card(const struct persondb_person *p, const char *card)
+{
+	for (uint8_t i = 0; i < p->n_cards; i++) {
+		if (strcmp(p->card[i], card) == 0) {
+			return true;
+		}
+	}
+	return false;
+}
+
+/*
+ * Reject a card id that cannot be stored *consistently*, before the first write
+ * rather than after.
+ *
+ * The record holds a fixed-width copy of the id while the credential index is
+ * keyed by the caller's string at its full length, so an over-long id would be
+ * silently truncated on one side and not the other: the card would resolve
+ * through the index to a person whose record lists a different string. Nothing
+ * afterwards could reconcile them — revoke would delete the index entry and
+ * then fail to find the card in the record, leaving it listed forever.
+ *
+ * An empty id is rejected for a duller reason with the same shape: kvhash
+ * refuses a zero-length key with -EINVAL, which lands *after* the record has
+ * been written, leaving a partially-applied change.
+ */
+static int card_valid(const char *card)
+{
+	size_t n = card ? strlen(card) : 0;
+
+	return (n == 0 || n > PERSONDB_CARD_LEN) ? -EINVAL : 0;
+}
+
+/* Same argument, one structure: a truncated permission is stored, and then no
+ * caller can revoke it by the name they granted. */
+static int perm_valid(const char *perm)
+{
+	size_t n = perm ? strlen(perm) : 0;
+
+	return (n == 0 || n > PERSONDB_PERM_MAX) ? -EINVAL : 0;
+}
+
 static int sb_commit(struct persondb *db)
 {
 	uint8_t buf[SUPERBLOCK_CBOR_MAX];
@@ -399,17 +456,55 @@ int persondb_prepare(int *buckets_formatted)
 
 int persondb_person_put(struct persondb *db, const struct persondb_person *p)
 {
-	uint8_t buf[PERSON_CBOR_MAX];
-	char key[PERSON_KEY_SZ];
-	size_t len;
-	int rc = person_cbor_encode(p, buf, sizeof(buf), &len);
+	struct persondb_person old;
+	bool replacing;
+	int rc;
 
-	if (rc != 0) {
-		return rc;
+	if (p->n_cards > PERSONDB_CARDS_MAX || p->n_perms > PERSONDB_PERMS_MAX) {
+		return -EINVAL;
+	}
+	for (uint8_t i = 0; i < p->n_cards; i++) {
+		rc = card_valid(p->card[i]);
+		if (rc != 0) {
+			return rc;
+		}
 	}
 
-	person_key(key, p->id);
-	rc = map_set(db, people_root(db, p->id), key, buf, len);
+	/*
+	 * This operation *replaces*, so the cards the previous version listed
+	 * and this one does not must lose their index entries. Skipping that
+	 * reaches the one outcome F5 exists to prevent — a credential granting
+	 * access on behalf of a person who does not list it — and reaches it
+	 * with no crash involved at all, just two ordinary calls.
+	 *
+	 * The two halves therefore take opposite orders, which is F5 applied
+	 * twice: drop an index entry *before* the record stops listing its
+	 * card, add one *after* the record starts. Every intermediate state
+	 * denies, in both directions.
+	 *
+	 * The cost is one extra map get per put, paid on inserts too, where it
+	 * only ever answers -ENOENT. That is the price of the operation meaning
+	 * what its name says; a caller that knows it is inserting still pays it.
+	 */
+	rc = persondb_person_get(db, p->id, &old);
+	if (rc != 0 && rc != -ENOENT) {
+		return rc;
+	}
+	replacing = (rc == 0);
+
+	if (replacing) {
+		for (uint8_t i = 0; i < old.n_cards; i++) {
+			if (person_lists_card(p, old.card[i])) {
+				continue;
+			}
+			rc = map_del(db, db->sb.cred_root, old.card[i]);
+			if (rc != 0 && rc != -ENOENT) {
+				return rc;
+			}
+		}
+	}
+
+	rc = person_store(db, p);
 	if (rc != 0) {
 		return rc;
 	}
@@ -472,48 +567,72 @@ int persondb_card_assign(struct persondb *db, uint32_t person_id,
 			 const char *card)
 {
 	struct persondb_person p;
-	int rc = persondb_person_get(db, person_id, &p);
+	uint32_t owner;
+	int rc = card_valid(card);
 
 	if (rc != 0) {
 		return rc;
 	}
 
-	for (uint8_t i = 0; i < p.n_cards; i++) {
-		if (strcmp(p.card[i], card) == 0) {
-			return 0;   /* idempotent: replay of a batch is free */
+	/*
+	 * A card is a physical object: it is in one person's hand or nobody's.
+	 * Without this check, assigning a card that is already live silently
+	 * leaves its previous holder still listing it — and deleting *that*
+	 * person then walks their record and revokes the new holder's working
+	 * credential. Fail-closed, but a lockout with no visible cause.
+	 */
+	rc = persondb_card_owner(db, card, &owner);
+	if (rc == 0 && owner != person_id) {
+		return -EEXIST;
+	}
+	if (rc != 0 && rc != -ENOENT) {
+		return rc;
+	}
+
+	rc = persondb_person_get(db, person_id, &p);
+	if (rc != 0) {
+		return rc;
+	}
+
+	if (!person_lists_card(&p, card)) {
+		if (p.n_cards >= PERSONDB_CARDS_MAX) {
+			return -ENOSPC;
+		}
+		snprintf(p.card[p.n_cards], sizeof(p.card[0]), "%s", card);
+		p.n_cards++;
+
+		/* Person first, index second — see F5. The reverse order would
+		 * leave a credential that grants access on behalf of a person
+		 * who does not list it: a crash that fails *open*. */
+		rc = person_store(db, &p);
+		if (rc != 0) {
+			return rc;
 		}
 	}
-	if (p.n_cards >= PERSONDB_CARDS_MAX) {
-		return -ENOSPC;
-	}
 
-	snprintf(p.card[p.n_cards], sizeof(p.card[0]), "%s", card);
-	p.n_cards++;
-
-	/* Person first, index second — see F5. The reverse order would leave a
-	 * credential that grants access on behalf of a person who does not
-	 * list it: a crash that fails *open*. */
-	uint8_t buf[PERSON_CBOR_MAX];
-	size_t len;
-	char key[PERSON_KEY_SZ];
-
-	rc = person_cbor_encode(&p, buf, sizeof(buf), &len);
-	if (rc != 0) {
-		return rc;
-	}
-	person_key(key, person_id);
-	rc = map_set(db, people_root(db, person_id), key, buf, len);
-	if (rc != 0) {
-		return rc;
-	}
-
+	/*
+	 * Deliberately not an `else`. When the record already lists the card,
+	 * the index entry may still be missing — that is precisely the state a
+	 * crash between the two writes above leaves behind, and it is the state
+	 * a redo has to *finish*, not skip.
+	 *
+	 * This function used to return 0 here, calling itself idempotent. It was
+	 * idempotent in the weak sense that redoing it wrote nothing; it was not
+	 * *convergent*, so an interrupted assign became permanent — the card
+	 * stayed listed and unresolvable, and every later verify reported it.
+	 * Fail-safe is not the same property as repairable, and ordering buys
+	 * only the first (F5, C8). Making the second write unconditional buys
+	 * the second, for the cost of one map set on a path only replay reaches.
+	 */
 	return cred_put(db, card, person_id);
 }
 
-int persondb_card_revoke(struct persondb *db, const char *card)
+int persondb_card_revoke_from(struct persondb *db, uint32_t person_id,
+			      const char *card)
 {
-	uint32_t person_id;
-	int rc = persondb_card_owner(db, card, &person_id);
+	struct persondb_person p;
+	uint8_t n = 0;
+	int rc = card_valid(card);
 
 	if (rc != 0) {
 		return rc;
@@ -526,14 +645,13 @@ int persondb_card_revoke(struct persondb *db, const char *card)
 		return rc;
 	}
 
-	struct persondb_person p;
-
+	/* -ENOENT above is tolerated rather than reported, which is what makes
+	 * a redo converge: the caller named the person, so the second write can
+	 * still be completed whether or not the first one already landed. */
 	rc = persondb_person_get(db, person_id, &p);
 	if (rc != 0) {
 		return rc;
 	}
-
-	uint8_t n = 0;
 
 	for (uint8_t i = 0; i < p.n_cards; i++) {
 		if (strcmp(p.card[i], card) != 0) {
@@ -548,16 +666,35 @@ int persondb_card_revoke(struct persondb *db, const char *card)
 	}
 	p.n_cards = n;
 
-	uint8_t buf[PERSON_CBOR_MAX];
-	size_t len;
-	char key[PERSON_KEY_SZ];
+	return person_store(db, &p);
+}
 
-	rc = person_cbor_encode(&p, buf, sizeof(buf), &len);
+int persondb_card_revoke(struct persondb *db, const char *card)
+{
+	uint32_t person_id;
+	int rc = card_valid(card);
+
 	if (rc != 0) {
 		return rc;
 	}
-	person_key(key, person_id);
-	return map_set(db, people_root(db, person_id), key, buf, len);
+
+	/*
+	 * Resolving the owner through the index is the only way to reach the
+	 * record from a card alone — and it is exactly why this form cannot
+	 * repair itself. Once the index entry is gone the owner is unknown, so
+	 * an interrupted revoke redone here returns -ENOENT and stops, with the
+	 * card still listed in a record nobody can now identify.
+	 *
+	 * A caller that can name the person should call
+	 * persondb_card_revoke_from() instead and get a redo that converges.
+	 * The asymmetry is not an oversight in this API: it is what a single
+	 * index and no multi-key transaction (C8) actually buy you.
+	 */
+	rc = persondb_card_owner(db, card, &person_id);
+	if (rc != 0) {
+		return rc;
+	}
+	return persondb_card_revoke_from(db, person_id, card);
 }
 
 int persondb_card_owner(struct persondb *db, const char *card,
@@ -575,26 +712,17 @@ int persondb_card_owner(struct persondb *db, const char *card,
 
 /* -- permissions -------------------------------------------------------- */
 
-static int person_store(struct persondb *db, const struct persondb_person *p)
-{
-	uint8_t buf[PERSON_CBOR_MAX];
-	char key[PERSON_KEY_SZ];
-	size_t len;
-	int rc = person_cbor_encode(p, buf, sizeof(buf), &len);
-
-	if (rc != 0) {
-		return rc;
-	}
-	person_key(key, p->id);
-	return map_set(db, people_root(db, p->id), key, buf, len);
-}
-
 int persondb_permission_grant(struct persondb *db, uint32_t person_id,
 			      const char *perm)
 {
 	struct persondb_person p;
-	int rc = persondb_person_get(db, person_id, &p);
+	int rc = perm_valid(perm);
 
+	if (rc != 0) {
+		return rc;
+	}
+
+	rc = persondb_person_get(db, person_id, &p);
 	if (rc != 0) {
 		return rc;
 	}
@@ -620,13 +748,17 @@ int persondb_permission_revoke(struct persondb *db, uint32_t person_id,
 			       const char *perm)
 {
 	struct persondb_person p;
-	int rc = persondb_person_get(db, person_id, &p);
+	uint8_t n = 0;
+	int rc = perm_valid(perm);
 
 	if (rc != 0) {
 		return rc;
 	}
 
-	uint8_t n = 0;
+	rc = persondb_person_get(db, person_id, &p);
+	if (rc != 0) {
+		return rc;
+	}
 
 	for (uint8_t i = 0; i < p.n_perms; i++) {
 		if (strcmp(p.perm[i], perm) != 0) {
@@ -665,8 +797,12 @@ int persondb_check(struct persondb *db, const char *card, const char *perm,
 
 	rc = persondb_person_get(db, person_id, p);
 	if (rc == -ENOENT) {
-		/* The index resolved to a person that is not there. Neither
-		 * write ordering in this file can produce that (F5), so it is
+		/* The index resolved to a person that is not there. No sequence
+		 * of operations in this file can produce that: every write
+		 * order here drops an index entry before, and adds it after,
+		 * the record that owns it (F5) — including the replace path in
+		 * persondb_person_put(), which is where this claim was false
+		 * until it learned to unindex the cards it drops. So this is
 		 * real damage — deny, and say so. */
 		LOG_ERR("credential %s resolves to absent person %u", card,
 			person_id);

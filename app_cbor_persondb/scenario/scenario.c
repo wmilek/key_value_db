@@ -247,7 +247,13 @@ int scenario_mutate(struct scenario *s, struct scenario_mutate_report *out)
 				continue;
 			}
 			dataset_card(idx, DATASET_TEMP_CARD_SLOT, card);
-			rc = persondb_card_revoke(s->db, card);
+			/* The owner-qualified form, because this caller knows
+			 * the person: a round interrupted between the index
+			 * delete and the record rewrite is then finished by the
+			 * redo. The card-only form would resolve -ENOENT and
+			 * leave the record listing a card forever. */
+			rc = persondb_card_revoke_from(s->db, dataset_id_of(idx),
+						       card);
 			if (rc == 0) {
 				out->revoked++;
 			} else if (rc != -ENOENT) {
@@ -295,8 +301,21 @@ const char *scenario_bench_name(enum scenario_bench_kind which)
 	return which < SCENARIO_BENCH_KINDS ? bench_names[which] : "?";
 }
 
-/* A time inside every generated person's validity window, so `check` measures
- * the full path rather than short-circuiting on EXPIRED. */
+/*
+ * The instant the access decision is benchmarked at.
+ *
+ * It sits inside the validity window of ~99.5 % of generated persons, not all
+ * of them: dataset.c issues badges across a two-year span ending at
+ * 1 830 297 599, so the last ~0.47 % are not yet valid here and their `check`
+ * short-circuits on EXPIRED before the permission compare. The benchmark
+ * reports those separately: RESULTS.md §8's 10 000-person capture records 2 of
+ * 200 samples, and the 1 000- and 200-person runs record none, because which
+ * indices a sample lands on decides whether it meets one.
+ *
+ * They are left alone rather than tuned away. A decision path that never takes
+ * its cheap exit is not the one a product sees either, and moving this constant
+ * would silently redefine the benchmark.
+ */
 #define BENCH_NOW 1830000000u
 
 int scenario_bench(struct scenario *s, enum scenario_bench_kind which,
