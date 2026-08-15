@@ -35,7 +35,8 @@ report a number no product would ever see.
 |---|--:|
 | `check` — resolve a credential and decide (**R-D**) | **44 µs/op · 21 510 ops/s** |
 | `byid` — fetch a person record | **23 µs/op · 39 666 ops/s** |
-| Same on the nRF5340-DK, pre-merge (§5) | **114.2 ms/op · 8.8 ops/s** |
+| Same on the **nRF5340-DK** (§5, post-merge) | **14.605 ms/op · 68 ops/s** |
+| …on the DK before the large-payload merge | 114.2 ms/op · 8.8 ops/s |
 
 ## 1. What `native_sim` can and cannot tell you
 
@@ -413,13 +414,18 @@ The DK run gives two constants the `native_sim` numbers cannot: a `blob_db`
 read costs **28.8 ms** for a 64 KB sector (0.45 ms/KB), and a 64 KB erase costs
 **1 072 ms**.
 
-**Predicted `check` after the merge.** The decision now moves 13.3 KB in 261
-transactions instead of 256 KB in 4. At 0.45 ms/KB the data is ~6 ms; 261 SPI
-transactions at a plausible 5–20 µs of fixed command-address-and-driver cost add
-1.3–5 ms. So **≈ 7–11 ms, against 114.2 ms measured** — roughly a 10–15×
-improvement, and the spread between those two estimates is exactly the
-transaction-cost question in `FINDINGS.md` N1. **Measuring it is the one thing
-that settles N1**, and only the board can.
+**Predicted `check` after the merge — and the prediction was wrong.** This
+section estimated ~6 ms of data plus 1.3–5 ms of fixed cost from "261
+transactions at a plausible 5–20 µs", giving **≈ 7–11 ms**. The board measured
+**14.605 ms** (§5). Both inputs were wrong and partly cancelled: 112
+transactions, not 261, but at ~65 µs each rather than 5–20 — the
+per-transaction cost was low by 3–13×.
+
+The prediction is left standing above rather than quietly corrected, because
+the size of the error is the point: **a plausible-looking estimate of fixed
+per-transaction cost was off by up to an order of magnitude**, and no amount of
+`native_sim` work would have revealed it. See `FINDINGS.md` N1 for what the
+measurement changed.
 
 > **Measured: 14.605 ms, and N1 is settled — a transaction costs ~65 µs.** The
 > estimate above was wrong in both of its terms. The real transaction count is
@@ -444,15 +450,19 @@ codec was "a projected 0.009 % of the decision on hardware". That was the
 |---|--:|--:|--:|
 | `native_sim`, pre-merge | 6 µs | 580 µs | 1.0 % |
 | **DK, pre-merge** | **955 µs** | **114.2 ms** | **0.84 %** |
-| DK, post-merge (predicted) | 955 µs | ≈ 7–11 ms | 9–14 % |
 | **DK, post-merge (measured)** | **950 µs** | **14.605 ms** | **6.5 %** |
 
 The headline conclusion survives — **the serialization format is not the
 bottleneck**, and refusing to denormalize (D2) remains right. But the margin is
-1–2 orders of magnitude thinner than claimed, and once B1 is fixed the codec
-stops being free: at ~10 % of a decision it is no longer beneath notice. Had the
-storage layer been fast from the start, the "CBOR costs nothing" claim would
-have needed the board to make honestly.
+1–2 orders of magnitude thinner than first claimed: the codec is **6.5 %** of a
+decision on today's code, against the "0.009 %" this document once projected.
+The 9–14 % predicted alongside the 7–11 ms guess was the closer of the two
+estimates, and still high, for the same reason — the storage term was
+underestimated.
+
+At 6.5 % the codec is no longer beneath notice, and it is now the *second*
+largest term in a decision after flash. Had the storage layer been fast from
+the start, "CBOR costs nothing" would have needed the board to say honestly.
 
 Two lessons, both about method rather than about the stack:
 

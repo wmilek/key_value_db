@@ -94,14 +94,16 @@ writes, same cost, opposite security posture.
 The tempting optimization is a permission bitmask cached in the credential
 index, turning the access decision into one lookup instead of two. This app
 refuses it, and measures what the refusal costs (`RESULTS.md`): the decision is
-2 map gets, and the CBOR encode/decode inside it is **0.84 %** of the time
-measured on the DK — and a predicted **9–14 %** once `main`'s faster storage
-path is re-measured there. Still not the bottleneck; no longer negligible.
+2 map gets, and the CBOR encode/decode inside it is **6.5 %** of the time —
+950 µs against a 14.605 ms decision, measured on the DK. Still not the
+bottleneck, and now the second-largest term after flash.
 
-An earlier edition of this file claimed "a projected 0.01 % on hardware". That
-was a `native_sim` compute figure carried onto a Cortex-M33, and the board says
-it was wrong by 159× (`RESULTS.md` §5a). The practice survived the correction;
-the number did not.
+That number was wrong twice before it was right. This file once claimed "a
+projected 0.01 % on hardware" — a `native_sim` compute figure carried onto a
+Cortex-M33, wrong by 159×. The correction then over-predicted at 9–14 %,
+because the storage term it divided by was itself a guess. Only the board
+settled it (`RESULTS.md` §5a). The practice survived both corrections; neither
+number did.
 
 *What it prevents:* buying a second copy of the truth — and the consistency
 problem in practice 5 — before knowing whether the first copy was the problem.
