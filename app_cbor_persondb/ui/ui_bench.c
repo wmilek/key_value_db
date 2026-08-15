@@ -55,9 +55,8 @@ static void print_bench(const struct bench_result *b)
 static void print_report(const struct scenario_report *r)
 {
 	printk("\nstore\n");
-	printk("  partition   : %zu B (%zu KiB), %zu B sectors\n",
-	       r->st.partition_bytes, r->st.partition_bytes / 1024,
-	       r->st.sector_bytes);
+	printk("  partition   : %zu B (%zu KiB)\n", r->st.partition_bytes,
+	       r->st.partition_bytes / 1024);
 	printk("  maps        : %u person + 1 credential "
 	       "(bucket count not observable — FINDINGS.md K10)\n",
 	       r->st.n_people_maps);

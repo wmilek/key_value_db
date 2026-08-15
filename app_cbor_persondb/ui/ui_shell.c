@@ -67,8 +67,7 @@ static int cmd_stat(const struct shell *sh, size_t argc, char **argv)
 		return rc;
 	}
 
-	shell_print(sh, "partition   : %zu B, %zu B sectors",
-		    r.st.partition_bytes, r.st.sector_bytes);
+	shell_print(sh, "partition   : %zu B", r.st.partition_bytes);
 	shell_print(sh, "maps        : %u person + 1 credential "
 			"(bucket count not observable)", r.st.n_people_maps);
 	shell_print(sh, "persons     : %u of %u (rev %u)", r.st.populated,

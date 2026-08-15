@@ -163,31 +163,35 @@ static int sb_commit(struct persondb *db)
 /* -- geometry ----------------------------------------------------------- */
 
 /*
- * blob_db knows the partition size, the sector size and the bucket count, and
- * exposes none of them (FINDINGS.md B3). To answer "how full is the store, as
- * a fraction of the external flash" — which is the whole of R-E — the
- * application has to rediscover the geometry through the same flash_area API
- * the library used, behind its back.
+ * The one number this app still has to fetch behind blob_db's back: the size of
+ * the medium, so "how full is the store, as a fraction of the external flash"
+ * — the whole of R-E — can be answered at all. blob_db computes it at mount and
+ * exposes nothing (FINDINGS.md B3, X1 row 7).
+ *
+ * Two hazards come with it, and the app can detect neither:
+ *
+ *  - It names `storage_partition` directly, because that is what the
+ *    flash_area backend hardcodes. CONFIG_BLOB_DB_PARTITION_LABEL looks like
+ *    the right thing to honour instead and is never read by anything (B11).
+ *  - On CONFIG_BLOB_DB_BACKEND_UBI the answer is simply wrong: blob_db is on a
+ *    UBI volume over a *different* partition, its erase unit is a UBI LEB
+ *    rather than a flash sector, and UBI reserves PEBs the raw partition size
+ *    knows nothing about. The fill percentage would be quietly computed
+ *    against the wrong denominator.
+ *
+ * The sector size used to be fetched here too, to model flash traffic as
+ * "operations x sector size". blob_db_iostats_get() measures that directly
+ * now, so it is gone — the leak shrank because a real API replaced a guess.
  */
-static int geometry(size_t *partition_bytes, size_t *sector_bytes)
+static int geometry(size_t *partition_bytes)
 {
 	const struct flash_area *fa;
-	struct flash_sector sector;
-	uint32_t count = 1;
 	int rc = flash_area_open(PARTITION_ID(storage_partition), &fa);
 
 	if (rc < 0) {
 		return rc;
 	}
-
 	*partition_bytes = fa->fa_size;
-	rc = flash_area_sectors(fa, &count, &sector);
-	if ((rc < 0 && rc != -ENOMEM) || count == 0) {
-		flash_area_close(fa);
-		return rc < 0 ? rc : -EIO;
-	}
-	*sector_bytes = sector.fs_size;
-
 	flash_area_close(fa);
 	return 0;
 }
@@ -266,7 +270,7 @@ static int create_store(struct persondb *db, uint32_t n_persons)
 int persondb_open(struct persondb **out, uint32_t n_persons)
 {
 	struct persondb *db = &g_db;
-	size_t partition_bytes, sector_bytes;
+	size_t partition_bytes;
 	int rc;
 
 	if (out == NULL) {
@@ -298,14 +302,13 @@ int persondb_open(struct persondb **out, uint32_t n_persons)
 		return rc;
 	}
 
-	rc = geometry(&partition_bytes, &sector_bytes);
+	rc = geometry(&partition_bytes);
 	if (rc != 0) {
 		LOG_ERR("cannot read partition geometry: %d", rc);
 		return rc;
 	}
 
 	db->st.partition_bytes = partition_bytes;
-	db->st.sector_bytes = sector_bytes;
 
 	rc = rootreg_get_or_create(PADB_ROOTREG_KEY, &db->sb_id);
 	if (rc != 0) {

@@ -813,6 +813,31 @@ lacks.
 
 ---
 
+### B11 — `CONFIG_BLOB_DB_PARTITION_LABEL` is documented and never read (moderate, `read`)
+
+```
+config BLOB_DB_PARTITION_LABEL
+	string "Storage partition label"
+	default "storage"
+	help
+	  Label of the fixed flash partition where blobs are stored. Must
+	  refer to a fixed-partitions child node in the device tree.
+```
+
+Nothing in `lib/` or `include/` reads it. The flash backend hardcodes
+`PARTITION_ID(storage_partition)` and the UBI backend uses
+`FIXED_PARTITION_ID(BLOB_DB_UBI_PARTITION)`; a grep for the symbol outside
+Kconfig returns nothing.
+
+Setting it therefore does exactly nothing, silently — and it is precisely the
+knob an application would reach for when trying *not* to hardcode a partition
+name (X1 row 7). A dead option is worse than a missing one: it advertises a
+capability that does not exist and rewards the careful caller with a wrong
+answer.
+
+Direction: honour it, or delete it. Either is fine; documenting it while
+ignoring it is not.
+
 ## X1 — An application cannot ask the stack anything, so it restates it (major, `hit`)
 
 Not a new defect — it is B3, K9 and K10 seen together, from the position of
@@ -830,7 +855,8 @@ The full inventory, and what closes each:
 | 4 | `CONFIG_BLOB_DB_SECTOR_BUF_SIZE` as a proxy for sector size | Kconfig | **removed** — same |
 | 5 | `MAX_BUCKETS = (MAX_PAYLOAD−8)/8` | `kvhash.c:47` (private) | **removed** — see below |
 | 6 | per-entry framing = 4 B, and the key length | `kvhash.c:291` | **still restated** |
-| 7 | partition and sector size | `blob_db`'s `struct st` | **still fetched behind its back**, via `flash_area` — B3 |
+| 7a | sector size | `blob_db`'s `struct st` | **removed** — `blob_db_iostats_get()` measures what it was modelling |
+| 7b | partition size | `blob_db`'s `struct st` | **still fetched behind its back** — and see below |
 
 Five of seven have now left the application — and note *how* each went: not by
 exporting the constants, but by **removing the caller's need to ask**.
@@ -856,7 +882,47 @@ either. **So neither proposed `info` struct should carry `n_buckets`: nothing
 above needs it, and offering it would invite exactly the restating this finding
 is about.**
 
-**What would close 6 and 7.** Two small, read-only calls, neither requiring an
+### Row 7 in detail — the leak that returns a wrong answer
+
+Rows 1–6 were duplication: the app knew something it shouldn't, but it knew it
+*correctly*. Row 7 is different, because the workaround can be silently wrong.
+
+The app calls `flash_area_open(PARTITION_ID(storage_partition))` and reports
+`fa_size` as the denominator of "51.6 % of the partition" — the whole of R-E.
+Three things are wrong with that, none detectable from where the app stands:
+
+1. **It hardcodes the partition, because so does the library.** The flash
+   backend does `#define BLOB_DB_PARTITION_ID PARTITION_ID(storage_partition)`
+   (`blob_db_store_flash.c:20`). An application trying to be careful would
+   instead honour `CONFIG_BLOB_DB_PARTITION_LABEL` — which is documented,
+   defaults to `"storage"`, and **is read by nothing at all** (B11). Doing the
+   apparently-correct thing is the way to get this wrong.
+
+2. **On the UBI backend the answer is simply false.** With
+   `CONFIG_BLOB_DB_BACKEND_UBI`, `blob_db_store_ubi.c` reports
+   `peb_size = info.leb_size` — a UBI *logical* erase block, smaller than a
+   physical one — over `FIXED_PARTITION_ID(BLOB_DB_UBI_PARTITION)`, a
+   **different devicetree node**, with `BLOB_DB_UBI_SPARE_PEBS` held back for
+   wear-levelling. So the app would open a partition the store is not on,
+   and divide by a capacity UBI never offers it. The percentage would be
+   confidently, quietly wrong.
+
+3. **It duplicates an invariant it cannot check.** `blob_db` verifies that every
+   sector is the same size and that the partition divides evenly by it
+   (`blob_db_store_flash.c:60-70`). The app read `sectors[0]` and assumed.
+
+The third is now moot: the sector size was only ever fetched to *model* flash
+traffic as `operations × sector size`, and `blob_db_iostats_get()` measures
+that directly, so it is gone (row 7a). **The leak shrank because a real API
+replaced a guess** — which is the same lesson as rows 1–5 arriving from a
+different direction.
+
+What remains is one number, `partition_bytes`, and one honest statement of the
+problem: **an application cannot ask the store how big it is, so it asks
+something else and hopes they agree.** On one of the two shipped backends, they
+do not.
+
+**What would close 6 and 7b.** Two small, read-only calls, neither requiring an
 on-flash format change, and both narrower than the sketch this finding
 originally carried:
 

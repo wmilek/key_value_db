@@ -78,8 +78,8 @@ struct persondb_stat {
 	 * (FINDINGS.md K9(c), K10). Reporting a number the firmware cannot
 	 * observe would be inventing one — tools/sizing.py models it instead. */
 
-	size_t   partition_bytes;    /* from devicetree — see B3 */
-	size_t   sector_bytes;       /* erase-block size, ditto */
+	size_t   partition_bytes;    /* read from devicetree — see B3, X1 row 7.
+				      * Wrong on the UBI backend, undetectably. */
 
 	uint32_t enospc_hits;        /* F11: bucket overflows, never expected */
 
