@@ -303,11 +303,16 @@ column.
 
 | Phase | Pre-merge board | §5a predicted | **Post-merge** | Δ | amp before → now |
 |---|--:|--:|--:|--:|--:|
-| `check` (**R-D**) | 114.2 ms | 7–11 ms | **14.605 ms** | ×7.8 | 701× → **24×** |
-| `byid` | 57.6 ms | — | **7.770 ms** | ×7.4 | 355× → **13×** |
-| `miss` | 56.6 ms | — | **7.165 ms** | ×7.9 | 26 214× → **210×** |
-| `put` | 313.8 ms | — | **83.920 ms** | ×3.7 | 1 770× → **47×** |
-| `cbor` | 955 µs | 955 µs | **950 µs** | — | — |
+| `check` — `persondb_check` (**R-D**) | 114.2 ms | 7–11 ms | **14.605 ms** | ×7.8 | 701× → **24×** |
+| `byid` — `persondb_person_get` | 57.6 ms | — | **7.770 ms** | ×7.4 | 355× → **13×** |
+| `miss` — `persondb_card_owner`, unknown card | 56.6 ms | — | **7.165 ms** | ×7.9 | 26 214× → **210×** |
+| `put` — `persondb_person_put`, settled store | 313.8 ms | — | **83.920 ms** | ×3.7 | 1 770× → **47×** |
+| `cbor` — `persondb_person_roundtrip` | 955 µs | 955 µs | **950 µs** | — | — |
+
+The row names are benchmark labels; the second half of each is the
+`persondb.h` operation it calls (`scenario.c:337`, `:359`, `:373`, `:392`,
+`:404`). §5b reads the same numbers as a cost model of that header, which is
+the level application code is written against.
 
 `cbor` is unchanged to within 0.5%, exactly as it must be: it touches no flash.
 That it did not move is the control that makes the other four rows credible.
@@ -472,6 +477,89 @@ Two lessons, both about method rather than about the stack:
 - **A ratio between two things measured on different platforms is not a
   ratio.** "1 % of the decision" was `native_sim` compute over `native_sim`
   flash, and neither term survived contact with the board.
+
+## 5b. Cost of the `persondb.h` operations
+
+The tables above are organised by benchmark phase. Application code is written
+against `persondb.h` (`DESIGN.md` F12), so this section restates the same
+measurements per operation of that header, and — more usefully — says which
+operations are **not** measured at all.
+
+### The read side: one map get ≈ 7 ms
+
+| operation | cost | how known |
+|---|--:|---|
+| `persondb_person_get` | **7.770 ms** | measured (`byid`) |
+| `persondb_card_owner`, card not found | **7.165 ms** | measured (`miss`) |
+| `persondb_card_owner`, card found | **≈6.8–7.0 ms** | derived, below |
+| `persondb_check` | **14.605 ms** | measured (`check`) |
+| `persondb_person_roundtrip` | **0.950 ms** | measured (`cbor`), no flash |
+
+`verify` and `re-verify` are pure compositions of two calls, which solves for
+the hit cost the benchmark never isolates:
+
+| phase | composition | measured | implies a hit at |
+|---|---|--:|--:|
+| verify | 256 `person_get` + 602 `card_owner` | 6 064 ms | **6.77 ms** |
+| re-verify | 256 `person_get` + 618 `card_owner` | 6 291 ms | **6.96 ms** |
+
+Two independent phases agree, and a hit being slightly cheaper than the 7.165 ms
+miss is the expected direction: a miss must scan the whole bucket.
+
+So the read side has a simple rule — **cost ≈ (number of map gets) × ~7 ms.**
+It predicts the composite operation from its parts:
+
+```
+persondb_check = card_owner + person_get = 6.77 + 7.770 = 14.54 ms
+                                measured:                 14.605 ms   (0.4%)
+```
+
+Permission evaluation is free: it runs inside the already-fetched record, which
+is why `check` is two gets and not three. Nothing above this header can beat
+~7 ms per lookup without changing how many map gets an operation needs — see
+`FINDINGS.md` K11, where a map get is two `blob_db` calls rather than one.
+
+### The write side: the same call can cost 84 ms or 808 ms
+
+| operation | cost | how known |
+|---|--:|---|
+| `persondb_person_put`, rewriting into a settled bucket | **83.920 ms** | measured (`put`) |
+| `persondb_person_put`, when the write grows a bucket into compaction | **807.7 ms** | measured (fill, per person) |
+| `persondb_card_assign` | **44.5 ms** | measured (mutate, 64 assigns) |
+| `persondb_prepare` | **1 100 ms per bucket** | measured (prepare, 106 buckets) |
+| `persondb_open` including the `FRESH_START` erase | **25.8 s** | measured (open) |
+
+**The 9.6× spread on `persondb_person_put` is the most important thing on this
+page for a caller**, and the header gives no way to predict which case you get.
+Both figures are the same function on the same board in the same run: the
+benchmark rewrites an existing record, while the fill grows buckets until their
+64 KB sector log must be compacted, and a compaction erases at ~1.09 s. Op
+counts confirm the two are otherwise the same shape of work — 3.32 map ops for
+the benchmark's `put` against 3.48 map writes per person during fill — so the
+gap is erase, not extra work.
+
+A caller that needs a bounded `put` therefore cannot get one from this API; the
+cost depends on the target bucket's fill state, which is not observable
+(`FINDINGS.md` B3, K10).
+
+### Not measured
+
+No phase exercises these, so this file says nothing about them:
+
+- `persondb_card_revoke` — the first run had nothing to revoke (`0 revoked`); a
+  rerun on a populated store would measure it
+- `persondb_open` **attaching to an existing store** — every DK run so far used
+  `FRESH_START`, so the only figure is 25.8 s of erase and the steady-state open
+  cost is unknown
+- `persondb_person_delete`, `persondb_permission_grant`,
+  `persondb_permission_revoke`
+- `persondb_close`, `persondb_erase`, `persondb_stat`,
+  `persondb_progress_get`/`_set`, `persondb_person_equal`,
+  `persondb_person_record_bytes`, `persondb_person_credential_bytes`
+
+That is 5 of the header's operations measured directly, one derived, and the
+rest unknown — worth remembering before quoting this file as the cost of the
+API as a whole.
 
 ## 6. What the numbers say
 
