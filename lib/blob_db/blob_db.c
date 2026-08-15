@@ -1431,6 +1431,24 @@ static int seg_geometry_init(void)
 	return 0;
 }
 
+#if defined(CONFIG_BLOB_DB_TEST_CRASH_HOOKS)
+enum blob_db_test_cut blob_db_test_cut;
+
+/* Stop dead at a chosen step of §6.4, leaving flash exactly as a power cut
+ * there would. Disarms itself, so one armed cut fires once and the recovery
+ * path that follows runs unhooked. */
+#define SEG_CUT(step)							\
+	do {								\
+		if (blob_db_test_cut == (step)) {			\
+			blob_db_test_cut = BLOB_DB_CUT_NONE;		\
+			LOG_WRN("test: cut after " #step);		\
+			return -EINTR;					\
+		}							\
+	} while (0)
+#else
+#define SEG_CUT(step)  do { } while (0)
+#endif
+
 /* Record a segmented mutation in flight, so mount knows to sweep. Costs one
  * master write; a segmented update already costs K slot writes. */
 static int persist_seg_owner(uint64_t owner)
@@ -2015,6 +2033,7 @@ static int seg_update(uint64_t id, const void *payload, size_t len,
 	if (rc < 0) {
 		return rc;
 	}
+	SEG_CUT(BLOB_DB_CUT_AFTER_OWNER_SET);   /* step 1 */
 
 	for (size_t j = 0; j < k; j++) {
 		const size_t n = MIN((size_t)g_seg_len, len - j * g_seg_len);
@@ -2026,7 +2045,12 @@ static int seg_update(uint64_t id, const void *payload, size_t len,
 			return rc;   /* seg_owner stays set; sweep cleans up */
 		}
 		memcpy(g_seg_b + j * sizeof(uint64_t), &sid, sizeof(sid));
+
+		if (j == 0 && k > 1) {
+			SEG_CUT(BLOB_DB_CUT_MID_SEGMENTS);   /* inside step 2 */
+		}
 	}
+	SEG_CUT(BLOB_DB_CUT_AFTER_SEGMENTS);    /* step 2 */
 
 	struct blob_db_index_hdr h = {
 		.version       = BLOB_DB_INDEX_VERSION,
@@ -2043,11 +2067,14 @@ static int seg_update(uint64_t id, const void *payload, size_t len,
 	if (rc < 0) {
 		return rc;
 	}
+	SEG_CUT(BLOB_DB_CUT_AFTER_COMMIT);      /* step 3 — the commit point */
 
 	if (old_k > 0) {
 		seg_release(old_ids, old_k);
 	}
-	return persist_seg_owner(0);
+	SEG_CUT(BLOB_DB_CUT_AFTER_RELEASE);     /* step 4 */
+
+	return persist_seg_owner(0);            /* step 5 */
 }
 #endif /* CONFIG_BLOB_DB_LARGE_PAYLOADS */
 
@@ -2330,6 +2357,7 @@ int blob_db_delete(uint64_t id)
 			if (rc < 0) {
 				return rc;
 			}
+			SEG_CUT(BLOB_DB_CUT_AFTER_OWNER_SET);
 		}
 	}
 #endif
@@ -2345,7 +2373,11 @@ int blob_db_delete(uint64_t id)
 	 * names them, so a crash here leaves work the sweep already knows how
 	 * to finish. */
 	if (old_k > 0) {
+		SEG_CUT(BLOB_DB_CUT_AFTER_COMMIT);
+
 		seg_release(g_seg_a, old_k);
+		SEG_CUT(BLOB_DB_CUT_AFTER_RELEASE);
+
 		rc = persist_seg_owner(0);
 		if (rc < 0) {
 			return rc;

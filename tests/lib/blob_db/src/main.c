@@ -1752,4 +1752,165 @@ ZTEST(blob_db, test_pwrite_survives_remount_and_sweep)
 	zassert_ok(blob_db_read(id, 0, big_dst, BIG_LEN, &got));
 	zassert_mem_equal(big_dst, big_src, BIG_LEN, "content after sweep");
 }
+
+#if defined(CONFIG_BLOB_DB_TEST_CRASH_HOOKS)
+/* --- the §6.4 crash table -----------------------------------------------
+ *
+ * Segmentation's whole crash-safety claim rests on one assertion: step 3,
+ * writing the index record, is the *single* commit point. Before it the new
+ * object is invisible; at it the switch is atomic because it is one
+ * slot-append (§4 latest-wins); after it everything remaining is garbage
+ * collection. So a power cut at any step must leave the payload **wholly old
+ * or wholly new**, never torn — and must leave **no unreferenced segment**
+ * once the sweep has run.
+ *
+ * These tests cut the write at each step and then remount, which is a faithful
+ * power cut: everything blob_db knows lives on flash, so dropping the mount
+ * discards exactly what RAM would lose. The armed cut fires once, so recovery
+ * itself runs unhooked.
+ */
+
+#define OLD_SEED  0x11
+#define NEW_SEED  0xa5
+
+/* Remount and report what survived: content wholly old or wholly new, and the
+ * live segment count after the sweep. */
+static void assert_wholly_old_or_new(uint64_t id, bool expect_new)
+{
+	zassert_ok(blob_db_unmount());
+	zassert_ok(blob_db_mount());   /* runs the sweep if seg_owner is set */
+
+	size_t got = 0;
+
+	zassert_ok(blob_db_read(id, 0, big_dst, BIG_LEN, &got),
+		   "object unreadable after recovery");
+	zassert_equal(got, BIG_LEN, "length changed: got %zu", got);
+
+	fill_pattern(big_src, BIG_LEN, expect_new ? NEW_SEED : OLD_SEED);
+	zassert_mem_equal(big_dst, big_src, BIG_LEN,
+			  "expected the %s payload, wholly",
+			  expect_new ? "new" : "old");
+}
+
+/* The invariant that outlives every individual step: after recovery exactly
+ * one object's worth of segments is live. Old and new payloads are the same
+ * length, so whichever one survived, the count must match what a single
+ * uncut write leaves — anything more is a leak, anything less is data loss. */
+static void assert_no_orphan_segments(int expect_segs)
+{
+	zassert_equal(live_segment_slots(), expect_segs,
+		      "want %d live segments after recovery, got %d",
+		      expect_segs, live_segment_slots());
+}
+
+/* Establish an object, then rewrite it with a cut at `where`. */
+static uint64_t seeded_object(int *out_segs)
+{
+	fill_pattern(big_src, BIG_LEN, OLD_SEED);
+
+	uint64_t id = put_blob(big_src, BIG_LEN);
+
+	*out_segs = live_segment_slots();
+	zassert_true(*out_segs > 1, "precondition: object must be segmented");
+	return id;
+}
+
+static void rewrite_cut_at(uint64_t id, enum blob_db_test_cut where)
+{
+	fill_pattern(big_src, BIG_LEN, NEW_SEED);
+	blob_db_test_cut = where;
+	zassert_equal(blob_db_update(id, big_src, BIG_LEN), -EINTR,
+		      "the cut did not fire — hook misplaced?");
+	zassert_equal(blob_db_test_cut, BLOB_DB_CUT_NONE,
+		      "cut must disarm itself so recovery runs unhooked");
+}
+
+/* Step 1 — the sweep window is open but nothing else happened. Wholly old. */
+ZTEST(blob_db, test_crash_after_owner_set_keeps_old)
+{
+	int segs;
+	uint64_t id = seeded_object(&segs);
+
+	rewrite_cut_at(id, BLOB_DB_CUT_AFTER_OWNER_SET);
+	assert_wholly_old_or_new(id, false);
+	assert_no_orphan_segments(segs);
+}
+
+/* Inside step 2 — some new segments exist, no index names them. Wholly old,
+ * and the half-written segments must not survive the sweep. */
+ZTEST(blob_db, test_crash_mid_segments_keeps_old_and_sweeps)
+{
+	int segs;
+	uint64_t id = seeded_object(&segs);
+
+	rewrite_cut_at(id, BLOB_DB_CUT_MID_SEGMENTS);
+	assert_wholly_old_or_new(id, false);
+	assert_no_orphan_segments(segs);
+}
+
+/* Step 2 complete — every new segment is on flash, but the index still points
+ * at the old ones. This is the case that would tear if the commit were not a
+ * single write. Wholly old. */
+ZTEST(blob_db, test_crash_after_segments_before_commit_keeps_old)
+{
+	int segs;
+	uint64_t id = seeded_object(&segs);
+
+	rewrite_cut_at(id, BLOB_DB_CUT_AFTER_SEGMENTS);
+	assert_wholly_old_or_new(id, false);
+	assert_no_orphan_segments(segs);
+}
+
+/* Step 3 — the commit landed. Wholly new, and the *old* segments are now
+ * unreferenced and must be swept. */
+ZTEST(blob_db, test_crash_after_commit_takes_new_and_sweeps_old)
+{
+	int segs;
+	uint64_t id = seeded_object(&segs);
+
+	rewrite_cut_at(id, BLOB_DB_CUT_AFTER_COMMIT);
+	assert_wholly_old_or_new(id, true);
+	assert_no_orphan_segments(segs);
+}
+
+/* Step 4 — old segments released, seg_owner still set. Wholly new; the sweep
+ * must be idempotent over already-released segments. */
+ZTEST(blob_db, test_crash_after_release_takes_new)
+{
+	int segs;
+	uint64_t id = seeded_object(&segs);
+
+	rewrite_cut_at(id, BLOB_DB_CUT_AFTER_RELEASE);
+	assert_wholly_old_or_new(id, true);
+	assert_no_orphan_segments(segs);
+}
+
+/* The delete sequence has the same shape, and the same commit point: a cut
+ * before the tombstone leaves the object intact, one after leaves it gone with
+ * no segment left behind. */
+ZTEST(blob_db, test_crash_during_delete_is_all_or_nothing)
+{
+	int segs;
+	uint64_t id = seeded_object(&segs);
+
+	/* Cut before the tombstone: the object survives whole. */
+	blob_db_test_cut = BLOB_DB_CUT_AFTER_OWNER_SET;
+	zassert_equal(blob_db_delete(id), -EINTR, "the cut did not fire");
+	assert_wholly_old_or_new(id, false);
+	assert_no_orphan_segments(segs);
+
+	/* Cut immediately after it: the object is gone, and the sweep must
+	 * reclaim every segment it used to name. */
+	blob_db_test_cut = BLOB_DB_CUT_AFTER_COMMIT;
+	zassert_equal(blob_db_delete(id), -EINTR, "the cut did not fire");
+
+	zassert_ok(blob_db_unmount());
+	zassert_ok(blob_db_mount());
+
+	zassert_false(blob_db_exists(id), "delete committed; id must be gone");
+	zassert_equal(live_segment_slots(), 0,
+		      "sweep left %d segments of a deleted object",
+		      live_segment_slots());
+}
+#endif /* CONFIG_BLOB_DB_TEST_CRASH_HOOKS */
 #endif /* CONFIG_BLOB_DB_LARGE_PAYLOADS */

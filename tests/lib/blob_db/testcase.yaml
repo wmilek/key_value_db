@@ -15,3 +15,8 @@ tests:
     extra_configs:
       - CONFIG_BLOB_DB_LARGE_PAYLOADS=y
       - CONFIG_MAIN_STACK_SIZE=32768
+      # Crash injection at each step of the segmented write sequence
+      # (proposal §6.4). Kept in the same config as the rest of the
+      # large-object tests so the commit-point claim is covered by the
+      # config that ships it, not by a config nothing else uses.
+      - CONFIG_BLOB_DB_TEST_CRASH_HOOKS=y

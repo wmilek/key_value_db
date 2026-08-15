@@ -448,6 +448,39 @@ void blob_db_iostats_get(struct blob_db_iostats *out);
 void blob_db_iostats_reset(void);
 #endif /* CONFIG_BLOB_DB_IOSTATS */
 
+#if defined(CONFIG_BLOB_DB_TEST_CRASH_HOOKS)
+/**
+ * @brief Where to cut a segmented write or delete, for crash tests.
+ *
+ * Names the steps of the segmented write sequence (proposal §6.4). Setting
+ * `blob_db_test_cut` makes the *next* segmented `blob_db_update()` or
+ * `blob_db_delete()` stop dead after that step and return `-EINTR`, leaving
+ * flash exactly as a power cut at that instant would. The caller then
+ * unmounts and remounts to run recovery.
+ *
+ * The point of interest is `BLOB_DB_CUT_AFTER_COMMIT`: step 3 writes the
+ * index record and is the single commit point, so a cut before it must leave
+ * the object wholly old, and a cut at or after it wholly new — never torn.
+ * Every cut must also leave no unreferenced segment behind once the sweep has
+ * run.
+ *
+ * Test builds only (`CONFIG_BLOB_DB_TEST_CRASH_HOOKS`).
+ */
+enum blob_db_test_cut {
+	BLOB_DB_CUT_NONE = 0,        /**< no cut — normal operation      */
+	BLOB_DB_CUT_AFTER_OWNER_SET, /**< after step 1: sweep window open */
+	BLOB_DB_CUT_MID_SEGMENTS,    /**< inside step 2: one chunk written */
+	BLOB_DB_CUT_AFTER_SEGMENTS,  /**< after step 2: all chunks, no index */
+	BLOB_DB_CUT_AFTER_COMMIT,    /**< after step 3: the commit point  */
+	BLOB_DB_CUT_AFTER_RELEASE,   /**< after step 4: owner still set   */
+};
+
+/**
+ * @brief Arm a cut. Cleared automatically when it fires, so it cuts once.
+ */
+extern enum blob_db_test_cut blob_db_test_cut;
+#endif /* CONFIG_BLOB_DB_TEST_CRASH_HOOKS */
+
 /**
  * @brief Pre-format the next @p n buckets the allocator will use.
  *

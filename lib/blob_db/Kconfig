@@ -109,6 +109,24 @@ config BLOB_DB_SEGMENT_LEN
 	  bucket with no headroom, so the partition hits -ENOSPC abruptly instead
 	  of degrading.
 
+config BLOB_DB_TEST_CRASH_HOOKS
+	bool "Test-only: allow a segmented write to be cut mid-sequence"
+	help
+	  Compiles in a stop point after each step of the segmented write and
+	  delete sequences (doc/proposals/2026-08-09-large-payloads.md §6.4), so
+	  a test can stop the operation dead at a chosen step and then remount —
+	  the faithful equivalent of a power cut, since everything blob_db knows
+	  lives on flash.
+
+	  This exists because segmentation's crash-safety claim is that step 3
+	  (writing the index record) is the single commit point: before it the
+	  new object is invisible, after it the old one is unreachable, and a
+	  crash anywhere leaves unreferenced segments rather than wrong data.
+	  That claim is only worth as much as the test that tries to break it.
+
+	  For tests only. Leave off in production builds — it adds a comparison
+	  on the write path and exports a symbol that can corrupt a store.
+
 endif # BLOB_DB_LARGE_PAYLOADS
 
 config BLOB_DB_IOSTATS
