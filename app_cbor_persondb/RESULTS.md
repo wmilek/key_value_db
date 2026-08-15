@@ -190,6 +190,13 @@ above were taken with a local SDK 1.0.1 install, which gives identical results.
 
 ## 5. Measured timings — nRF5340-DK
 
+> **These numbers predate the large-payload merge.** They were taken on the
+> branch before `main`'s slot-header walk (`7f10295`) landed — which is visible
+> in the amplification column: 701× / 355× / 26 214× are the whole-sector-read
+> figures. On `native_sim` the same merge cut bytes-per-decision 19× and time
+> 14× (§4). **The board numbers below are therefore an upper bound on today's
+> code and need re-taking.** §5a works out what to expect.
+
 Board 960115021 (PCA10095), Zephyr build `4a405846193f`, SDK 1.0.1, console on
 VCOM 2 at 115200. **`CONFIG_APP_CBOR_PERSONDB_N_PERSONS=1000`** with
 `FRESH_START=y`, 200 samples per benchmark phase. Raw capture in §8a.
@@ -259,6 +266,47 @@ This is the §1 claim holding up: structure transfers, wall-clock does not.
 Store contents for this run: 1 000 persons, 2 479 credentials, 432 759 B live
 = **5.1 %** of the partition. The 51.6 % occupancy in §3 is a 10 000-person
 result and is not reproduced at this scale.
+
+## 5a. What the board says about the merge — and about CBOR
+
+The DK run gives two constants the `native_sim` numbers cannot: a `blob_db`
+read costs **28.8 ms** for a 64 KB sector (0.45 ms/KB), and a 64 KB erase costs
+**1 072 ms**.
+
+**Predicted `check` after the merge.** The decision now moves 13.3 KB in 261
+transactions instead of 256 KB in 4. At 0.45 ms/KB the data is ~6 ms; 261 SPI
+transactions at a plausible 5–20 µs of fixed command-address-and-driver cost add
+1.3–5 ms. So **≈ 7–11 ms, against 114.2 ms measured** — roughly a 10–15×
+improvement, and the spread between those two estimates is exactly the
+transaction-cost question in `FINDINGS.md` N1. **Measuring it is the one thing
+that settles N1**, and only the board can.
+
+**The CBOR conclusion has to be restated.** This document previously said the
+codec was "a projected 0.009 % of the decision on hardware". That was the
+`native_sim` 6 µs carried across unchanged. Measured, it is **955 µs on a
+128 MHz Cortex-M33 — 159× the host figure**:
+
+| | encode+decode | `check` | codec share |
+|---|--:|--:|--:|
+| `native_sim`, pre-merge | 6 µs | 580 µs | 1.0 % |
+| **DK, pre-merge** | **955 µs** | **114.2 ms** | **0.84 %** |
+| DK, post-merge (predicted) | 955 µs | ≈ 7–11 ms | **9–14 %** |
+
+The headline conclusion survives — **the serialization format is not the
+bottleneck**, and refusing to denormalize (D2) remains right. But the margin is
+1–2 orders of magnitude thinner than claimed, and once B1 is fixed the codec
+stops being free: at ~10 % of a decision it is no longer beneath notice. Had the
+storage layer been fast from the start, the "CBOR costs nothing" claim would
+have needed the board to make honestly.
+
+Two lessons, both about method rather than about the stack:
+
+- **Compute does not transfer between platforms.** The flash model projected
+  within 1.65×; the compute figure was wrong by 159×. Only the part backed by a
+  hardware constant travelled.
+- **A ratio between two things measured on different platforms is not a
+  ratio.** "1 % of the decision" was `native_sim` compute over `native_sim`
+  flash, and neither term survived contact with the board.
 
 ## 6. What the numbers say
 

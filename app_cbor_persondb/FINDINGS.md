@@ -130,10 +130,9 @@ to learn that a card does not exist, **26 214×**. A write is 9.98 blob
 operations and 638 KB (1 799×), because the credential index is maintained per
 card. See `RESULTS.md` §4.
 
-The same table settles what the serialization format costs: CBOR encode plus
-decode is 6 µs against the decision's 599 µs on `native_sim` — **1.0 %** — and a
-projected **0.009 %** on hardware. The format is not the cost; the sector read
-is.
+**On hardware, pre-merge:** an access decision measured **114.2 ms** on the DK
+— 4 sector reads at 28.8 ms each. That confirmed the finding on the target and
+put a real constant behind it.
 
 **Fixed** by `7f10295 blob_db: walk buckets by slot header instead of reading
 whole sectors`, which is exactly the direction this finding proposed. Re-measured
@@ -833,9 +832,15 @@ the pending DK run can answer**, and it cannot be answered from `native_sim` at
 all. Both numbers are in `RESULTS.md` so the comparison is possible once the
 board numbers exist.
 
-Not a defect: it is the expected shape of the fix, and the bytes are what
-dominate at 64 KB sectors. It is recorded because a smaller-sector part, or a
-slower bus, could land on the other side of it.
+The board now supplies the constants to bound it: a 64 KB read is 28.8 ms
+(0.45 ms/KB), so 13.3 KB of data is ~6 ms, and 261 transactions at 5–20 µs of
+fixed cost add 1.3–5 ms. **`check` should land at 7–11 ms against 114.2 ms
+measured pre-merge** — but the width of that range *is* the finding, and only
+the board closes it.
+
+Not a defect: it is the expected shape of the fix, and bytes dominate at 64 KB
+sectors. It is recorded because a smaller-sector part, or a slower bus, could
+land on the other side of it.
 
 ## Not yet exercised
 
