@@ -596,6 +596,16 @@ Everything above is the **`flash_area`** backend: `CONFIG_BLOB_DB_BACKEND_FLASH_
 is the default and `prj.conf` selects no other. The harness's `store_host.c`
 models that seam too, so it says nothing about UBI either.
 
+**"UBI" here is not Linux UBI.** `west.yml` pulls `wmilek/ubi`
+(`feature/leb-partial-update`), a fork of `kamil-kielbasa/ubi` — a Zephyr
+library whose own README says it is "inspired by Linux's `drivers/mtd/ubi`,
+written from scratch for Zephyr's `flash_area` API". The model and the API
+names carry over, and the EC/VID magic values are literally the kernel's
+(`0x55424923`, `0x55424921`), but the headers are 16 B and 32 B against the
+kernel's 64 B each, and volume metadata lives in a device header on reserved
+PEBs rather than in a layout volume. **The two on-flash formats are not
+interchangeable, and share enough magic to be mistaken for one another.**
+
 **The action tree is unchanged.** `blob_db`'s slot walk, its append, its
 five-erase compaction commit, `kvhash`'s directory-plus-bucket structure and
 persondb's write orderings all live *above* `lib/blob_db/blob_db_store.h`. Only
@@ -640,6 +650,38 @@ either substrate. Three mechanisms account for the difference:
 fitted constants were measured on raw flash. The operation and byte counts
 above are real; the time model behind every other table in this document is
 not calibrated for this substrate, and calibrating it needs a board.
+
+### 12.1 What `ubi_leb_write_at()` does and does not promise
+
+Worth stating because blob_db's whole design rests on it: the partial write
+**never erases and never relocates**. `ubi_plain_leb_write_at()` checks the
+volume is dynamic, the offset is write-block aligned and the range fits, maps
+the LEB if this is its first touch, and then programs straight through to
+`flash_area_write` at `pnum × eb_size + EC_HDR + VID_HDR + offset`. There is no
+read-modify-write and no check that the target is still erased.
+
+So a LEB behaves as raw NOR: **a write may only clear bits, and nothing
+enforces it** — set a bit back to 1 and you silently get the AND. blob_db
+depends on exactly that liberty in `blob_db_erase_all()`, which invalidates a
+bucket by programming zeros over its `BDBH` magic. It works identically on both
+backends.
+
+Two divergences from the upstream contract this deliberately mirrors:
+
+- **Linux requires offset *and* length aligned to `min_io_size`.** This one
+  checks only the offset; `ubi_leb_data_write()` handles a short tail by
+  staging it in a **zero-filled** buffer and writing a whole write-block. On
+  NOR that drives the padding permanently to 0 — in an append log, that is the
+  next record's space. blob_db is safe today only because it rounds every write
+  itself (`slot_size_for()`, and the `0xff`-filled staging in `append_slot2()`
+  and `write_master()`), so it always lands on the aligned path.
+- **Upstream is a NAND layer first**, where reprogramming a page is prohibited
+  outright. "Overwrite is fine as long as it is 1→0" is a NOR liberty that
+  Linux UBI's contract does not grant, so blob_db's magic-zeroing would not be
+  portable to it.
+
+Neither is power-fail atomic, and the header says so — which is what blob_db's
+per-slot CRC and the compaction seal (B2) exist to detect.
 
 ### 12.1 It also demonstrates `FINDINGS.md` B11
 
