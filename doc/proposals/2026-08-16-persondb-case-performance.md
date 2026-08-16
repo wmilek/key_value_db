@@ -787,9 +787,40 @@ Two consequences:
   was written for. Any iostats figure in this repo taken on the UBI backend
   needs the ×2 stated alongside it.
 
-The fix on the UBI side would be to cache the VID header per mapped LEB — it
-is immutable for the life of a mapping, and the EBA entry is already resident.
-That is a ~16 B/LEB table against halving the read transactions of every caller.
+**Why this is worth more than "2× transactions" suggests.** The VID read is a
+*fixed* 32 B plus one transaction added to every read, whatever its size, so its
+weight is set by how small the caller's reads are. blob_db's dominant read is
+the slot-header walk, and `struct slot_head` is **12 B** — so the hottest read
+in the system carries 32 B of someone else's metadata, 267 % of its own payload.
+Averaged over the mix (`slot_verify` also pulls whole payloads), the measured
+read is 61.7 B and becomes 93.7 B.
+
+That makes it a tax in **either** cost regime, and §3.2a says which one is
+which:
+
+| per `byid` op | `flash_area` | UBI | |
+|---|--:|--:|--:|
+| at today's 65.5 µs/tx + 0.63 µs/B | 9.57 ms | 17.4 ms | **+82 %** |
+| at a hypothetical 5 µs/tx + 0.25 µs/B (bus-bound) | 1.87 ms | 3.07 ms | **+64 %** |
+
+Fixing the driver does not rescue it — the byte ratio is worse than the
+transaction ratio, so the tax survives into the regime where reads are
+proportional to size, which is the regime NOR actually has.
+
+**And it is not really a cache problem.** Linux does not read the VID header on
+a dynamic-volume read at all: `data_size` is a *static*-volume field there, and
+a dynamic LEB reads to `usable_leb_size`. This cost exists solely to support the
+divergence in §12.2 #5. So there are two fixes, and the second is free:
+
+- cache `data_size` in the EBA node — it is immutable for the life of a mapping
+  and the node is already resident, so ~8 B/LEB, ~1 KB for this device; or
+- **drop the bound for dynamic volumes and match Linux**, which deletes the read
+  rather than caching it.
+
+The per-read `check = true` CRC goes with it either way. Linux validates the VID
+header at attach and during scrubbing, not on every data read — and re-reading
+metadata per read is an expensive integrity strategy that protects the header
+and not the payload, which blob_db already CRCs itself.
 [`2026-08-16-blob-db-on-ubi.md`](2026-08-16-blob-db-on-ubi.md) makes it a
 prerequisite: until it lands, UBI pays 2× on every read, which is enough to eat
 the erase win that makes the backend worth having.

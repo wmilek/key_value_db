@@ -182,9 +182,16 @@ reformat if they land together.
    flash. If it is reducible, everything transaction-shaped in §5 reprices
    downward and may not be worth a format change at all. This is the cheapest
    experiment here and it gates the most expensive work.
-2. **Fix UBI's VID-header caching** (§12.2a). It is ~16 B per mapped LEB for an
-   immutable field, and until it lands UBI pays 2× on every read — enough to eat
-   the §5 win on the backend that is supposed to be better.
+2. **Remove UBI's per-read VID-header read** (`persondb-case-performance.md`
+   §12.2a). It adds a fixed 32 B and one transaction to *every* read, against a
+   12 B `slot_head` — so it costs +82 % on the read path today and **+64 % even
+   if the driver overhead in §3.2a is fixed**, because the byte ratio is worse
+   than the transaction ratio. Either cache `data_size` in the EBA node (~8 B
+   per LEB, immutable for the life of a mapping) or drop the bound for dynamic
+   volumes and match Linux, which deletes the read instead of caching it. Until
+   one of them lands, UBI is the slower backend on reads — which is most of what
+   a provisioned access-control store ever does, and enough to cancel the erase
+   win above.
 3. **Prototype `blob_db_store_replace` on UBI** and count erases across a fill.
    One build, one run, and §2's 5× is either there or it is not.
 4. **Confirm the free-pool depth holds.** `BLOB_DB_UBI_SPARE_PEBS` is 4, and
