@@ -29,10 +29,10 @@ enum {
 #define PERSON_PAIRS 9
 
 enum {
-	SB_VERSION = 1, SB_PEOPLE_ROOTS, SB_CRED_ROOT,
-	SB_N_PERSONS, SB_POPULATED, SB_REV,
+	SB_VERSION = 1, SB_PEOPLE_ROOTS, SB_CRED_ROOTS,
+	SB_N_PERSONS, SB_POPULATED, SB_REV, SB_N_BUCKETS,
 };
-#define SB_PAIRS 6
+#define SB_PAIRS 7
 
 /* Copy a decoded text slice into a fixed field, rejecting anything that would
  * not fit. A silent truncation here would surface as a verification failure
@@ -196,7 +196,9 @@ int cred_cbor_decode(const uint8_t *buf, size_t len, uint32_t *person_id)
 int superblock_cbor_encode(const struct superblock *sb, uint8_t *buf,
 			   size_t buf_sz, size_t *out_len)
 {
-	if (sb->n_people_maps > ARRAY_SIZE(sb->people_root)) {
+	if (sb->n_people_maps > ARRAY_SIZE(sb->people_root) ||
+	    sb->n_cred_maps == 0 ||
+	    sb->n_cred_maps > ARRAY_SIZE(sb->cred_root)) {
 		return -EINVAL;
 	}
 
@@ -213,8 +215,16 @@ int superblock_cbor_encode(const struct superblock *sb, uint8_t *buf,
 	}
 
 	ok = ok && zcbor_list_end_encode(zs, ARRAY_SIZE(sb->people_root)) &&
-	     zcbor_uint32_put(zs, SB_CRED_ROOT) &&
-	     zcbor_uint64_put(zs, sb->cred_root) &&
+	     zcbor_uint32_put(zs, SB_CRED_ROOTS) &&
+	     zcbor_list_start_encode(zs, ARRAY_SIZE(sb->cred_root));
+
+	for (uint8_t i = 0; ok && i < sb->n_cred_maps; i++) {
+		ok = zcbor_uint64_put(zs, sb->cred_root[i]);
+	}
+
+	ok = ok && zcbor_list_end_encode(zs, ARRAY_SIZE(sb->cred_root)) &&
+	     zcbor_uint32_put(zs, SB_N_BUCKETS) &&
+	     zcbor_uint32_put(zs, sb->n_buckets) &&
 	     zcbor_uint32_put(zs, SB_N_PERSONS) &&
 	     zcbor_uint32_put(zs, sb->n_persons) &&
 	     zcbor_uint32_put(zs, SB_POPULATED) &&
@@ -254,8 +264,23 @@ int superblock_cbor_decode(const uint8_t *buf, size_t len,
 	}
 
 	ok = ok && zcbor_list_end_decode(zs) &&
-	     zcbor_uint32_expect(zs, SB_CRED_ROOT) &&
-	     zcbor_uint64_decode(zs, &out->cred_root) &&
+	     zcbor_uint32_expect(zs, SB_CRED_ROOTS) &&
+	     zcbor_list_start_decode(zs);
+
+	while (ok && !zcbor_array_at_end(zs)) {
+		if (out->n_cred_maps >= ARRAY_SIZE(out->cred_root) ||
+		    !zcbor_uint64_decode(zs,
+					 &out->cred_root[out->n_cred_maps])) {
+			return -EILSEQ;
+		}
+		out->n_cred_maps++;
+	}
+
+	uint32_t n_buckets = 0;
+
+	ok = ok && zcbor_list_end_decode(zs) &&
+	     zcbor_uint32_expect(zs, SB_N_BUCKETS) &&
+	     zcbor_uint32_decode(zs, &n_buckets) &&
 	     zcbor_uint32_expect(zs, SB_N_PERSONS) &&
 	     zcbor_uint32_decode(zs, &out->n_persons) &&
 	     zcbor_uint32_expect(zs, SB_POPULATED) &&
@@ -263,5 +288,6 @@ int superblock_cbor_decode(const uint8_t *buf, size_t len,
 	     zcbor_uint32_expect(zs, SB_REV) &&
 	     zcbor_uint32_decode(zs, &out->rev) && zcbor_map_end_decode(zs);
 
+	out->n_buckets = (uint16_t)n_buckets;
 	return ok ? 0 : -EILSEQ;
 }

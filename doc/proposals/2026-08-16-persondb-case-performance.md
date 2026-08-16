@@ -1,13 +1,19 @@
 # Improving the cost of `app_cbor_persondb`'s benchmark cases
 
-**Status: investigation. Nothing here is implemented.** Every number is
-modelled or harness-measured; none is from hardware. The recommendations end
-with what would have to change and what it would cost, so the decision — which
-includes a store reformat and a re-taking of `RESULTS.md` — stays with whoever
-makes it.
+**Status: investigation, now measured.** The levers below were found with a
+host harness and then **measured on `native_sim` with the real application**,
+which changed one of the conclusions — see §4. Flash operation and byte counts
+are therefore real; wall-clock for the DK is still modelled from `app_perf`'s
+fitted constants, and **nothing here has been run on hardware**.
 
-Harness, and how to re-derive all of this:
-[`doc/proposals/persondb-perf/`](persondb-perf/README.md).
+The app carries the three Kconfig options the measurements need
+(`MAP_BUCKETS`, `CRED_MAPS`, and a `PEOPLE_MAPS` that no longer overruns its
+array). **Their defaults reproduce the shipped behaviour exactly** — this
+document proposes changing them, and does not change them.
+
+- Harness, for the mechanism and for re-deriving the model:
+  [`doc/proposals/persondb-perf/`](persondb-perf/README.md).
+- Reproducing the measured tables: §11.
 
 ---
 
@@ -34,15 +40,23 @@ the sizing history behind it (`RESULTS.md` §9) is sound. But the maximum bucket
 count is *also* the maximum directory and the maximum blob count, and those are
 paid on every read the product ever performs.
 
-Harness-measured, at the headline 10 000-person scale, times modelled with
-`app_perf`'s fitted DK constants:
+Measured on `native_sim` with the real application at the headline
+10 000-person scale — real flash counters, DK times modelled from them with
+`app_perf`'s fitted constants, CBOR excluded (add 0.95 ms as `RESULTS.md` §5
+does). Every configuration passed both verification rounds with zero bucket
+overflows:
 
-| configuration | `check` | `byid` | `miss` | cost |
-|---|--:|--:|--:|---|
-| **shipped** — 4 KB payload, 16 maps × 511 buckets, 1 credential map | **25.7 ms** | **12.5 ms** | **13.2 ms** | — |
-| choose the directory size: 32 × 256, 4 credential maps × 128 | 22.4 ms | 11.5 ms | 11.0 ms | none — a reformat |
-| …and raise the payload ceiling to 8 KB: 16 × 256, 4 × 128 | 18.8 ms | 9.5 ms | 9.5 ms | +12 KB RAM |
-| …to 16 KB: 16 × 128, 4 × 64 | **12.7 ms** | **6.5 ms** | **6.3 ms** | +40 KB RAM, ~2× write bytes |
+| configuration | `check` | `byid` | `miss` | `put` ops | cost |
+|---|--:|--:|--:|--:|---|
+| **shipped** — 4 KB payload, 16 × 511, 1 credential map | **25.4 ms** | **12.4 ms** | **12.9 ms** | 806 | — |
+| choose the directory size: 32 × 256, 2 credential maps | 24.0 ms | 11.5 ms | 12.3 ms | 801 | none — a reformat |
+| raise the payload ceiling to 8 KB: 16 × 256, 2 credential maps | 19.0 ms | 9.5 ms | 9.4 ms | 616 | +12 KB RAM |
+| …to 16 KB: 16 × 128, 4 credential maps | **13.4 ms** | **7.1 ms** | **6.3 ms** | **426** | +40 KB RAM |
+
+**The 16 KB row is better than the shipped configuration on every axis
+measured** — every read case roughly halved, 47 % fewer flash operations per
+`put`, its bytes within 2 %, and the fill 57 % faster. It costs RAM and a
+reformat, nothing else.
 
 **Halving every read case is available, and the price is RAM and write
 amplification, not correctness.** Nothing here denormalizes anything, so
@@ -53,13 +67,14 @@ the truth.
 Three things fell out along the way that are worth acting on independently of
 any of the above:
 
-- **A latent out-of-bounds write.** `CONFIG_APP_CBOR_PERSONDB_PEOPLE_MAPS`
-  accepts `1..64`; `struct superblock` holds `people_root[16]`. §8.1.
+- **A latent out-of-bounds write**, now fixed because the measurements needed
+  it: `CONFIG_APP_CBOR_PERSONDB_PEOPLE_MAPS` accepted `1..64` while
+  `struct superblock` held `people_root[16]`. §8.1.
 - **A hash trap waiting for anyone who sharded the credential index** the
   obvious way. It cost this investigation an `-ENOSPC` before it was
   understood. §6.
 - **A prediction for the outstanding `A4` run.** The harness says the
-  full-scale DK `check` should land near **26.6 ms**, not the ~24 ms
+  full-scale DK `check` should land near **26.4 ms**, not the ~24 ms
   `README.md` currently projects. §3.3.
 
 ---
@@ -83,7 +98,7 @@ before it is compared with a board.
 This is the `doc/proposals/sizing/` pattern: not project code, built by its own
 `measure.sh`, existing so the tables can be re-derived.
 
-### 2.1 It reproduces both published runs
+### 2.1 It reproduces the published runs, and the application itself
 
 `sh doc/proposals/persondb-perf/measure.sh validate`:
 
@@ -100,6 +115,12 @@ This is the `doc/proposals/sizing/` pattern: not project code, built by its own
 | `check` flash bytes/op | 13.4 KB | 13.3 KB | −0.7 % |
 | `byid` flash ops/op | 131 | 128.5 | −1.9 % |
 | `put` flash ops/op | 815 | 810 | −0.7 % |
+| **the real app, rebuilt and rerun here** (`native_sim`, 10 000) | | | |
+| `check` flash ops/op | 260.9 | 264.2 | +1.3 % |
+| `check` flash bytes/op | 13 270 | 13 310 | +0.3 % |
+| `byid` flash ops/op | 127.6 | 128.5 | +0.7 % |
+| `miss` flash ops/op | 132.4 | 135.2 | +2.1 % |
+| `put` flash ops/op | 805.8 | 809.5 | +0.5 % |
 
 And the time model closes the loop the same way `RESULTS.md` §5 does. Applying
 `app_perf`'s independently fitted constants (~65.5 µs/transaction, ~0.63 µs/B)
@@ -126,6 +147,13 @@ place. The harness carries the fix, and its 4.32 map ops match the post-fix
   identical cell counts differed by ~10 % in the read-op column for the same
   reason. Conclusions below rest on effects of 25–50 %, well clear of that;
   the smaller differences within a payload tier should not be over-read.
+- **It found the levers; it did not size all of them correctly.** §4 is the
+  case in point: the harness modelled lever 1 at −13 % and the real
+  application measured −5.9 %, because the harness's bookkeeping held the cell
+  count fixed while the map count rose, and every extra map is another root
+  blob. It was also wrong in the *pessimistic* direction on `put` bytes at
+  16 KB (§5). Where §4 and §5 disagree with a modelled figure, the measured
+  one is the one quoted.
 - **Nothing here has been near a board.** §9 says what to measure first.
 
 ---
@@ -179,8 +207,8 @@ Two things follow, and the second is the one that changes what to do:
 `RESULTS.md` has never measured the full 10 000-person configuration on
 hardware; `README.md` projects "near 24 ms" for `check` from the tenth-scale
 run. The harness's counters at full scale, through the same fitted constants,
-give 25.69 ms of flash plus 0.95 ms of codec: **≈ 26.6 ms**. If the A4 run
-lands materially below that, this harness is wrong somewhere and the rest of
+give 25.45 ms of flash plus 0.95 ms of codec: **≈ 26.4 ms**. If the A4 run
+lands materially below that, the cost model is wrong somewhere and the rest of
 this document should be re-read with that in mind.
 
 ---
@@ -190,7 +218,7 @@ this document should be re-read with that in mind.
 `kvhash` reads the whole directory blob on every `get`, `set` and `del`. The
 directory is `8 + 8 × n_buckets` bytes: at the maximum 511 buckets that is
 **4 096 B, re-read on every operation, for a structure that never changes once
-the fill is done**. Two of them per decision is 8 192 B of the 13 310 B a
+the fill is done**. Two of them per decision is 8 192 B of the 13 270 B a
 `check` reads at full scale — **62 %**.
 
 The directory size is set by buckets *per map*. The capacity constraint (K2:
@@ -201,97 +229,110 @@ numbers**, and the application has only ever varied the first factor:
 throughout, and concludes that "every extra map adds directory-rewrite traffic
 (K5), so more is not freely better".
 
-Holding the *product* constant instead inverts that conclusion. 32 maps × 256
-buckets has the same 8 192 cells as 16 × 511, so the same bucket occupancy and
-the same capacity margin — and half the directory:
+Holding the *product* constant instead — 32 maps × 256 buckets is the same
+8 192 cells as 16 × 511, so the same bucket occupancy and the same capacity
+margin — does shrink the directory as expected. Measured:
 
-| people × buckets | credential maps | cells | `check` bytes | `check` | `byid` | `miss` |
-|---|---|--:|--:|--:|--:|--:|
-| **16 × 511** | 1 × 511 | 8 687 | 13 310 | **25.69 ms** | **12.49 ms** | **13.15 ms** |
-| 32 × 256 | 2 × 256 | 8 704 | 9 874 | 21.25 ms | 10.40 ms | 10.83 ms |
-| 32 × 256 | 4 × 128 | 8 704 | 8 132 | 22.39 ms | 11.46 ms | 10.99 ms |
-| 64 × 128 | 8 × 64 | 8 704 | 6 793 | 22.30 ms | 11.30 ms | 11.12 ms |
+| people × buckets | credential maps | `check` ops | `check` bytes | `check` | `byid` | `miss` |
+|---|--:|--:|--:|--:|--:|--:|
+| **16 × 511** (shipped) | 1 | **260.9** | **13 270** | **25.45 ms** | **12.43 ms** | **12.94 ms** |
+| 32 × 256 | 2 | 276.3 | 9 304 | 23.96 ms | 11.49 ms | 12.34 ms |
+| 32 × 256 | 4 | 308.4 | 9 138 | 25.96 ms | 13.17 ms | 12.84 ms |
 
-**−13 % on a decision, for free** — no library change, no extra RAM, the same
-capacity margin. The transaction count is essentially unmoved (264 → 264–275),
-exactly as §3.2 predicts: the cell count did not change, so the blob count did
-not change. The entire win is bytes.
+**This is where the real application corrected the harness.** The bytes fall
+exactly as modelled — 13 270 → 9 304, −30 % — but the transaction count *rises*
+(260.9 → 276.3), and transactions are the larger term. The net is **−5.9 % on a
+decision, not the −13 % the harness predicted.**
 
-Take −13 %, not the −17 % the `2 × 256` row shows. That row's transaction count
-(229.5) is the outlier in a column where every other configuration with the
-same cell count reads 264–275, so its extra 4 ms is compaction placement rather
-than an effect of the split — §2.2. Quoting the best row of a noisy column is
-how a sweep flatters itself.
+The mechanism is the one §3.2 already gives, applied to a population the
+harness's cell-count bookkeeping treated as fixed: **every extra map is another
+root blob**, and every root blob is another slot header on the walk. Going from
+17 maps to 34 adds 17 blobs and their directory-rewrite garbage. Push it
+further and the effect swallows the win outright: the third row above, with
+four credential shards at 256 buckets each, has 9 216 cells against the
+baseline's 8 687 and comes out **2 % slower than doing nothing**.
 
-The returns flatten below ~256 buckets per map because the directory stops
-being the dominant byte, so 32 × 256 is the sensible stopping point rather than
-the extreme.
+So lever 1 is real but small, and it is only safe when the cell count is held
+constant — which means the credential shard count and the bucket count must be
+chosen together, not independently. It remains worth taking because it is free,
+and because §5 needs the same option.
 
-`K5` is not made worse by this, despite §6.1's expectation. A directory is
-rewritten once per *fresh bucket*, and the number of fresh buckets is the cell
-count — unchanged. Each rewrite simply moves a quarter as many bytes. Fill
-flash traffic falls accordingly (772 MB → 513 MB at 32 × 256 / 4 × 128).
+`K5` is not made worse, despite §6.1's expectation: a directory is rewritten
+once per *fresh bucket*, the number of fresh buckets is the cell count, and
+each rewrite moves a quarter as many bytes. The fill is **25 % faster**
+(6 394 ms → 4 790 ms on `native_sim`).
 
 ---
 
 ## 5. Lever 2 — raise the bucket payload ceiling, and spend it on fewer buckets
 
-Lever 1 leaves the transaction term untouched, and at full scale that term is
-two thirds of a decision. Cutting it means cutting the number of blobs, which
-means fewer cells, which the 4 KB payload ceiling forbids: at 8 176 person
-cells the fullest bucket is already 2 711 B (`RESULTS.md` §9), and halving the
-cell count would overflow it.
+Lever 1 cannot touch the transaction term; §4 shows it slightly worsening it.
+Cutting transactions means cutting the number of blobs, which means fewer
+cells, which the 4 KB payload ceiling forbids: at 8 176 person cells the
+fullest bucket is already 2 711 B (`RESULTS.md` §9), and halving the cell count
+would overflow it.
 
 `CONFIG_BLOB_DB_MAX_PAYLOAD_LEN` is an application `prj.conf` setting. Raising
-it buys the headroom to halve the cell count:
+it buys the headroom to halve the cell count. Measured, real application,
+10 000 persons, all rows `VERIFY PASS` with zero bucket overflows:
 
-| payload | people × buckets | cred | cells | `check` ops | `check` | `byid` | `miss` | `put` bytes written | `put` erases |
-|--:|---|---|--:|--:|--:|--:|--:|--:|--:|
-| 4 KB | 16 × 511 | 1 × 511 | 8 687 | 264.2 | **25.69 ms** | 12.49 ms | 13.15 ms | 12 416 | 0.60 |
-| 8 KB | 16 × 256 | 4 × 128 | 4 608 | 211.0 | **18.84 ms** | 9.47 ms | 9.46 ms | 14 044 | 0.70 |
-| 8 KB | 32 × 128 | 4 × 128 | 4 608 | 202.9 | **17.60 ms** | 9.19 ms | 8.28 ms | 16 531 | 0.88 |
-| 16 KB | 16 × 128 | 4 × 64 | 2 304 | 123.9 | **12.75 ms** | 6.50 ms | 6.25 ms | 26 465 | 1.32 |
-| 16 KB | 32 × 64 | 8 × 32 | 2 304 | 123.9 | **12.35 ms** | 6.15 ms | 6.14 ms | 25 536 | 1.28 |
+| payload | people × buckets | cred | cells | `check` ops | `check` | `byid` | `miss` | `put` ops | `put` bytes | fill |
+|--:|---|--:|--:|--:|--:|--:|--:|--:|--:|--:|
+| 4 KB | 16 × 511 | 1 | 8 687 | 260.9 | **25.45 ms** | 12.43 ms | 12.94 ms | 806 | 93 395 | 6 394 ms |
+| 4 KB | 32 × 256 | 2 | 8 704 | 276.3 | 23.96 ms | 11.49 ms | 12.34 ms | 801 | 79 552 | 4 790 ms |
+| 8 KB | 16 × 256 | 4 | 5 120 | 241.6 | 21.37 ms | 10.84 ms | 10.50 ms | 733 | 61 238 | 3 138 ms |
+| **8 KB** | **16 × 256** | **2** | **4 608** | **204.1** | **18.97 ms** | **9.51 ms** | **9.43 ms** | **616** | **78 685** | **3 719 ms** |
+| **16 KB** | **16 × 128** | **4** | **2 560** | **138.3** | **13.41 ms** | **7.05 ms** | **6.34 ms** | **426** | **95 494** | **2 758 ms** |
+| 16 KB | 16 × 128 | 2 | 2 304 | 119.1 | 12.71 ms | 6.44 ms | 6.32 ms | 362 | 141 556 | 3 828 ms |
+| 16 KB | 16 × 128 | 1 | 2 176 | 113.2 | 13.70 ms | 5.97 ms | 7.73 ms | 338 | 242 803 | 6 210 ms |
 
-**At 16 KB every read case is roughly halved.** The mechanism is exactly §3.2:
-2 304 cells instead of 8 687 means 25.8 slots per sector instead of 64.4.
+Against the shipped configuration:
+
+| | 8 KB, 16 × 256, 2 cred | 16 KB, 16 × 128, 4 cred |
+|---|--:|--:|
+| `check` | **−25 %** | **−47 %** |
+| `byid` | −24 % | −43 % |
+| `miss` | −27 % | −51 % |
+| `put` flash operations | −24 % | −47 % |
+| `put` flash bytes | −16 % | +2 % |
+| fill | −42 % | −57 % |
+
+**The 16 KB row is not a trade at all** — it is better than the shipped
+configuration on every column measured. That is the one result here that the
+harness got wrong in the *pessimistic* direction: it predicted `put` bytes
+roughly doubling, because it modelled the bucket rewrite and not the erase
+traffic that dominates the real total. Halving the number of buckets halves the
+directory-rewrite traffic too, and the two effects cancel.
+
+The last two rows show why the credential shard count has to be chosen with
+the bucket count rather than maximised: at 16 KB, dropping from 4 shards to 2
+buys 0.7 ms of `check` and costs 48 % more `put` bytes; dropping to 1 costs
+160 %.
 
 ### 5.1 What it costs
 
-**RAM**, which `RESULTS.md` §4a already accounts for precisely:
+**RAM**, on the arithmetic `RESULTS.md` §4a already sets out:
 
 | | today | 8 KB | 16 KB |
 |---|--:|--:|--:|
 | `kvhash` `dir_buf` + `bkt_buf` | 8 192 B | 16 384 B | 32 768 B |
-| `CONFIG_MAIN_STACK_SIZE` (driven by `append_slot`'s `MAX_PAYLOAD + 46` frame, B5 job 3) | 12 288 B | ~16 KB | ~28 KB |
+| `CONFIG_MAIN_STACK_SIZE` (driven by `append_slot`'s `MAX_PAYLOAD + 46` frame, B5 job 3) | 12 288 B | 16 384 B | 28 672 B |
 | **image total** (from 157 584 B) | 34.4 % of 448 KB | ~38 % | ~44 % |
 
-Both are the same symbol doing two jobs that `FINDINGS.md` **B5** already
-names. Stage 1 of the large-payload proposal — staging the slot in `.bss`
-instead of on the stack — would remove the stack half of this cost entirely,
-which makes the sequencing question in §9 worth asking.
-
-**Write amplification.** Every insert rewrites its whole `kvhash` bucket (K4),
-so doubling the bucket size doubles the bytes written per enrollment: 12.4 KB →
-26.5 KB per `put`, and erases per `put` from 0.60 to 1.32. For a product whose
-reads happen at every door and whose writes happen at enrollment, that is the
-right side of the trade — but it is a real cost, and it lands on the phase that
-is already the slowest thing the app does.
-
-The 8 KB tier is the better-balanced choice: **−24 to −28 % on every read case
-for +13 % write bytes and +12 KB of RAM**, and it also *improves* fill (772 MB →
-493 MB of flash traffic, modelled 6 286 s → 4 228 s) because the directory
-shrinks faster than the buckets grow. The 16 KB tier buys another 30 % of read
-performance and gives the fill improvement back.
+The stack figures are what the measured builds used, not estimates; the image
+totals are arithmetic on `RESULTS.md` §4a and have not been re-measured for the
+DK. Both costs are the same symbol doing two jobs that `FINDINGS.md` **B5**
+already names, and Stage 1 of the large-payload proposal — staging the slot in
+`.bss` instead of on the stack — would remove the stack half of it.
 
 ### 5.2 The capacity check is the fill itself
 
 `DESIGN.md` §6.1's rule is that a `kvhash` map must be sized by enumeration,
 because there is no per-bucket occupancy query (K10) and no growth path (K3).
-Every configuration in the table above **completed a full 10 000-person fill
-with zero `-ENOSPC`**, through the real `kvhash`. That is a stronger check than
-`tools/sizing.py`'s model, since it is the shipping code doing the bucketing —
-and it is the check that caught §6.
+Every configuration above **completed a full 10 000-person fill and both
+verification passes with zero `-ENOSPC`**, in the real application. That is a
+stronger check than `tools/sizing.py`'s model, and it is the check that caught
+§6.
 
 ---
 
@@ -313,9 +354,9 @@ only `n_buckets` of the `n_maps × n_buckets` cells are ever reachable, and the
 map runs at `n_maps`× the intended load.
 
 Measured: `-ENOSPC` at person 7 843 of 10 000, with a capacity plan that said
-there was 4× headroom. The fix is a second, independent mixing step
-(`mix(fnv1a(card), salt) % n_cred_maps`); the harness carries it and the
-comment explaining it.
+there was 4× headroom. The fix is a second, independent avalanche step before
+the modulo; `persondb.c`'s `cred_root()` carries it, with the comment
+explaining why, and so does the harness.
 
 Worth recording in `FINDINGS.md`: *a container that hashes the caller's key
 internally makes the caller's own sharding hash unsafe, and says nothing about
@@ -365,7 +406,8 @@ only from the fill.
 
 ### 8.1 `CONFIG_APP_CBOR_PERSONDB_PEOPLE_MAPS` can write out of bounds
 
-Not a performance finding, but it blocks levers 1 and 2 and it is live today:
+Not a performance finding. It blocked levers 1 and 2, so it is fixed here —
+but it was live in every build before this branch:
 
 ```c
 /* Kconfig */          range 1 64
@@ -382,10 +424,11 @@ fields. The guard that would catch it —
 `superblock_cbor_encode()` — runs at `sb_commit()`, after the damage.
 
 Anyone taking `DESIGN.md` §6.1's table at face value and trying 24 or 32 maps
-hits this. It should be fixed regardless of whether anything else here is
-adopted: either lower the Kconfig range to `1 16`, or raise the array — and
-`SUPERBLOCK_CBOR_MAX` (256 B) with it, since 32 roots encode to roughly 330 B
-and the commit would fail `-ENOMEM`.
+hit this. The fix here raises the array to 64 — matching the range that was
+already documented — and `SUPERBLOCK_CBOR_MAX` from 256 B to 896 B with it,
+since 32 roots alone encode to roughly 330 B and the commit would otherwise
+fail `-ENOMEM`. Lowering the Kconfig range to `1 16` would have been the other
+valid answer; it was not taken because §5 needs the range.
 
 ### 8.2 CBOR is still not the problem, and still worth restating
 
@@ -420,44 +463,85 @@ measured and dropped rather than never considered.
 
 ## 9. Recommendation and sequencing
 
-1. **Fix §8.1 now.** It is independent of everything else and it is a memory
-   corruption reachable from a documented Kconfig range.
-2. **Do not adopt anything else before the `A4` full-scale DK run.** Every
-   number here is modelled; `RESULTS.md` §5a is a standing account of what
-   happens when a plausible model meets a board. The run also tests §3.3's
-   26.6 ms prediction, which is the cheapest available check on this whole
-   document.
-3. **Then take lever 1** (32 × 256 person maps, 2 × 256 credential maps, with
-   §6's independent shard hash). It costs no RAM, needs no library change, and
-   is worth ~15 % on every read case. It does require a reformat and the
-   superblock changes in §8.1.
-4. **Then decide on lever 2 with the 8 KB tier as the default** — another
-   ~25 % on reads and a faster fill for +12 KB of RAM. Consider whether
-   `FINDINGS.md` B5 job 3 (staging the slot in `.bss`) should land first, since
-   it removes the stack half of the RAM cost and would make the 16 KB tier
-   affordable too.
-5. **Lever 4 whenever the fill is being touched anyway.** A tenth of its flash
-   work, and it is the change with the largest API-safety cost per millisecond
-   saved.
+1. **§8.1 is already fixed** — `people_root[]` now matches the Kconfig range,
+   and `SUPERBLOCK_CBOR_MAX` grew with it. It had to be, to measure anything
+   above 16 maps.
+2. **Do not change a default before the `A4` full-scale DK run.** Every
+   duration here is modelled; `RESULTS.md` §5a is a standing account of what
+   happens when a plausible model meets a board. That run also tests §3.3's
+   26.6 ms prediction, which is the cheapest available check on this document.
+3. **Then take the 16 KB configuration** — `MAP_BUCKETS=128`, `CRED_MAPS=4`,
+   `CONFIG_BLOB_DB_MAX_PAYLOAD_LEN=16384`, `CONFIG_MAIN_STACK_SIZE=28672`. It
+   is better than the shipped configuration on every measured column, and the
+   only question is whether the image can afford ~44 % of the DK's RAM
+   (`RESULTS.md` §4a puts it at 34.4 % today). If it cannot, the 8 KB row is
+   −25 % for +12 KB.
+4. **Consider landing `FINDINGS.md` B5 job 3 first.** Staging blob_db's slot
+   in `.bss` removes the stack half of the RAM cost, which is 16 KB of the
+   40 KB at the 16 KB tier and would make the choice in step 3 easy.
+5. **Lever 1 on its own is not worth a reformat.** At −5.9 % it is inside the
+   noise a board run would have to resolve. Take it as part of step 3, where
+   choosing the bucket count is required anyway.
+6. **Lever 4 whenever the fill is being touched.** A tenth of its flash work,
+   ~2 % of its time, and the largest API-safety cost per millisecond saved.
 
-Each of steps 3 and 4 bakes a bucket count into the store at create time (K3),
-so each is a reformat: ~2.2 h of refill, and `RESULTS.md` has to be re-taken
+Steps 3 and 5 bake a bucket count into the store at create time (K3), so each
+is a reformat: ~2.2 h of refill on the DK, and `RESULTS.md` has to be re-taken
 rather than edited. That, not the code, is the expensive part.
 
 ---
 
 ## 10. What this investigation did not do
 
-- **Nothing was built for a target, and nothing was run on hardware.** No
-  Zephyr tree was available, which is why the harness exists at all.
-- **`put` and `fill` durations are the weakest numbers here.** The write
-  constant in the model is not fitted against a board. Read them as op, byte
-  and erase counts.
-- **One run per configuration.** §2.2 quantifies the variance that implies.
+- **Nothing was run on hardware.** The flash operation and byte counts are
+  real, from `native_sim`; every duration is those counts through `app_perf`'s
+  fitted constants.
+- **`put` and `fill` durations remain the weakest numbers.** The model has no
+  hardware-fitted write constant, so §5 quotes `put` as operations and bytes.
+  `RESULTS.md` §3b's ±20 % on the write path applies to the fill column too.
+- **One run per configuration**, and `native_sim`'s host µs/op column is not
+  comparable to anything (`RESULTS.md` §1).
+- **The DK RAM figures in §5.1 are arithmetic, not a target build.** No ARM
+  toolchain was available here; `west build -b nrf5340dk/nrf5340/cpuapp -t
+  ram_report` would settle them.
 - **`persondb_card_revoke`, `persondb_person_delete`, the permission
   operations, and a steady-state `persondb_open` are still unmeasured** — the
-  same gap `RESULTS.md` §5b lists. The harness could cover them; this
-  investigation stayed on the five benchmark cases it was asked about.
+  same gap `RESULTS.md` §5b lists. This investigation stayed on the five
+  benchmark cases it was asked about.
 - **`CONFIG_BLOB_DB_LARGE_PAYLOADS` was left off**, matching the app's
-  configuration. Whether segmented payloads change the arithmetic in §5 is a
+  configuration. Whether segmented payloads change §5's arithmetic is a
   separate question.
+
+---
+
+## 11. Reproducing the measured tables
+
+The defaults are the shipped configuration, so a plain run is the baseline row:
+
+```
+west build -p always -b native_sim app_cbor_persondb
+./build/zephyr/zephyr.exe --flash=db.bin --flash_erase
+```
+
+Each other row is the same command with its overrides, on a fresh store:
+
+```
+west build -p always -b native_sim app_cbor_persondb --                 \
+      -DCONFIG_APP_CBOR_PERSONDB_MAP_BUCKETS=128                        \
+      -DCONFIG_APP_CBOR_PERSONDB_CRED_MAPS=4                            \
+      -DCONFIG_BLOB_DB_MAX_PAYLOAD_LEN=16384                            \
+      -DCONFIG_MAIN_STACK_SIZE=28672
+./build/zephyr/zephyr.exe --flash=db16k.bin --flash_erase
+```
+
+`--flash_erase` matters: a bucket count is fixed at create time, so a build
+that disagrees with the store refuses to mount and says so.
+
+The modelled DK column is `flash ops × 65.5 µs + flash bytes × 0.63 µs`, from
+the benchmark's own printed counters. `RESULTS.md` §5 is where those constants
+come from and where the same arithmetic is checked against a board.
+
+The harness in [`persondb-perf/`](persondb-perf/README.md) is not needed to
+reproduce any of the above. It is what found the mechanism in §3.2 — the
+per-sector slot census, which the application cannot report — and it is the
+only way to explore a configuration without a full build and fill.

@@ -41,8 +41,12 @@ extern "C" {
 /** A credential index entry is just the owner's id. */
 #define CRED_CBOR_MAX 16
 
-/** The application superblock: version, map roots, dataset geometry. */
-#define SUPERBLOCK_CBOR_MAX 256
+/** The application superblock: version, map roots, dataset geometry.
+ *
+ * Sized for the widest shape the Kconfig ranges allow: 64 person roots and 16
+ * credential roots, each a CBOR uint64 (9 B), plus the scalars. It was 256 B
+ * when a build could only have 16 roots and one credential map. */
+#define SUPERBLOCK_CBOR_MAX 896
 
 /**
  * @brief Encode @p p into @p buf.
@@ -78,8 +82,11 @@ int cred_cbor_decode(const uint8_t *buf, size_t len, uint32_t *person_id);
 struct superblock {
 	uint32_t version;
 	uint8_t  n_people_maps;
-	uint64_t people_root[16];
-	uint64_t cred_root;
+	uint64_t people_root[64];      /* matches the Kconfig range, which the
+					* 16-element version did not (§8.1) */
+	uint8_t  n_cred_maps;
+	uint64_t cred_root[16];
+	uint16_t n_buckets;            /* buckets per map, 0 = "as many as fit" */
 	uint32_t n_persons;
 	uint32_t populated;
 	uint32_t rev;
