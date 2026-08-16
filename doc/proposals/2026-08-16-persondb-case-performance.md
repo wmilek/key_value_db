@@ -666,24 +666,79 @@ depends on exactly that liberty in `blob_db_erase_all()`, which invalidates a
 bucket by programming zeros over its `BDBH` magic. It works identically on both
 backends.
 
-Two divergences from the upstream contract this deliberately mirrors:
+### 12.2 Where the contract diverges from the Linux one it mimics
 
-- **Linux requires offset *and* length aligned to `min_io_size`.** This one
-  checks only the offset; `ubi_leb_data_write()` handles a short tail by
-  staging it in a **zero-filled** buffer and writing a whole write-block. On
-  NOR that drives the padding permanently to 0 — in an append log, that is the
-  next record's space. blob_db is safe today only because it rounds every write
-  itself (`slot_size_for()`, and the `0xff`-filled staging in `append_slot2()`
-  and `write_master()`), so it always lands on the aligned path.
-- **Upstream is a NAND layer first**, where reprogramming a page is prohibited
-  outright. "Overwrite is fine as long as it is 1→0" is a NOR liberty that
-  Linux UBI's contract does not grant, so blob_db's magic-zeroing would not be
-  portable to it.
+The project's aim is to carry Linux concepts onto Zephyr, so the interesting
+comparison is semantic, not structural. The **model** carries over intact: a
+two-tier write — a non-atomic in-place offset write plus an atomic whole-LEB
+replace — over LEBs mapped on first touch, EC headers carrying erase counts for
+a global wear pool, unmap returning a PEB for reclaim, and bad-block isolation
+on write failure. Five things do not carry over, and each is a contract, not a
+detail.
 
-Neither is power-fail atomic, and the header says so — which is what blob_db's
-per-slot CRC and the compaction seal (B2) exist to detect.
+**1. The two write calls are named the other way round.**
 
-### 12.1 It also demonstrates `FINDINGS.md` B11
+| Linux | semantics | here |
+|---|---|---|
+| `ubi_leb_write(…, buf, offset, len)` | in-place, offset-based, **not** atomic | `ubi_leb_write_at()` |
+| `ubi_leb_change(…, buf, len)` | atomic whole-LEB replace: fresh PEB, then mapping swap | **`ubi_leb_write()`** |
+
+`leb_prepare_new_mapping()` + `leb_commit_mapping_swap()` is exactly
+`ubi_leb_change`'s algorithm — payload to a PEB off the free pool, VID header
+as the commit point, then the EBA swap, so a failure before the swap leaves the
+previous content intact. Correct, and correctly atomic. But a caller carrying
+Linux intuition writes `ubi_leb_write(…, buf, len)` expecting an in-place write
+at offset 0 and gets a copy-on-write replace instead.
+
+**2. Reading an unmapped LEB is an error, not 0xFF.** In Linux, unmapped means
+*erased*: the read fills 0xFF and returns 0. Here `ubi_plain_leb_read()`
+returns `-ENOENT` and logs. That is why `blob_db_store_ubi.c` calls
+`ubi_leb_is_mapped()` before **every** read — and blob_db's slot walk issues one
+read per slot, so this sits on the hottest path in the system. It is part of the
++10 % / +15 % in §12.
+
+**3. The in-place path does not recover from a write failure.** Linux
+`ubi_eba_write_leb()` reacts to a failed write with `recover_peb()`: take a
+fresh PEB, copy the LEB across, retry, torture and mark the old one — so the
+caller sees success and the LEB is never left damaged. Here `write_at` returns
+`-EIO` with the LEB partially written and the mapping untouched; recovery is the
+caller's problem. The atomic path *does* behave (`leb_mark_peb_bad()`, old
+mapping intact), so the divergence is specific to the path blob_db uses for
+every append.
+
+**4. The alignment precondition is silently repaired instead of enforced.**
+Linux requires offset *and* length aligned to `min_io_size` and returns
+`-EINVAL` otherwise. Here only the offset is checked; `ubi_leb_data_write()`
+pads a short tail from a **zero-filled** buffer and writes a whole write-block.
+On NOR that drives those bytes permanently to 0 — in an append log, the next
+record's space. blob_db escapes it only because it rounds every write itself
+(`slot_size_for()`, and the `0xff`-filled staging in `append_slot2()` and
+`write_master()`), so it always lands on the aligned path.
+
+**5. `data_size` is load-bearing on dynamic volumes.** Linux uses the VID
+header's `data_size` for static volumes only; a dynamic LEB is readable to
+`usable_leb_size`. Here a whole-LEB `ubi_leb_write()` records `data_size = len`
+and **bounds later reads to it**, with `data_size == 0` meaning "whole LEB".
+So mixing the two write forms on one LEB changes what can be read back.
+blob_db only ever uses `write_at`, so it always sees `data_size == 0`.
+
+One more, less a divergence than a different cost model: **reclaim is
+caller-driven.** Linux unmaps immediately and erases later in a background
+wear-levelling thread. Here `blob_db_store_erase()` loops
+`ubi_device_erase_peb()` itself to keep the free pool up, so the erase is paid
+inline. For a single-threaded store that is arguably the better trade —
+deterministic rather than deferred — but it means an unmap is not the cheap
+operation Linux's contract makes it.
+
+And a caveat on all five: the Zephyr side is read from this tree; the Linux side
+is not, because there is no kernel source in the environment these were written
+in. `drivers/mtd/ubi/eba.c` and `kapi.c` are where to check #2 and #3.
+
+Neither write path is power-fail atomic on the in-place side, and the header
+says so — which is what blob_db's per-slot CRC and the compaction seal (B2)
+exist to detect.
+
+### 12.3 It also demonstrates `FINDINGS.md` B11
 
 The run reports `live content: 4336158 B = 51.6 % of the partition` — the same
 figure as the `flash_area` run, and **wrong**. `persondb.c`'s `geometry()`
@@ -696,7 +751,7 @@ sector. The true denominator is smaller, so the true occupancy is higher.
 with no error and no warning, which is the whole point of the finding: the app
 cannot detect it, because no layer will tell it how big the store actually is.
 
-### 12.2 Reproducing
+### 12.4 Reproducing
 
 ```
 west build -p always -b native_sim app_cbor_persondb --                 \
