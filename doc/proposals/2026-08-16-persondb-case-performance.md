@@ -692,10 +692,56 @@ at offset 0 and gets a copy-on-write replace instead.
 
 **2. Reading an unmapped LEB is an error, not 0xFF.** In Linux, unmapped means
 *erased*: the read fills 0xFF and returns 0. Here `ubi_plain_leb_read()`
-returns `-ENOENT` and logs. That is why `blob_db_store_ubi.c` calls
-`ubi_leb_is_mapped()` before **every** read — and blob_db's slot walk issues one
-read per slot, so this sits on the hottest path in the system. It is part of the
-+10 % / +15 % in §12.
+returns `-ENOENT` and logs, which is why `blob_db_store_ubi.c` calls
+`ubi_leb_is_mapped()` before every read.
+
+That guard is **not** a flash cost: `ubi_plain_leb_is_mapped()` is
+`ubi_find_volume()` plus an rbtree lookup in the RAM-resident EBA table, under
+the device mutex. An earlier revision of this document claimed it contributed to
+the +10 % in §12. It cannot — it never reaches the flash — and §12.2a is what
+actually does.
+
+### 12.2a blob_db's own counters stop being the truth under UBI
+
+`RESULTS.md` practice 12 is "count your own flash traffic — measure, do not
+model", and `blob_db_iostats_get()` is where that counting happens. It sits
+*above* the store seam, so it counts one read per `blob_db_store_read()`. On
+`flash_area` that is exactly one `flash_read()`. On UBI it is not.
+
+Measured with the `native_sim` flash simulator's own
+`flash_sim_stats.flash_read_calls`, which counts physical calls *below*
+everything — `byid`, 200 ops, 2 000 persons:
+
+| | blob_db counters | physical | ratio |
+|---|--:|--:|--:|
+| `flash_area` reads | 17 443 | **17 443** | **1.000×** |
+| `flash_area` bytes | 1 120 977 | **1 120 977** | **1.000×** |
+| UBI reads | 18 348 | **36 696** | **2.000×** |
+| UBI bytes | 1 131 837 | **1 718 973** | 1.519× |
+
+The 2.000× is exact and the cause is one line: `ubi_plain_leb_read()` calls
+`ubi_vid_hdr_read()` on **every** read, to recover `data_size` and bound the
+range, with a CRC32 over the header. It is not cached. So each logical read is
+two physical transactions, and the byte gap is exactly
+`18 348 × 32 B = 587 136 B` of VID headers — 1 131 837 + 587 136 = 1 718 973,
+to the byte.
+
+Two consequences:
+
+- **§12's +10 % / +15 % understates UBI.** Those are blob_db's counters; the
+  physical transaction count is double. Applying `app_perf`'s ~65.5 µs per
+  transaction to the counters would price a UBI `byid` at ~6 ms when the flash
+  actually sees ~12 ms of transactions. The host clock agrees in direction —
+  21 µs/op on `flash_area` against 47 µs on UBI, and `native_sim` has no real
+  flash to wait for.
+- **The instrument became a model when the backend changed**, which is the
+  exact failure practice 12 exists to prevent, one layer further down than it
+  was written for. Any iostats figure in this repo taken on the UBI backend
+  needs the ×2 stated alongside it.
+
+The fix on the UBI side would be to cache the VID header per mapped LEB — it
+is immutable for the life of a mapping, and the EBA entry is already resident.
+That is a ~16 B/LEB table against halving the read transactions of every caller.
 
 **3. The in-place path does not recover from a write failure.** Linux
 `ubi_eba_write_leb()` reacts to a failed write with `recover_peb()`: take a
