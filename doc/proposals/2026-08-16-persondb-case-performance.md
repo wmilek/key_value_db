@@ -58,6 +58,12 @@ measured** — every read case roughly halved, 47 % fewer flash operations per
 `put`, its bytes within 2 %, and the fill 57 % faster. It costs RAM and a
 reformat, nothing else.
 
+**Read §3.2a before acting on any of it.** The read cases are dominated by a
+~65 µs per-transaction cost that is ~25× the QSPI bus time for a read command,
+so it is driver overhead rather than flash. Profiling that path could beat this
+whole table without a reformat. What the flash genuinely imposes is the
+**erase**, and only `put` and `fill` pay it.
+
 **Halving every read case is available, and the price is RAM and write
 amplification, not correctness.** Nothing here denormalizes anything, so
 `DESIGN.md` D2 and `README.md` practice 6 are untouched: `check` is still
@@ -201,6 +207,48 @@ Two things follow, and the second is the one that changes what to do:
    superseded. A post-provisioning compaction pass — the obvious idea, and one
    the stack has no API for — would remove at most a quarter of the walk. It
    was worth measuring before proposing; it is not worth proposing.
+
+### 3.2a How much of that 65 µs is the flash? Almost none
+
+The two fitted constants are solid — `app_perf/RESULTS.md` derives them from
+the `lg read` pair and then predicts, independently, the small-blob `read`
+phase to 4 %, an `update` regression to 1 %, and this app's `check` to a
+fraction of a percent. They describe **this system**. They do not describe NOR.
+
+The DK's `mx25r6435f` node is `readoc = "read4io"` at `sck-frequency =
+<8000000>` — quad I/O at 8 MHz, so **4 MB/s = 0.25 µs/B** of bus, and a read
+command (1 cmd + 3 address + dummy) is on the order of **2.5 µs**:
+
+| | measured | bus ceiling | what the gap is |
+|---|--:|--:|---|
+| per transaction | **65.5 µs** | ~2.5 µs | ~25× — nrfx QSPI transfer setup, peripheral start latency, the driver's per-transfer completion wait |
+| per byte, small reads | 0.63 µs | 0.25 µs | 2.5× — per-transfer overhead spread over few bytes |
+| per byte, 64 KB bulk | 0.35 µs | 0.25 µs | 1.4× — close to the bus |
+| **64 KB erase** | **~1 072 ms** | — | **the flash itself.** MX25R6435F block erase is ~0.5–0.7 s typical. Irreducible |
+
+So the cost model splits into two very different halves, and the benchmark
+cases fall cleanly on either side:
+
+- **`check` / `byid` / `miss` issue no erases at all.** Their cost is
+  transactions (67 %) plus bytes (33 %), and the transaction term is *software
+  overhead*, not flash. It is the largest single number in this document and it
+  is the one least anchored in physics.
+- **`put` and `fill` are erase-bound**, and that erase cost is real device
+  physics. 0.493 erases per person added, ~1.07 s each — ≈88 min of the ≈2.2 h
+  fill, and the reason `RESULTS.md` §5b records the same `put` call costing
+  84 ms or 808 ms.
+
+**This demotes §5.** Restructuring the store attacks the transaction *count*,
+which is only worth attacking while a transaction costs 65 µs. If that is
+driver overhead and it can be cut to, say, 5 µs, `check` goes to
+264 × 5 µs + 13 270 × 0.63 = **9.7 ms** — better than the 16 KB reformat's
+13.4 ms, with no format change, no extra RAM and no reformat. Hitting the bus
+ceiling on bytes as well would give ~4.6 ms.
+
+Nobody has profiled that path, so this is arithmetic, not a measurement. But
+the ordering it implies is worth stating plainly: **profile the QSPI driver
+before reformatting the store.** The erase-side lever (§B2 and the atomic-LEB
+sketch in §12) is the one that attacks a cost the flash genuinely imposes.
 
 ### 3.3 A prediction for `A4`
 
