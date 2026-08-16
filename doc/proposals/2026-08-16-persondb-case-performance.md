@@ -790,6 +790,9 @@ Two consequences:
 The fix on the UBI side would be to cache the VID header per mapped LEB — it
 is immutable for the life of a mapping, and the EBA entry is already resident.
 That is a ~16 B/LEB table against halving the read transactions of every caller.
+[`2026-08-16-blob-db-on-ubi.md`](2026-08-16-blob-db-on-ubi.md) makes it a
+prerequisite: until it lands, UBI pays 2× on every read, which is enough to eat
+the erase win that makes the backend worth having.
 
 **3. The in-place path does not recover from a write failure.** Linux
 `ubi_eba_write_leb()` reacts to a failed write with `recover_peb()`: take a
