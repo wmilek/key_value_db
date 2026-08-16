@@ -207,6 +207,8 @@ reformat if they land together.
 
 - **Nothing here is implemented or measured as proposed.** The erase counts and
   slot occupancy are measured; every "after" figure is arithmetic on them.
+- The companion document's RAM figures are now measured on ARM by PR #19's
+  cross-build job; nothing in *this* document has been near a target build.
 - The **1 072 ms erase** and the fitted read constants come from the DK
   (`app_perf/RESULTS.md`); the counters come from `native_sim`. That is the same
   split `RESULTS.md` §1 sanctions — structure transfers, wall-clock does not.

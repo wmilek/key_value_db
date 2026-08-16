@@ -390,13 +390,37 @@ does not depend on the architecture:
   under `CONFIG_BLOB_DB_LARGE_PAYLOADS` and this app does not enable it. It
   would add the same again if that ever changed.
 
-So the honest cost, added to `RESULTS.md` §4a's measured 157 584 B:
+#### The baseline itself moved, and CI measured it
+
+An earlier revision added those deltas to `RESULTS.md` §4a's 157 584 B and
+called the totals arithmetic. **PR #19's `nrf5340dk cross-build` job settles
+them** — a real `arm-zephyr-eabi` link of this branch:
+
+| build | FLASH | RAM | `RESULTS.md` §4a | Δ RAM |
+|---|--:|--:|--:|--:|
+| `nrf_persondb` (bench) | 61 864 B | **158 200 B** | 157 584 B | **+616 B** |
+| `nrf_persondb_shell` | 96 316 B | **162 944 B** | 162 328 B | **+616 B** |
+
+The +616 B is this branch's own doing and §5 never accounted for it: the
+superblock widened (`people_root[16]`→`[64]` = +384 B, `cred_root` scalar →
+`[16]` = +120 B, plus `n_cred_maps`, `n_buckets` and alignment), and it lands
+in the file-scope `g_db`. Both frontends move by exactly the same amount, which
+is the check that it is `g_db` and not something frontend-specific. The ~2.8 KB
+of FLASH is the new `cred_root()`/`mix32()`, the wider CBOR loops and the log
+strings.
+
+So the honest cost, from the measured ARM baseline:
 
 | | image RAM | of 448 KB |
 |---|--:|--:|
-| today | 157 584 B | 34.4 % |
-| 8 KB ceiling | 165 776 B | **37.0 %** |
-| 16 KB ceiling | 182 160 B | **40.7 %** |
+| today, on this branch (**measured**) | 158 200 B | 34.5 % |
+| 8 KB ceiling | 166 392 B | **36.3 %** |
+| 16 KB ceiling | 182 776 B | **39.8 %** |
+
+Two of those percentages were previously quoted as 37.0 % and 40.7 %. Both were
+arithmetic slips — 448 KB is 458 752 B, and the correct figures are ~0.9 pp
+lower. The check that should have caught it was in the same table: §4a's
+157 584 B is 34.35 %, which the document already printed as 34.4 %.
 
 And there is change to spare. The write chain now measures **3 008 B**
 (`scenario_bench` 1696 + `persondb_person_put` 784 + `kvhash_set` 128 +
@@ -588,12 +612,12 @@ rather than edited. That, not the code, is the expensive part.
   `RESULTS.md` §3b's ±20 % on the write path applies to the fill column too.
 - **One run per configuration**, and `native_sim`'s host µs/op column is not
   comparable to anything (`RESULTS.md` §1).
-- **The RAM deltas in §5.1 are measured, but on `native_sim`.** They are
-  fixed-size arrays, so the delta carries to ARM unchanged; the *totals* are
-  those deltas added to `RESULTS.md` §4a's measured 157 584 B. No ARM toolchain
-  was available here, so `west build -b nrf5340dk/nrf5340/cpuapp -t ram_report`
-  would still settle them — and would settle the stack question in §9 step 4
-  at the same time.
+- **The RAM figures in §5.1 are now measured on ARM**, by PR #19's
+  `nrf5340dk cross-build` job, which also revealed that this branch's own
+  superblock widening costs +616 B that §5 had not accounted for. What is still
+  *not* settled is the **stack** question in §9 step 4: the 3 008 B chain is a
+  host measurement, and `CONFIG_MAIN_STACK_SIZE` was chosen from ARM frames that
+  need re-taking with `-fstack-usage` on a target build.
 - **`persondb_card_revoke`, `persondb_person_delete`, the permission
   operations, and a steady-state `persondb_open` are still unmeasured** — the
   same gap `RESULTS.md` §5b lists. This investigation stayed on the five
