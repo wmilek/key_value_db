@@ -3,15 +3,23 @@
 Keep this file honest: update it when the shape of the app changes or when
 regenerating on new hardware.
 
-**Status: `native_sim` measured at 10 000 persons; nRF5340-DK re-measured on
-post-merge code at 1 000 persons (§5).** The DK timings are no longer
-projections, and they no longer predate the large-payload merge — §5 was
-re-taken at `338ec24` (which contains all of `e80f404`). They were taken at a
-tenth of the target scale, so §5's per-operation numbers are directly
-comparable to the rest of this file, while its whole-run numbers (fill
-duration, occupancy) are *not* the 10 000-person figures and are marked where
-they appear. A full-scale DK run remains outstanding for `A4`; §5 gives a
-revised floor of ≈2.2 h for it.
+**Status: `native_sim` measured at 10 000 persons; nRF5340-DK measured on
+`main` at 1 000 persons (§5).** The DK timings are no longer projections, they
+no longer predate the large-payload merge, and they are no longer from a branch:
+§5 was re-taken on **`f1100f1`** (main), after the API consistency fixes and the
+timing-bug fix landed. The earlier `338ec24` column is kept alongside, because
+its read counters are byte-identical and that is the evidence those fixes
+touched only the write path.
+
+They were taken at a tenth of the target scale, so §5's per-operation numbers
+are directly comparable to the rest of this file, while its whole-run numbers
+(fill duration, occupancy) are *not* the 10 000-person figures and are marked
+where they appear. A full-scale DK run remains outstanding for `A4`; §5 gives a
+floor of ≈2.2 h for it.
+
+Two figures moved on `main` and both are deliberate: `persondb_person_put` and
+`persondb_card_assign` each gained one store operation from the consistency
+fixes, costing ~6.5 ms apiece at the ~7 ms per-operation rate §5b establishes.
 
 ---
 
@@ -35,7 +43,7 @@ report a number no product would ever see.
 |---|--:|
 | `check` — resolve a credential and decide (**R-D**) | **44 µs/op · 21 510 ops/s** |
 | `byid` — fetch a person record | **23 µs/op · 39 666 ops/s** |
-| Same on the **nRF5340-DK** (§5, post-merge) | **14.605 ms/op · 68 ops/s** |
+| Same on the **nRF5340-DK** (§5, on `main`) | **14.260 ms/op · 70 ops/s** |
 | …on the DK before the large-payload merge | 114.2 ms/op · 8.8 ops/s |
 
 ## 1. What `native_sim` can and cannot tell you
@@ -325,21 +333,52 @@ column.
 
 ### Per-operation
 
-| Phase | Pre-merge board | §5a predicted | **Post-merge** | Δ | amp before → now |
-|---|--:|--:|--:|--:|--:|
-| `check` — `persondb_check` (**R-D**) | 114.2 ms | 7–11 ms | **14.605 ms** | ×7.8 | 701× → **24×** |
-| `byid` — `persondb_person_get` | 57.6 ms | — | **7.770 ms** | ×7.4 | 355× → **13×** |
-| `miss` — `persondb_card_owner`, unknown card | 56.6 ms | — | **7.165 ms** | ×7.9 | 26 214× → **210×** |
-| `put` — `persondb_person_put`, settled store | 313.8 ms | — | **83.920 ms** | ×3.7 | 1 770× → **47×** |
-| `cbor` — `persondb_person_roundtrip` | 955 µs | 955 µs | **950 µs** | — | — |
+| Phase | Pre-merge board | §5a predicted | `338ec24` | **On `main` (`f1100f1`)** | Δ vs pre-merge | amp before → now |
+|---|--:|--:|--:|--:|--:|--:|
+| `check` — `persondb_check` (**R-D**) | 114.2 ms | 7–11 ms | 14.605 ms | **14.260 ms** | ×8.0 | 701× → **24×** |
+| `byid` — `persondb_person_get` | 57.6 ms | — | 7.770 ms | **7.600 ms** | ×7.6 | 355× → **13×** |
+| `miss` — `persondb_card_owner`, unknown card | 56.6 ms | — | 7.165 ms | **7.005 ms** | ×8.1 | 26 214× → **210×** |
+| `put` — `persondb_person_put`, settled store | 313.8 ms | — | 83.920 ms | **90.470 ms** ⚠ | ×3.5 | 1 770× → **59×** |
+| `cbor` — `persondb_person_roundtrip` | 955 µs | 955 µs | 950 µs | **970 µs** | — | — |
 
 The row names are benchmark labels; the second half of each is the
 `persondb.h` operation it calls (`scenario.c:337`, `:359`, `:373`, `:392`,
 `:404`). §5b reads the same numbers as a cost model of that header, which is
 the level application code is written against.
 
-`cbor` is unchanged to within 0.5%, exactly as it must be: it touches no flash.
+`cbor` is unchanged to within 2%, exactly as it must be: it touches no flash.
 That it did not move is the control that makes the other four rows credible.
+
+#### What the API fixes cost — `put` gained exactly one store operation
+
+The `main` column was re-taken after `b4d6fe6` (four consistency defects in the
+`persondb` API) and `0103985` (timing bugs, a dead baseline). Three of the four
+flash-bound rows did not move meaningfully, and one did:
+
+| | `338ec24` | on `main` | change |
+|---|--:|--:|--:|
+| `check` / `byid` / `miss` flash ops and bytes | 22 415 / 10 753 / 11 368 ops | **identical** | none |
+| `put` store ops | 664 (3.32/op) | **864 (4.32/op)** | **+1 per put** |
+| `put` flash ops | 63 679 | **75 314** | +18% |
+| `put` bytes | 4 174 041 | **5 211 595** | +25% |
+| `put` time | 83.920 ms | **90.470 ms** | **+6.55 ms** |
+
+Two things follow, and both are worth more than the numbers themselves.
+
+**The read counters are byte-for-byte identical**, which retroactively validates
+the earlier run: the "dead baseline" the timing commit removed really was dead
+for these phases, so the pre-fix counts were right. The 2% time differences on
+the read rows are run-to-run noise, not the fix.
+
+**`put`'s extra cost is one store operation, and the §5b model prices it.** The
+read side costs ~7 ms per store operation; `put` gained exactly 1.0 and slowed by
+**6.55 ms**. A correctness fix, paid for at the going rate, predicted by a model
+fitted on a different application. That is the third independent confirmation of
+the cost model in this file.
+
+Read amplification for `put` rises 47× → 59× accordingly. ⚠ marks it in the
+table because it is the one row where `main` is *slower* than the branch, and
+deliberately so.
 
 **§5a's prediction was too optimistic, and the reason is the constant it
 guessed.** It estimated 7–11 ms from "261 transactions at a plausible 5–20 µs"
@@ -359,35 +398,45 @@ app's own counters, with no refitting:
 | flash ops | 112.1 |
 | bytes | 10 030 B |
 | predicted 112.1 × 65.5 µs + 10 030 × 0.63 µs | **13.66 ms** |
-| measured, less the 0.95 ms of CBOR | **13.66 ms** |
+| measured at `338ec24`, less CBOR | **13.66 ms** |
+| measured on `main`, less CBOR | **13.29 ms** |
 
 The constants fitted on `app_perf` predict a different application's decision
-cost to within a fraction of a percent. That is a single test point and two
-free parameters, so it is a cross-check rather than a proof — but it is a
-cross-check across two apps, two payload configurations and two access
-patterns, which is the strongest evidence in this file that the cost model is
-real. **Transactions are expensive: at 112 per decision they are 54% of
-`check`, against the 12–36% the 5–20 µs guess implied.**
+cost to **within 3% across two runs**. The counters are identical in both, so
+the 0.37 ms spread is run-to-run timing noise — which also means the exact
+agreement at `338ec24` was partly luck, and ~3% is the honest accuracy to claim
+from two points against two free parameters. It remains a cross-check rather
+than a proof, but one spanning two apps, two payload configurations and two
+access patterns, which is the strongest evidence in this file that the cost
+model is real. **Transactions are expensive: at 112 per decision they are ~54%
+of `check`, against the 12–36% the 5–20 µs guess implied.**
 
 ### Whole-run phases (**1 000 persons — not the 10 000-person figures**)
 
-| Phase | Pre-merge | **Post-merge** | Δ | Work |
-|---|--:|--:|--:|---|
-| open | 24 478 ms | **25 837 ms** | — | **includes the `FRESH_START` 8 MiB erase** — not the steady-state open cost |
-| prepare | 113 685 ms | **116 564 ms** | — | 106 buckets formatted = **1 100 ms per bucket** |
-| fill | 983 833 ms (16.4 min) | **807 681 ms (13.5 min)** | ×1.22 | 1 000 persons + 2 479 credentials, 4 progress commits |
-| verify | 48 023 ms | **6 064 ms** | ×7.9 | 256 persons, 602 credential resolutions |
-| mutate | 14 712 ms | **2 850 ms** | ×5.2 | rev 0 → 1, 64 cards assigned (nothing to revoke on a first run) |
-| re-verify | 49 758 ms | **6 291 ms** | ×7.9 | 256 persons, 618 credential resolutions |
+| Phase | Pre-merge | `338ec24` | **On `main`** | Δ vs pre-merge | Work |
+|---|--:|--:|--:|--:|---|
+| open | 24 478 ms | 25 837 ms | **22 468 ms** | — | **includes the `FRESH_START` 8 MiB erase** — not the steady-state open cost |
+| prepare | 113 685 ms | 116 564 ms | **112 766 ms** | — | 106 buckets formatted = **1 064 ms per bucket** |
+| fill | 983 833 ms (16.4 min) | 807 681 ms | **808 745 ms (13.5 min)** | ×1.22 | 1 000 persons + 2 479 credentials, 4 progress commits |
+| verify | 48 023 ms | 6 064 ms | **5 915 ms** | ×8.1 | 256 persons, 602 credential resolutions |
+| mutate | 14 712 ms | 2 850 ms | **3 233 ms** | ×4.6 | rev 0 → 1, 64 cards assigned (nothing to revoke on a first run) |
+| re-verify | 49 758 ms | 6 291 ms | **6 138 ms** | ×8.1 | 256 persons, 618 credential resolutions |
+
+The two post-merge runs agree to within 2% on every phase except `mutate`
+(+13%, or +6 ms per card assigned), which moved for the same reason `put` did —
+see the API-fix note above. `fill` reproduces to **0.1%** across runs, which is
+what makes it usable as the extrapolation base below.
 
 Both verification passes reported `VERIFY PASS`, and the fill hit **0 bucket
 overflows** — the `tools/sizing.py` geometry holds on hardware.
 
-`open` and `prepare` did not move, and could not have: both are pure 64 KB
-sector erase, a property of the MX25R6435F. The 1 100 ms per bucket here
-matches `app_perf`'s independently measured 1.06–1.09 s per sector.
+`open` and `prepare` did not move across any of the three runs, and could not
+have: both are pure 64 KB sector erase, a property of the MX25R6435F. The
+**1 064 ms per bucket** here (1 072 and 1 100 ms in the other two runs) matches
+`app_perf`'s independently measured 1.06–1.09 s per sector, and the ~3% spread
+between runs is the honest repeatability of a single-sector erase timing.
 
-**Fill gained only ×1.22 while the read-bound phases gained ×7.9.** That is
+**Fill gained only ×1.22 while the read-bound phases gained ×8.1.** That is
 the sharpest confirmation of §5's finding that fill is dominated by erase and
 compaction rather than by the operations it performs: making reads eight times
 faster barely moved it. The erase share of fill is therefore now *higher* than
@@ -398,12 +447,16 @@ Extrapolating fill linearly to 10 000 persons gives **≈2.2 h** (down from
 ≈2.7 h), still a floor for the same reason as before: occupancy and compaction
 both worsen with scale.
 
-### A counter was renamed — do not diff it against the old table
+### The counter has been renamed twice — do not diff it across editions
 
-The pre-merge edition printed a single `blob ops` figure (4.00 per `check`).
-This edition prints **`map ops` plus `flash ops` and bytes** — 2.00 map ops and
-112 flash ops per `check`. Those are different counters, not a halving of work;
-the physically meaningful quantity is `flash ops`, which the old edition did
+| edition | what the bench line prints | per `check` |
+|---|---|--:|
+| pre-merge | a single `blob ops` figure | 4.00 |
+| `338ec24` | `map ops` + `flash ops` + bytes | 2.00 map ops, 112 flash ops |
+| **`main`** | **`store ops`** + `flash ops` + bytes, and a `?` when a figure is not measured | 2.00 store ops, 112 flash ops |
+
+These are different counters, not work appearing and disappearing; the
+physically meaningful quantity is `flash ops`, which the earliest edition did
 not report at all. Structural results are unchanged where they are comparable:
 2 479 credentials, mean entry 432 B, 0 overflows, live content 432 759 B
 (5.1% of the partition at a tenth scale, consistent with §3's 51.6% at full
@@ -511,31 +564,35 @@ operations are **not** measured at all.
 
 ### The read side: one map get ≈ 7 ms
 
+All figures on `main` (`f1100f1`).
+
 | operation | cost | how known |
 |---|--:|---|
-| `persondb_person_get` | **7.770 ms** | measured (`byid`) |
-| `persondb_card_owner`, card not found | **7.165 ms** | measured (`miss`) |
-| `persondb_card_owner`, card found | **≈6.8–7.0 ms** | derived, below |
-| `persondb_check` | **14.605 ms** | measured (`check`) |
-| `persondb_person_roundtrip` | **0.950 ms** | measured (`cbor`), no flash |
+| `persondb_person_get` | **7.600 ms** | measured (`byid`) |
+| `persondb_card_owner`, card not found | **7.005 ms** | measured (`miss`) |
+| `persondb_card_owner`, card found | **≈6.6–6.8 ms** | derived, below |
+| `persondb_check` | **14.260 ms** | measured (`check`) |
+| `persondb_person_roundtrip` | **0.970 ms** | measured (`cbor`), no flash |
 
 `verify` and `re-verify` are pure compositions of two calls, which solves for
 the hit cost the benchmark never isolates:
 
 | phase | composition | measured | implies a hit at |
 |---|---|--:|--:|
-| verify | 256 `person_get` + 602 `card_owner` | 6 064 ms | **6.77 ms** |
-| re-verify | 256 `person_get` + 618 `card_owner` | 6 291 ms | **6.96 ms** |
+| verify | 256 `person_get` + 602 `card_owner` | 5 915 ms | **6.59 ms** |
+| re-verify | 256 `person_get` + 618 `card_owner` | 6 138 ms | **6.78 ms** |
 
-Two independent phases agree, and a hit being slightly cheaper than the 7.165 ms
-miss is the expected direction: a miss must scan the whole bucket.
+Two independent phases agree, and a hit being slightly cheaper than the 7.005 ms
+miss is the expected direction: a miss must scan the whole bucket. The same
+derivation on the `338ec24` run gave 6.77 and 6.96 ms, so this value reproduces
+across runs to ~3%.
 
 So the read side has a simple rule — **cost ≈ (number of map gets) × ~7 ms.**
 It predicts the composite operation from its parts:
 
 ```
-persondb_check = card_owner + person_get = 6.77 + 7.770 = 14.54 ms
-                                measured:                 14.605 ms   (0.4%)
+persondb_check = card_owner + person_get = 6.59 + 7.600 = 14.19 ms
+                                measured:                 14.260 ms   (0.5%)
 ```
 
 Permission evaluation is free: it runs inside the already-fetched record, which
@@ -543,24 +600,33 @@ is why `check` is two gets and not three. Nothing above this header can beat
 ~7 ms per lookup without changing how many map gets an operation needs — see
 `FINDINGS.md` K11, where a map get is two `blob_db` calls rather than one.
 
-### The write side: the same call can cost 84 ms or 808 ms
+### The write side: the same call can cost 90 ms or 809 ms
 
 | operation | cost | how known |
 |---|--:|---|
-| `persondb_person_put`, rewriting into a settled bucket | **83.920 ms** | measured (`put`) — see note below |
-| `persondb_person_put`, when the write grows a bucket into compaction | **807.7 ms** | measured (fill, per person) |
-| `persondb_card_assign` | **44.5 ms** | measured (mutate, 64 assigns) |
-| `persondb_prepare` | **1 100 ms per bucket** | measured (prepare, 106 buckets) |
-| `persondb_open` including the `FRESH_START` erase | **25.8 s** | measured (open) |
+| `persondb_person_put`, rewriting into a settled bucket | **90.470 ms** | measured (`put`) — see note below |
+| `persondb_person_put`, when the write grows a bucket into compaction | **808.7 ms** | measured (fill, per person) |
+| `persondb_card_assign` | **50.5 ms** | measured (mutate, 64 assigns) |
+| `persondb_prepare` | **1 064 ms per bucket** | measured (prepare, 106 buckets) |
+| `persondb_open` including the `FRESH_START` erase | **22.5 s** | measured (open) |
 
-**The 9.6× spread on `persondb_person_put` is the most important thing on this
-page for a caller**, and the header gives no way to predict which case you get.
-Both figures are the same function on the same board in the same run: the
-benchmark rewrites an existing record, while the fill grows buckets until their
-64 KB sector log must be compacted, and a compaction erases at ~1.09 s. Op
-counts confirm the two are otherwise the same shape of work — 3.32 map ops for
-the benchmark's `put` against 3.48 map writes per person during fill — so the
-gap is erase, not extra work.
+Both write-side per-call figures rose on `main` — `put` by 6.55 ms and
+`card_assign` by 6 ms — because the API consistency fixes added one store
+operation per mutation. §5's per-operation note prices that against the ~7 ms
+rule above.
+
+**The ~9× spread on `persondb_person_put` is the most important thing on this
+page for a caller** (808.7 / 90.470 = 8.9×), and the header gives no way to
+predict which case you get. Both figures are the same function on the same board
+in the same run: the benchmark rewrites an existing record, while the fill grows
+buckets until their 64 KB sector log must be compacted, and a compaction erases
+at ~1.06 s. Both paths call `persondb_person_put` once per record, so the work is
+the same shape and the gap is erase, not extra logic.
+
+That the ratio barely moved between the two runs is itself informative. `put`
+gained a store operation on `main` (+6.55 ms) while `fill` changed by 0.1%,
+because 6.55 ms is noise against a per-person cost of ~809 ms that is almost
+entirely erase.
 
 A caller that needs a bounded `put` therefore cannot get one from this API; the
 cost depends on the target bucket's fill state, which is not observable
@@ -682,7 +748,45 @@ Board 960115021, `N_PERSONS=1000`, `FRESH_START=y`. This is a *first* run, so
 `open` carries the partition erase and `mutate` has nothing to revoke — neither
 is a steady-state number.
 
-Post-merge, at `338ec24`:
+On `main` (`f1100f1`) — the current reference:
+
+```
+*** Booting Zephyr OS build 4a405846193f ***
+
+persondb 1.0.0 — CBOR person/credential database
+[00:00:21.637,054] <inf> persondb: created store: 16 people maps + 1 credential map, max buckets each, 1000 persons planned
+open         :  22468 ms
+prepare      : 112766 ms (106 buckets formatted)
+fill         : 808745 ms  1000 written, 1000/1000 total, 4 commits
+verify       :   5915 ms  256 persons, 602 cards
+VERIFY PASS
+mutate       :   3233 ms  rev 0 -> 1  (0 revoked, 64 assigned)
+re-verify    :   6138 ms  256 persons, 618 cards
+VERIFY PASS
+
+bench check :   200 ops in  2852000 us ->      70 ops/s    14260 us/op   400 store ops  22415 flash ops   2006077 B  amp 24x
+             : 200 granted, 0 denied, 0 unknown, 0 expired
+bench byid  :   200 ops in  1520000 us ->     131 ops/s     7600 us/op   200 store ops  10753 flash ops   1026970 B  amp 13x
+bench miss  :   200 ops in  1401000 us ->     142 ops/s     7005 us/op   200 store ops  11368 flash ops    969175 B  amp 210x
+bench put   :   200 ops in 18094000 us ->      11 ops/s    90470 us/op   864 store ops  75314 flash ops   5211595 B  amp 59x
+bench cbor  :   200 ops in   194000 us ->    1030 ops/s      970 us/op     0 store ops      0 flash ops         0 B  amp 0x
+
+store
+  partition   : 8388608 B (8192 KiB)
+  maps        : 16 person + 1 credential (bucket count not observable — FINDINGS.md K10)
+  persons     : 1000 of 1000   credentials: 2479
+  mean entry  : 432 B
+  live content: 432759 B = 5.1 % of the partition
+  bucket overflows: 0
+  NOTE: physical occupancy (live + uncompacted garbage) is not
+        observable through the API — see FINDINGS.md B3.
+
+persondb: done — store at rev 1; rerun to prove persistence
+```
+
+At `338ec24`, before the API consistency fixes — kept because the read counters
+are byte-identical to the run above, which is the evidence that those fixes
+touched only the write path:
 
 ```
 *** Booting Zephyr OS build 4a405846193f ***
