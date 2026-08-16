@@ -1,0 +1,38 @@
+sample:
+  description: CBOR person/credential database over the L2 Map shape
+  name: cbor-persondb
+common:
+  tags: storage cbor
+tests:
+  # The headline configuration. Build only: a 10 000-person fill is roughly
+  # 2.5 h on the DK's QSPI NOR (DESIGN.md §6.2).
+  app.cbor_persondb.bench:
+    build_only: true
+
+  # Same app, interactive frontend.
+  app.cbor_persondb.shell:
+    build_only: true
+    extra_configs:
+      - CONFIG_APP_CBOR_PERSONDB_FRONTEND_SHELL=y
+
+  # Small enough to actually run in CI, so fill -> verify -> mutate ->
+  # re-verify stays regression-tested even though the headline config never
+  # runs here.
+  app.cbor_persondb.smoke:
+    platform_allow: native_sim
+    extra_configs:
+      - CONFIG_APP_CBOR_PERSONDB_N_PERSONS=200
+      - CONFIG_APP_CBOR_PERSONDB_PEOPLE_MAPS=2
+      - CONFIG_APP_CBOR_PERSONDB_VERIFY_SAMPLES=64
+      - CONFIG_APP_CBOR_PERSONDB_BENCH_SAMPLES=20
+    harness: console
+    harness_config:
+      type: multi_line
+      ordered: true
+      regex:
+        - "VERIFY PASS"
+        # A8: the sizing rule of DESIGN.md §6.1 holds for this configuration.
+        # Without this line a fill that overflows a bucket still prints both
+        # of the others, and CI calls it a pass.
+        - "bucket overflows: 0"
+        - "persondb: done"
