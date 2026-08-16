@@ -91,7 +91,21 @@ the planned interfaces:
 > is deferred until an ordered backend (kvtree) needs it.
 
 Keys and values are opaque byte strings (`ptr + len`); key semantics (strings,
-paths, hashes) belong to L3. Concrete containers export a `const struct
+paths, hashes) belong to L3.
+
+> **Id-valued entries.** A value that is a *reference* — an i-node id naming
+> another blob — is a recurring case (a blobfs dirent, an interface's meta
+> pointer, the root of a nested structure). It needs no shape of its own: the
+> id is eight bytes like any other value.
+> `include/app/lib/containers/map_idref.h` provides `map_idref_set/get`, two
+> inlines over `map_ops` that pass a `uint64_t` instead of a `(ptr, len)` pair
+> and, on read, reject a value that is not exactly eight non-zero bytes
+> (`-EINVAL`) so a data-valued key cannot be misread as a reference. It is a
+> **typing aid only**: the bytes on flash are unchanged, every provider gets it
+> for free, and **no ownership is implied** — `del` removes the entry, never
+> the blob it names. Reference counting and reachability are deliberately not
+> answered here; a blob may be named from several entries, and its lifetime
+> stays the business of whoever created it. Concrete containers export a `const struct
 map_ops`/`seq_ops` instance; the L3 backend `choice` (P4) decides which instance
 an interface is compiled against — a compile-time binding, no runtime dispatch
 cost beyond one indirection.
