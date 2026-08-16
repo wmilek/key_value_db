@@ -50,8 +50,8 @@ overflows:
 |---|--:|--:|--:|--:|---|
 | **shipped** — 4 KB payload, 16 × 511, 1 credential map | **25.4 ms** | **12.4 ms** | **12.9 ms** | 806 | — |
 | choose the directory size: 32 × 256, 2 credential maps | 24.0 ms | 11.5 ms | 12.3 ms | 801 | none — a reformat |
-| raise the payload ceiling to 8 KB: 16 × 256, 2 credential maps | 19.0 ms | 9.5 ms | 9.4 ms | 616 | +12 KB RAM |
-| …to 16 KB: 16 × 128, 4 credential maps | **13.4 ms** | **7.1 ms** | **6.3 ms** | **426** | +40 KB RAM |
+| raise the payload ceiling to 8 KB: 16 × 256, 2 credential maps | 19.0 ms | 9.5 ms | 9.4 ms | 616 | +8 KB RAM |
+| …to 16 KB: 16 × 128, 4 credential maps | **13.4 ms** | **7.1 ms** | **6.3 ms** | **426** | +24 KB RAM |
 
 **The 16 KB row is better than the shipped configuration on every axis
 measured** — every read case roughly halved, 47 % fewer flash operations per
@@ -309,21 +309,59 @@ the bucket count rather than maximised: at 16 KB, dropping from 4 shards to 2
 buys 0.7 ms of `check` and costs 48 % more `put` bytes; dropping to 1 costs
 160 %.
 
-### 5.1 What it costs
+### 5.1 What it costs — measured, and less than first claimed
 
-**RAM**, on the arithmetic `RESULTS.md` §4a already sets out:
+An earlier revision of this document put the 16 KB tier at **+40 KB of RAM**,
+by arithmetic on `RESULTS.md` §4a. That was wrong, and the way it was wrong is
+worth keeping.
 
-| | today | 8 KB | 16 KB |
+Measured instead — `nm --size-sort` on the `native_sim` image at each ceiling,
+which is exact for these objects because they are fixed-size arrays whose size
+does not depend on the architecture:
+
+| symbol | 4 KB | 8 KB | 16 KB |
 |---|--:|--:|--:|
-| `kvhash` `dir_buf` + `bkt_buf` | 8 192 B | 16 384 B | 32 768 B |
-| `CONFIG_MAIN_STACK_SIZE` (driven by `append_slot`'s `MAX_PAYLOAD + 46` frame, B5 job 3) | 12 288 B | 16 384 B | 28 672 B |
-| **image total** (from 157 584 B) | 34.4 % of 448 KB | ~38 % | ~44 % |
+| `kvhash` `dir_buf` | 4 096 B | 8 192 B | 16 384 B |
+| `kvhash` `bkt_buf` | 4 096 B | 8 192 B | 16 384 B |
+| `blob_db` `g_bbuf` + `g_bbuf_new` | 131 072 B | 131 072 B | 131 072 B |
+| `z_main_stack` | 12 288 B | 12 288 B | 12 288 B |
+| **added by the ceiling** | — | **+8 KB** | **+24 KB** |
 
-The stack figures are what the measured builds used, not estimates; the image
-totals are arithmetic on `RESULTS.md` §4a and have not been re-measured for the
-DK. Both costs are the same symbol doing two jobs that `FINDINGS.md` **B5**
-already names, and Stage 1 of the large-payload proposal — staging the slot in
-`.bss` instead of on the stack — would remove the stack half of it.
+**Two of the three costs I assumed do not exist.**
+
+- **The stack does not move.** `-fstack-usage` gives byte-identical frames at
+  `MAX_PAYLOAD` 4096 and 16384, because `main` stages the slot in `blob_db`'s
+  existing `.bss` scratch (`append_slot2`) rather than on the stack. That is
+  `FINDINGS.md` **B5 job 3**, which the register already records as fixed —
+  but `prj.conf`'s comment and `RESULTS.md` §4a still describe the 4 200 B
+  frame it removed, and this document believed them. The measurement builds in
+  §11 passed `CONFIG_MAIN_STACK_SIZE` overrides that were never needed; they do
+  not affect a single flash counter, so the results stand and only this column
+  changes.
+- **`blob_db`'s `g_chunk[MAX_PAYLOAD]` is not compiled in**, because it lives
+  under `CONFIG_BLOB_DB_LARGE_PAYLOADS` and this app does not enable it. It
+  would add the same again if that ever changed.
+
+So the honest cost, added to `RESULTS.md` §4a's measured 157 584 B:
+
+| | image RAM | of 448 KB |
+|---|--:|--:|
+| today | 157 584 B | 34.4 % |
+| 8 KB ceiling | 165 776 B | **37.0 %** |
+| 16 KB ceiling | 182 160 B | **40.7 %** |
+
+And there is change to spare. The write chain now measures **3 008 B**
+(`scenario_bench` 1696 + `persondb_person_put` 784 + `kvhash_set` 128 +
+`blob_db_update` 112 + `compact_bucket` 192 + `append_slot` 96) against a
+12 288 B reservation sized for a 7 640 B chain at ~1.5× margin. At the same
+margin the stack would be ~4.5 KB, returning **~7 KB** — which makes the 8 KB
+ceiling **RAM-neutral** and the 16 KB ceiling cost ~17 KB net.
+
+Those are host frames, so this is a claim about the *shape* of the requirement,
+not a number to set `CONFIG_MAIN_STACK_SIZE` from; `RESULTS.md` §4a's ARM
+figures are what that value was chosen against and they need re-taking. The
+comment in `prj.conf` is corrected to say so rather than keep describing a
+frame that no longer exists.
 
 ### 5.2 The capacity check is the fill itself
 
@@ -472,13 +510,14 @@ measured and dropped rather than never considered.
    26.6 ms prediction, which is the cheapest available check on this document.
 3. **Then take the 16 KB configuration** — `MAP_BUCKETS=128`, `CRED_MAPS=4`,
    `CONFIG_BLOB_DB_MAX_PAYLOAD_LEN=16384`, `CONFIG_MAIN_STACK_SIZE=28672`. It
-   is better than the shipped configuration on every measured column, and the
-   only question is whether the image can afford ~44 % of the DK's RAM
-   (`RESULTS.md` §4a puts it at 34.4 % today). If it cannot, the 8 KB row is
-   −25 % for +12 KB.
-4. **Consider landing `FINDINGS.md` B5 job 3 first.** Staging blob_db's slot
-   in `.bss` removes the stack half of the RAM cost, which is 16 KB of the
-   40 KB at the 16 KB tier and would make the choice in step 3 easy.
+   is better than the shipped configuration on every measured column, and it
+   costs **+24 KB of RAM** — 40.7 % of the DK's 448 KB against 34.4 % today
+   (§5.1, measured). If that is too much, the 8 KB row is −25 % for +8 KB.
+4. **Re-take `RESULTS.md` §4a's stack measurement on the board.** It, and
+   `prj.conf`'s comment, still describe an `append_slot` frame that `main`
+   removed; the chain is now ~3 KB against a 12 288 B reservation. Confirming
+   that on ARM would return ~7 KB, which pays for the 8 KB ceiling outright
+   and most of the way to the 16 KB one.
 5. **Lever 1 on its own is not worth a reformat.** At −5.9 % it is inside the
    noise a board run would have to resolve. Take it as part of step 3, where
    choosing the bucket count is required anyway.
@@ -501,9 +540,12 @@ rather than edited. That, not the code, is the expensive part.
   `RESULTS.md` §3b's ±20 % on the write path applies to the fill column too.
 - **One run per configuration**, and `native_sim`'s host µs/op column is not
   comparable to anything (`RESULTS.md` §1).
-- **The DK RAM figures in §5.1 are arithmetic, not a target build.** No ARM
-  toolchain was available here; `west build -b nrf5340dk/nrf5340/cpuapp -t
-  ram_report` would settle them.
+- **The RAM deltas in §5.1 are measured, but on `native_sim`.** They are
+  fixed-size arrays, so the delta carries to ARM unchanged; the *totals* are
+  those deltas added to `RESULTS.md` §4a's measured 157 584 B. No ARM toolchain
+  was available here, so `west build -b nrf5340dk/nrf5340/cpuapp -t ram_report`
+  would still settle them — and would settle the stack question in §9 step 4
+  at the same time.
 - **`persondb_card_revoke`, `persondb_person_delete`, the permission
   operations, and a steady-state `persondb_open` are still unmeasured** — the
   same gap `RESULTS.md` §5b lists. This investigation stayed on the five
