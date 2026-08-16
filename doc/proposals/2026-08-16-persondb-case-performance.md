@@ -587,3 +587,83 @@ The harness in [`persondb-perf/`](persondb-perf/README.md) is not needed to
 reproduce any of the above. It is what found the mechanism in §3.2 — the
 per-sector slot census, which the application cannot report — and it is the
 only way to explore a configuration without a full build and fill.
+
+---
+
+## 12. Does any of this describe the UBI backend? No — measured
+
+Everything above is the **`flash_area`** backend: `CONFIG_BLOB_DB_BACKEND_FLASH_AREA`
+is the default and `prj.conf` selects no other. The harness's `store_host.c`
+models that seam too, so it says nothing about UBI either.
+
+**The action tree is unchanged.** `blob_db`'s slot walk, its append, its
+five-erase compaction commit, `kvhash`'s directory-plus-bucket structure and
+persondb's write orderings all live *above* `lib/blob_db/blob_db_store.h`. Only
+the four functions beneath it are swapped. So the map-op counts, the three
+sector walks per `set`, the whole-bucket read-modify-write: identical.
+
+What changes is underneath, and it is not free. One run each, same app, same
+10 000 persons, `native_sim`:
+
+| per op | `flash_area` | UBI | Δ |
+|---|--:|--:|--:|
+| `check` flash ops | 260.9 | 287.2 | **+10.1 %** |
+| `check` flash bytes | 13 270 | 13 586 | +2.4 % |
+| `byid` flash ops | 127.6 | 135.7 | +6.4 % |
+| `miss` flash ops | 132.4 | 152.6 | **+15.3 %** |
+| `put` flash ops | 805.8 | 857.9 | +6.5 % |
+| `put` flash bytes | 93 395 | 103 930 | +11.3 % |
+| buckets formatted by `prepare` | 106 | **100** | −6 |
+
+Both runs `VERIFY PASS` with zero bucket overflows, so the app is correct on
+either substrate. Three mechanisms account for the difference:
+
+- **blob_db gets fewer, smaller erase blocks.** A PEB becomes a UBI **LEB** —
+  a PEB minus UBI's two headers — and the backend holds back
+  `BLOB_DB_UBI_SPARE_PEBS` (4) plus whatever UBI reserves for itself. Six
+  sectors fewer here. Since `id_to_bucket()` is `id % n_buckets`, fewer buckets
+  means **more blobs per sector**, and §3.2 says the walk length *is* the blob
+  count. That is where the +10 % comes from — the same lever as §5, pushed the
+  wrong way.
+- **Every store read acquires a mapping check.** `blob_db_store_read()` calls
+  `ubi_leb_is_mapped()` before each `ubi_leb_read()`, and the slot walk issues
+  one store read *per slot*. The `miss` case, which walks furthest without
+  finding anything, pays the most (+15 %).
+- **An erase is no longer an erase.** `blob_db_store_erase()` becomes
+  `ubi_leb_unmap()` plus a bounded `ubi_device_erase_peb()` reclaim. The
+  physical block erase still happens, but deferred and amortised rather than
+  inline — so the ~1 072 ms-per-erase term in every model above **does not
+  transfer**, and UBI's own wear-levelling copies never appear in
+  `blob_db_iostats_get()` at all.
+
+**Consequently: do not apply §5's DK milliseconds to a UBI build.** Its two
+fitted constants were measured on raw flash. The operation and byte counts
+above are real; the time model behind every other table in this document is
+not calibrated for this substrate, and calibrating it needs a board.
+
+### 12.1 It also demonstrates `FINDINGS.md` B11
+
+The run reports `live content: 4336158 B = 51.6 % of the partition` — the same
+figure as the `flash_area` run, and **wrong**. `persondb.c`'s `geometry()`
+opens `storage_partition` and reports its raw size, but under UBI `blob_db`
+lives on a *volume* over that partition: fewer LEBs, each smaller than a
+sector. The true denominator is smaller, so the true occupancy is higher.
+
+`persondb.c` already says this in a comment and `FINDINGS.md` records it as
+**B11**. What was missing was a run that shows the wrong number being printed
+with no error and no warning, which is the whole point of the finding: the app
+cannot detect it, because no layer will tell it how big the store actually is.
+
+### 12.2 Reproducing
+
+```
+west build -p always -b native_sim app_cbor_persondb --                 \
+      -DCONFIG_BLOB_DB_BACKEND_UBI=y -DCONFIG_UBI_MAX_NR_OF_DATA_PEBS=256
+./build/zephyr/zephyr.exe --flash=ubi.bin --flash_erase
+```
+
+The `UBI_MAX_NR_OF_DATA_PEBS` override is required: its default of 14 is far
+below the 126 data PEBs an 8 MiB partition presents, and the failure is a clear
+`-ENOMEM` at `ubi_device_init()`. The two on-flash layouts are not
+interchangeable (`lib/blob_db/Kconfig` says so), so a backend switch needs a
+fresh store.
