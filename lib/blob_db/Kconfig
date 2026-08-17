@@ -15,17 +15,21 @@ if BLOB_DB
 
 choice BLOB_DB_BACKEND
 	prompt "blob_db storage backend"
-	default BLOB_DB_BACKEND_FLASH_AREA
+	default BLOB_DB_BACKEND_UBI
 	help
 	  Selects the substrate blob_db stores blobs on. Both expose the same
 	  PEB-addressed store interface (lib/blob_db/blob_db_store.h); the
-	  on-flash layouts are NOT interchangeable.
+	  on-flash layouts are NOT interchangeable, so switching an existing
+	  device between them requires erasing the partition first.
 
 config BLOB_DB_BACKEND_FLASH_AREA
 	bool "Raw partition (flash_area)"
 	help
 	  Store directly on the raw storage partition via Zephyr's flash_area
-	  API. This is the original behaviour.
+	  API. This was the original behaviour and the former default. It is
+	  faster — see app_perf/RESULTS.md, "The UBI backend" — but has no
+	  wear-leveling and no bad-block handling: an interrupted write can
+	  leave the part unusable until it is externally recovered.
 
 config BLOB_DB_BACKEND_UBI
 	bool "UBI volume"
@@ -33,6 +37,21 @@ config BLOB_DB_BACKEND_UBI
 	help
 	  Store on a dynamic UBI volume, gaining wear-leveling and bad-block
 	  handling. blob_db's in-place slot append maps onto ubi_leb_write_at().
+
+	  The default, on the grounds that a store which survives a torn write
+	  is worth more than a faster one. Measured cost on the nRF5340-DK
+	  (app_perf/RESULTS.md): reads 2.5x slower, updates 1.5x, +23 KB of
+	  flash. UBI's LEB->PEB indirection costs ~112 us per flash
+	  transaction and nothing per byte, so transaction-heavy paths pay
+	  most; the sector-erase cost that dominates writes is unchanged.
+
+	  With the static memory backend (the UBI default) this requires
+	  CONFIG_UBI_MAX_NR_OF_DATA_PEBS >= the partition's data PEB count,
+	  which is (partition_size / erase_block_size) -
+	  CONFIG_UBI_DEV_HDR_NR_OF_RES_PEBS. It defaults to 14, which builds
+	  cleanly and then fails to attach at runtime, so every board that
+	  uses this backend must set it. The pool costs 16 bytes per PEB, so
+	  size it to the geometry rather than to the maximum.
 
 endchoice
 
