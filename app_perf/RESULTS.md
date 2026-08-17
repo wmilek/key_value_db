@@ -10,10 +10,12 @@ are all `0 ms`, because the flash simulator models no latency; only the
 `io …` counters are meaningful there.
 
 Everything below is the **`flash_area` backend** unless a section says
-otherwise — that is `CONFIG_BLOB_DB_BACKEND_FLASH_AREA`, the Kconfig
-default. "The UBI backend" near the end is the only UBI measurement in
-this repo; the two backends are separate substrates and their numbers are
-not interchangeable.
+otherwise. Note that this is no longer the default: `blob_db` defaults to
+`CONFIG_BLOB_DB_BACKEND_UBI`, and "The UBI backend" measures it. The tables
+here remain flash_area because that is where the four-commit history was
+taken, and because it is still the faster substrate and a supported
+opt-out — but a default build gets UBI's numbers, not these. The two are
+separate substrates and their figures are not interchangeable.
 
 Four commits were measured on the same board, so each change under review
 can be read straight off the tables:
@@ -392,16 +394,37 @@ bytes to reclaim, so erase is the only lever, and UBI does not move it.
   the DK's 64 KB PEBs, 2 046 on native_sim's 4 KB. It defaults to **14**,
   which builds fine and then hangs at runtime.
 
-### What this says about making UBI the default
+### What this costs as the default
 
-It is a **1.5–2.5× regression on every read** plus 23 KB of flash, in
-exchange for wear-levelling and bad-block handling, with no improvement to
-the erase cost that dominates writes. That trade is worth making on worn
-or unreliable flash and not worth making by default, which is what the
-current `default BLOB_DB_BACKEND_FLASH_AREA` already encodes. A flip would
-also need per-board PEB sizing before any default build would run, and
-would silently re-base every benchmark in this repo onto an unmeasured
-substrate.
+**UBI is now the default** (`default BLOB_DB_BACKEND_UBI`), so this table is
+what a default build gets and the `flash_area` column is the opt-out. The
+price is stated plainly rather than buried: a **1.5–2.5× regression on every
+read**, plus 23 KB of flash and 3.4 KB of RAM, in exchange for wear-levelling
+and bad-block handling. The sector-erase cost that dominates writes is
+unchanged.
+
+The judgement behind that trade is that a store which survives a torn write
+is worth more than a faster one — and the failure it prevents was observed
+here by accident, not argued: an interrupted reflash corrupted a PEB and UBI
+repaired it in 2.3 s, where the same interruption on `flash_area` leaves the
+part needing `nrfutil device recover`.
+
+Two effects only visible once the other apps were measured on it:
+
+- **`fill` gets slightly cheaper, not dearer.** `app_cbor_persondb`'s fill is
+  1.10× faster on UBI (809 s → 733 s), because that phase is ~97% erase — the
+  one cost UBI does not inflate. Its full-scale `A4` floor improves from
+  ≈2.2 h to ≈2.0 h.
+- **First-time store creation can halve.** `app_perf_kvdb`'s format+prepare
+  goes 274.5 s → 145.5 s, because `flash_area` erases the partition and then
+  erases every bucket again, while UBI reuses the blocks its own format just
+  erased. That discount applies only where the format erased everything;
+  `app_perf_mc` and `app_cbor_persondb` see no such gain, which is the
+  clearest evidence that **UBI moves erase cost in time rather than removing
+  it.**
+
+Choosing `flash_area` remains a one-line opt-out, and is the right choice
+where the flash is known-good and reads dominate.
 
 ## Raw UART capture — UBI backend (`f1100f1`)
 

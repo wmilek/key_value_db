@@ -1,18 +1,29 @@
 common:
   tags: storage blob_db
   platform_allow: native_sim
+# blob_db defaults to the UBI backend, but most of this suite injects faults by
+# writing the raw partition at offsets that are only blob_db's on flash_area
+# (see SKIP_UNLESS_RAW_PARTITION in src/main.c). The first three scenarios
+# therefore pin flash_area so the injection keeps its meaning; lib.blob_db.ubi
+# runs the same suite on the shipped default with those cases skipping
+# themselves. The backend is named per scenario rather than in `common` because
+# the two are a Kconfig choice and must not both be set.
 tests:
-  lib.blob_db: {}
+  lib.blob_db:
+    extra_configs:
+      - CONFIG_BLOB_DB_BACKEND_FLASH_AREA=y
   # Production policy for an unparseable-but-not-erased master: refuse with
   # -EIO instead of reformatting. Exercises the other half of the recovery
   # branch in blob_db_mount().
   lib.blob_db.no_autoformat:
     extra_configs:
+      - CONFIG_BLOB_DB_BACKEND_FLASH_AREA=y
       - CONFIG_BLOB_DB_AUTOFORMAT_ON_CORRUPT=n
   # Segmented large objects. Bumps the on-flash format major, so this config
   # also covers that older software refuses such a store.
   lib.blob_db.large_payloads:
     extra_configs:
+      - CONFIG_BLOB_DB_BACKEND_FLASH_AREA=y
       - CONFIG_BLOB_DB_LARGE_PAYLOADS=y
       - CONFIG_MAIN_STACK_SIZE=32768
       # Crash injection at each step of the segmented write sequence
@@ -20,3 +31,25 @@ tests:
       # large-object tests so the commit-point claim is covered by the
       # config that ships it, not by a config nothing else uses.
       - CONFIG_BLOB_DB_TEST_CRASH_HOOKS=y
+  # The shipped default: UBI, single-slot payloads. Everything that goes
+  # through the API runs here; the raw-partition injection cases skip
+  # themselves, because under UBI those offsets are UBI's device header rather
+  # than blob_db's masters. Keeping this scenario means the default is
+  # exercised by the library's own suite and not only by the apps.
+  #
+  # The PEB pool is set here rather than in boards/native_sim.conf so the
+  # flash_area scenarios above do not assign a symbol that does not exist when
+  # UBI_ENABLE is off. 8 MB of 4 KB blocks is 2048 PEBs, less 2 reserved.
+  #
+  # LARGE_PAYLOADS is deliberately absent, and cannot simply be added here:
+  # UBI spends 48 B per PEB on its own headers, so the LEB blob_db sees is
+  # 4048 B rather than 4096. The rebind rule caps a payload at
+  # (4048 - 16) / 2 - 14 = 2002 B, while enabling LARGE_PAYLOADS raises
+  # MAX_PAYLOAD_LEN to 2016 — mount then refuses with -ENOTSUP, correctly.
+  # The pair is only reachable on this geometry by also lowering
+  # MAX_PAYLOAD_LEN to <= 2002. The DK's 64 KB blocks have room to spare and
+  # are unaffected, which is why app_perf runs both options there.
+  lib.blob_db.ubi:
+    extra_configs:
+      - CONFIG_BLOB_DB_BACKEND_UBI=y
+      - CONFIG_UBI_MAX_NR_OF_DATA_PEBS=2046

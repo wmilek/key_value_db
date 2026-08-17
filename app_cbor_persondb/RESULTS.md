@@ -13,6 +13,10 @@ duration, occupancy) are *not* the 10 000-person figures and are marked where
 they appear. A full-scale DK run remains outstanding for `A4`; §5 gives a
 revised floor of ≈2.2 h for it.
 
+**`blob_db` now defaults to the UBI backend; §5 and §5b are `flash_area`.**
+§5c measures the default on the same board: reads cost ~1.9× more, `fill` is
+1.10× *cheaper*, and the `A4` floor improves slightly to ≈2.0 h.
+
 ---
 
 ## 0. What this benchmark measures
@@ -592,6 +596,84 @@ No phase exercises these, so this file says nothing about them:
 That is 5 of the header's operations measured directly, one derived, and the
 rest unknown — worth remembering before quoting this file as the cost of the
 API as a whole.
+
+## 5c. On the UBI backend (the default)
+
+`blob_db` now defaults to `CONFIG_BLOB_DB_BACKEND_UBI`; everything above is
+`flash_area`. Same board, same 1 000-person config, with the backend and its
+PEB pool coming from `boards/nrf5340dk_nrf5340_cpuapp.conf` rather than a
+command-line override.
+
+Both columns were taken on `f1100f1`. The `flash_area` column is therefore
+the re-run recorded in PR #18, not the `338ec24` figures in §5 above — the
+two differ by ~2% (e.g. `check` 14.260 against 14.605 ms), which is run-to-run
+noise and does not move any ratio below. Where §5's numbers and these
+disagree by that much, §5 is the older code.
+
+| phase | `flash_area` | **UBI** | |
+|---|--:|--:|--:|
+| `check` | 14.260 ms | **27.660 ms** | ×1.94 slower |
+| `byid` | 7.600 ms | **14.060 ms** | ×1.85 slower |
+| `miss` | 7.005 ms | **13.720 ms** | ×1.96 slower |
+| `put` | 90.470 ms | **107.405 ms** | ×1.19 slower |
+| `cbor` | 0.970 ms | **0.945 ms** | unchanged |
+| `verify` | 5 915 ms | 11 379 ms | ×1.92 slower |
+| `mutate` | 3 233 ms | 5 325 ms | ×1.65 slower |
+| `re-verify` | 6 138 ms | 12 010 ms | ×1.96 slower |
+| `open` | 22 468 ms | 26 014 ms | ×1.16 slower |
+| `prepare` | 112 766 ms (106 buckets) | 109 969 ms (100 buckets) | 1 064 → 1 099 ms/bucket |
+| **`fill`** | **808 745 ms** | **732 573 ms** | **×1.10 faster** |
+
+`cbor` is unchanged, which is the control: it touches no flash. The store is
+structurally identical — 2 479 credentials, mean entry 432 B, 0 bucket
+overflows, `VERIFY PASS` both times.
+
+### The UBI cost model transfers between applications
+
+`app_perf/RESULTS.md` fits UBI at **178 µs per flash transaction and
+0.616 µs/B**, from a different app with different payloads. Applied to this
+app's own counters for `check`, with no refitting:
+
+| | per `check` |
+|---|--:|
+| flash transactions | 115.6 |
+| bytes | 10 073 B |
+| predicted 115.6 × 178 µs + 10 073 × 0.616 µs + 945 µs CBOR | **27.73 ms** |
+| **measured** | **27.66 ms** |
+
+**0.3% apart.** Both backends' constants now predict this application's
+decision cost from `app_perf`'s numbers, which is the strongest evidence in
+either file that the model is real rather than fitted noise.
+
+It also moves `FINDINGS.md` N1 further: fixed transaction cost is now
+**~77% of a decision** on the default backend, against ~54% on flash_area.
+Whatever reduces transaction count is worth roughly half again as much as it
+was.
+
+### Fill is *faster*, which nothing else here is
+
+Every read-bound phase pays ~1.9×, and yet `fill` — the phase that dominates
+the whole run — is **76 s cheaper** on UBI. That is consistent with the rest
+of this file rather than in tension with it: `fill` is ~97% sector erase, the
+one cost UBI does not inflate, and UBI's block management appears to place
+erases slightly more efficiently than repeated in-place formatting does.
+
+The practical consequence is that the full-scale `A4` estimate does **not**
+get worse on the new default. Extrapolating this fill linearly to 10 000
+persons gives **≈2.0 h**, against ≈2.2 h on flash_area.
+
+### `prepare` does not get kvdb's discount
+
+`app_perf_kvdb/RESULTS.md` reports its `prepare` phase 909× faster on UBI,
+because its `FRESH_START` erases the whole partition first and leaves UBI a
+pool of pre-erased PEBs. This app's format only touches what it needs — its
+`open` is 26 s against kvdb's 145 s — so there is no such pool and each
+bucket format pays a real erase, at 1 099 ms against flash_area's 1 064 ms.
+Two apps, opposite results, same mechanism: **UBI moves erase cost in time,
+it does not remove it.**
+
+Note also `prepare` formats **100** buckets here against 106 on flash_area:
+UBI reserves 2 PEBs for its own headers, so the volume is smaller.
 
 ## 6. What the numbers say
 

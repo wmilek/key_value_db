@@ -64,7 +64,7 @@ static int find_existing_volume(struct ubi_device *ubi, int *vol_id_out)
 
 int blob_db_store_open(struct blob_db_store_geom *geom)
 {
-	const struct device *flash_dev = FIXED_PARTITION_DEVICE(BLOB_DB_UBI_PARTITION);
+	const struct device *flash_dev = PARTITION_DEVICE(BLOB_DB_UBI_PARTITION);
 	struct flash_pages_info page_info = { 0 };
 
 	int rc = flash_get_page_info_by_offs(flash_dev, 0, &page_info);
@@ -75,7 +75,7 @@ int blob_db_store_open(struct blob_db_store_geom *geom)
 	}
 
 	struct ubi_flash_desc flash = {
-		.partition_id = FIXED_PARTITION_ID(BLOB_DB_UBI_PARTITION),
+		.partition_id = PARTITION_ID(BLOB_DB_UBI_PARTITION),
 		.erase_block_size = page_info.size,
 		.write_block_size = flash_get_write_block_size(flash_dev),
 	};

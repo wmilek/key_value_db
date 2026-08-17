@@ -9,6 +9,11 @@ Regenerated on `e80f404` (main, after PR 10 merged). The previous numbers
 predated PR 2's lookup change; the "~59 reads/s (17 ms)" this file used to
 scale against is now 2174 reads/s (460 µs).
 
+**`blob_db` now defaults to the UBI backend, and the headline table below is
+`flash_area`.** Both are measured — see "On the UBI backend". The default
+costs roughly 2× on reads, so the numbers a caller should expect from a
+default build are the UBI column, not the first table.
+
 ## Setup
 
 - **Target**: nRF5340-DK (S/N 960115021, PCA10095), cpuapp core
@@ -42,6 +47,43 @@ Against the previous run, with the container's own code unchanged:
 
 Behaviour is bit-for-bit identical across the change: same `get checksum:
 0xac6a5f02`, same end state of 1 live blob.
+
+## On the UBI backend (the default)
+
+Same commit, same board, same defaults; only `CONFIG_BLOB_DB_BACKEND_UBI`
+differs, taken from the board conf rather than a command-line override.
+
+| workload  | `flash_area` |     UBI |     Δ |
+| --------- | -----------: | ------: | ----: |
+| `get`     |      3.53 ms | 8.59 ms | ×2.43 |
+| `set`     |     13.60 ms | 20.9 ms | ×1.54 |
+| `overwrite` |   29.10 ms | 56.5 ms | ×1.94 |
+| `delete`  |     37.00 ms | 83.8 ms | ×2.26 |
+| `cleanup` |     23.00 ms | 56.0 ms | ×2.43 |
+| `prepare` |  1 088 620 µs | 1 088 542 µs | — |
+
+`get checksum: 0xac6a5f02` and the 1-live-blob end state hold on both
+backends, so the container behaves identically; only the substrate's cost
+changes.
+
+The spread across rows is explained by what each operation is made of.
+`get` is ~7 reads and pays UBI's per-transaction penalty on every one, so
+it takes the full ×2.4. `set` is dominated by 4 updates whose cost is
+program time rather than transactions, so it only takes ×1.5. That matches
+`app_perf/RESULTS.md`, which fits the penalty at ~112 µs per flash
+transaction and nothing per byte.
+
+`prepare` is **identical** to the byte, and worth dwelling on because
+`app_perf_kvdb/RESULTS.md` shows the same phase 865× *faster* on UBI. There
+is no contradiction: this app calls `erase_all()` and then `prepare()` on a
+volume that has been in use, so UBI has no pre-erased PEBs left and each
+bucket format forces a real sector erase. kvdb's first run formats the store
+immediately beforehand, so its `prepare` finds PEBs UBI has already erased.
+**UBI moves erase cost in time; it does not remove it.**
+
+Note also that `prepare` formats **118** buckets here against 124 on
+`flash_area` — UBI keeps 2 PEBs for its headers and the volume is smaller by
+that much, so the usable bucket count drops.
 
 ### Where the multiples come from
 
@@ -83,7 +125,25 @@ structural floor (registry + list + intent); the final cleanup phase —
 registry §8) — takes it all the way down to **1 blob: the empty registry**.
 Nothing leaks anywhere in the lifecycle.
 
-## Raw UART capture
+## Raw UART capture — UBI backend (the default)
+
+UBI's volume-probe and PEB-recovery lines are elided; it logs recoverable
+conditions at `<err>` level.
+
+```
+*** Booting Zephyr OS build 4a405846193f ***
+model-container perf 1.0.0  (N_KEYS=10  N_GET=100  N_OVW=50  VAL_LEN=24)
+bench prepare  :  118 ops in  128448 ms  ->    0.918 ops/s  (  1088542 us/op)
+bench set      :   10 ops in     209 ms  ->   47.846 ops/s  (    20900 us/op)
+bench get      :  100 ops in     859 ms  ->  116.414 ops/s  (     8590 us/op)
+bench overwrite:   50 ops in    2826 ms  ->   17.692 ops/s  (    56520 us/op)
+bench delete   :   10 ops in     838 ms  ->   11.933 ops/s  (    83800 us/op)
+bench cleanup  :    1 ops in      56 ms  ->   17.857 ops/s  (    56000 us/op)
+get checksum: 0xac6a5f02
+live blobs at end: 1 (expect 1 — the empty registry alone)
+```
+
+## Raw UART capture — `flash_area`
 
 ```
 *** Booting Zephyr OS build 4a405846193f ***

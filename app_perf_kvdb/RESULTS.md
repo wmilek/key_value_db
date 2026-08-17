@@ -9,6 +9,13 @@ in this file predated PR 2's lookup change and are superseded — the
 reference to app_perf's "16.9 ms per blob_db read" no longer describes
 this library at all; a small-blob read is now 460 µs.
 
+**`blob_db` now defaults to the UBI backend, and the tables below are
+`flash_area`.** Both are measured — see "On the UBI backend", which is also
+where this app's most interesting result lives: **UBI halves the cost of
+creating the store**, because `flash_area` erases the partition and then
+erases every bucket again, while UBI reuses the blocks its own format just
+erased.
+
 ## Setup
 
 - **Target**: nRF5340-DK (S/N 960115021, PCA10095), cpuapp core
@@ -70,7 +77,97 @@ measured; the gap is the bucket repack plus the second directory read.
 64 KB sector erase at ~1.09 s each, a property of the MX25R64 and not of
 any code in this tree.
 
-## Raw UART capture (first run after FRESH_START, gen 1 -> 2)
+## On the UBI backend (the default)
+
+Same commit, same board, same defaults; only `CONFIG_BLOB_DB_BACKEND_UBI`
+differs, taken from the board conf rather than a command-line override.
+
+### Store creation is halved — the one place UBI wins outright
+
+| phase | `flash_area` | UBI | |
+|---|--:|--:|--:|
+| `mount+open` (incl. format) | 140.0 s | 145.4 s | +4% |
+| `prepare` (116–122 buckets) | **134.5 s** | **0.148 s** | **×909** |
+| **format + prepare total** | **274.5 s** | **145.5 s** | **×1.89 faster** |
+| `populate` | 27.1 ms/op | 29.8 ms/op | ×1.10 slower |
+
+`prepare` costs 1 275 µs/op against 1 102 467. The reason is not that UBI
+made erasing cheap — it is that **`flash_area` erases the same blocks
+twice.** `FRESH_START` erases the whole partition, and then `prepare()`
+erases each of the 122 buckets again, because on the raw partition a bucket
+format means erasing that sector whether or not it was just erased. On UBI
+a bucket format is an LEB operation, and UBI still has the PEBs its own
+format erased moments earlier, so it hands one over without touching flash.
+
+**This is a genuine saving of ~129 s on first population, not an accounting
+artifact** — but it is available only while UBI has pre-erased blocks in
+hand. `app_perf_mc/RESULTS.md` measures the same `prepare` phase at
+1 088 542 µs/op on UBI, identical to `flash_area`, because that app runs
+`erase_all()` and then `prepare()` on a volume already in use. UBI moves
+erase cost in time; it does not remove it.
+
+### Steady state is slower, in proportion to read count
+
+| phase | `flash_area` | UBI | Δ |
+|---|--:|--:|--:|
+| `mount+open` (rerun) | 1.26 s | 1.52 s | ×1.21 |
+| `verify` | 2.71 ms | 6.08 ms | ×2.24 |
+| `modify` | 11.1 ms | 16.1 ms | ×1.46 |
+| `reverify` | 2.82 ms | 6.40 ms | ×2.27 |
+| **rerun total** | **≈6.4 s** | **≈12.8 s** | **×2.0** |
+
+Both `VERIFY PASS` results hold on both backends, at the same generations.
+
+The pattern matches `app_perf/RESULTS.md`: UBI's LEB→PEB indirection costs
+~112 µs per flash transaction and nothing per byte, so read-dominated
+phases take the full ~2.25× while `modify`, which is half write, takes
+~1.46×. A `kvdb_get` is two blob_db reads, and both now pay the penalty.
+
+So on the default backend the "one-minute steady-state test" is a
+~13-second test rather than a ~6-second one — still far from the minute the
+`N_KEYS` help text assumes.
+
+## Raw UART capture — UBI, first run (`FRESH_START`, gen 1 -> 2)
+
+UBI's volume-probe lines are elided; it logs them at `<err>` level.
+
+```
+*** Booting Zephyr OS build 4a405846193f ***
+kvdb perf 1.0.0  (N_KEYS=768  VAL_LEN=16  STRIDE=4  val=24 B)
+FRESH_START: formatting store
+[00:02:25.567,413] <inf> rootreg: virgin store — registry bootstrapped at id 1
+mount+open   :         145366 ms
+state: empty store -> initial population
+bench prepare  :  116 ops in    148 ms  ->   783.783 ops/s  (   1275 us/op)
+bench populate :  770 ops in  22923 ms  ->    33.590 ops/s  (  29770 us/op)
+bench verify   :  769 ops in   4254 ms  ->   180.771 ops/s  (   5531 us/op)
+VERIFY PASS (gen 1)
+bench modify   :  196 ops in   3009 ms  ->    65.137 ops/s  (  15352 us/op)
+bench reverify :  769 ops in   4649 ms  ->   165.411 ops/s  (   6045 us/op)
+VERIFY PASS (gen 2)
+done — store at gen 2; rerun to verify persistence
+```
+
+Note `prepare` formats **116** buckets against 122 on `flash_area`: UBI
+reserves 2 PEBs for its headers, so the volume is smaller and fewer buckets
+fit.
+
+## Raw UART capture — UBI, rerun (gen 2 -> 3)
+
+```
+*** Booting Zephyr OS build 4a405846193f ***
+kvdb perf 1.0.0  (N_KEYS=768  VAL_LEN=16  STRIDE=4  val=24 B)
+mount+open   :           1518 ms
+state: rerun, store at gen 2
+bench verify   :  769 ops in   4678 ms  ->   164.386 ops/s  (   6083 us/op)
+VERIFY PASS (gen 2)
+bench modify   :  196 ops in   3160 ms  ->    62.025 ops/s  (  16122 us/op)
+bench reverify :  769 ops in   4923 ms  ->   156.205 ops/s  (   6401 us/op)
+VERIFY PASS (gen 3)
+done — store at gen 3; rerun to verify persistence
+```
+
+## Raw UART capture — `flash_area`, first run (gen 1 -> 2)
 
 ```
 *** Booting Zephyr OS build 4a405846193f ***
@@ -89,7 +186,7 @@ VERIFY PASS (gen 2)
 done — store at gen 2; rerun to verify persistence
 ```
 
-## Raw UART capture (rerun, gen 2 -> 3)
+## Raw UART capture — `flash_area`, rerun (gen 2 -> 3)
 
 ```
 *** Booting Zephyr OS build 4a405846193f ***
@@ -116,7 +213,13 @@ west build -p always -b nrf5340dk/nrf5340/cpuapp -d build/kvdb app_perf_kvdb
 # add -- -DCONFIG_APP_PERF_KVDB_FRESH_START=y for the store-creation run
 ```
 
-The store must be one this build can mount. `app_perf` enables
+That build uses the default UBI backend, with the PEB pool sized in
+`boards/nrf5340dk_nrf5340_cpuapp.conf`. For the `flash_area` column add
+`-DCONFIG_BLOB_DB_BACKEND_FLASH_AREA=y`, and **erase the partition raw when
+switching between backends** — the two layouts are not interchangeable, and
+UBI only formats a partition it finds erased.
+
+The store must also be one this build can mount. `app_perf` enables
 `CONFIG_BLOB_DB_LARGE_PAYLOADS=y`, which bumps the on-flash format major
 to 2, and this app does not — so after running `app_perf` on the same
 board, mount fails `-ENOTSUP` (a foreign store) *before* `FRESH_START`

@@ -22,6 +22,33 @@
 /* native_sim overlay geometry: 8 MB of 4 KB sectors. */
 #define TEST_SECTOR_SZ  4096
 
+/*
+ * Several cases here inject faults by writing or erasing the storage partition
+ * directly, at offsets derived from blob_db's own on-flash layout — a torn
+ * append, a corrupt master, a half-finished compaction.
+ *
+ * That is only meaningful on the flash_area backend, where those offsets are
+ * blob_db's. Under CONFIG_BLOB_DB_BACKEND_UBI the store lives inside a UBI
+ * volume and the same offsets belong to UBI's reserved PEBs and device header,
+ * so "corrupting a master" actually destroys UBI's metadata: the injection
+ * proves nothing about blob_db, and every later attach fails with
+ * "no active reserved PEBs" (-EIO), taking the rest of the suite with it.
+ *
+ * So these cases skip on UBI rather than pretend to pass. The gap is real and
+ * deliberate: blob_db's crash-safety is verified on flash_area only, because
+ * doing it on UBI needs injection at the store seam rather than at fixed flash
+ * offsets. Everything that does not reach past the API still runs on both
+ * backends — see the lib.blob_db.ubi scenario in testcase.yaml.
+ *
+ * The guard goes at the top of each affected case, not inside the injection
+ * helpers. ztest_test_skip() escapes by longjmp, which the compiler cannot see,
+ * so guarding a helper leaves every local it fills looking uninitialised to
+ * -Werror=uninitialized. Guarding the case works because Z_TEST_SKIP() ends in
+ * a plain return.
+ */
+#define SKIP_UNLESS_RAW_PARTITION() \
+	Z_TEST_SKIP_IFNDEF(CONFIG_BLOB_DB_BACKEND_FLASH_AREA)
+
 /* alloc + bind in one step — the contract's replacement for the old `put`. */
 static uint64_t put_blob(const void *payload, size_t len)
 {
@@ -223,6 +250,8 @@ ZTEST(blob_db, test_boundary_payload_len)
  *     different bucket is unaffected. */
 ZTEST(blob_db, test_corrupted_slot_is_invisible)
 {
+	SKIP_UNLESS_RAW_PARTITION();
+
 	uint64_t a = put_blob("AAA", 3);
 	uint64_t b = put_blob("BBB", 3);
 
@@ -271,6 +300,8 @@ ZTEST(blob_db, test_corrupted_slot_is_invisible)
  */
 ZTEST(blob_db, test_corrupt_slot_does_not_hide_later_slots)
 {
+	SKIP_UNLESS_RAW_PARTITION();
+
 	const uint16_t n_buckets = 2045;
 
 	/* Two ids exactly one full round of the bucket hash apart, so they
@@ -384,6 +415,8 @@ ZTEST(blob_db, test_compaction_drops_tombstones_and_overrides)
 /* 13. Compaction preserves ids of live blobs in other buckets. */
 ZTEST(blob_db, test_compaction_preserves_ids)
 {
+	SKIP_UNLESS_RAW_PARTITION();
+
 	uint64_t ids[20];
 	char p[16];
 
@@ -496,6 +529,8 @@ static void masters_erase(void)
 
 ZTEST(blob_db, test_mid_compaction_crash_recovery)
 {
+	SKIP_UNLESS_RAW_PARTITION();
+
 	uint64_t a = put_blob("AA", 2);
 	uint64_t b = put_blob("BB", 2);
 
@@ -834,6 +869,8 @@ ZTEST(blob_db, test_prepare_survives_remount)
 /* A store declaring a newer major is refused — and, above all, left alone. */
 ZTEST(blob_db, test_foreign_major_is_refused_and_partition_untouched)
 {
+	SKIP_UNLESS_RAW_PARTITION();
+
 	uint64_t id = put_blob("KEEP", 4);
 
 	ARG_UNUSED(id);
@@ -867,6 +904,8 @@ ZTEST(blob_db, test_foreign_major_is_refused_and_partition_untouched)
  * (contract D1) — same rule, refuse and leave it. */
 ZTEST(blob_db, test_foreign_magic_is_refused)
 {
+	SKIP_UNLESS_RAW_PARTITION();
+
 	zassert_ok(blob_db_unmount());
 
 	struct master_img m;
@@ -895,6 +934,8 @@ ZTEST(blob_db, test_foreign_magic_is_refused)
  * under the library and erase the partition through flash_area directly. */
 ZTEST(blob_db, test_format_discards_an_unmountable_store)
 {
+	SKIP_UNLESS_RAW_PARTITION();
+
 	put_blob("DOOMED", 6);
 	zassert_ok(blob_db_unmount());
 
@@ -966,6 +1007,8 @@ ZTEST(blob_db, test_format_on_a_mounted_store_stays_mounted)
  * mount a stale view, so the whole store must be refused. */
 ZTEST(blob_db, test_split_major_refuses_without_falling_back)
 {
+	SKIP_UNLESS_RAW_PARTITION();
+
 	put_blob("AA", 2);
 	zassert_ok(blob_db_unmount());
 
@@ -992,6 +1035,8 @@ ZTEST(blob_db, test_split_major_refuses_without_falling_back)
  * what the separate prefix CRC buys over a single header CRC. */
 ZTEST(blob_db, test_corrupt_prefix_falls_back_to_the_good_master)
 {
+	SKIP_UNLESS_RAW_PARTITION();
+
 	uint64_t id = put_blob("SURVIVE", 7);
 
 	zassert_ok(blob_db_unmount());
@@ -1026,6 +1071,8 @@ ZTEST(blob_db, test_corrupt_prefix_falls_back_to_the_good_master)
  * newer software still mounts. */
 ZTEST(blob_db, test_future_minor_is_tolerated)
 {
+	SKIP_UNLESS_RAW_PARTITION();
+
 	uint64_t id = put_blob("MINOR", 5);
 
 	zassert_ok(blob_db_unmount());
@@ -1053,6 +1100,8 @@ ZTEST(blob_db, test_future_minor_is_tolerated)
  * this is recoverable — the store is reformatted rather than left dead. */
 ZTEST(blob_db, test_both_masters_corrupt_autoformats)
 {
+	SKIP_UNLESS_RAW_PARTITION();
+
 	Z_TEST_SKIP_IFNDEF(CONFIG_BLOB_DB_AUTOFORMAT_ON_CORRUPT);
 
 	uint64_t survivor = put_blob("STALE", 5);
@@ -1089,6 +1138,8 @@ ZTEST(blob_db, test_both_masters_corrupt_autoformats)
  * caller to deal with. Covered by the lib.blob_db.no_autoformat config. */
 ZTEST(blob_db, test_both_masters_corrupt_refused_when_configured)
 {
+	SKIP_UNLESS_RAW_PARTITION();
+
 	Z_TEST_SKIP_IFDEF(CONFIG_BLOB_DB_AUTOFORMAT_ON_CORRUPT);
 
 	put_blob("STALE", 5);
@@ -1134,6 +1185,8 @@ ZTEST(blob_db, test_both_masters_corrupt_refused_when_configured)
  * seal existed this lost every blob in the bucket past the tear. */
 ZTEST(blob_db, test_torn_scratch_write_does_not_clobber_bucket)
 {
+	SKIP_UNLESS_RAW_PARTITION();
+
 	uint64_t id = put_blob("VICTIM", 6);
 	const uint16_t n_buckets = 2045;          /* 2048 sectors - 3 metadata */
 	const uint16_t bid = (uint16_t)(id % n_buckets);
@@ -1177,6 +1230,8 @@ ZTEST(blob_db, test_torn_scratch_write_does_not_clobber_bucket)
  * bucket was already erased when power went. Recovery must restore it. */
 ZTEST(blob_db, test_sealed_scratch_is_restored_over_erased_bucket)
 {
+	SKIP_UNLESS_RAW_PARTITION();
+
 	uint64_t id = put_blob("RESTORE", 7);
 	const uint16_t n_buckets = 2045;
 	const uint16_t bid = (uint16_t)(id % n_buckets);
@@ -1515,6 +1570,8 @@ ZTEST(blob_db, test_segments_are_invisible_to_count_and_iterate)
  */
 ZTEST(blob_db, test_sweep_reclaims_orphan_segments)
 {
+	SKIP_UNLESS_RAW_PARTITION();
+
 	fill_pattern(big_src, BIG_LEN, 0x88);
 
 	uint64_t id = put_blob(big_src, BIG_LEN);
@@ -1712,6 +1769,8 @@ ZTEST(blob_db, test_pwrite_inline_payload)
  * left in place for orphans. */
 ZTEST(blob_db, test_pwrite_survives_remount_and_sweep)
 {
+	SKIP_UNLESS_RAW_PARTITION();
+
 	fill_pattern(big_src, BIG_LEN, 0x94);
 
 	uint64_t id = put_blob(big_src, BIG_LEN);
@@ -2160,6 +2219,8 @@ ZTEST(blob_db, test_wedged_store_refuses_writes_but_still_reads)
  * state, not something to be blocked by it. */
 ZTEST(blob_db, test_wedged_store_can_still_be_formatted)
 {
+	SKIP_UNLESS_RAW_PARTITION();
+
 	put_blob("DOOMED", 6);
 	blob_db_test_wedge();
 
@@ -2302,6 +2363,8 @@ static uint64_t first_segment_id(void)
  * were the caller's payload is worse than an error. */
 ZTEST(blob_db, test_segment_ids_are_not_visible_through_the_api)
 {
+	SKIP_UNLESS_RAW_PARTITION();
+
 	fill_pattern(big_src, BIG_LEN, 0x6d);
 
 	uint64_t owner = put_blob(big_src, BIG_LEN);
@@ -2356,6 +2419,8 @@ ZTEST(blob_db, test_zero_length_write_still_reports_a_missing_id)
  * the CRC-verified lookup; update() was the outlier. */
 ZTEST(blob_db, test_update_after_a_torn_append_releases_old_segments)
 {
+	SKIP_UNLESS_RAW_PARTITION();
+
 	fill_pattern(big_src, BIG_LEN, 0x2b);
 
 	uint64_t id = put_blob(big_src, BIG_LEN);
