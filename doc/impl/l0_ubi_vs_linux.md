@@ -152,7 +152,7 @@ Linux will not format an MTD device for you: `ubiformat`/`ubinize` prepare the
 image and `ubiattach` binds it, all out of band. Here `ubi_device_init()`
 formats a blank partition on first use and `ubi_volume_create()` is idempotent
 by name, so `blob_db_store_open()` self-provisions on first boot
-(`blob_db_store_ubi.c:63`). For firmware that ships on blank flash, that
+(`blob_db_store_ubi.c:116`). For firmware that ships on blank flash, that
 removes a production step outright.
 
 Two rough edges follow from the missing "open by name": the shim probes volume
