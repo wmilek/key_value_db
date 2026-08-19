@@ -10,7 +10,7 @@ Status: v2 · Top-level document; per-layer detail lives in `doc/layers/`
 |---|---|
 | **this file** | The stack: layers, boundaries, composition model |
 | `doc/principles.md` | Binding design principles (P1–P8) for every layer |
-| `doc/layers/l0_flash.md` | L0 — flash translation: `flash_area` contract, future UBI-like FTL |
+| `doc/layers/l0_flash.md` | L0 — flash translation: the `blob_db_store` seam and its two providers (`flash_area`, UBI) |
 | `doc/layers/l1_blob_db.md` | L1 — `blob_db` **contract & requirements** (implementation-agnostic) |
 | `doc/layers/l1_model_container.md` | L1 — the model container: **sufficiency proof** that the blob_db contract can carry the layers above; reference pattern + acceptance-test blueprint |
 | `doc/layers/l1_root_registry.md` | L1½ — root registry (optional helper): key → structure-root map; owns id = 1 when enabled |
@@ -30,6 +30,16 @@ implemented** against the current contract — `alloc_id` + bind/rebind
 `native_sim` by a unit suite (`tests/lib/blob_db`) and the model-container
 acceptance suite (`tests/lib/blob_db_contract`, the sufficiency proof of
 `l1_model_container.md` with crash injection at every mutation step).
+
+**L0 ships two providers behind a seam inside L1.** `blob_db` addresses
+storage as an array of erase blocks through `lib/blob_db/blob_db_store.h`, and
+the `BLOB_DB_BACKEND` Kconfig choice picks what implements it: a raw partition
+via `flash_area`, or a dynamic **UBI volume — the default since PR #20**,
+which adds wear leveling and bad-block handling for a measured 2.5× on reads
+and +23 KB of flash. This replaced the virtual-`flash_area` integration this
+document previously described; `layers/l0_flash.md` §1.1 records why. Both
+backends are built by CI on both targets, and `tests/lib/blob_db` runs its
+suite on each.
 
 Above L1, the first vertical slice is **implemented and tested on
 `native_sim`**: the root registry (`lib/rootreg`, `tests/lib/rootreg`), the
@@ -57,7 +67,7 @@ implemented.
 │  L1  i-node allocation      blob_db: stable u64 id → blob            │  the always-present core
 │      crash-atomic alloc_id/update/get/delete by id                   │
 ├──────────────────────────────────────────────────────────────────────┤
-│  L0  Flash translation      flash_area today · UBI-like FTL later    │  swappable provider
+│  L0  Flash translation      UBI volume (default) · flash_area        │  swappable provider
 │      erase blocks, alignment, (wear/bad blocks in FTL form)          │
 └──────────────────────────────────────────────────────────────────────┘
 ```
@@ -65,7 +75,7 @@ implemented.
 Dependencies point strictly downward (P6); each boundary is a narrow contract:
 
 ```
-L3 ──map_ops / seq_ops──► L2 ──blob_db API──► L1 ──flash_area API──► L0
+L3 ──map_ops / seq_ops──► L2 ──blob_db API──► L1 ──blob_db_store──► L0
 ```
 
 ## 3. The unifying idea
@@ -82,11 +92,15 @@ rebuild, no side-band state (P3, P5).
 
 ## 4. Layer summaries
 
-**L0 — Flash translation.** Owns raw flash behind the fixed `flash_area`
-interface. Today: a device-tree partition, 1 sector = 1 erase block, no
-management (NOR/native_sim). Later: a UBI-like FTL adding wear leveling and
-bad-block remapping behind the *same* interface — a pointer swap via
-`CONFIG_BLOB_DB_PARTITION_LABEL`, zero change above. → `layers/l0_flash.md`
+**L0 — Flash translation.** Owns raw flash behind the fixed `blob_db_store`
+seam: an array of equally-sized, individually-erasable blocks, plus the
+promise that a torn write damages only the block being written. Two providers,
+one `BLOB_DB_BACKEND` choice: **UBI** (default) — a dynamic volume adding wear
+leveling and bad-block remapping, attached at UBI's own `ubi_leb_write_at()`
+rather than through a synthesized `flash_area`; or **`flash_area`** — a
+device-tree partition, 1 block = 1 erase block, no management. The layouts are
+not interchangeable, and mount does not yet reliably refuse the wrong one
+(`layers/l0_flash.md` §5). → `layers/l0_flash.md`
 
 **L1 — i-node allocation (`blob_db`).** The always-present core: turns the
 partition into a pool of stably-identified, crash-atomically updatable blobs

@@ -533,6 +533,21 @@ draft implementation and will be reworked against the final API; the
    sketches below) bind id = 1 directly, which is legitimate in registry-less
    builds; once the demo image enables the root registry, they move to
    `ROOTREG_KEY` roots.
+7. **A foreign *substrate* classifies as `CORRUPT`, not `FOREIGN`.** The
+   compatibility prefix (§3.1) lets a build classify a store written by
+   another *allocator* and refuse it (D1). It does not reach the *backend*
+   axis added by the `blob_db_store` seam: booting a `flash_area` build on a
+   partition holding a UBI volume fails the prefix CRC before the magic is
+   ever compared, so both masters land in `CORRUPT` — and
+   `BLOB_DB_AUTOFORMAT_ON_CORRUPT` (default `y`) then reformats a perfectly
+   good store of the other kind. Measured, both directions, in
+   `doc/layers/l0_flash.md` §5; the reverse direction is safe because UBI's
+   own attach refuses first. Candidate fix: a backend-id byte inside the
+   frozen prefix so a substrate mismatch classifies as `FOREIGN` (never
+   formatted). That is an on-flash format change — cheap now, since the
+   prefix already carries `hdr_len` and reserved space, and it needs a
+   `format_minor` bump at most. Until then, production builds should set
+   `BLOB_DB_AUTOFORMAT_ON_CORRUPT=n`.
 
 ---
 

@@ -68,7 +68,7 @@ workspace or be added to an existing one.
 │  L1  i-node allocation      blob_db: stable u64 id → blob            │  the always-present core
 │      crash-atomic alloc_id/update/get/delete by id                   │
 ├──────────────────────────────────────────────────────────────────────┤
-│  L0  Flash translation      flash_area today · UBI volume            │  swappable provider
+│  L0  Flash translation      UBI volume (default) · flash_area        │  swappable provider
 │      erase blocks, alignment, (wear/bad blocks in FTL form)          │
 └──────────────────────────────────────────────────────────────────────┘
 ```
@@ -76,7 +76,7 @@ workspace or be added to an existing one.
 Dependencies point strictly downward across narrow contracts:
 
 ```
-L3 ──map_ops / seq_ops──► L2 ──blob_db API──► L1 ──flash_area / UBI──► L0
+L3 ──map_ops / seq_ops──► L2 ──blob_db API──► L1 ──blob_db_store──► L0
 ```
 
 ## Status
@@ -87,8 +87,8 @@ bottom-up. Modules marked *skeleton* are build-wired and Kconfig-gated
 
 | Layer | Module | Kconfig | State | Tests |
 |---|---|---|---|---|
-| L0 | raw partition (`flash_area`) | `BLOB_DB_BACKEND_FLASH_AREA` | implemented (default) | via L1 suites |
-| L0 | UBI volume | `BLOB_DB_BACKEND_UBI` | implemented | built in CI, both targets |
+| L0 | UBI volume (wear-leveled) | `BLOB_DB_BACKEND_UBI` | implemented (**default**) | `tests/lib/blob_db` (`.ubi` scenario) + every other L1–L3 suite |
+| L0 | raw partition (`flash_area`) | `BLOB_DB_BACKEND_FLASH_AREA` | implemented | `tests/lib/blob_db` (3 pinned scenarios) |
 | L1 | `blob_db` | `BLOB_DB` | implemented | `tests/lib/blob_db`, `tests/lib/blob_db_contract` |
 | L1½ | `rootreg` | `BLOB_ROOTREG` | implemented | `tests/lib/rootreg` |
 | L2 | `kvhash` (Map, O(1)) | `BLOB_CONTAINER_KVHASH` | implemented | via `tests/lib/kvdb` |
@@ -150,13 +150,28 @@ CI. The `custom_plank` board and the `nucleo_f302r8` overlay come from the
 example-application scaffolding. A debug configuration is available with
 `-DEXTRA_CONF_FILE=debug.conf`.
 
-To build on the UBI backend instead of the raw partition, size the static PEB
-pool to the target's partition:
+#### Storage backend
+
+`blob_db` stores blobs on a **wear-leveled UBI volume by default**. The builds
+above get it with no extra flags; every in-tree board file already sizes UBI's
+static block pool for its partition. To opt out and store directly on the raw
+partition — faster, but no wear leveling and no bad-block handling:
 
 ```shell
-west build -b native_sim key_value_db/app -- \
-    -DCONFIG_BLOB_DB_BACKEND_UBI=y -DCONFIG_UBI_MAX_NR_OF_DATA_PEBS=2046
+west build -b native_sim key_value_db/app -- -DCONFIG_BLOB_DB_BACKEND_FLASH_AREA=y
 ```
+
+Two things to know before switching a real device:
+
+- A **new board** using the UBI backend must set
+  `CONFIG_UBI_MAX_NR_OF_DATA_PEBS` to its partition's block count. The default
+  of 14 builds cleanly and then fails to attach at runtime.
+- The two layouts are **not interchangeable**, and mount does not reliably
+  refuse the wrong one — booting a `flash_area` build on a UBI store currently
+  reformats it. Erase the partition deliberately when switching, and set
+  `CONFIG_BLOB_DB_AUTOFORMAT_ON_CORRUPT=n` in production. Details and the
+  measured behavior in both directions:
+  [`doc/layers/l0_flash.md`](doc/layers/l0_flash.md) §5.
 
 ### Test
 
@@ -200,13 +215,15 @@ unrepresentable.
 |---|---|---|
 | String key/value store | `CONFIG_BLOBDB_KVDB=y` | blob_db + rootreg + kvhash + kvdb |
 | Ids and blobs only, no containers | `CONFIG_BLOB_DB=y` | blob_db |
-| Wear-leveled storage | `+ CONFIG_BLOB_DB_BACKEND_UBI=y` | + UBI volume backend |
+| Raw partition instead of UBI | `+ CONFIG_BLOB_DB_BACKEND_FLASH_AREA=y` | drops the UBI volume backend |
 
 Frequently adjusted options (see the module `Kconfig` files for the rest):
 
 | Option | Meaning |
 |---|---|
 | `CONFIG_BLOB_DB_PARTITION_LABEL` | fixed-partition label to store blobs in (default `storage`) |
+| `CONFIG_UBI_MAX_NR_OF_DATA_PEBS` | UBI's static block pool; must match the partition's block count (UBI backend) |
+| `CONFIG_BLOB_DB_AUTOFORMAT_ON_CORRUPT` | reformat when both master blocks are unreadable (default `y`; set `n` in production) |
 | `CONFIG_BLOB_DB_MAX_PAYLOAD_LEN` | largest blob payload; also caps the kvhash bucket directory |
 | `CONFIG_BLOB_DB_SECTOR_BUF_SIZE` | upper bound on supported flash sector size (64 KB for mx25r64) |
 | `CONFIG_ROOTREG_MAX_ROOTS` | how many structure roots the registry can hold |
