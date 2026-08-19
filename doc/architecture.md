@@ -10,13 +10,14 @@ Status: v2 · Top-level document; per-layer detail lives in `doc/layers/`
 |---|---|
 | **this file** | The stack: layers, boundaries, composition model |
 | `doc/principles.md` | Binding design principles (P1–P8) for every layer |
-| `doc/layers/l0_flash.md` | L0 — flash translation: the `blob_db_store` seam and its two providers (`flash_area`, UBI) |
+| `doc/layers/l0_flash.md` | L0 — flash translation: the `blob_db_store` seam its providers must implement |
 | `doc/layers/l1_blob_db.md` | L1 — `blob_db` **contract & requirements** (implementation-agnostic) |
 | `doc/layers/l1_model_container.md` | L1 — the model container: **sufficiency proof** that the blob_db contract can carry the layers above; reference pattern + acceptance-test blueprint |
 | `doc/layers/l1_root_registry.md` | L1½ — root registry (optional helper): key → structure-root map; owns id = 1 when enabled |
 | `doc/layers/l2_containers.md` | L2 — containers: seq, kvlist, kvhash, kvtree |
 | `doc/layers/l3_interfaces.md` | L3 — access interfaces: kvdb, blobfs, settings |
 | `doc/impl/l1_bucketlog.md` | **Implementation design** (non-normative): the v1 bucket-log allocator — formats, algorithms, costs, open items |
+| `doc/impl/l0_backends.md` | **Implementation design** (non-normative): the two L0 providers — operation mapping, geometry overhead, measured costs |
 | `doc/proposals/` | **Change proposals** (non-normative until accepted): analysis + design for a change that spans a contract and its implementation |
 | `doc/reviews/*.md` | Dated reviews of this document set, with findings and their resolution |
 
@@ -100,7 +101,7 @@ leveling and bad-block remapping, attached at UBI's own `ubi_leb_write_at()`
 rather than through a synthesized `flash_area`; or **`flash_area`** — a
 device-tree partition, 1 block = 1 erase block, no management. The layouts are
 not interchangeable, and mount does not yet reliably refuse the wrong one
-(`layers/l0_flash.md` §5). → `layers/l0_flash.md`
+(`layers/l0_flash.md` §4). → `layers/l0_flash.md`
 
 **L1 — i-node allocation (`blob_db`).** The always-present core: turns the
 partition into a pool of stably-identified, crash-atomically updatable blobs

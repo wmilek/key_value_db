@@ -169,9 +169,9 @@ Two things to know before switching a real device:
 - The two layouts are **not interchangeable**, and mount does not reliably
   refuse the wrong one — booting a `flash_area` build on a UBI store currently
   reformats it. Erase the partition deliberately when switching, and set
-  `CONFIG_BLOB_DB_AUTOFORMAT_ON_CORRUPT=n` in production. Details and the
-  measured behavior in both directions:
-  [`doc/layers/l0_flash.md`](doc/layers/l0_flash.md) §5.
+  `CONFIG_BLOB_DB_AUTOFORMAT_ON_CORRUPT=n` in production. The measured
+  behavior in both directions is in
+  [`doc/impl/l0_backends.md`](doc/impl/l0_backends.md) §4.
 
 ### Test
 
@@ -239,13 +239,14 @@ contracts and must never be depended on from above.
 |---|---|
 | [`doc/architecture.md`](doc/architecture.md) | the stack: layers, boundaries, composition model |
 | [`doc/principles.md`](doc/principles.md) | binding design principles (P1–P8) for every layer |
-| [`doc/layers/l0_flash.md`](doc/layers/l0_flash.md) | L0 — flash translation and the `flash_area` contract |
+| [`doc/layers/l0_flash.md`](doc/layers/l0_flash.md) | L0 — flash translation and the `blob_db_store` contract |
 | [`doc/layers/l1_blob_db.md`](doc/layers/l1_blob_db.md) | L1 — `blob_db` contract & requirements |
 | [`doc/layers/l1_model_container.md`](doc/layers/l1_model_container.md) | L1 — sufficiency proof + acceptance-test blueprint |
 | [`doc/layers/l1_root_registry.md`](doc/layers/l1_root_registry.md) | L1½ — root registry: key → structure root |
 | [`doc/layers/l2_containers.md`](doc/layers/l2_containers.md) | L2 — containers: seq, kvlist, kvhash, kvtree |
 | [`doc/layers/l3_interfaces.md`](doc/layers/l3_interfaces.md) | L3 — access interfaces: kvdb, blobfs, settings |
 | [`doc/impl/l1_bucketlog.md`](doc/impl/l1_bucketlog.md) | implementation design of the v1 bucket-log allocator |
+| [`doc/impl/l0_backends.md`](doc/impl/l0_backends.md) | implementation design of the two L0 providers (`flash_area`, UBI) |
 | [`doc/reviews/`](doc/reviews) | dated design-document reviews and their findings |
 
 API reference lives in the public headers under

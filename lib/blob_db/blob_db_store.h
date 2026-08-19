@@ -15,8 +15,8 @@
  *   - flash_area    — raw partition via Zephyr's flash_area API. No wear
  *                     leveling and no bad-block handling; faster.
  *
- * The layouts are NOT interchangeable — see doc/layers/l0_flash.md §5 for what
- * happens when a build meets the other one.
+ * The layouts are NOT interchangeable — see doc/impl/l0_backends.md §4 for
+ * what happens when a build meets the other one.
  *
  * A byte offset passed to read/write/erase never crosses a PEB boundary
  * (blob_db operates one bucket/master/scratch sector at a time), so a backend

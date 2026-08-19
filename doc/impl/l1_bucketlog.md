@@ -541,7 +541,7 @@ draft implementation and will be reworked against the final API; the
    ever compared, so both masters land in `CORRUPT` — and
    `BLOB_DB_AUTOFORMAT_ON_CORRUPT` (default `y`) then reformats a perfectly
    good store of the other kind. Measured, both directions, in
-   `doc/layers/l0_flash.md` §5; the reverse direction is safe because UBI's
+   `doc/impl/l0_backends.md` §4; the reverse direction is safe because UBI's
    own attach refuses first. Candidate fix: a backend-id byte inside the
    frozen prefix so a substrate mismatch classifies as `FOREIGN` (never
    formatted). That is an on-flash format change — cheap now, since the
