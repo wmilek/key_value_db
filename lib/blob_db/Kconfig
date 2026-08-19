@@ -83,10 +83,13 @@ config BLOB_DB_LARGE_PAYLOADS
 	bool "Objects larger than one slot (segmented)"
 	help
 	  Store an object too large for one slot as K segment slots plus an index
-	  slot at the object's id, committed by writing the index last. Adds
-	  blob_db_size() and blob_db_read() and bumps the on-flash format major,
-	  so software without this option refuses such a store rather than
-	  misreading an index record as data.
+	  slot at the object's id, committed by writing the index last. Bumps the
+	  on-flash format major, so software without this option refuses such a
+	  store rather than misreading an index record as data.
+
+	  This lifts the size cap only. Partial access — blob_db_size(),
+	  blob_db_read(), blob_db_write() — is always compiled in and works on
+	  inline payloads whether or not this is set.
 
 	  Off (default) is today's implementation byte for byte: no segmented
 	  writes, no new code, the format major older builds already understand.
