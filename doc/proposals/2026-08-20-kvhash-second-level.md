@@ -206,15 +206,18 @@ not worth the same. Smaller blobs also compact more finely and strand less of
 the medium, which is the K13 mechanism running in the favourable direction, so
 the same choice buys capacity as well.
 
-**The design rule that falls out is roughly one entry per bucket** — not a
-comfortably full bucket. That is the opposite of what a one-level map forces,
+**The design rule that falls out is roughly one entry per bucket, floored at
+`MIN_BUCKET_BYTES`** (D3f: 256) — not a comfortably full bucket, and not a
+bucket smaller than the slot header carrying it. That is the opposite of what a one-level map forces,
 where few buckets is the only affordable choice and each therefore holds many
 entries and is rewritten whole on every touch.
 
 **The floor is per-blob overhead**, and it is what stops "more buckets" from
 being free forever: a 14 B slot header on a 211 B bucket is 7 %, on a 53 B
 bucket 26 %, plus a blob id and bookkeeping each. Somewhere below a few hundred
-bytes per bucket the overhead wins. For this application the useful band is
+bytes per bucket the overhead wins — **`tools/sizing.py` puts that point at
+about 256 B**, measured over this application's credential population, which is
+where D3f's `MIN_BUCKET_BYTES` comes from. For this application the useful band is
 **8 100–16 384 buckets**, and the curve is flat enough across it that the choice
 is not delicate — which is §5.1's point restated on the axis that matters.
 
@@ -935,8 +938,22 @@ For the record, so these are not re-opened as blockers:
   `safe_bucket_bytes / max_entry_bytes`, so a map of large records gets a lower
   load and more buckets rather than a bucket sitting near K2's ceiling.
 
-  A constant, not a format field: each map records its own geometry, so moving
-  it later changes only maps created afterwards and never invalidates a store.
+  **Also decided, and found by building the check: `MIN_BUCKET_BYTES` = 256.**
+  §5.2 said the limit on "more buckets" is per-blob overhead and left it
+  unquantified. The model quantified it on the first run: targeting ~1 entry per
+  bucket gave this application's credential map **20 164 buckets for 23 B
+  entries** — a blob per entry, 14 B of slot header carrying 23 B of data, 62 %
+  overhead, 2 311 B per `get`. With a 256 B floor on the target bucket size:
+  1 849 buckets, 6 % overhead, **952 B per `get`**. The floor never binds for
+  entries larger than itself, so the people map is unchanged at 90 × 90.
+
+  So the two-level target is `max(typical_entry_bytes, MIN_BUCKET_BYTES)`, not
+  one entry per bucket. §5.2's rule was right about the direction and wrong at
+  the small-entry end, which is exactly what a check is for.
+
+  Both are constants, not format fields: each map records its own geometry, so
+  moving either later changes only maps created afterwards and never invalidates
+  a store.
 
   **With `initial_capacity` gone this derivation rule is the entire sizing
   interface**, and no caller can correct it — which is what D3b's readback
@@ -1076,8 +1093,9 @@ For the record, so these are not re-opened as blockers:
   3. **Total bytes written over a full fill**, with `CONFIG_BLOB_DB_IOSTATS`.
      Two components, both modelled and neither yet measured:
      directory-rewrite traffic should fall from **32.0 MiB to under 1 MiB**
-     (§5), and bucket-rewrite traffic from ~8 MiB to **~3 MiB** at one entry per
-     bucket (§5.2). The write side is where this design earns its keep, and it
+     (§5), and bucket-rewrite traffic from ~8 MiB to **~3 MiB** (§5.2).
+     On the read side the model puts an access decision at **~3 000 B against a
+     measured 37 384 B** — people 17 870 → 2 051, credentials 16 608 → 952. The write side is where this design earns its keep, and it
      is the part of the proposal resting on a model rather than a measurement —
      so it is the number to check first.
 
