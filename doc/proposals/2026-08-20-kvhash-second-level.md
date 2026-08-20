@@ -333,7 +333,40 @@ happens in the common case where an application genuinely cannot answer.
   20 000 credentials but has no view on their size sets `expected_entries` and
   leaves the rest zero, and the container defaults only what it was not told.
 - **A field that *is* set is a request the container must honour or refuse** —
-  `-ENOSPC` or `-EINVAL`, never a silent clamp.
+  never a silent clamp. **`-EINVAL` when the declaration itself cannot be
+  satisfied; `-ENOSPC` when it could be, but the medium is too full right now.**
+
+  The split is by *what kind of wrong it is*, and it is load-bearing:
+
+  | condition | code | why |
+  |---|---|---|
+  | `max_entry_bytes` exceeds what any bucket can ever hold | `-EINVAL` | no medium state makes this work |
+  | `expected_entries` needs more buckets than the format allows (`u16` per level) | `-EINVAL` | a limit of the build, not of the device |
+  | `typical_entry_bytes` > `max_entry_bytes` | `-EINVAL` | the declaration contradicts itself |
+  | geometry is valid, but there is not enough free space to create the sub-maps | `-ENOSPC` | true now, possibly false after compaction or on a fresh device |
+
+  **`-EINVAL` is deterministic and `-ENOSPC` is stateful**, which is the whole
+  point of separating them. An `-EINVAL` will fail identically on every boot of
+  every unit: it is a build-time mistake in the declaration or the Kconfig, and
+  it should be found on the first run and fixed in source. An `-ENOSPC` may
+  succeed after compaction, on a fresh device, or with a smaller store, so
+  retrying or reformatting is a rational response. A caller that cannot tell
+  them apart cannot choose between "fix my code" and "free some space".
+
+  **This tree already has the injury.** `map_ops->set` returns `-ENOSPC` both
+  when a bucket bursts (K2) and when the medium cannot stage another write
+  (K13), so `app_cbor_persondb` prints *"bucket overflow on key … see
+  FINDINGS.md K2"* for a failure that is not a bucket overflow — the fullest
+  bucket at that moment is 28 % of its ceiling. It reports the cause it was
+  expecting because the errno cannot distinguish them, and a confident wrong
+  diagnosis costs more than none. One errno for two conditions is how that
+  happened; this rule is the same mistake declined at `create`.
+
+  **Validate before the first write.** A rejected `create` must touch no flash —
+  return `-EINVAL` before allocating an id or writing a blob. Otherwise a bad
+  declaration leaves unreferenced blobs behind, which is **B8**'s leak with no
+  reachability GC to clean it up. The check is arithmetic on the config and the
+  geometry, so there is no reason to have written anything by then.
 
 That last clause is what makes the convention worth writing down, because it
 resolves **K9(b)** as well as K9(a). Today `buckets_for()` clamps every request
@@ -1052,6 +1085,28 @@ For the record, so these are not re-opened as blockers:
   readback, the derivation rule would be trusted rather than checkable. What it
   does not buy is anything a running system needs — there is no functional
   caller, only the report path, a post-`create` log line, and tests.
+- **D3g. DECIDED: `-EINVAL` for a set-but-unhonourable field.** `-ENOSPC` stays
+  for "the geometry is fine, the medium is too full right now" (§7.1).
+
+  The split is by what kind of wrong it is. `-EINVAL` is deterministic — it
+  fails identically on every boot of every unit, so it is a build-time mistake
+  in the declaration or the Kconfig, to be found on the first run and fixed in
+  source. `-ENOSPC` is stateful and may succeed after compaction or on a fresh
+  device, so retry or reformat is a rational response. A caller that cannot tell
+  them apart cannot choose between "fix my code" and "free some space".
+
+  This tree already carries the injury that motivates it: `set` returns
+  `-ENOSPC` both for a burst bucket (K2) and for a medium that cannot stage a
+  write (K13), so `app_cbor_persondb` prints "bucket overflow … see K2" for a
+  failure whose fullest bucket is at 28 % of its ceiling. It names the cause it
+  expected, because the errno cannot distinguish them.
+
+  Two riders: validation is arithmetic on the config, so it happens **before any
+  flash write** — a rejected `create` must not leave an allocated id or an
+  orphan blob behind (**B8**). And it does not collide with §9.7's warning,
+  which is deliberately a *positive* return.
+
+
 - **D3c.** Per-map bucket sizing (§7.1) — worth it, or does declarative config
   make it redundant by deriving bucket size from the declared entry size?
 - **D4. DECIDED: v1 — fixed two levels, splitting deferred.**
