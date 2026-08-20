@@ -353,30 +353,51 @@ proposal is already extending once: a caller compiled against a later header
 that adds a field keeps working, because the field it never heard of is zero and
 zero means unset.
 
-**The honest difficulty is what the container does with `{0}`.** It must pick,
-and any pick is wrong for someone. Today it picks `DEFAULT_BUCKETS = 8` — a map
-that overflows at about ninety person-sized entries (K9). Two levels change the
-economics of that choice, because §5.1 and §5.2 make a generous default nearly
-free on reads and *cheaper* on writes, so the default can be far more generous
-than 8 without punishing the small-map case on lookup cost.
+**What `{0}` builds — DECIDED: one level, small, exactly as today.** The
+default serves the small single-level map, and a second level is something an
+application asks for by declaring a population that needs one. Two consequences
+worth having in writing:
 
-What it cannot escape is that **eager sub-map creation makes a generous default
-cost blobs at `create`**: 64 × 64 buckets is 64 sub-maps written up front, which
-is right for a database and absurd for a three-key boot-counter. So the zero
-config is exactly where v1's lack of promotion (D4) bites hardest — a declared
-population lets the container size correctly, and an undeclared one leaves it
-guessing with no way to correct itself later. Two mitigations, neither free:
+- **Nothing regresses for callers who say nothing.** `{0}` and `NULL` keep
+  producing today's `DEFAULT_BUCKETS` map with today's on-flash shape. A
+  settings store, a boot counter, `blobfs`' directory — none of them pay a byte
+  or a blob for a feature they did not ask for.
+- **It removes the sharpest edge in D4.** An earlier draft of this section
+  worried that v1's lack of promotion bites hardest on the undeclared map. It
+  does not, under this rule: the undeclared map is *exactly as well or badly
+  served as it is today*, so v1 introduces no new way to be wrong. Only a
+  declared population changes anything, and a declaration is precisely the case
+  where the container can size correctly.
 
-- Keep `{0}` **one-level with a modest bucket count**, close to today's
-  behaviour, and treat two levels as something a declared population opts into.
-  Cheap, and leaves undeclared maps no better off than they are now.
-- Let `{0}` mean *two levels, small fan-out* — a floor high enough to survive an
-  unexpected population without paying much when unused.
+**Where the boundary falls, and why it is not where the arithmetic first
+suggests.** On lookup bytes alone two levels win almost immediately — at 64
+entries a one-level directory is 520 B against 144 B for two — and the crossover
+against one extra flash transaction (65 µs ≈ 103 B) lands near **25 entries**.
+That is not the right threshold, because eager sub-map creation is not free:
+**B7** puts a first write to a fresh `blob_db` bucket at ~1.1 s on the DK, and a
+two-level map pays that per sub-map at `create`. Six sub-maps for a thirty-entry
+map is several seconds of boot to save a few hundred bytes per lookup.
 
-This proposal recommends the first for v1 and the second once splitting exists,
-since splitting is what makes an initially small guess recoverable. **D3e asks
-review to settle it**, because it is the difference between a default that is
-merely defined and one that is safe.
+So the threshold is set by create cost, not lookup cost, and it sits far above
+the byte crossover. The proposed rule:
+
+```
+buckets_needed = expected_entries / target_entries_per_bucket   /* ~1, §5.2 */
+
+buckets_needed <= ONE_LEVEL_MAX_BUCKETS  ->  one level, that many buckets
+otherwise                                ->  two levels, m = n = ceil(sqrt(buckets_needed))
+```
+
+with `ONE_LEVEL_MAX_BUCKETS` recommended at **255** — a 2 048 B directory, one
+blob at `create`, and comfortably inside every existing use. `app_cbor_persondb`
+declaring 8 000 persons lands well past it and gets two levels at m = n ≈ 90;
+a settings store declaring 50 keys stays one level with a 408 B directory; an
+application that declares nothing stays at 8 buckets.
+
+`ONE_LEVEL_MAX_BUCKETS` is a **tunable constant, not a format field**. Each map
+records its own depth, so moving the threshold later changes only maps created
+afterwards and never invalidates a store — which is the property that makes it
+safe to pick a conservative value now and revisit it with measurements.
 
 `max_entry_bytes` is load-bearing, not padding. **K2 is about variance, not the
 mean** — a bucket bursts on the tail. Sizing from a mean alone is exactly how
@@ -522,8 +543,13 @@ giving it a second level costs a transaction for nothing. So the map must
 start one-level and grow a level, which means the promote path must be
 correct from the first release.
 
-**9.4 A format break**, guarded by the `version` byte §4.3 reserves. Existing
-stores need a reformat; there is no in-place migration and none is proposed.
+**9.4 A format break**, guarded by the `version` byte §4.3 reserves — but a
+narrower one than first stated, given D3e. A one-level map is unchanged, on
+flash and in code, so every store that exists today and every future undeclared
+map stays on the current format and needs no migration. The new depth field and
+the two-level layout are reached only by declaring a population past
+`ONE_LEVEL_MAX_BUCKETS`. `app_cbor_persondb` is the store that must be rebuilt,
+and it is rebuilt from `dataset/` on every run anyway.
 
 **9.5 RAM is unchanged — an earlier draft of this section was wrong.** It
 claimed two directory buffers instead of one. Walking the access path shows one
@@ -550,8 +576,10 @@ v1 does not need it.
 **Option B, implemented so that C stays reachable**, and A folded in as the
 leaf-level id scheme if `blob_db` gains the range call.
 
-**Ship v1 only** (D4, decided): a fixed two-level map with eagerly created
-sub-maps, no splitting. It carries no crash-consistency work beyond what the
+**Ship v1 only** (D4, decided): a two-level map with eagerly created sub-maps,
+no splitting — and, per D3e, **reached only by declaring a population that needs
+it**. A caller who says nothing gets today's small one-level map, unchanged on
+flash and in code. It carries no crash-consistency work beyond what the
 stack already does once per store, and it delivers every number in §1 and §5.
 
 K2 and K3 stay open as findings, and §5.1 is why that is acceptable rather than
@@ -687,13 +715,15 @@ For the record, so these are not re-opened as blockers:
 - **D3d.** How are the two level indices derived from one key (§11.2)? Split a
   64-bit hash, or salt per level? Unspecified today, and getting it wrong
   clusters keys into exactly the failure K2 punishes.
-- **D3e.** What does `{0}` build (§7.1)? The zero config — `NULL` or all-zero,
-  meaning "I do not know" — must map to *something*, and today that something is
-  8 buckets, which overflows at about ninety person-sized entries. One level
-  with a modest count (close to today, and no worse), or two levels with a small
-  fan-out (survives an unexpected population, costs sub-map blobs at `create`
-  even when unused)? Recommended: the first for v1, the second once splitting
-  makes an initially small guess recoverable.
+- **D3e. DECIDED: `{0}` builds one level, small — today's behaviour
+  unchanged.** The default serves the small single-level map; two levels are
+  opted into by declaring a population that needs one (§7.1). Nothing regresses
+  for callers who say nothing, and v1's lack of promotion therefore introduces
+  no new way to be wrong — the undeclared map is served exactly as it is today.
+  What review still owns is the **value of `ONE_LEVEL_MAX_BUCKETS`**, proposed
+  at 255: a 2 048 B directory and one blob at `create`. It is set by create cost
+  (B7, ~1.1 s per fresh bucket on the DK), not by lookup bytes, whose crossover
+  is near 25 entries. A tunable constant, not a format field.
 
   The rest of §7.1's rule is not offered as a choice, because it is what makes
   the field meanings enforceable: `NULL` ≡ `{0}` ≡ no information; each field
