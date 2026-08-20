@@ -300,49 +300,53 @@ static int create_store(struct persondb *db, uint32_t n_persons)
 	sb->n_persons = n_persons;
 
 	/*
-	 * "Give me the largest map you can build."
+	 * Declare the two populations; let kvhash choose the geometry.
 	 *
-	 * This app wants every bucket it can get — more buckets means a lower
-	 * load factor and more distance from K2's per-bucket cliff — and there
-	 * is no way to *ask* for the maximum. But kvhash clamps any request
-	 * above its capacity down to it, so asking for more than could possibly
-	 * fit expresses the intent exactly, and the application never learns the
-	 * formula.
+	 * This app used to pass `initial_capacity = SIZE_MAX` — "the largest
+	 * map you can build" — because the field was a bucket count and there
+	 * was no way to say anything else. That was never what the application
+	 * knew. It knows how many persons it will store and roughly how big a
+	 * record is; it does not know, and should not know, how many buckets
+	 * that implies at this payload size.
 	 *
-	 * What this costs is now visible, and is left visible. The clamp lands
-	 * on 2047 buckets, so the directory is a 16 384 B blob — and kvhash
-	 * reads all of it on every get, set and delete (K11). Enumerating
-	 * offline says ~683 buckets would move 40 % of those bytes
-	 * (tools/sizing.py). The app does not pass 683: hand-tuning a bucket
-	 * count against another layer's read amplification is a workaround, and
-	 * it would bury K11 under a magic number. The number is measured
-	 * instead (RESULTS.md).
+	 * The difference is not cosmetic. "As large as possible" produced a
+	 * 16 384 B directory read on every lookup (K11), and at the geometry's
+	 * largest payload it produced a map that could not be written to at all
+	 * (K12). Both were the application asking for a shape instead of
+	 * describing its data.
 	 *
-	 * "The largest map you can build" is also, at this geometry's largest
-	 * payload, a map that cannot be written to — 4089 buckets make the
-	 * directory an entire erase block. prj.conf carries that arithmetic and
-	 * FINDINGS.md K12 the finding.
-	 *
-	 * This used to restate `(MAX_PAYLOAD - 8) / 8` here. That was a private
-	 * constant from another layer, wrong by 8x after one Kconfig edit, and
-	 * it bought nothing: the number was only ever passed straight back down.
-	 *
-	 * Note what this does to K9. The silent clamp is a defect when you ask
-	 * for a specific size and quietly get less — and it is the very thing
-	 * that makes "as much as possible" expressible. Both are true.
+	 * The two maps hold very different things and now say so. Person
+	 * records are ~380 B and worst-case ~700; credential entries are a
+	 * fixed 23 B (4 + 14-char UID + a CBOR uint). Sized as one population
+	 * they would have shared a geometry that suited neither.
 	 */
-	const struct map_config cfg = { .initial_capacity = SIZE_MAX };
+	const struct map_config people_cfg = {
+		.expected_entries = n_persons,
+		.typical_entry_bytes = 380,
+		.max_entry_bytes = 700,
+	};
+	/* Mean cards per person is ~2.5 (DESIGN.md §6); the bound is
+	 * PERSONDB_CARDS_MAX. Declaring the mean rather than the bound sizes
+	 * for the store that exists rather than the worst one imaginable. */
+	const struct map_config cred_cfg = {
+		.expected_entries = (size_t)n_persons * 5u / 2u,
+		.typical_entry_bytes = 23,
+		.max_entry_bytes = 23,
+	};
 
 	for (uint8_t i = 0; i < sb->n_people_maps; i++) {
 		sb->people_root[i] = blob_db_alloc_id();
 		if (sb->people_root[i] == 0) {
 			return -EIO;
 		}
-		int rc = db->ops->create(sb->people_root[i], &cfg);
+		struct map_info info;
+		int rc = db->ops->create(sb->people_root[i], &people_cfg, &info);
 
 		if (rc != 0) {
 			return rc;
 		}
+		LOG_INF("people map: depth %u, %u buckets, entries up to %zu B",
+			info.depth, info.buckets, info.entry_bytes_limit);
 	}
 
 	sb->cred_root = blob_db_alloc_id();
@@ -350,11 +354,14 @@ static int create_store(struct persondb *db, uint32_t n_persons)
 		return -EIO;
 	}
 
-	int rc = db->ops->create(sb->cred_root, &cfg);
+	struct map_info cred_info;
+	int rc = db->ops->create(sb->cred_root, &cred_cfg, &cred_info);
 
 	if (rc != 0) {
 		return rc;
 	}
+	LOG_INF("credential map: depth %u, %u buckets",
+		cred_info.depth, cred_info.buckets);
 
 	LOG_INF("created store: %u people map(s) + 1 credential map, "
 		"max buckets each, %u persons planned",

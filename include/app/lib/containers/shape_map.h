@@ -29,15 +29,60 @@ extern "C" {
  */
 
 /**
- * @brief Creation parameters, consumed once when a map is first built.
+ * @brief What the application knows about the population it will store.
  *
- * These are hints, not a contract: a container applies what is meaningful to
- * it and ignores the rest (a hash uses @ref initial_capacity to size its
- * bucket directory; a linear list ignores it). Once a map exists the values
- * that shaped it are fixed on flash and a later open cannot change them.
+ * These describe the *data*, not the container's geometry: a provider derives
+ * its own shape (bucket count, depth, bucket size) from them. An application
+ * that states its population does not need to know how any container is built.
+ *
+ * **The zero value means "I do not know".** A NULL @p cfg and an all-zero
+ * struct are identical and always legal — the provider chooses everything.
+ * Each field is independently unset at zero, so partial knowledge is normal:
+ * fill in what you know and leave the rest.
+ *
+ * **A field that IS set is binding.** A provider either honours it or fails
+ * the create; it must never silently deliver something else. Unset is the
+ * provider's business, set is the caller's, and quietly substituting a
+ * different value is neither.
+ *
+ * Once a map exists the values that shaped it are fixed on flash, and a later
+ * open cannot change them.
  */
 struct map_config {
-	size_t initial_capacity; /**< expected entry count (0 = provider default) */
+	/** How many entries will live here (0 = unknown). */
+	size_t expected_entries;
+	/** Mean key+value bytes of an entry (0 = unknown). */
+	size_t typical_entry_bytes;
+	/**
+	 * Largest key+value bytes any single entry will reach (0 = unknown).
+	 *
+	 * Not padding: a provider that packs entries together sizes its
+	 * records against the *tail*, not the mean, so this is what keeps a
+	 * heavy-tailed population from overflowing a record that the average
+	 * would have fitted comfortably.
+	 */
+	size_t max_entry_bytes;
+};
+
+/**
+ * @brief What a provider actually built, reported back.
+ *
+ * Every field is derived from state the map already keeps in order to work —
+ * reading it costs at most a blob read and never a write. Deliberately absent:
+ * the entry count and the largest stored entry. Neither can be produced
+ * without either maintaining a counter on the write path or walking every
+ * record, and a diagnostic that costs a write per insert is worse than no
+ * diagnostic.
+ */
+struct map_info {
+	/** Levels of indirection above the records (1 = flat). */
+	uint8_t depth;
+	/** Slots in the top level; 0 when @ref depth is 1. */
+	uint16_t fanout;
+	/** Total records the map can spread entries over. */
+	uint32_t buckets;
+	/** Largest key+value bytes a single entry may reach. */
+	size_t entry_bytes_limit;
 };
 
 /**
@@ -52,14 +97,37 @@ struct map_ops {
 	 * @brief Build a fresh, empty map at @p root.
 	 *
 	 * Called exactly once, when the structure does not yet exist. @p cfg
-	 * may be NULL for provider defaults. On return @p root holds a valid,
-	 * empty structure.
+	 * may be NULL for provider defaults. @p out may be NULL; when given, it
+	 * receives the geometry the provider chose, at no extra cost — create
+	 * already has every value in hand.
+	 *
+	 * A set @p cfg field that cannot be satisfied fails the call, and the
+	 * provider must not have written anything: validation is arithmetic, so
+	 * a rejected create leaves no allocated id and no orphan blob behind.
 	 *
 	 * @retval 0        created
-	 * @retval -ENOSPC  requested capacity cannot fit the on-flash record
+	 * @retval -EINVAL  a set cfg field cannot be satisfied by any medium
+	 *                  state — a contradiction, or past what the format
+	 *                  allows. Deterministic: it will fail identically on
+	 *                  every boot, so it is a build-time mistake to fix in
+	 *                  source rather than a condition to retry.
+	 * @retval -ENOSPC  the geometry is valid but the medium cannot hold it
+	 *                  right now. Stateful: may succeed after compaction or
+	 *                  on a fresh device.
 	 * @retval -EIO     flash error
 	 */
-	int (*create)(uint64_t root, const struct map_config *cfg);
+	int (*create)(uint64_t root, const struct map_config *cfg,
+		      struct map_info *out);
+
+	/**
+	 * @brief Report the geometry this map was built with.
+	 *
+	 * Costs at most a blob read and never a write (see @ref map_info).
+	 *
+	 * @retval 0        *out filled
+	 * @retval -EIO     flash error, or @p root does not hold a valid map
+	 */
+	int (*stat)(uint64_t root, struct map_info *out);
 
 	/**
 	 * @brief Look up @p key; copy its value into @p out.
@@ -78,7 +146,17 @@ struct map_ops {
 	/**
 	 * @brief Insert @p key or replace its value. Keeps map identity.
 	 *
+	 * A **positive** return still means stored — it is a warning, not a
+	 * failure, so callers testing `rc != 0` for failure must test `rc < 0`.
+	 * The provider pays nothing to produce it: a set has already read the
+	 * record it is about to rewrite, so it knows how full that record is.
+	 *
 	 * @retval 0        stored
+	 * @retval >0       stored, and the record holding this key has passed
+	 *                  the provider's near-full threshold. The next few
+	 *                  inserts here may return -ENOSPC, and a map that
+	 *                  cannot grow has no recovery from that — so this is
+	 *                  the point at which to re-plan, not the -ENOSPC.
 	 * @retval -ENOSPC  the record holding this key would overflow
 	 * @retval -EIO     flash error
 	 */
