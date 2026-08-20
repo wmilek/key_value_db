@@ -1242,10 +1242,47 @@ code's twin or it is checking something else.
   transaction. The DK is where the operation-count win should matter *more*
   than it does here, since each operation carries a fixed ~65 µs — but that is
   a prediction, and predictions in this document have not had a good record.
-- **10 000 persons**, D5's second criterion. K13's ceiling was 9 670 with the
-  one-level container; the two-level one holds a fraction of the blobs and
-  should clear it, but it has not been tried.
+- ~~**10 000 persons**, D5's second criterion.~~ **Tried, and it passes** —
+  §13.3.
 - **`tools/sizing.py` as a sizing prerequisite** (D5's first criterion) is met
   in the sense that matters — the application declares populations and the
   container derives geometry — but the script survives with a changed job, as
   §11.1 said it should.
+
+### 13.3 10 000 persons — D5's second criterion, met
+
+The scale no configuration could reach (**K13**) completes on the two-level
+container: `VERIFY PASS` twice, **zero** bucket overflows, **zero** near-full
+warnings, **51.6 %** live. That is the same fill percentage the *sixteen-shard*
+build reached at 10 000 — so the second level recovers the capacity the
+one-level container lost, while also being 2.6× faster per lookup. The
+workaround is retired rather than traded against, which is what §12.2 of the
+application's `DESIGN.md` asked for and could not have.
+
+**The ceiling moved with it**, and is now medium-bound rather than
+directory-bound:
+
+| | one level | two levels |
+|---|--:|--:|
+| ceiling | 9 670 persons | **~13 900** |
+| usable partition | 49.9 % | **67.2 % at 13 000; ~72 % at the ceiling** |
+| largest blob | 16 384 B directory | ~4–8 KB bucket |
+
+It is the same K13 mechanism — the largest blob must fit one erase block's free
+space — with a much smaller largest blob. Two runs establish that it is the
+medium and not the geometry: a store declared at 14 000 stops at person 13 844,
+one declared at 20 000 stops at 14 048. Nearly the same number from very
+different bucket counts.
+
+**K13 is relieved, not retired**, and `FINDINGS.md` now says so. There is still
+a largest blob and it still has to be placed. Two details worth keeping:
+
+- **The near-full warning stayed silent through every one of these runs**, at
+  8 000, 10 000 and 13 000 — correctly, because §9.7 is a *bucket* signal and
+  this is a medium wall. It is not the early warning for this failure and
+  should not be mistaken for one. §9.6's gap stands: for K13 the application
+  still gets `-ENOSPC` with nothing before it.
+- **The benchmark constant is now conservative.** `DESIGN.md` §6.5 set 8 000
+  because the ceiling was 9 670. On this container 10 000 completes with room.
+  Restoring it is a benchmark decision under D14/D15 — a deliberate re-size,
+  recorded — and not something this proposal should do silently.
