@@ -1323,6 +1323,12 @@ assuming, since it shifts with USB enumeration order.
 Board 960115021, `ade6a3e`, `N_PERSONS=1000`, `FRESH_START=y`, default UBI
 backend, partition raw-erased beforehand. UBI's volume-probe lines are elided.
 
+The `ops/s` column below is the **pre-fix, truncated** form — `ui_bench.c`
+computed it by integer division, so `put`'s 5.57 printed as `5` and, at 5 000
+persons in §8b, 1.23 printed as `1` (a 19 % under-report). Every figure in §5e
+is derived from `us/op`, which was always exact. A rerun now prints two
+rounded decimals.
+
 ```
 *** Booting Zephyr OS build 4a405846193f ***
 

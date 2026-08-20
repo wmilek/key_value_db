@@ -39,17 +39,32 @@
 
 static void print_bench(const struct bench_result *b)
 {
-	uint64_t ops_per_s = (b->us > 0)
-				     ? (uint64_t)b->ops * 1000000ULL /
-					       (uint64_t)b->us
-				     : 0;
+	/* Two decimals, and rounded rather than truncated. Integer ops/s
+	 * silently under-reports whenever the rate is low, which is exactly
+	 * where the write path lives on real flash: put measured 1.23 ops/s at
+	 * 5 000 persons on the DK and printed "1", a 19 % error, and 5.57
+	 * printed as "5". us/op was right the whole time, so the two columns
+	 * disagreed and the wrong one was the eye-catching one.
+	 *
+	 * app_perf/src/main.c hit the same thing on its partial-vs-whole write
+	 * ratio, where truncation turned 1.95x into "1x" and swallowed the
+	 * entire result; this is that fix applied to the other reporter.
+	 *
+	 * ops * 1e8 is at most ~6.6e12 for the 65 536-sample ceiling, so the
+	 * scaled numerator cannot overflow 64 bits. */
+	uint64_t ops_x100 = (b->us > 0)
+				    ? ((uint64_t)b->ops * 100000000ULL +
+				       (uint64_t)b->us / 2) /
+					      (uint64_t)b->us
+				    : 0;
 
-	printk("bench %-6s: %5u ops in %8" PRId64 " us -> %7" PRIu64 " ops/s  "
+	printk("bench %-6s: %5u ops in %8" PRId64 " us -> %5" PRIu64 ".%02" PRIu64
+	       " ops/s  "
 	       "%7u us/op  %4" PRIu64 " store ops  %5" PRIu64 " flash ops  "
 	       "%8" PRIu64 " B%s  amp %ux\n",
-	       b->name, b->ops, b->us, ops_per_s, b->us_per_op, b->store_ops,
-	       b->flash_ops, b->flash_bytes, b->measured ? "" : "?",
-	       b->amplification);
+	       b->name, b->ops, b->us, ops_x100 / 100ULL, ops_x100 % 100ULL,
+	       b->us_per_op, b->store_ops, b->flash_ops, b->flash_bytes,
+	       b->measured ? "" : "?", b->amplification);
 }
 
 static void print_report(const struct scenario_report *r)
