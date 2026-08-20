@@ -171,6 +171,53 @@ rather than 60 %, is that margin is expensive and being wrong is unrecoverable.
 Two levels removes the first half of that. It does not remove the second — see
 §9.1 and D4.
 
+### 5.2 The objective is write bytes, not read bytes — so size for small buckets
+
+§5.1 prices margin by what a `get` moves. That is the wrong cost to optimise
+against, and correcting it moves the answer.
+
+A write is erase-and-program, it leaves the superseded copy behind as garbage,
+and that garbage must be compacted — the same compaction whose granularity caps
+the store at 9 670 persons (**K13**). A read moves bytes once and costs nothing
+afterwards. So the objective is bytes *written*, and **K4 sets it: every `set`
+rewrites the whole bucket blob.** Write cost per operation is bucket size,
+directly.
+
+Inserting *k* entries into one bucket rewrites it *k* times, at 1e, 2e … ke, so
+a fill writes about `E·e·(k+1)/2` with `k = E/N` — **inversely proportional to
+the bucket count.** Modelled over this application's people map (8 000 entries,
+433 B mean):
+
+| buckets | entries/bucket | mean bucket | **bytes written over the fill** | bytes per `get` |
+|--:|--:|--:|--:|--:|
+| 529 | 15.1 | 6 548 B | 26.7 MiB | 6 932 B |
+| 2 070 | 3.9 | 1 673 B | 8.1 MiB | 2 417 B |
+| 4 096 | 1.9 | 846 B | 5.0 MiB | 1 886 B |
+| **8 100** | **1.0** | **428 B** | **3.4 MiB** | **1 884 B** |
+| **16 384** | **0.5** | **211 B** | **2.6 MiB** | 2 275 B |
+| 65 025 | 0.1 | 53 B | 2.0 MiB | 4 149 B |
+
+*(Analytic, from K4's rewrite rule and the enumerated population — not measured.
+`CONFIG_BLOB_DB_IOSTATS` can check it, and D5 asks for that.)*
+
+**The write curve keeps falling past the read optimum.** From 8 100 to 16 384
+buckets, writes fall 24 % while reads rise 21 % — and those two percentages are
+not worth the same. Smaller blobs also compact more finely and strand less of
+the medium, which is the K13 mechanism running in the favourable direction, so
+the same choice buys capacity as well.
+
+**The design rule that falls out is roughly one entry per bucket** — not a
+comfortably full bucket. That is the opposite of what a one-level map forces,
+where few buckets is the only affordable choice and each therefore holds many
+entries and is rewritten whole on every touch.
+
+**The floor is per-blob overhead**, and it is what stops "more buckets" from
+being free forever: a 14 B slot header on a 211 B bucket is 7 %, on a 53 B
+bucket 26 %, plus a blob id and bookkeeping each. Somewhere below a few hundred
+bytes per bucket the overhead wins. For this application the useful band is
+**8 100–16 384 buckets**, and the curve is flat enough across it that the choice
+is not delicate — which is §5.1's point restated on the axis that matters.
+
 **The reason to prefer this over A is not the bytes. It is that a two-level map
 can split.** Bucket overflow stops being `-ENOSPC` and becomes "split this
 sub-map and rehash it". That retires **K2**, and with it the reason
@@ -236,7 +283,9 @@ struct map_config {
 ```
 
 `kvhash` derives fan-out, depth and bucket size from those three plus the
-geometry it already knows. This is not a hypothetical improvement: **every
+geometry it already knows — **targeting roughly one entry per bucket** (§5.2),
+not a comfortably full one, because write cost is bucket size and a fill's write
+traffic is inversely proportional to the bucket count. This is not a hypothetical improvement: **every
 number in `app_cbor_persondb`'s `DESIGN.md` §6.1, and every line of
 `tools/sizing.py`, is computable from that triple.** The application performs
 the container's arithmetic offline today only because the interface will not
@@ -408,6 +457,12 @@ being a calculation an application can get fatally wrong and becomes a generous
 default. Splitting is deferred until an application needs a genuinely unbounded
 population, or until B8 gains a multi-blob commit.
 
+**Size for small buckets, not for full ones** (§5.2). The generous default is
+not only safe, it is *cheaper on the axis that costs most*: writes are
+erase-and-program plus the compaction that follows, K4 rewrites a whole bucket
+on every `set`, and fill write traffic is inversely proportional to the bucket
+count. Roughly one entry per bucket, with per-blob overhead as the floor.
+
 The ordering that matters: A is a performance fix, B is a capability fix. A
 makes this application fast; B makes `kvhash` a map rather than a fixed-size
 table that the caller must size correctly in advance. Only B retires K2 and K3,
@@ -486,9 +541,13 @@ proposal does not merge them.
      (**K13**), and the benchmark had to be re-sized to 8 000 because of it
      (`DESIGN.md` §6.5). This is the direct test of whether the capacity wall
      is gone.
-  3. **Directory-rewrite traffic over a full fill falls from 32.0 MiB to under
-     1 MiB** (§5). It is the largest single number in this proposal and the
-     easiest to verify with `CONFIG_BLOB_DB_IOSTATS`.
+  3. **Total bytes written over a full fill**, with `CONFIG_BLOB_DB_IOSTATS`.
+     Two components, both modelled and neither yet measured:
+     directory-rewrite traffic should fall from **32.0 MiB to under 1 MiB**
+     (§5), and bucket-rewrite traffic from ~8 MiB to **~3 MiB** at one entry per
+     bucket (§5.2). The write side is where this design earns its keep, and it
+     is the part of the proposal resting on a model rather than a measurement —
+     so it is the number to check first.
 
   The p99-write measurement moves to v2 with the splitting it was meant to
   characterise.
