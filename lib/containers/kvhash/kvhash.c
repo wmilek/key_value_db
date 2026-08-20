@@ -64,7 +64,7 @@ LOG_MODULE_REGISTER(kvhash, CONFIG_BLOB_CONTAINER_KVHASH_LOG_LEVEL);
 #define DEFAULT_BUCKETS         8u   /* what "I do not know" builds */
 #define SMALL_MAP_LOAD          4u   /* entries per bucket while one level fits */
 #define ONE_LEVEL_MAX_BUCKETS   255u /* past this, spend a second level */
-#define MIN_BUCKET_BYTES        256u /* below this, per-blob overhead dominates */
+#define MIN_BUCKET_BYTES        4096u /* below this, per-blob overhead dominates */
 #define NEAR_FULL_PCT           60u  /* warn when a bucket passes this */
 
 BUILD_ASSERT(MAX_BUCKETS >= 2, "MAX_PAYLOAD too small to hold a bucket directory");

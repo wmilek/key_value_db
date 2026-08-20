@@ -57,15 +57,17 @@ static void print_report(const struct scenario_report *r)
 	printk("\nstore\n");
 	printk("  partition   : %zu B (%zu KiB)\n", r->st.partition_bytes,
 	       r->st.partition_bytes / 1024);
-	printk("  maps        : %u person + 1 credential "
-	       "(bucket count not observable — FINDINGS.md K10)\n",
-	       r->st.n_people_maps);
+	printk("  maps        : %u person (depth %u, %u buckets) + 1 credential "
+	       "(depth %u, %u buckets)\n",
+	       r->st.n_people_maps, r->st.people_depth, r->st.people_buckets,
+	       r->st.cred_depth, r->st.cred_buckets);
 	printk("  persons     : %u of %u   credentials: %u\n",
 	       r->st.populated, r->st.n_persons, r->credentials);
 	printk("  mean entry  : %u B\n", r->mean_record);
 	printk("  live content: %" PRIu64 " B = %u.%u %% of the partition\n",
 	       r->logical_bytes, r->fill_permille / 10, r->fill_permille % 10);
 	printk("  bucket overflows: %u\n", r->st.enospc_hits);
+	printk("  buckets past near-full: %u\n", r->st.near_full_hits);
 	if (r->stack_size) {
 		printk("  main stack  : %zu of %zu B used\n", r->stack_used,
 		       r->stack_size);

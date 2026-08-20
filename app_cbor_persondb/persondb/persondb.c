@@ -131,6 +131,22 @@ static int map_set(struct persondb *db, uint64_t root, const char *key,
 
 	db->st.map_sets++;
 	rc = db->ops->set(root, key, strlen(key), val, len);
+	if (rc > 0) {
+		/* Stored, with a warning: this key's bucket has passed the
+		 * container's near-full threshold. Positive is success under
+		 * the Map contract, so it must not be returned as an error —
+		 * this application read `rc != 0` as failure and aborted a
+		 * fill on the first warning until this line existed.
+		 *
+		 * It is counted rather than ignored because it is the only
+		 * early signal the stack offers: a map cannot be re-shaped
+		 * after create (K3) and its contents cannot be iterated out
+		 * (K6), so once a bucket actually overflows there is no repair
+		 * short of a reformat. The warning is what turns that from a
+		 * surprise into something a fill could act on. */
+		db->st.near_full_hits++;
+		rc = 0;
+	}
 	if (rc == -ENOSPC) {
 		/* Two different walls arrive here as the same errno, and the
 		 * application cannot tell them apart:
@@ -998,6 +1014,20 @@ int persondb_stat(struct persondb *db, struct persondb_stat *out)
 	out->populated = db->sb.populated;
 	out->rev = db->sb.rev;
 	out->n_people_maps = db->sb.n_people_maps;
+
+	/* Read the geometry back rather than modelling it. Costs one or two
+	 * blob reads and no writes — the container reports only what it
+	 * already had to persist in order to work. */
+	struct map_info info;
+
+	if (db->ops->stat && db->ops->stat(db->sb.people_root[0], &info) == 0) {
+		out->people_depth = info.depth;
+		out->people_buckets = info.buckets;
+	}
+	if (db->ops->stat && db->ops->stat(db->sb.cred_root, &info) == 0) {
+		out->cred_depth = info.depth;
+		out->cred_buckets = info.buckets;
+	}
 	return 0;
 }
 
