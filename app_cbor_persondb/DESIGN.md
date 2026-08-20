@@ -8,12 +8,15 @@ before the numbers:
   `-ENOSPC` at person 9 670 on the 8 MiB part, with live content at half the
   partition. **The store's maximum is 9 670 persons** — measured, and the
   reason is `kvhash`'s bucket directory, not the medium (`FINDINGS.md`
-  **K13**). `RESULTS.md` §4b reports the 9 000-person run. This is a finding,
-  not a defect to repair by sharding again.
-- **The nRF5340-DK figures in `RESULTS.md` §5 predate this change** and
-  describe the sixteen-shard build. They are kept, and marked, because the
-  before/after is the measurement. A4 was already open for a full-scale board
-  run; it now also wants a two-instance one.
+  **K13**). `RESULTS.md` §4 ("Two `kvhash` instances") reports the 9 000-person
+  run. This is a finding, not a defect to repair by sharding again.
+- **Every nRF5340-DK figure in `RESULTS.md` predates this change** — §5, §5a–§5d
+  and the raw captures §8a/§8b, including the 5 000-person UBI run that landed
+  in `main` at `98ead91`. All of them describe the *sixteen-shard* build. They
+  are kept, and marked, because the before/after is the measurement. A4 was
+  already open for a full-scale board run; it now also wants a two-instance one,
+  and the 5 000-person point is the one worth repeating first — it is the only
+  DK scale that both builds can reach.
 
 The design document for this test application, kept beside the code it
 describes. Governed by `doc/principles.md` · consumes the stack in
@@ -265,7 +268,8 @@ Enumerating offline says ~683 buckets would be the minimum of that curve, at
 10 980 B. The application does not pass 683. Hand-tuning a bucket count against
 another layer's read amplification is precisely the workaround §1 forbids: it
 would bury K11 under a magic number and make the app look faster than the stack
-is. The 3.8× is measured and recorded instead (`RESULTS.md` §4b).
+is. The 3.8× is measured and recorded instead (`RESULTS.md` §4,
+"Two `kvhash` instances").
 
 **And it is not enough.** At the benchmark's fixed 10 000 persons this layout
 stops at **person 9 670** — 4.19 MiB live, 49.9 % of an 8 MiB partition. Not

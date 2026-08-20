@@ -189,7 +189,7 @@ cost of the fix rather than noise:
   compaction timing — and this store has one more mutation round in its past.
   The byte column moved 0.8 %, and the amplification factor not at all.
 
-### 4b. Measured — two `kvhash` instances (`DESIGN.md` §12.2)
+### Two `kvhash` instances — the sixteen shards removed
 
 The shards are gone: one person map, one credential map. Same host, same
 benchmark, 200 samples, steady state. **9 000 persons, not 10 000** — the

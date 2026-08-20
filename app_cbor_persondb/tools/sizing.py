@@ -185,7 +185,7 @@ def two_instance():
     print("\nShipped: 16384 -- fullest bucket 30 % of the ceiling, and the only")
     print("row that neither bursts a bucket nor hands an erase block to a")
     print("directory. Costs 3.8x the bytes per lookup of the 16-shard build;")
-    print("that is FINDINGS.md K11, measured in RESULTS.md §4b, not tuned away.")
+    print("that is FINDINGS.md K11, measured in RESULTS.md section 4, not tuned away.")
 
     mx, over, used = cred_run(buckets=2047, cap=1 << 30)
     print(f"\ncredential map (2047 buckets): max bucket {mx} B, used {used}/2047")
