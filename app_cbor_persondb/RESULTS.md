@@ -13,9 +13,12 @@ duration, occupancy) are *not* the 10 000-person figures and are marked where
 they appear. A full-scale DK run remains outstanding for `A4`; §5 gives a
 revised floor of ≈2.2 h for it.
 
-**`blob_db` now defaults to the UBI backend; §5 and §5b are `flash_area`.**
-§5c measures the default on the same board: reads cost ~1.9× more, `fill` is
-1.10× *cheaper*, and the `A4` floor improves slightly to ≈2.0 h.
+**`blob_db` now defaults to the UBI backend; §4a, §5 and §5b are
+`flash_area`.** §5c measures the default's *timings* on the same board: reads
+cost ~1.9× more, `fill` is 1.10× *cheaper*, and the `A4` floor improves
+slightly to ≈2.0 h. §4b measures its *footprint*: **+23 032 B FLASH and
++3 408 B RAM**, which is 2.1% of this image's RAM and leaves §4a's B6 finding
+— that two sector buffers own 83% of it — completely unchanged.
 
 ---
 
@@ -235,6 +238,10 @@ Cross-built with Zephyr SDK 1.0.1 (`arm-zephyr-eabi`) for
 `nrf5340dk/nrf5340/cpuapp`. These are real target numbers, as are the timings
 in §5.
 
+**This section is the `flash_area` backend.** `blob_db` now defaults to UBI,
+which adds 23 KB of ROM and 3.4 KB of RAM — see §4b for the default build's
+numbers and for which conclusions below survive the change.
+
 | | FLASH | of 1 MB | RAM | of 448 KB |
 |---|--:|--:|--:|--:|
 | benchmark frontend | 59 072 B | 5.6 % | **157 584 B** | **34.4 %** |
@@ -313,6 +320,92 @@ docker run --rm -v "$PWD/..:/ws" -w /ws ghcr.io/zephyrproject-rtos/ci:latest bas
 
 Swap `ram_report` for `rom_report`, or drop `-t` for a plain build. The numbers
 above were taken with a local SDK 1.0.1 install, which gives identical results.
+
+## 4b. Footprint on the UBI backend (the default)
+
+§4a is `flash_area`. `blob_db` now defaults to `CONFIG_BLOB_DB_BACKEND_UBI`, so
+these are the numbers a default build of this app actually produces. Both
+columns were rebuilt at the same commit with the same method — `text + data`
+from `arm-zephyr-eabi-size`, which is what Zephyr reports as the FLASH region —
+so the delta is attributable to the backend and nothing else.
+
+| | FLASH | of 1 MB | RAM | of 448 KB |
+|---|--:|--:|--:|--:|
+| `flash_area` | 61 316 B | 5.8 % | 157 695 B | 34.4 % |
+| **UBI (default)** | **84 348 B** | **8.0 %** | **161 103 B** | **35.1 %** |
+| **Δ** | **+23 032 B** | +2.2 pp | **+3 408 B** | +0.7 pp |
+
+`app_perf/RESULTS.md` measures the same delta independently at **+23 036 /
++3 408 B** on a different application. Four bytes apart on ROM and exact on
+RAM, which is what it should be: the cost is the library, not the caller.
+
+The `flash_area` column above is 2.2 KB larger than §4a's 59 072 B because the
+tree has moved since that section was taken; §4a's *breakdown* still holds, and
+this table is the one to diff against.
+
+### ROM — where the 23 KB goes
+
+| Component | Δ bytes | share |
+|---|--:|--:|
+| `ubi/lib` — the UBI library itself | **+13 982** | 60.7 % |
+| linker/build artefacts not attributed to a path | +6 216 | 27.0 % |
+| `zephyr/lib/utils` — CRC and helpers UBI pulls in | +1 474 | 6.4 % |
+| `kernel/mutex.c` + `mem_slab.c` + `sched.c` | +944 | 4.1 % |
+| `blob_db_store_ubi.c` against `blob_db_store_flash_area.c` | +412 | 1.8 % |
+| `zephyr/subsys/storage` — flash_map partly dropped | −120 | −0.5 % |
+| libc `memmove`/`memcpy` variant shifts | +124 | 0.5 % |
+
+The store seam itself is nearly free: swapping the backend implementation costs
+**412 bytes**. Everything else is UBI and what UBI depends on. Note the app,
+`kvhash`, `rootreg` and `zcbor` are **byte-identical** across the two builds —
+the abstraction holds, and nothing above L0 knows which backend it has.
+
+### RAM — where the 3.4 KB goes
+
+All of it is UBI's own state, in four `k_mem_slab` pools:
+
+| Symbol | Bytes | |
+|---|--:|---|
+| `_k_mem_slab_buf_leaf_slab` | **2 176** | **the PEB pool — 16 B per PEB** |
+| `_k_mem_slab_buf_scratch_slab` | 512 | |
+| `_k_mem_slab_buf_volume_slab` | 440 | |
+| `_k_mem_slab_buf_device_slab` | 136 | |
+| four slab descriptors + `guard_mutex` + `active_partitions` | 136 | |
+| **total** | **3 400** | `blob_db` itself grows by 8 B |
+
+**The dominant term scales with `CONFIG_UBI_MAX_NR_OF_DATA_PEBS`**, which this
+board's conf sets to 126 — the DK's 8 MiB partition in 64 KB blocks, less the 2
+UBI reserves. That is the whole reason PR #20 sized the pool per geometry
+instead of picking one generous default: `native_sim`'s 4 KB blocks need 2 046
+PEBs, and the same symbol would then cost ~32 KB of RAM on a board that has
+128 blocks.
+
+### It does not move the needle on this app, and here is why
+
+Against §4a's finding B6 — that `blob_db`'s two 64 KB sector buffers own 83 % of
+this image's RAM — UBI's 3.4 KB is **2.1 %** of the total and 2.6 % of what
+`g_bbuf` alone costs. The RAM problem in this application is unchanged by the
+backend and remains the sector buffers.
+
+ROM is a different story only in proportion: +23 KB takes the storage stack from
+5.4 KB to roughly 19.4 KB, so what was 9.1 % of the image is now about 23 %.
+The image is still 8 % of a 1 MB part, so §4a's conclusion stands — **nothing
+about this application is ROM-constrained** — but the statement "the whole
+storage stack is 5.4 KB of ROM" is now specific to `flash_area` and should not
+be quoted for a default build.
+
+### Reproducing
+
+```
+west build -p always -b nrf5340dk/nrf5340/cpuapp -d build/pdb_ubi app_cbor_persondb
+west build -p always -b nrf5340dk/nrf5340/cpuapp -d build/pdb_fa  app_cbor_persondb \
+      -- -DCONFIG_BLOB_DB_BACKEND_FLASH_AREA=y
+$ZEPHYR_SDK_INSTALL_DIR/gnu/arm-zephyr-eabi/bin/arm-zephyr-eabi-size \
+      build/pdb_{fa,ubi}/zephyr/zephyr.elf
+```
+
+For the attribution tables, `-t rom_report` / `-t ram_report` on each build and
+diff the generated `rom.json` / `ram.json` by path.
 
 ## 5. Measured timings — nRF5340-DK
 
