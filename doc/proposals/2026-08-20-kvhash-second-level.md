@@ -315,6 +315,69 @@ number in `app_cbor_persondb`'s `DESIGN.md` §6.1, and every line of
 the container's arithmetic offline today only because the interface will not
 take the inputs.
 
+### 7.1 `{0}` means "I do not know", and that is a contract, not a convention
+
+The zero value has to be defined before the fields are, because it decides what
+happens in the common case where an application genuinely cannot answer.
+
+**The rule:**
+
+- **`cfg == NULL` and `cfg == {0}` are identical**, and both mean *no
+  information supplied*. The container chooses everything. This is never an
+  error.
+- **Each field is independently unset at zero.** Partial knowledge is the normal
+  case, not a special one: an application that knows it will store roughly
+  20 000 credentials but has no view on their size sets `expected_entries` and
+  leaves the rest zero, and the container defaults only what it was not told.
+- **A field that *is* set is a request the container must honour or refuse** —
+  `-ENOSPC` or `-EINVAL`, never a silent clamp.
+
+That last clause is what makes the convention worth writing down, because it
+resolves **K9(b)** as well as K9(a). Today `buckets_for()` clamps every request
+to `MAX_BUCKETS` and returns success, so "384 buckets" quietly becomes 127 and
+the caller is never told (`app_perf_kvdb` does exactly this in-tree). Under this
+rule the clamp has nowhere to hide: *unset* is the container's business, *set*
+is the caller's, and silently delivering something else than what was asked is
+not one of the two.
+
+It also removes the `initial_capacity = SIZE_MAX` idiom, and should.
+`app_cbor_persondb` passes it to mean "the largest you can build" — an intent
+the current API has no word for except an out-of-range number that the clamp
+converts into a value. Under the rule above `SIZE_MAX` is a request for
+`SIZE_MAX` entries and must fail. The application that wanted "as large as
+possible" turns out to have wanted the wrong thing anyway (§7, K12), and what it
+actually needed — "I have no strong opinion, size this sensibly" — is `{0}`.
+
+**Forward compatibility comes free**, which matters for a struct that this
+proposal is already extending once: a caller compiled against a later header
+that adds a field keeps working, because the field it never heard of is zero and
+zero means unset.
+
+**The honest difficulty is what the container does with `{0}`.** It must pick,
+and any pick is wrong for someone. Today it picks `DEFAULT_BUCKETS = 8` — a map
+that overflows at about ninety person-sized entries (K9). Two levels change the
+economics of that choice, because §5.1 and §5.2 make a generous default nearly
+free on reads and *cheaper* on writes, so the default can be far more generous
+than 8 without punishing the small-map case on lookup cost.
+
+What it cannot escape is that **eager sub-map creation makes a generous default
+cost blobs at `create`**: 64 × 64 buckets is 64 sub-maps written up front, which
+is right for a database and absurd for a three-key boot-counter. So the zero
+config is exactly where v1's lack of promotion (D4) bites hardest — a declared
+population lets the container size correctly, and an undeclared one leaves it
+guessing with no way to correct itself later. Two mitigations, neither free:
+
+- Keep `{0}` **one-level with a modest bucket count**, close to today's
+  behaviour, and treat two levels as something a declared population opts into.
+  Cheap, and leaves undeclared maps no better off than they are now.
+- Let `{0}` mean *two levels, small fan-out* — a floor high enough to survive an
+  unexpected population without paying much when unused.
+
+This proposal recommends the first for v1 and the second once splitting exists,
+since splitting is what makes an initially small guess recoverable. **D3e asks
+review to settle it**, because it is the difference between a default that is
+merely defined and one that is safe.
+
 `max_entry_bytes` is load-bearing, not padding. **K2 is about variance, not the
 mean** — a bucket bursts on the tail. Sizing from a mean alone is exactly how
 the analytic estimate failed at person 9 232 and why §6.1 had to switch to
@@ -334,7 +397,7 @@ cannot help a population that outgrows what was declared, because `n_buckets` is
 fixed after create (**K3**). Only splitting makes being wrong survivable. The
 two are complementary, and neither substitutes for the other.
 
-### 7.1 Per-map bucket sizing
+### 7.2 Per-map bucket sizing
 
 A related question, and the answer bounds it: can bucket *size* be per-map
 rather than one global `CONFIG_BLOB_DB_MAX_PAYLOAD_LEN`?
@@ -593,7 +656,7 @@ For the record, so these are not re-opened as blockers:
 |---|---|
 | **D2** `alloc_id_range()` | v1 stores child ids in directories; Option A is not on the v1 path |
 | **D3** promotion | disappears if D3a is declarative — depth is chosen at `create` |
-| **D3c** per-map bucket sizing | redundant once the container derives bucket size from a declared population (§7.1) |
+| **D3c** per-map bucket sizing | redundant once the container derives bucket size from a declared population (§7.2) |
 | p99 write measurement | moves to v2 with the splitting it was meant to characterise |
 | RAM for a second directory | not needed — one `dir_buf` suffices (§9.5) |
 
@@ -624,6 +687,18 @@ For the record, so these are not re-opened as blockers:
 - **D3d.** How are the two level indices derived from one key (§11.2)? Split a
   64-bit hash, or salt per level? Unspecified today, and getting it wrong
   clusters keys into exactly the failure K2 punishes.
+- **D3e.** What does `{0}` build (§7.1)? The zero config — `NULL` or all-zero,
+  meaning "I do not know" — must map to *something*, and today that something is
+  8 buckets, which overflows at about ninety person-sized entries. One level
+  with a modest count (close to today, and no worse), or two levels with a small
+  fan-out (survives an unexpected population, costs sub-map blobs at `create`
+  even when unused)? Recommended: the first for v1, the second once splitting
+  makes an initially small guess recoverable.
+
+  The rest of §7.1's rule is not offered as a choice, because it is what makes
+  the field meanings enforceable: `NULL` ≡ `{0}` ≡ no information; each field
+  independently unset at zero; and **a field that is set is honoured or
+  refused, never silently clamped** — which closes K9(b) as well as K9(a).
 - **D3b.** Is `kvhash_info()` (readback of depth, fan-out, bucket count, entry
   count) in scope? It closes half of **K9** and much of **K10**, and it is
   independent of everything else here.
