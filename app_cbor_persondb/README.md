@@ -41,21 +41,41 @@ above it. Acceptance criterion **A7** checks this rather than trusting it.
 
 ### 2. Use the highest layer whose *shape* matches — then drop down
 
-`kvdb` (L3) is the ergonomic interface and it does not fit a sharded dataset:
-one instance per name means **seventeen** registry entries, seventeen meta blobs
-and thirty-four sector reads at boot, and it overruns
-`CONFIG_ROOTREG_MAX_ROOTS` (default 8) twice over. Dropping to the L2 Map shape
-— one registry key, one app-owned superblock, seventeen map roots — costs
-**two** sector reads at boot.
+`kvdb` (L3) is the ergonomic interface, and its unit — one named instance —
+is not this application's unit of structure. This application is two
+collections: people and credentials. So it is **two L2 containers behind one
+root**: one registry key, one app-owned superblock, two `kvhash` instances.
+L3 would wrap each container in an instance to give it a name the app never
+uses and a backend record it never varies.
 
-*What it prevents:* paying for an abstraction whose shape you are fighting. The
-comparison is tabulated in `DESIGN.md` §12; the decision is not "L2 is faster",
-it is "L3's unit of naming is not this application's unit of structure".
+*What it prevents:* paying for an abstraction whose shape you are fighting.
+
+*And the same rule, applied downward.* This dataset was sixteen person maps
+plus a credential index until `DESIGN.md` §12.2 — not because the domain has
+sixteen of anything, but because a bucket burst at a 4 KB payload cap. That is
+a workaround for the layer below, and it made the application faster: sixteen
+small maps move 4 756 B per lookup against 18 228 B for one. It was removed
+anyway, and the app is 4.1× slower on its read path and no longer completes its
+own headline scale. Two findings (**K12**, **K13**) were sitting underneath it,
+unreachable while it was there. A model application does not get to keep a
+workaround because the workaround wins the benchmark.
+
+*And re-check it.* This decision was first argued from boot I/O (thirty-four
+sector reads against two) and from `CONFIG_ROOTREG_MAX_ROOTS` defaulting to 8.
+Neither argument stands: the first expired when `blob_db` learned to walk
+buckets by slot header, and the second was never valid — a database is
+reachable from one root, so it takes **one** registry entry, and a layout that
+wants seventeen is misusing the registry rather than outgrowing it. A third —
+that sharding keeps lookups cheap — turned out to be a workaround arguing for
+its own survival, and went with the shards. The decision held anyway, on the
+shape argument above. A
+rationale is a claim about the code as it is today; `DESIGN.md` §12.1 re-runs
+this one and records which parts survived.
 
 ### 3. Make every persistent structure reachable from one integer
 
 ```
-rootreg[ROOTREG_KEY('PADB', 1)] -> superblock -> people_root[0..15], cred_root
+rootreg[ROOTREG_KEY('PADB', 0)] -> superblock -> people_root, cred_root
 ```
 
 `persondb_open()` reads one registry entry and one blob, and has the whole
@@ -66,7 +86,7 @@ where recovery depends on state that recovery is supposed to reconstruct.
 
 ### 4. Publish a multi-blob structure with a single final write
 
-`create_store()` allocates seventeen map roots and creates each map, then binds
+`create_store()` allocates both map roots and creates each map, then binds
 the superblock **last**. Until that one atomic write lands, none of it is
 reachable and the next boot simply builds it again.
 

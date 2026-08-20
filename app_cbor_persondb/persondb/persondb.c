@@ -4,13 +4,18 @@
  *
  * persondb — the person management API, on L2 map_ops + rootreg + blob_db.
  *
- * Layout (DESIGN.md §12). One registry key, one app-owned superblock, N + 1
- * maps; everything is reachable from the integer 1 (P5), and boot costs two
- * sector reads rather than the eighteen an equivalent set of named kvdb
- * instances would:
+ * Layout (DESIGN.md §12). One registry key, one app-owned superblock, two
+ * kvhash instances; everything is reachable from the integer 1 (P5):
  *
- *   rootreg[ ROOTREG_KEY('PADB', 1) ] -> superblock -> people_root[0..N-1]
+ *   rootreg[ ROOTREG_KEY('PADB', 0) ] -> superblock -> people_root[0]
  *                                                   -> cred_root
+ *
+ * Two containers, because the domain has two collections. The people map was
+ * sixteen shards until DESIGN.md §12.2, to keep any one bucket under a 4 KB
+ * payload cap that has since been lifted; that was a workaround for K2, and
+ * workarounds hide the limitations this application exists to find (DESIGN.md
+ * §1). The loop below still runs over n_people_maps because the superblock
+ * format carries the count -- it is 1.
  *
  * This is the only file in the application that mentions a key, a shard, a
  * blob id or a map operation.
@@ -34,7 +39,13 @@
 LOG_MODULE_REGISTER(persondb, CONFIG_APP_CBOR_PERSONDB_LOG_LEVEL);
 
 #define PADB_MAGIC        0x50414442u /* 'PADB' */
-#define PADB_ROOTREG_KEY  ROOTREG_KEY(PADB_MAGIC, 1)
+/* Instance 0: this application is one database, and a database is one
+ * structure with one root (P5) -- so it takes one registry entry, and that
+ * entry is the magic's first. The instance field exists to distinguish a
+ * *second*, independent store of the same type (rootreg contract, section 3);
+ * numbering the only one 1 would imply a ('PADB', 0) that does not exist.
+ */
+#define PADB_ROOTREG_KEY  ROOTREG_KEY(PADB_MAGIC, 0)
 #define SUPERBLOCK_VERSION 1
 
 #define N_PEOPLE_MAPS CONFIG_APP_CBOR_PERSONDB_PEOPLE_MAPS
@@ -121,9 +132,23 @@ static int map_set(struct persondb *db, uint64_t root, const char *key,
 	db->st.map_sets++;
 	rc = db->ops->set(root, key, strlen(key), val, len);
 	if (rc == -ENOSPC) {
-		/* A single bucket overflowed while the medium is nearly empty
-		 * (K2). DESIGN.md §6.1 sizes this away; if it fires, that
-		 * sizing rule was wrong (A8). */
+		/* Two different walls arrive here as the same errno, and the
+		 * application cannot tell them apart:
+		 *
+		 *   K2   a single bucket overflowed while the medium is nearly
+		 *        empty — the sizing rule of DESIGN.md §6.1 was wrong (A8)
+		 *   K13  the bucket directory can no longer be placed in any
+		 *        erase block, so the map cannot take a key in a bucket
+		 *        it has not used yet — at the shipped payload this is
+		 *        the store's real ceiling, 9 670 persons
+		 *
+		 * The message below names K2 because that is the one an
+		 * application can act on. It is wrong for K13, and there is no
+		 * query that would let it be right: no per-bucket occupancy
+		 * (K10), no physical occupancy (B3), no fill level (V3). The
+		 * misdiagnosis is left in place, and recorded in K13, because
+		 * it is what the stack leaves an application able to say.
+		 */
 		db->st.enospc_hits++;
 		LOG_ERR("bucket overflow on key '%s' — see FINDINGS.md K2", key);
 	}
@@ -284,6 +309,20 @@ static int create_store(struct persondb *db, uint32_t n_persons)
 	 * fit expresses the intent exactly, and the application never learns the
 	 * formula.
 	 *
+	 * What this costs is now visible, and is left visible. The clamp lands
+	 * on 2047 buckets, so the directory is a 16 384 B blob — and kvhash
+	 * reads all of it on every get, set and delete (K11). Enumerating
+	 * offline says ~683 buckets would move 40 % of those bytes
+	 * (tools/sizing.py). The app does not pass 683: hand-tuning a bucket
+	 * count against another layer's read amplification is a workaround, and
+	 * it would bury K11 under a magic number. The number is measured
+	 * instead (RESULTS.md).
+	 *
+	 * "The largest map you can build" is also, at this geometry's largest
+	 * payload, a map that cannot be written to — 4089 buckets make the
+	 * directory an entire erase block. prj.conf carries that arithmetic and
+	 * FINDINGS.md K12 the finding.
+	 *
 	 * This used to restate `(MAX_PAYLOAD - 8) / 8` here. That was a private
 	 * constant from another layer, wrong by 8x after one Kconfig edit, and
 	 * it bought nothing: the number was only ever passed straight back down.
@@ -317,7 +356,7 @@ static int create_store(struct persondb *db, uint32_t n_persons)
 		return rc;
 	}
 
-	LOG_INF("created store: %u people maps + 1 credential map, "
+	LOG_INF("created store: %u people map(s) + 1 credential map, "
 		"max buckets each, %u persons planned",
 		sb->n_people_maps, n_persons);
 

@@ -17,8 +17,9 @@
 #
 #     python3 tools/sizing.py
 #
-# Rerun it whenever the record shape, the person count, the shard count or
-# CONFIG_BLOB_DB_MAX_PAYLOAD_LEN changes. Keep the constants below in step with
+# Rerun it whenever the record shape, the person count or
+# CONFIG_BLOB_DB_MAX_PAYLOAD_LEN changes. The app no longer shards (DESIGN.md
+# §12.2), so what this picks is the payload, not a map count. Keep the constants below in step with
 # src/dataset.c and src/person_cbor.c — nothing enforces that they match, which
 # is itself a consequence of the missing introspection.
 
@@ -102,3 +103,91 @@ for nmaps in (12, 16):
     tot, mx, over, mean = run(nmaps, VOCAB_NEW, 10, 13)
     print(f"{nmaps} maps: max {mx} B = {100*mx/4096:.0f}% of a bucket; "
           f"non-empty buckets ~{int(nmaps*511*(1-2.718**(-10000/(nmaps*511))))}")
+
+# ---------------------------------------------------------------------------
+# The L3 re-check (DESIGN.md §12).
+#
+# CONFIG_BLOB_DB_MAX_PAYLOAD_LEN was capped at 4096 when D10 was taken; the
+# range is now 1..65535, bound at mount by the geometry to
+# (sector - 16) / 2 - 14 = 32 746 B on the DK's 64 KB sectors. That lifts C2's
+# 2.09 MB per map, so "does the dataset fit ONE map?" has to be re-asked — a
+# one-map dataset is one kvdb instance, and the whole D10 argument was that
+# seventeen of them do not fit.
+#
+# Two costs move in opposite directions and both land on R-D, so the sweep
+# reports both:
+#   directory  - read by dir_load on EVERY get/set/del (K11), 8 + 8*n_buckets
+#   bucket     - the second read, and the whole rewrite on a set (K4)
+# Fewer maps means fewer buckets to spread the same bytes over, so one of the
+# two must grow. Column "get B" is their sum: the bytes one map get moves.
+
+def l3_recheck():
+    print(f"\n{'payload':>7} {'maps':>4} {'buckets':>7} {'dir B':>6} {'mean bkt':>8} "
+          f"{'max bkt':>7} {'%ceil':>5} {'get B':>6} {'vs now':>6} {'dir traffic':>11}")
+    base = None
+    for pay, nmaps, nb in ((4096, 16, 511),      # as built
+                           (4096,  8, 511),
+                           (16384, 1, 511), (16384, 1, 1023), (16384, 1, 2047),
+                           (32746, 1, 511), (32746, 1, 2047), (32746, 1, 4092),
+                           (32746, 2, 4092)):
+        if nb > (pay - 8) // 8:
+            continue
+        tot, mx, over, mean = run(nmaps, VOCAB_NEW, 10, 13, buckets=nb, cap=pay)
+        dirb = 8 + 8 * nb
+        getb = dirb + mean
+        base = base or getb
+        # Every fresh bucket rewrites the whole directory (K5), once per bucket.
+        traffic = nmaps * nb * dirb
+        flag = '' if over == 0 else f'  OVER x{over}'
+        print(f"{pay:>7} {nmaps:>4} {nb:>7} {dirb:>6} {mean:>8.0f} {mx:>7} "
+              f"{100*mx/pay:>4.0f}% {getb:>6.0f} {getb/base:>5.1f}x "
+              f"{traffic/1048576:>9.1f} MiB{flag}")
+
+l3_recheck()
+
+
+# ---------------------------------------------------------------------------
+# The two-instance layout (DESIGN.md §12).
+#
+# The app is one people map + one credential map. Sharding is gone, so the
+# bucket count is no longer "as many as fit" — kvhash's initial_capacity IS the
+# bucket count, and the two costs it drives move in opposite directions:
+#
+#   directory   8 + 8*n_buckets, read by dir_load on EVERY get/set/del (K11)
+#   bucket      total_bytes / n_buckets, the second read
+#
+# so bytes-per-get has a minimum in n. The fullest bucket must also stay well
+# under CONFIG_BLOB_DB_MAX_PAYLOAD_LEN, because it overflows with no warning
+# (K2) and the count cannot change afterwards (K3). Report both.
+
+# The app asks kvhash for the largest map it can build, so the bucket count is
+# not chosen directly -- MAX_PAYLOAD chooses it, via (MAX_PAYLOAD - 8) / 8.
+# This is the sweep DESIGN.md §6.1 reports, and the reason 16384 ships.
+
+def two_instance():
+    print(f"\n{'payload':>7} {'buckets':>7} {'dir B':>6} {'mean bkt':>8} "
+          f"{'max bkt':>7} {'%ceil':>6} {'get B':>6} {'vs 16-shard':>11}")
+    for pay in (4096, 8192, 16384, 32722):
+        nb = (pay - 8) // 8
+        tot, mx, over, mean = run(1, VOCAB_NEW, 10, 13, buckets=nb, cap=1 << 30)
+        dirb = 8 + 8 * nb
+        getb = dirb + mean
+        note = ''
+        if mx > pay:
+            note = '  BURSTS'
+        # K12: two copies of the directory plus slot headers must leave room in
+        # an erase block, or blob_db compacts on every write and the fill dies.
+        if 16 + 2 * (dirb + 14) > 65488 - 1024:
+            note += '  DIRECTORY OWNS AN ERASE BLOCK (K12)'
+        print(f"{pay:>7} {nb:>7} {dirb:>6} {mean:>8.0f} {mx:>7} "
+              f"{100*mx/pay:>5.0f}% {getb:>6.0f} {getb/4756:>10.1f}x{note}")
+
+    print("\nShipped: 16384 -- fullest bucket 30 % of the ceiling, and the only")
+    print("row that neither bursts a bucket nor hands an erase block to a")
+    print("directory. Costs 3.8x the bytes per lookup of the 16-shard build;")
+    print("that is FINDINGS.md K11, measured in RESULTS.md section 4, not tuned away.")
+
+    mx, over, used = cred_run(buckets=2047, cap=1 << 30)
+    print(f"\ncredential map (2047 buckets): max bucket {mx} B, used {used}/2047")
+
+two_instance()

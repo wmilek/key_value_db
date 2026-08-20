@@ -22,7 +22,8 @@ tests:
     platform_allow: native_sim
     extra_configs:
       - CONFIG_APP_CBOR_PERSONDB_N_PERSONS=200
-      - CONFIG_APP_CBOR_PERSONDB_PEOPLE_MAPS=2
+      # No map-count override: the app is two kvhash instances (DESIGN.md
+      # §12.2) and the default is the shipped layout.
       - CONFIG_APP_CBOR_PERSONDB_VERIFY_SAMPLES=64
       - CONFIG_APP_CBOR_PERSONDB_BENCH_SAMPLES=20
     harness: console

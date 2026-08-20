@@ -25,8 +25,10 @@ remaining open ones are listed in the summary below.
 | | |
 |---|---|
 | **Closed by `main`** | B1, B5 (partly), B9, B10, B3 (partly) |
-| **Still open** | B2, B4, B6, B7, B8, B11, B12, K1–K11, V1–V4, R1, X1 |
+| **Still open** | B2, B4, B6, B7, B8, B11, B12, K1–K11, **K12**, **K13**, V1–V4, X1 |
+| **Withdrawn** | R1 — `ROOTREG_MAX_ROOTS`'s default was never the problem; the layout that wanted seventeen entries was (`DESIGN.md` §12.1) |
 | **Newly observed** | N1 — transaction count rose sharply as byte count fell (closed on hardware: ~65 µs per transaction) · B12 — compaction lowers the durable id ceiling ([issue #14](https://github.com/wmilek/key_value_db/issues/14)) |
+| **Found by removing a workaround** | **K12** — the largest map the geometry allows cannot be written to · **K13** — the directory blob caps the store at 9 670 persons, half the partition. Both were invisible while the app sharded its person records over sixteen maps; both appeared in the first hour after it stopped (`DESIGN.md` §12.2). |
 
 This is the *probe* output of `app_cbor_persondb` (see `DESIGN.md` §1). Every
 drawback the app trips over on its way to a working 4 MiB person database is
@@ -765,20 +767,154 @@ instead of two — R-D's cost halves**, with no denormalization, no index, and n
 change to the on-flash format beyond the root record's own layout.
 
 This is the strongest single conclusion in this register: `MAX_BUCKETS` (K1),
-the directory rewrites (K5), and half of every read (K11) are all the same
-decision — storing bucket ids that could have been computed.
+the directory rewrites (K5), half of every read (K11) — and half the usable
+medium (K13) — are all the same decision: storing bucket ids that could have
+been computed.
+
+---
+
+### K12 — The largest map the geometry allows cannot be written to (major, **`hit`**)
+
+Found by building the application the way the stack intends — two containers,
+no sharding (`DESIGN.md` §12.2) — and asking `kvhash` for the largest map it
+can build, which is what this app has always asked for.
+
+Set `CONFIG_BLOB_DB_MAX_PAYLOAD_LEN` to the 32 722 B this geometry sustains and
+the arithmetic closes on itself:
+
+```
+payload            32 722 B     the most blob_db can rebind on a 65 488 B sector
+MAX_BUCKETS        4 089        (32 722 - 8) / 8
+directory blob     32 720 B     8 + 8 x 4 089  — one blob, rewritten per K5
+two copies + hdrs  65 484 B     16 + 2 x (32 720 + 14)
+erase block        65 488 B
+                   --------
+slack                  4 B
+```
+
+A blob that large is legal — `blob_db_mount()` accepts it, because it is
+exactly what the rebind rule permits — and it consumes an entire erase block
+for itself. Both maps' directories then do, so `blob_db` compacts on almost
+every write:
+
+```
+<inf> blob_db: compact bid=3: new bucket has 32750 B (was up to 65488 B)
+<dbg> blob_db.blob_db_update: update id=3 bid=3 off=0x7fee len=32720
+<inf> blob_db: compact bid=4: new bucket has 32750 B (was up to 65488 B)
+<dbg> blob_db.blob_db_update: update id=4 bid=4 off=0x7fee len=32720
+```
+
+The fill dies at **person 36** with `-ENOSPC`, on an 8 MiB partition holding
+about 15 KB of data.
+
+The defect is not the ceiling; it is that the two rules are set independently
+and their product is never checked. `blob_db` validates that one payload can be
+rebound (B9/B10, both closed by `main`). `kvhash` validates that its directory
+fits one payload. Nobody validates that a *map sized to the payload* leaves
+room for anything else in an erase block, and the application has no way to ask
+— K10 gives no bucket count, B3 no occupancy. So "ask for the biggest map"
+compiles, mounts, passes `create`, and fails 36 records into a multi-hour fill.
+
+The app ships `16384` instead, and prj.conf carries this arithmetic beside the
+symbol so the next person to raise it finds out here rather than there.
+
+### K13 — The directory blob caps how much of the medium a store can use (major, **`hit`**)
+
+**The application's maximum is 9 670 persons** — 4 192 710 B live, **49.9 % of
+an 8 MiB partition** — measured, not projected: 9 670 completes fill, verify,
+mutate, re-verify and the benchmark with zero bucket overflows, and person
+9 671 fails with `-ENOSPC` at any configured scale (a run set to 20 000 stops at
+the same index).
+
+Half the medium is free and the store cannot take another record. What is full
+is not the flash and not a bucket — it is the set of places a **16 384 B blob**
+can go.
+
+**Why a blob is that big.** `kvhash` stores a directory of bucket ids,
+`8 + 8n` bytes in one blob (K1), and rewrites it whole on every first insert
+into a fresh bucket (K5). At the shipped payload that is 2 047 buckets = 16 384
+B. `blob_db` appends each new copy into an erase block that has room for it,
+and once the store is around half live, compaction can no longer leave any
+65 488 B block with 16 398 B contiguous:
+
+```
+compact bid=3: new bucket has 53456 B (was up to 65488 B)   -> 12 032 B free
+put person 9670: -28
+```
+
+A 1 KB person bucket still fits in that 12 032 B. The directory does not, so
+the map cannot accept a key in a bucket it has not used yet, and the store is
+finished.
+
+**This is an L2 limit, and the layer below is behaving.** `blob_db` promised
+that a blob up to `MAX_PAYLOAD` can be written and rebound within a sector, and
+it delivers exactly that; it never promised that an arbitrarily large blob
+remains placeable in a fragmented store, and no storage layer can. The 16 KB
+blob is `kvhash`'s: nothing in the Map *shape* requires a directory. The bucket
+ids are stored because they are allocated one at a time and could be anything —
+allocate them as a range and they are computable from the root, the directory
+disappears, and with it this ceiling. `n_buckets` is already a u16 on flash
+(K1), so the format does not stand in the way.
+
+**It is the fourth consequence of one decision.** K1 (capacity cap), K5
+(rewrite traffic), K11 (half of every read) and this are all *storing bucket
+ids that could have been computed*. The first three cost speed and space. This
+one costs **half the part**.
+
+**Two ceilings, moving in opposite directions.** `MAX_PAYLOAD` sets the bucket
+ceiling *and* the directory size, so an application sizing a `kvhash` store is
+between two walls:
+
+| `MAX_PAYLOAD` | buckets | directory | **max persons** | which wall | fullest bucket at the wall |
+|---|--:|--:|--:|---|--:|
+| 8 192 | 1 023 | 8 192 B | **11 787** | K2 — a bucket burst | 8 141 B = **99 %** |
+| 16 384 (shipped) | 2 047 | 16 384 B | **9 670** | K13 — this one | 4 621 B = 28 % |
+
+Both measured on `native_sim`. Raising the payload to give one map enough
+capacity is what lowers the usable fraction of the medium — and the app cannot
+see either wall coming, because there is no per-bucket occupancy (K10), no
+physical-occupancy query (B3) and no fill query (V3).
+
+**And it is misreported.** Both walls arrive as `-ENOSPC` from
+`map_ops->set`, so the application prints *"bucket overflow on key … see
+FINDINGS.md K2"* for both. At 8 192 that message is correct. At 16 384 it is
+wrong — the fullest bucket is at 28 % of its ceiling — and there is no way for
+the caller to tell the difference. A wrong diagnosis is worse than none.
+
+**The sixteen-shard build did not hit this**, because its largest blob was
+4 096 B. It was not designed to avoid it; it hid it. Removing the workaround is
+what exposed it (`DESIGN.md` §12.2).
 
 ---
 
 ## L1½ — `rootreg`
 
-### R1 — `ROOTREG_MAX_ROOTS` defaults to 8 (minor, `read`)
+### R1 — ~~`ROOTREG_MAX_ROOTS` defaults to 8~~ — **WITHDRAWN, not a finding**
 
-Eight registered roots is below what a sharded dataset needs if each shard is a
-named `kvdb` instance — the seventeen-instance L3 variant in `DESIGN.md` §12 does not
-fit the default. The app's L2 layout uses one entry, so it never trips this, but
-it is a sharp edge for the L3 route: the failure is `-ENOSPC` from
-`kvdb_open`, at a layer that says nothing about registry capacity.
+Raised as: *"eight registered roots is below what a sharded dataset needs if
+each shard is a named `kvdb` instance — the seventeen-instance L3 variant in
+`DESIGN.md` §12 does not fit the default"*, with the failure being `-ENOSPC`
+from `kvdb_open` at a layer that says nothing about registry capacity.
+
+**Withdrawn on re-check (`DESIGN.md` §12.1). The number eight was never the
+problem; needing seventeen was.** `rootreg` registers **structure roots**, and
+every structure in the stack is reachable from one root (P5) — so a database is
+*one* entry. Its own contract sets the scale and says so outright: "a few
+registered roots (Kconfig-bounded, must fit one i-node payload). **It is a
+registry, not a database**" (`l1_root_registry.md` §1). Eight is ample for what
+the module is; this app registers one, and a correctly shaped L3 layout would
+also register one.
+
+What the seventeen-entry figure actually showed is that the L3 route reaches
+for L1.5 as an **id allocator** — one entry per shard, for a structure that has
+a single root. That is a defect in the route, and it is already recorded where
+it belongs: **V4**, nothing at L3 composes shards, so an application that must
+shard has no way to keep its shards behind one root without dropping to L2.
+
+Left in the register rather than deleted, because a withdrawn finding is part
+of the record: the original wording would have sent a reader to raise
+`ROOTREG_MAX_ROOTS`, which is precisely the wrong fix — sizing a registry to
+absorb a misuse is how a registry becomes a database.
 
 ---
 
@@ -788,17 +924,45 @@ The app does not link `kvdb` (`DESIGN.md` D10). These come from evaluating it as
 the implementation route and rejecting it, which is itself a finding about L3's
 current reach.
 
-### V4 — Nothing composes shards, so L3 stops being useful past ~2 MB (major, `read`)
+### V4 — Nothing composes shards, so L3 cannot hold a low-latency dataset (major, `read`)
 
 K1 makes sharding mandatory past ~2.09 MB, and `kvdb` offers no help: the
 application invents instance naming, the key→shard hash, read fan-out and
 per-shard capacity accounting regardless. What `kvdb` still charges for that is
-seventeen registry entries, seventeen meta blobs, thirty-four sector reads at boot, and a
-collision with R1's default — in exchange for a naming feature a sharded app
-does not need, because it has one superblock and knows its own shards.
+seventeen registry entries, seventeen meta blobs and thirty-four sector reads at
+boot — in exchange for a naming feature a sharded app does not need, because it
+has one superblock and knows its own shards.
+
+The seventeen **registry** entries are the sharpest of those, and not because of
+their size: a structure is reachable from one root (P5), so a database is one
+entry. Asking `rootreg` for seventeen is using a registry as an id allocator —
+the module's own contract says "a registry, not a database" — and there is no
+way to avoid it at L3, because a `kvdb` instance *is* a registry key. That is
+this finding, stated at its own layer.
 
 L3's current audience is therefore **small stores of a few named instances**.
 Every application larger than one map drops to L2, as this one does.
+
+**Re-stated after the payload cap moved** (`DESIGN.md` §12.1). One of those
+charges has shrunk to nothing: B1 made the thirty-four reads slot walks rather
+than sector reads (≈62 ms once, at §5's fitted cost). The `~2.09 MB` threshold
+in this finding's title is also obsolete — at the 32 746 B payload the DK's
+geometry now sustains, one map reaches 4 092 buckets, and this app's 3.6 MB
+dataset fits in **one** `kvdb`.
+
+The finding survives the correction and gets sharper, because sharding turns
+out not to be a capacity workaround at all. `kvhash`'s directory must fit one
+payload (K1), so bucket count and bucket size are one knob, and a map get reads
+one of each (K11). Sixteen maps of 511 small buckets move **4 756 B** per get;
+every single-instance layout that holds the same data moves **11 458–33 748 B**,
+because it has to fatten the directory or the buckets and both are on the read
+path. So the reason to shard is *latency*, and the reason `kvdb` cannot serve
+this app is that it cannot put sixteen maps behind one name — not that the app
+outgrew a map.
+
+> That makes the proposed L3 addition more valuable, not less: a sharded-map
+> interface would not be relieving a capacity ceiling, it would be owning the
+> fan-out that keeps a lookup cheap.
 
 > The finding most likely to justify an L3 addition rather than an L1/L2 fix: a
 > sharded-map interface over N `kvhash` maps, owning the fan-out, the capacity
