@@ -429,10 +429,41 @@ enumerating the whole population.
 
 Two more pieces make it a contract rather than a hint:
 
-- **Readback.** `kvhash_info()` reporting actual depth, fan-out, bucket count
-  and entry count. That closes the "cannot be read back" half of **K9** and much
-  of **K10** — `app_cbor_persondb`'s store report currently prints "bucket count
-  not observable — FINDINGS.md K10" where the number should be.
+- **Readback, under one rule: it must be free.** `map_ops.stat()` reports only
+  values *already persisted because the map needs them to work*. No new header
+  fields, no counters maintained on the write path, no writes of any kind. A
+  diagnostic that costs a write per insert to serve a number nobody reads is
+  worse than no diagnostic.
+
+  | field | derived from | cost |
+  |---|---|---|
+  | `depth`, `fanout` | top-level header | 1 blob read |
+  | `buckets` | `fanout × n`, `n` from any sub-directory header | 1 more read at depth 2 |
+  | `entry_bytes_limit` | payload − slot and key overhead | arithmetic, no flash |
+  | ~~entry count~~ | — | **excluded**: needs a counter rewritten on every insert and delete, which is the K5 traffic this proposal removes |
+  | ~~largest stored entry~~ | — | **excluded**: needs a walk of every bucket (B4 is O(n²)) |
+
+  Note `entry_bytes_limit` is the *ceiling the map can accept*, not the largest
+  entry stored. It is deliberately not named `max_entry_bytes`, which is the
+  input field where the application declares the largest entry it intends to
+  write — the same word for a declaration and for a capability is how "expected
+  entry count" came to mean a bucket count.
+
+  **An earlier draft of this section proposed recording `n` in the top-level
+  header** so `stat()` could compute `buckets` in one read instead of two. That
+  is struck: it adds persisted state to every store, forever, to save one read
+  in a diagnostic called once. The cost belongs to whoever calls the diagnostic.
+  It would also duplicate a value that v2's splitting makes non-uniform, so the
+  redundancy would have to be maintained or become wrong.
+
+  `create(root, cfg, &info)` fills the same struct at **zero** cost, since
+  `create` has every value in RAM already. That is the path an application would
+  actually use; `stat()` serves reopen and reporting.
+
+  This closes the "cannot be read back" half of **K9** and the geometry half of
+  **K10** — `app_cbor_persondb`'s store report prints "bucket count not
+  observable — FINDINGS.md K10" today. It does **not** close K10's entry-count
+  half, and that is a deliberate trade rather than an oversight.
 - **No override, and this is deliberate.** An earlier draft of this section
   proposed `bucket_count_override` "for the caller who genuinely knows better".
   That is `initial_capacity` under a friendlier name, and it is struck. It
@@ -600,6 +631,16 @@ covers a split without a reachability GC is what review must settle.
 byte-count and capacity result in §1 and §5, and leaves K2 and K3 open — which
 §5.1 argues is affordable, because two levels make the margin that guards
 against K2 essentially free.
+
+**9.1a A split breaks the uniformity that makes `stat()` free.** Noted here so
+v2 inherits it rather than rediscovers it. v1's sub-maps all have the same
+bucket count, so `buckets` is `fanout × n` — arithmetic over two blob reads
+(§7). Splitting makes sub-maps differ by construction, after which the total is
+either an O(*m*) query or a running count maintained in the top level, which
+means **rewriting the top level on every split**. The top level is otherwise
+written exactly once, at `create`, which is most of why v1 carries no new
+crash-consistency work. So v2 pays for that number twice: once in writes, once
+in the commit protocol.
 
 **9.2 Split latency.** Rehashing a sub-map lands in the middle of a `set`, on a
 device where rewriting one bucket is already the expensive operation (K4).
@@ -852,9 +893,22 @@ For the record, so these are not re-opened as blockers:
   the field meanings enforceable: `NULL` ≡ `{0}` ≡ no information; each field
   independently unset at zero; and **a field that is set is honoured or
   refused, never silently clamped** — which closes K9(b) as well as K9(a).
-- **D3b.** Is `kvhash_info()` (readback of depth, fan-out, bucket count, entry
-  count) in scope? It closes half of **K9** and much of **K10**, and it is
-  independent of everything else here.
+- **D3b. DECIDED: geometry readback in v1, and nothing that costs a write.**
+  `map_ops.stat()` plus a `create()` out-param, reporting only what the map
+  already persists to function: depth, fan-out, bucket count, entry-size ceiling
+  (§7). One or two blob reads on the reopen path, zero through `create`.
+
+  **Entry count is excluded**, because maintaining it means rewriting a
+  directory on every insert and delete — reintroducing the K5 traffic this
+  proposal exists to remove — and computing it on demand means a full walk
+  (B4). Largest-stored-entry likewise. No new persisted fields, no counters, no
+  writes: if a value cannot be derived from what the map already stores, it is
+  not in the struct.
+
+  What it buys is the one thing D3a made unobservable: with no override and no
+  readback, the derivation rule would be trusted rather than checkable. What it
+  does not buy is anything a running system needs — there is no functional
+  caller, only the report path, a post-`create` log line, and tests.
 - **D3c.** Per-map bucket sizing (§7.1) — worth it, or does declarative config
   make it redundant by deriving bucket size from the declared entry size?
 - **D4. DECIDED: v1 — fixed two levels, splitting deferred.**
