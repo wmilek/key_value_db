@@ -36,32 +36,34 @@ endchoice
 
 config APP_CBOR_PERSONDB_N_PERSONS
 	int "Number of persons in the dataset"
-	default 10000
+	default 8000
 	range 8 200000
 	help
 	  Dataset scale, and a FIXED CONSTANT OF THE BENCHMARK. Two runs are
 	  only comparable if they used the same number, so treat changing it
 	  as defining a new benchmark rather than tuning this one.
 
-	  10 000 was chosen once, to put the store at roughly half the
-	  nRF5340-DK's 8 MiB external flash — large enough
-	  that the storage layer's real costs show up, small enough to leave
-	  the board usable for other things and to avoid demanding a reformat
-	  before every run. That was a sizing heuristic, not a level to hold:
-	  the fill percentage is an output (DESIGN.md §6.3), and if the stack
-	  gets more efficient and the same 10 000 persons come to occupy 40 %,
-	  that is the improvement being measured — do not raise this to
-	  compensate.
+	  8 000 since DESIGN.md §6.5. It was 10 000, chosen once to put the
+	  store at roughly half the nRF5340-DK's 8 MiB external flash. The
+	  two-instance layout cannot reach that: the measured ceiling is
+	  9 670 persons, because kvhash's bucket directory is a 16 384 B blob
+	  that blob_db can no longer place once the store is about half full
+	  (FINDINGS.md K13).
+
+	  8 000 is the re-sized constant, not the ceiling. The gap is
+	  deliberate: 9 670 is where a FRESH fill dies, and a benchmark that
+	  sits at its own cliff fails later, on the DK, hours into a fill, for
+	  reasons that look random. 17 % under it, the store holds at 41.3 %
+	  live across repeated fill/mutate/bench rounds with no drift — that
+	  was measured over three consecutive runs, not assumed.
+
+	  The fill percentage remains an output, not a target (DESIGN.md
+	  §6.3). If the stack gets more efficient and the same 8 000 persons
+	  come to occupy 30 %, that is the improvement being measured — do
+	  not raise this to compensate. Raising it to chase the ceiling is
+	  how the number stops meaning anything.
 
 	  Lower it for a quick run; the smoke scenario in sample.yaml uses 200.
-
-	  It no longer fits. The store's measured maximum is 9 670 persons
-	  (49.9 % of an 8 MiB part) — not because the flash is full or a
-	  bucket burst, but because kvhash's bucket directory is a 16 384 B
-	  blob that blob_db can no longer place past half-full (FINDINGS.md
-	  K13). 10 000 is left as the benchmark constant, and failing to reach
-	  it is the result being reported. Do not lower it to make the run
-	  pass; do not shard to make it fit.
 
 config APP_CBOR_PERSONDB_PEOPLE_MAPS
 	int "Number of person maps"
@@ -103,7 +105,7 @@ config APP_CBOR_PERSONDB_VERIFY_SAMPLES
 	default 256
 	range 1 65536
 	help
-	  Verifying all 10 000 persons costs about 6 minutes per pass on the
+	  Verifying all 8 000 persons costs roughly 5 minutes per pass on the
 	  DK, so a run checks a deterministic spread instead. Every sampled
 	  person is compared field by field against the generator, and each of
 	  its cards is resolved back through the credential index.

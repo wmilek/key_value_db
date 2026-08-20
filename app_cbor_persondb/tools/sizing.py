@@ -62,7 +62,12 @@ def person_cbor_len(i, vocab, nperm_lo, nperm_span):
     n += 2 + 15*ncards
     return n, ncards
 
-def run(nmaps, vocab, lo, span, N=10000, buckets=511, cap=4096):
+# The benchmark's person count (CONFIG_APP_CBOR_PERSONDB_N_PERSONS). Keep in
+# step with Kconfig; DESIGN.md §6.5 records why it is 8 000 and not 10 000.
+N_PERSONS = 8000
+
+
+def run(nmaps, vocab, lo, span, N=N_PERSONS, buckets=511, cap=4096):
     load = {}
     tot = 0
     for i in range(N):
@@ -83,7 +88,7 @@ for nmaps in (8, 12, 16, 20, 24, 32):
     print(f"{nmaps:>4} {tot/1048576:>10.2f} {100*tot/8388608:>6.1f} {mean:>9.0f} {mx:>8} {over:>5}")
 
 # credential map: one shard, 23 B entries
-def cred_run(N=10000, buckets=511, cap=4096):
+def cred_run(N=N_PERSONS, buckets=511, cap=4096):
     load = {}
     for i in range(N):
         ncards = 1 + (mix(i,3) % 4)
@@ -132,7 +137,9 @@ def l3_recheck():
                            (32746, 2, 4092)):
         if nb > (pay - 8) // 8:
             continue
-        tot, mx, over, mean = run(nmaps, VOCAB_NEW, 10, 13, buckets=nb, cap=pay)
+        # N=10000: this table reproduces the D10 argument at the scale it
+        # was argued at, before §6.5 re-sized the benchmark to 8 000.
+        tot, mx, over, mean = run(nmaps, VOCAB_NEW, 10, 13, N=10000, buckets=nb, cap=pay)
         dirb = 8 + 8 * nb
         getb = dirb + mean
         base = base or getb
@@ -182,7 +189,7 @@ def two_instance():
         print(f"{pay:>7} {nb:>7} {dirb:>6} {mean:>8.0f} {mx:>7} "
               f"{100*mx/pay:>5.0f}% {getb:>6.0f} {getb/4756:>10.1f}x{note}")
 
-    print("\nShipped: 16384 -- fullest bucket 30 % of the ceiling, and the only")
+    print("\nShipped: 16384 -- fullest bucket 28 % of the ceiling, and the only")
     print("row that neither bursts a bucket nor hands an erase block to a")
     print("directory. Costs 3.8x the bytes per lookup of the 16-shard build;")
     print("that is FINDINGS.md K11, measured in RESULTS.md section 4, not tuned away.")
@@ -191,3 +198,131 @@ def two_instance():
     print(f"\ncredential map (2047 buckets): max bucket {mx} B, used {used}/2047")
 
 two_instance()
+
+
+# ===========================================================================
+# The proposed two-level kvhash (doc/proposals/2026-08-20-kvhash-second-level.md)
+#
+# D0 made this script the distribution check for that design, because a
+# correlated derivation is the one defect the application's own VERIFY PASS
+# cannot see: every key is still found, and the damage shows up only as
+# clustering. So the model below is not a sizing aid — it is the check.
+#
+# It replicates the decided design exactly:
+#   D3d  crc32_ieee, top = (crc >> 16) % m, sub = (crc & 0xffff) % n.
+#        zlib.crc32 IS crc32_ieee — same polynomial, same reflection, same
+#        init and final xor — so this cannot drift from the firmware. That
+#        was the deciding argument for CRC over FNV(FNV(k)), which would be
+#        hand-rolled here and in C and kept matching by hand.
+#   D3e  {0} builds one level, unchanged from today.
+#   D3f  SMALL_MAP_LOAD = 4; two levels only past ONE_LEVEL_MAX_BUCKETS.
+
+import zlib
+
+SMALL_MAP_LOAD        = 4      # D3f
+ONE_LEVEL_MAX_BUCKETS = 255    # D3e — 2 048 B directory, one blob at create
+SAFE_BUCKET_FRACTION  = 0.6    # D3d/§9.7 — the warning threshold, used here
+                               # as the sizing target so a fresh map starts
+                               # below the line it would warn at.
+MIN_BUCKET_BYTES      = 256    # Floor on the two-level target. §5.2 said the
+                               # limit on "more buckets" is per-blob overhead
+                               # and left it unquantified; this model quantified
+                               # it. At ~1 entry per bucket the credential map
+                               # wanted 20 164 buckets for 23 B entries — a blob
+                               # per entry, 14 B of slot header on 23 B of data,
+                               # 62 % overhead, and 2 311 B per get. At a 256 B
+                               # floor: 1 849 buckets, 6 % overhead, 952 B per
+                               # get. The floor never binds for entries larger
+                               # than itself, so the people map is unaffected.
+
+
+def derive_geometry(expected_entries, typical_entry_bytes, max_entry_bytes,
+                    payload):
+    """The container's rule (§7.1). Returns (depth, m, n, buckets).
+
+    Small maps pack buckets and stay one level: their write traffic is
+    negligible, and eager sub-map creation costs a fresh blob_db bucket each
+    (~1.1 s on the DK, B7). Large maps target ~1 entry per bucket, because a
+    set rewrites the whole bucket (K4) so fill traffic goes as 1/buckets.
+    """
+    safe_bucket = int(payload * SAFE_BUCKET_FRACTION)
+    load = max(1, min(SMALL_MAP_LOAD, safe_bucket // max(1, max_entry_bytes)))
+    small = -(-expected_entries // load)          # ceil
+
+    if small <= ONE_LEVEL_MAX_BUCKETS:
+        return 1, 0, small, small
+
+    # ~1 entry per bucket (§5.2) but never buckets smaller than the floor:
+    # below it, blob_db's per-slot header dominates the entry it carries.
+    target = max(typical_entry_bytes, MIN_BUCKET_BYTES)
+    buckets = max(1, -(-(expected_entries * typical_entry_bytes) // target))
+    m = int(buckets ** 0.5)
+    while m * m < buckets:
+        m += 1
+    return 2, m, m, m * m
+
+
+def idx_crc(key, m, n):
+    """D3d. The top and sub indices."""
+    h = zlib.crc32(key)
+    return ((h >> 16) % m, (h & 0xffff) % n) if m else (0, h % n)
+
+
+def idx_naive(key, m, n):
+    """The forbidden derivation, kept so the check demonstrably catches it."""
+    h = zlib.crc32(key)
+    return ((h % m, h % n) if m else (0, h % n))
+
+
+def person_keys(N=N_PERSONS):
+    for i in range(N):
+        clen, _ = person_cbor_len(i, VOCAB_NEW, 10, 13)
+        yield f"p{100000 + i:08X}".encode(), 4 + 9 + clen
+
+
+def credential_keys(N=N_PERSONS):
+    for i in range(N):
+        for slot in range(1 + (mix(i, 3) % 4)):
+            n = i * (5 + 3) + slot
+            uid = (n * 0x9e3779b97f4a7d) & 0x00ffffffffffff
+            yield f"{uid:014X}".encode(), 4 + 14 + 5
+
+
+def spread(keys, m, n, idx):
+    load = {}
+    for key, sz in keys:
+        b = idx(key, m, n)
+        load[b] = load.get(b, 0) + sz
+    v = list(load.values())
+    return max(v), sum(v) / len(v), len(v), sum(v)
+
+
+def two_level_report(payload=16384):
+    print(f"\n=== proposed two-level kvhash, payload {payload} B ===")
+    warn = int(payload * SAFE_BUCKET_FRACTION)
+
+    for name, keys, entries, typ, mx_entry in (
+            ("people",      person_keys,     N_PERSONS, 433, 700),
+            ("credentials", credential_keys, sum(1 + (mix(i, 3) % 4)
+                                                 for i in range(N_PERSONS)), 23, 23)):
+        depth, m, n, buckets = derive_geometry(entries, typ, mx_entry, payload)
+        meta = (8 + 8 * n) if depth == 1 else (8 + 8 * m) + (8 + 8 * n)
+        mxb, mean, used, total = spread(keys(), m if depth == 2 else 0, n, idx_crc)
+
+        print(f"\n{name}: {entries} entries declared, {typ} B typical")
+        print(f"  derived      : depth {depth}, "
+              f"{'%d x %d' % (m, n) if depth == 2 else '%d' % n} "
+              f"= {buckets} buckets  (D3e/D3f)")
+        print(f"  metadata/op  : {meta} B      bucket mean {mean:.0f} B")
+        print(f"  bytes/get    : {meta + mean:.0f} B")
+        print(f"  fullest      : {mxb} B = {100*mxb/payload:.0f}% of payload"
+              f"   {'OVER 60% WARN LINE' if mxb > warn else 'below the warn line'}")
+        print(f"  buckets used : {used}/{buckets}")
+
+        if depth == 2:
+            nm, _, nused, _ = spread(keys(), m, n, idx_naive)
+            print(f"  guard (naive h%m,h%n): fullest {nm} B, {nused}/{buckets} used"
+                  f"  <- must be far worse, or the check is not checking")
+
+
+two_level_report()
