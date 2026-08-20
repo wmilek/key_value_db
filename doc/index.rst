@@ -38,6 +38,7 @@ instructions live in the repository ``README.md``.
    :caption: Design — implementation
 
    impl/l1_bucketlog
+   impl/l0_backends
 
 .. toctree::
    :maxdepth: 1

@@ -11,12 +11,99 @@ Target board for bring-up: `native_sim`.
 
 ---
 
-## 1. Approach & cost summary
+## 1. The idea, and what it costs
 
-One erase sector = one **bucket**; a blob with id `i` lives in bucket
-`i mod N`. Buckets are append-only slot logs; per-bucket compaction reclaims
-garbage; a double-buffered master sector carries generation, compaction
-state, and the id hint.
+### 1.1 What flash allows
+
+Everything below follows from one property of NOR flash: **programming only
+clears bits (1→0), and the only way to set them back is to erase — a whole
+sector at a time.** Nothing can be modified in place. A design can therefore
+do exactly two things cheaply: *append* into space that is still erased, and
+*read*. Erasing is the expensive, destructive operation, so it must be rare
+and must never be the only thing standing between a crash and the data.
+
+That rules out any layout that maintains a record by rewriting it. What is
+left is a log: write forward, and let the newest entry define the truth.
+
+### 1.2 A bucket is one erase sector
+
+The allocator divides the partition into **buckets, one per erase sector**, and
+a blob with id `i` lives in bucket `i mod N`. That is the whole index: the id
+*is* the address, so nothing has to be looked up, cached, or rebuilt at mount
+to find where a blob lives (P3, P5).
+
+A bucket holds a small fixed **header** and, after it, an append-only stream of
+variable-length **slots**:
+
+```
+┌────────────┬────────────┬────────────┬───────────┬──────────────────────────┐
+│ hdr (16 B) │ slot       │ slot       │ slot      │ still erased (0xff …)    │
+└────────────┴────────────┴────────────┴───────────┴──────────────────────────┘
+                                                   ▲
+                                                   write cursor
+```
+
+The header is written once per erase; slots accumulate after it. Each slot is
+self-describing — flags, `val_len`, the id, the payload, a CRC — and `val_len`
+gives the stride to the next slot, so the stream is walked without any index.
+The **write cursor** is not stored anywhere: it is the first offset whose slot
+header cannot be trusted (still erased, or malformed), found by walking.
+
+### 1.3 Three operations, one primitive
+
+Every mutation is the same primitive — *append a slot* — and the rule that
+gives it meaning is **latest wins**: for a given id, the last matching slot in
+append order is the truth.
+
+| Operation | What is written | What happens to the old bytes |
+|---|---|---|
+| bind (first `update`) | a slot carrying the payload | — |
+| rebind (later `update`) | a *new* slot with the new payload | the previous slot is left in place and becomes garbage |
+| `delete` | a slot with the TOMBSTONE flag and no payload | likewise |
+
+So a rebind does not overwrite, and a delete does not remove. Both append, and
+both work by *shadowing* what came before. A read walks the bucket and takes
+the last slot for the id: if that slot is a tombstone, the blob reads as gone
+(`-ENOENT`); otherwise its payload is the current value.
+
+```
+append order ──►
+  [id=7 "aaa"]   [id=7 "bb"]   [id=7 ✝]
+   garbage        garbage       current: id 7 is dead
+```
+
+This is also what makes a mutation atomic against power loss for free. A slot
+is assembled complete in RAM — flags, id, payload, and a CRC over all of it —
+and handed to the store as **one write into erased space**. It therefore either
+lands whole, or lands as something that fails its own CRC (or never gets its
+SEALED flag), which readers skip. Either way the *previous* slot for that id is
+untouched and is still the newest valid one, so the old value survives intact.
+No journal, no two-phase write, no recovery pass: the commit point *is* the
+moment the new slot verifies.
+
+### 1.4 Garbage, and getting rid of it
+
+The cost of never overwriting is that dead slots accumulate: every rebind and
+every delete leaves one behind. A bucket therefore fills faster than its live
+contents suggest. Compaction is lazy: when an append finds the next slot would
+not fit, the allocator **compacts** the bucket first — builds an image holding
+only the live slots, dropping tombstones and superseded ones, stages it in the
+scratch sector, then erases the bucket and writes the image back (§5.6). This
+is where a tombstone's bytes finally disappear, and — apart from `format`, and
+`prepare` pre-erasing empty sectors — the only thing that erases at all.
+
+Compaction reclaims *space*, never *ids*. A deleted id stays permanently spent:
+the id counter is a durable ceiling that never moves backwards (§13.1), so an
+id is never re-issued even after every trace of it has been compacted away.
+That is what lets the layers above treat a stale id as safely dead rather than
+as a pointer that might silently resolve to somebody else's blob.
+
+Two sectors sit outside this scheme: a **master** (double-buffered across two
+sectors) carrying the generation counter, compaction state and the id ceiling,
+and a **scratch** sector that compaction stages into so a crash mid-rebuild
+cannot lose the bucket.
+
+### 1.5 Cost summary
 
 Costs achieved by this design (satisfying contract §3):
 
@@ -533,6 +620,21 @@ draft implementation and will be reworked against the final API; the
    sketches below) bind id = 1 directly, which is legitimate in registry-less
    builds; once the demo image enables the root registry, they move to
    `ROOTREG_KEY` roots.
+7. **A foreign *substrate* classifies as `CORRUPT`, not `FOREIGN`.** The
+   compatibility prefix (§3.1) lets a build classify a store written by
+   another *allocator* and refuse it (D1). It does not reach the *backend*
+   axis added by the `blob_db_store` seam: booting a `flash_area` build on a
+   partition holding a UBI volume fails the prefix CRC before the magic is
+   ever compared, so both masters land in `CORRUPT` — and
+   `BLOB_DB_AUTOFORMAT_ON_CORRUPT` (default `y`) then reformats a perfectly
+   good store of the other kind. Measured, both directions, in
+   `doc/impl/l0_backends.md` §4; the reverse direction is safe because UBI's
+   own attach refuses first. Candidate fix: a backend-id byte inside the
+   frozen prefix so a substrate mismatch classifies as `FOREIGN` (never
+   formatted). That is an on-flash format change — cheap now, since the
+   prefix already carries `hdr_len` and reserved space, and it needs a
+   `format_minor` bump at most. Until then, production builds should set
+   `BLOB_DB_AUTOFORMAT_ON_CORRUPT=n`.
 
 ---
 

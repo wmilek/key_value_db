@@ -9,10 +9,14 @@
  * within). This header abstracts that access so the same blob_db algorithm
  * can run on two substrates, selected at build time:
  *
- *   - flash_area  (default) — raw partition via Zephyr's flash_area API.
- *   - UBI                    — a dynamic UBI volume; each PEB maps 1:1 to a
- *                              LEB and blob_db's in-place slot appends map
- *                              directly onto ubi_leb_write_at().
+ *   - UBI (default) — a dynamic UBI volume; each PEB maps 1:1 to a LEB and
+ *                     blob_db's in-place slot appends map directly onto
+ *                     ubi_leb_write_at().
+ *   - flash_area    — raw partition via Zephyr's flash_area API. No wear
+ *                     leveling and no bad-block handling; faster.
+ *
+ * The layouts are NOT interchangeable — see doc/impl/l0_backends.md §4 for
+ * what happens when a build meets the other one.
  *
  * A byte offset passed to read/write/erase never crosses a PEB boundary
  * (blob_db operates one bucket/master/scratch sector at a time), so a backend

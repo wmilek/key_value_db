@@ -1,110 +1,147 @@
 # L0 — Flash Translation Layer
 
-Status: v1 (interface fixed; UBI-like provider is future work)
+Status: v2 (the L0 boundary is the `blob_db_store` seam; two providers ship,
+UBI is the default)
 · Part of the stack in `doc/architecture.md` · Governed by `doc/principles.md`
+· Provider implementations (non-normative): `doc/impl/l0_backends.md`
 
 ---
 
 ## 1. Role
 
-L0 owns raw flash: erase blocks, write alignment, and — in its future form — wear
-leveling, bad-block handling, and logical-to-physical block mapping. It presents
-the layer above (L1, `blob_db`) with a **linear, sector-erasable partition**
-through one fixed interface: Zephyr's `flash_area` API.
+L0 owns raw flash: erase blocks, write alignment, and — where the substrate
+needs it — wear leveling, bad-block handling, and logical-to-physical block
+mapping. It presents the layer above (L1, `blob_db`) with a **uniform array of
+equally-sized, individually-erasable blocks**, and nothing else.
 
-The interface is the design decision; the provider behind it is interchangeable.
+The **interface is the design decision; the provider behind it is
+interchangeable.** That interface is `lib/blob_db/blob_db_store.h`, and a
+build selects one provider through the `BLOB_DB_BACKEND` Kconfig choice.
 
 ```
 ┌──────────────────────────────────────────────┐
 │ L1  blob_db                                  │
 └──────────────────────────────────────────────┘
-                 │  <zephyr/storage/flash_map.h>
-                 │  flash_area_{open,close,read,write,erase}
-                 │  flash_area_{get_size,get_sectors,align}
+                 │  lib/blob_db/blob_db_store.h
+                 │  blob_db_store_{open,close,read,write,erase}
+                 │  struct blob_db_store_geom {peb_size, write_align, n_pebs}
                  ▼
 ┌──────────────────────────────────────────────┐
-│ L0 provider (one of):                        │
-│   a) fixed DT partition on NOR / native_sim  │   ← today
-│   b) UBI-like FTL exposing a virtual         │   ← future
-│      flash_area over NAND                    │
+│ L0 provider (exactly one, Kconfig choice):   │
+│   a) flash_area over a fixed DT partition    │   BLOB_DB_BACKEND_FLASH_AREA
+│   b) a dynamic UBI volume                    │   BLOB_DB_BACKEND_UBI ← default
 └──────────────────────────────────────────────┘
 ```
 
+### 1.1 Why the boundary is not `flash_area` (supersedes the v1 plan)
+
+v1 of this document put the boundary at Zephyr's `flash_area` API and specified
+UBI integration as a *virtual `flash_area` provider* — "a pointer swap via
+`CONFIG_BLOB_DB_PARTITION_LABEL`, zero code in this repository". That plan was
+abandoned during implementation: a synthesized `flash_area` would have had to
+hide block identity behind a flat offset and then reconstruct it, which costs
+`blob_db` its append-in-place write and buys nothing.
+
+The boundary therefore moved up one level, to a **narrower** contract than
+`flash_area` (P6): five calls and three geometry fields, none of which assume a
+Zephyr flash map. `flash_area` is now one provider behind the seam rather than
+the boundary itself.
+
 ## 2. The interface contract
 
-L1 consumes **only** the following, and L0 providers must honor exactly this —
-nothing more is ever assumed (principle P6):
+L1 consumes **only** the following, and every L0 provider must honor exactly
+this — nothing more is ever assumed (P6):
 
 | Primitive | Contract |
 |---|---|
-| `flash_area_open/close` | Partition resolved by label (`CONFIG_BLOB_DB_PARTITION_LABEL`); geometry stable for the mount's lifetime. |
-| `flash_area_read` | Returns the last committed bytes at that offset. |
-| `flash_area_write` | Write-block aligned (`flash_area_align`); a completed write is durable across power loss. |
-| `flash_area_erase` | Returns whole sectors to the all-`0xff` state. |
-| `flash_area_get_sectors` | Reports erase-block geometry; L1 sizes its buckets from it at runtime. |
-| **Torn-write blast radius** | A power loss mid-write/mid-erase may leave arbitrary bytes **in the affected sector only**. Other sectors are untouched. |
+| `blob_db_store_open` | Opens the substrate and reports geometry: `peb_size` (usable bytes per block), `write_align`, `n_pebs`. |
+| `blob_db_store_read` | Returns the last committed bytes at that offset. |
+| `blob_db_store_write` | Offset and length aligned to `write_align`; a completed write is durable across power loss. Never spans two blocks. |
+| `blob_db_store_erase` | Returns whole blocks to the erased state; afterwards the region reads back as `0xff`. |
+| `blob_db_store_close` | Releases the substrate. Idempotent. |
+| **Torn-write blast radius** | A power loss mid-write/mid-erase may leave arbitrary bytes **in the affected block only**. Other blocks are untouched. |
+| **Geometry stability** | The same store reports the same `peb_size` and `n_pebs` on every boot. |
 
-The last row is the load-bearing one: L1's crash model (CRC-guarded slots,
-double-buffered master, scratch-sector compaction — see
-`doc/layers/l1_blob_db.md` §8) absorbs any single-sector corruption, but assumes
-corruption never leaks across sector boundaries.
+Two rows carry the weight.
 
-## 3. Provider a) — fixed partition (today, v1)
+**Torn-write blast radius.** L1's crash model absorbs any single-block
+corruption but assumes corruption never leaks across block boundaries. A
+provider that cannot promise this cannot carry `blob_db` — including one that
+relocates blocks internally, which must commit the move atomically rather than
+leave two partial copies.
 
-- A `fixed-partitions` child node in the device tree (label `storage`), mapped
-  1:1 onto physical flash. On `native_sim`: 16 MB simulated flash, 8 MB
-  partition at 0x800000 (`app/boards/native_sim.overlay`).
-- 1 sector = 1 physical erase block. No remapping, no wear leveling, no bad
-  blocks — appropriate for NOR and for simulation.
-- Zero code in this repository: the provider is Zephyr's flash map over the
-  platform flash driver. Enabled by `CONFIG_FLASH` + `CONFIG_FLASH_MAP`
-  (selected by `CONFIG_BLOB_DB`).
+**Geometry stability.** L1 places blobs by block count, so a store that reports
+a different `n_pebs` on a later boot is a *different store*: every id resolves
+elsewhere. A provider whose geometry depends on anything but the device must
+derive it deterministically.
 
-Wear consideration without an FTL: L1 already spreads erases naturally — writes
-are append-only per bucket, sequential ids round-robin across all 2045 buckets,
-and only compaction erases. Hot-spot risk concentrates in the two master sectors,
-which alternate (double-buffering halves the wear) and are written only
-occasionally (id-hint persistence, compaction brackets).
+Two properties are deliberately **not** promised, and L1 must never grow a
+dependency on either: that a block's usable size equals the physical erase-block
+size, and that flat offsets correspond to physical addresses. Neither holds
+under a translating provider.
 
-## 4. Provider b) — UBI-like FTL (future)
+## 3. The providers
 
-A translation layer inspired by Linux UBI, for flash that needs management
-(NAND, or NOR at high write volumes):
+Both are implemented. What distinguishes them, at this altitude, is only what
+they guarantee about the substrate:
 
-- **Logical erase blocks (LEBs)** presented upward as the sectors of a virtual
-  `flash_area`; mapped to physical erase blocks (PEBs) via per-PEB headers.
-- **Wear leveling** by moving cold LEBs onto worn PEBs.
-- **Bad-block handling** by remapping LEBs away from failed PEBs (NAND).
-- **Same contract as §2** at its upper edge — including the single-sector torn
-  blast radius, which the FTL must preserve even though a logical write may
-  internally involve a PEB copy.
+| | `flash_area` | UBI (default) |
+|---|---|---|
+| Wear leveling | none | yes |
+| Bad-block handling | none | yes |
+| Torn write during an internal move | n/a — no moves | contained (§2) |
+| `peb_size` vs physical erase block | equal | smaller (per-block headers) |
+| Cost | faster, smaller | slower reads, more flash |
 
-Integration is a pointer swap, not a rewrite: `blob_db` gets aimed at the FTL's
-virtual partition via `CONFIG_BLOB_DB_PARTITION_LABEL`. No source change above
-L0 (see `doc/architecture.md` §4 and the L1 contract, decision D1).
+`flash_area` maps 1:1 onto a device-tree partition and manages nothing, which
+suits NOR and simulation and keeps blob_db's structures at known partition
+offsets — useful to tests that inject faults there. UBI is the default on the
+grounds that a store which survives a torn write is worth more than a faster
+one.
 
-The FTL's own design (PEB header format, atomic LEB move, erase-counter
-persistence) will be specified in a dedicated document when scheduled:
-`doc/layers/l0_ubi.md`.
+Measured costs, geometry overhead, the operation mapping and the
+per-board configuration each provider needs are implementation matters:
+`doc/impl/l0_backends.md`.
+
+## 4. Store compatibility
+
+The two providers write **incompatible on-flash layouts**. Switching an
+existing device between backends requires erasing the partition deliberately.
+
+Mount does not reliably refuse the mismatch. One direction is refused cleanly
+before `blob_db` mounts; the other is currently **destructive** — a
+`flash_area` build reformats a UBI store rather than rejecting it, because a
+foreign substrate is indistinguishable from a corrupt store at the point where
+mount decides. Until that is closed, production builds should set
+`CONFIG_BLOB_DB_AUTOFORMAT_ON_CORRUPT=n`, which turns the destructive case into
+`-EIO` with nothing written.
+
+This is a gap against the L1 contract's D1 rule — "distinct on-flash magic so a
+mismatched mount fails cleanly with `-ENOTSUP`" — which was written for the
+allocator axis and does not reach the backend axis. The measured behavior in
+both directions, the reason, and the candidate fix are in
+`doc/impl/l0_backends.md` §4 and `doc/impl/l1_bucketlog.md` §13.7.
 
 ## 5. Kconfig
 
-Today L0 has no symbols of its own — L1 `select`s `FLASH` and `FLASH_MAP`, and
-the partition is chosen by `CONFIG_BLOB_DB_PARTITION_LABEL`. The future FTL adds:
+L0 is selected through one choice, owned by L1's Kconfig
+(`lib/blob_db/Kconfig`) because the seam is L1-internal:
 
 ```
-CONFIG_FLASH_UBI            bool "UBI-like flash translation layer"
-CONFIG_FLASH_UBI_...        (spares %, wear-leveling threshold, …)
+choice BLOB_DB_BACKEND
+    BLOB_DB_BACKEND_FLASH_AREA    raw partition via flash_area
+    BLOB_DB_BACKEND_UBI           dynamic UBI volume        (default)
 ```
 
-with the stack above unchanged: selecting the FTL only changes which partition
-label L1 is pointed at.
+The partition is named by `CONFIG_BLOB_DB_PARTITION_LABEL` under either
+backend.
 
-## 6. What L0 must never do
+## 6. What an L0 provider must never do
 
 - Cache writes in RAM and acknowledge before they are durable (breaks P7).
 - Reorder a write after a later write's acknowledgment (breaks L1's master
   generation ordering).
-- Let a torn operation corrupt a sector other than the one being written/erased.
-- Change geometry (sector size/count) between mounts without an explicit
-  reformat story.
+- Let a torn operation corrupt a block other than the one being
+  written/erased (§2).
+- Report a different `peb_size` or `n_pebs` for the same store on a later boot
+  without an explicit reformat story (§2).

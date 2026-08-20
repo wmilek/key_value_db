@@ -37,7 +37,7 @@ permissions:
 
 jobs:
   native-sim:
-    name: native_sim (twister + UBI backend)
+    name: native_sim (twister + flash_area backend)
     runs-on: ubuntu-latest
     container:
       image: ghcr.io/zephyrproject-rtos/ci:latest
@@ -57,15 +57,21 @@ jobs:
           west init -l key_value_db
           west update --narrow -o=--depth=1
 
-      - name: Twister — apps & tests (native_sim, flash_area backend)
+      # blob_db defaults to the UBI backend, so this is what the apps and the
+      # suites without an explicit backend run on. tests/lib/blob_db pins both
+      # backends per scenario and therefore covers flash_area at runtime here
+      # too.
+      - name: Twister — apps & tests (native_sim, default = UBI backend)
         run: |
           west twister -T key_value_db -p native_sim -v --inline-logs
 
-      - name: Build app on the UBI backend (native_sim)
+      # The apps above are only ever built on the default backend. Build one on
+      # flash_area so the non-default backend does not rot in application
+      # builds — it is still a supported option, just no longer the default.
+      - name: Build app on the flash_area backend (native_sim)
         run: |
-          west build -p always -b native_sim -d build/kvdb_ubi key_value_db/app -- \
-            -DCONFIG_BLOB_DB_BACKEND_UBI=y \
-            -DCONFIG_UBI_MAX_NR_OF_DATA_PEBS=2046
+          west build -p always -b native_sim -d build/kvdb_flash key_value_db/app -- \
+            -DCONFIG_BLOB_DB_BACKEND_FLASH_AREA=y
 
   cross-build:
     name: nrf5340dk cross-build (both backends)
