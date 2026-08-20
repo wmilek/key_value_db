@@ -1,0 +1,22 @@
+# kvhash sample — Kconfig entry point.
+#
+# Copyright (c) 2026
+# SPDX-License-Identifier: Apache-2.0
+
+menu "Zephyr"
+source "Kconfig.zephyr"
+endmenu
+
+module = SAMPLE_KVHASH
+module-str = SAMPLE_KVHASH
+source "subsys/logging/Kconfig.template.log_config"
+
+config SAMPLE_KVHASH_FRESH_START
+	bool "Erase the store at boot"
+	default y
+	help
+	  Erase the blob_db store before the sample runs, so every run starts
+	  from an empty map and prints the same narration. Set to n and rerun
+	  against the same flash (on native_sim: ./zephyr.exe --flash=kvhash.bin)
+	  to watch step 2 take the "reopen" path instead — the map is found
+	  through the root registry and its contents survive the reboot.
