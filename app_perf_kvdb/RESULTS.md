@@ -101,10 +101,10 @@ format erased moments earlier, so it hands one over without touching flash.
 
 **This is a genuine saving of ~129 s on first population, not an accounting
 artifact** — but it is available only while UBI has pre-erased blocks in
-hand. `app_perf_mc/RESULTS.md` measures the same `prepare` phase at
-1 088 542 µs/op on UBI, identical to `flash_area`, because that app runs
-`erase_all()` and then `prepare()` on a volume already in use. UBI moves
-erase cost in time; it does not remove it.
+hand. `app_perf_mc/RESULTS.md` now shows both sides of that from a single
+binary run twice: 1 279 µs/op on a volume UBI has just formatted, and
+1 102 000 µs/op on the very next run, when the pool is spent. UBI moves erase
+cost in time; it does not remove it.
 
 ### Steady state is slower, in proportion to read count
 

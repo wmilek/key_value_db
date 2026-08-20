@@ -14,14 +14,20 @@ scale against is now 2174 reads/s (460 µs).
 costs roughly 2× on reads, so the numbers a caller should expect from a
 default build are the UBI column, not the first table.
 
+The UBI numbers were **revalidated on the DK at `1d3fcb6`**, after the default
+flip, from a build that takes the backend from Kconfig with no override. Two
+fresh runs reproduce the timed phases within a tick, and settle what `prepare`
+costs on UBI: nothing on a freshly formatted volume, a full sector erase per
+bucket on one already in use. See "`prepare` on UBI is not one number".
+
 ## Setup
 
 - **Target**: nRF5340-DK (S/N 960115021, PCA10095), cpuapp core
 - **Storage**: `storage_partition` on the on-board MX25R6435F QSPI NOR
   (8 MB, 64 KB sectors, 8 MHz Quad-SPI)
 - **Config**: `N_KEYS = 10`, `N_GET = 100`, `N_OVW = 50`, `VAL_LEN = 24 B`
-- **Code**: `e80f404`; **Zephyr** build `4a405846193f`, SDK
-  `zephyr-sdk-1.0.1`
+- **Code**: `e80f404` for the `flash_area` table, `1d3fcb6` for the UBI
+  revalidation; **Zephyr** build `4a405846193f`, SDK `zephyr-sdk-1.0.1`
 - One `erase_all` + `blob_db_prepare(150)` up front (capped to the 124
   non-root buckets), so every timed op runs on the warm append-only path.
 
@@ -51,19 +57,21 @@ Behaviour is bit-for-bit identical across the change: same `get checksum:
 ## On the UBI backend (the default)
 
 Same commit, same board, same defaults; only `CONFIG_BLOB_DB_BACKEND_UBI`
-differs, taken from the board conf rather than a command-line override.
+differs. **Revalidated on `1d3fcb6`** after the default flip, where the backend
+now comes from the Kconfig default with no override on the command line at all.
+Three UBI runs agree to within 0.7% on every timed phase except `cleanup`,
+which is a single op timed to 1 ms and moves by one tick; all three produce
+`get checksum: 0xac6a5f02` and the same 1-live-blob end state.
 
-| workload  | `flash_area` |     UBI |     Δ |
-| --------- | -----------: | ------: | ----: |
-| `get`     |      3.53 ms | 8.59 ms | ×2.43 |
-| `set`     |     13.60 ms | 20.9 ms | ×1.54 |
-| `overwrite` |   29.10 ms | 56.5 ms | ×1.94 |
-| `delete`  |     37.00 ms | 83.8 ms | ×2.26 |
-| `cleanup` |     23.00 ms | 56.0 ms | ×2.43 |
-| `prepare` |  1 088 620 µs | 1 088 542 µs | — |
+| workload    | `flash_area` |     UBI |     Δ | spread over 3 UBI runs |
+| ----------- | -----------: | ------: | ----: | ---------------------: |
+| `get`       |      3.53 ms | 8.59 ms | ×2.43 |         8.55 – 8.60 ms |
+| `set`       |     13.60 ms | 20.9 ms | ×1.54 |         20.9 – 21.0 ms |
+| `overwrite` |     29.10 ms | 56.5 ms | ×1.94 |         56.3 – 56.6 ms |
+| `delete`    |     37.00 ms | 83.8 ms | ×2.26 |         83.3 – 83.9 ms |
+| `cleanup`   |     23.00 ms | 56.0 ms | ×2.43 |         55.0 – 56.0 ms |
 
-`get checksum: 0xac6a5f02` and the 1-live-blob end state hold on both
-backends, so the container behaves identically; only the substrate's cost
+The container behaves identically on both backends; only the substrate's cost
 changes.
 
 The spread across rows is explained by what each operation is made of.
@@ -73,13 +81,38 @@ program time rather than transactions, so it only takes ×1.5. That matches
 `app_perf/RESULTS.md`, which fits the penalty at ~112 µs per flash
 transaction and nothing per byte.
 
-`prepare` is **identical** to the byte, and worth dwelling on because
-`app_perf_kvdb/RESULTS.md` shows the same phase 865× *faster* on UBI. There
-is no contradiction: this app calls `erase_all()` and then `prepare()` on a
-volume that has been in use, so UBI has no pre-erased PEBs left and each
-bucket format forces a real sector erase. kvdb's first run formats the store
-immediately beforehand, so its `prepare` finds PEBs UBI has already erased.
-**UBI moves erase cost in time; it does not remove it.**
+### `prepare` on UBI is not one number, it is two
+
+`prepare` is left out of the table above because on UBI it does not have a
+single value. The same firmware, run twice back to back on the same board,
+measures:
+
+| `blob_db_prepare()` of 118 buckets                              |     total | per bucket |
+| --------------------------------------------------------------- | --------: | ---------: |
+| on a volume UBI has just formatted (partition raw-erased first)  | **0.151 s** |   **1 279 µs** |
+| on a volume already in use (the very next run)                   | **130.0 s** | **1 102 000 µs** |
+
+**×861, from nothing but the state the previous run left behind.** On
+`flash_area` the same phase costs 1 088 620 µs/op either way, because a bucket
+format there means erasing that sector whether or not it was erased a moment
+ago.
+
+This is the whole of UBI's erase behaviour in one measurement. A bucket format
+on UBI is an LEB operation: if UBI is holding a pre-erased PEB it hands one
+over without touching flash, and if it is not, it erases one first. Formatting
+the volume leaves it holding a pool of them; the benchmark spends that pool.
+**UBI moves erase cost in time; it does not remove it** — the erase this app
+skips on a fresh volume is one the next run pays.
+
+Which figure applies to a caller depends on what the device did before, and
+neither is the "real" one. A product that formats at manufacture and prepares
+its buckets in the same session gets the 0.151 s; one that prepares more
+buckets later, in the field, pays the full second per bucket.
+
+`app_perf_kvdb/RESULTS.md` reports the same effect on its `FRESH_START` path
+(0.148 s against 134.5 s), where it had to be inferred by comparing two
+different apps. Here it is one binary twice, so the volume state is the only
+variable.
 
 Note also that `prepare` formats **118** buckets here against 124 on
 `flash_area` — UBI keeps 2 PEBs for its headers and the volume is smaller by
@@ -125,23 +158,47 @@ structural floor (registry + list + intent); the final cleanup phase —
 registry §8) — takes it all the way down to **1 blob: the empty registry**.
 Nothing leaks anywhere in the lifecycle.
 
-## Raw UART capture — UBI backend (the default)
+## Raw UART captures — UBI backend (the default), `1d3fcb6`
 
-UBI's volume-probe and PEB-recovery lines are elided; it logs recoverable
-conditions at `<err>` level.
+Two runs of the identical `build/mc` image, back to back. UBI's volume-probe
+and PEB-recovery lines are elided; it logs recoverable conditions at `<err>`
+level.
+
+Run A — partition raw-erased beforehand, so UBI formats the volume on this
+boot and `prepare` finds pre-erased PEBs waiting:
 
 ```
 *** Booting Zephyr OS build 4a405846193f ***
 model-container perf 1.0.0  (N_KEYS=10  N_GET=100  N_OVW=50  VAL_LEN=24)
-bench prepare  :  118 ops in  128448 ms  ->    0.918 ops/s  (  1088542 us/op)
+bench prepare  :  118 ops in     151 ms  ->  781.456 ops/s  (     1279 us/op)
 bench set      :   10 ops in     209 ms  ->   47.846 ops/s  (    20900 us/op)
-bench get      :  100 ops in     859 ms  ->  116.414 ops/s  (     8590 us/op)
-bench overwrite:   50 ops in    2826 ms  ->   17.692 ops/s  (    56520 us/op)
-bench delete   :   10 ops in     838 ms  ->   11.933 ops/s  (    83800 us/op)
+bench get      :  100 ops in     855 ms  ->  116.959 ops/s  (     8550 us/op)
+bench overwrite:   50 ops in    2817 ms  ->   17.749 ops/s  (    56340 us/op)
+bench delete   :   10 ops in     833 ms  ->   12.004 ops/s  (    83300 us/op)
+bench cleanup  :    1 ops in      55 ms  ->   18.181 ops/s  (    55000 us/op)
+get checksum: 0xac6a5f02
+live blobs at end: 1 (expect 1 — the empty registry alone)
+```
+
+Run B — same image reflashed immediately after, on the volume run A left
+behind. Only `prepare` moves, by ×861:
+
+```
+*** Booting Zephyr OS build 4a405846193f ***
+model-container perf 1.0.0  (N_KEYS=10  N_GET=100  N_OVW=50  VAL_LEN=24)
+bench prepare  :  118 ops in  130036 ms  ->    0.907 ops/s  (  1102000 us/op)
+bench set      :   10 ops in     210 ms  ->   47.619 ops/s  (    21000 us/op)
+bench get      :  100 ops in     860 ms  ->  116.279 ops/s  (     8600 us/op)
+bench overwrite:   50 ops in    2831 ms  ->   17.661 ops/s  (    56620 us/op)
+bench delete   :   10 ops in     839 ms  ->   11.918 ops/s  (    83900 us/op)
 bench cleanup  :    1 ops in      56 ms  ->   17.857 ops/s  (    56000 us/op)
 get checksum: 0xac6a5f02
 live blobs at end: 1 (expect 1 — the empty registry alone)
 ```
+
+The earlier UBI run this file's table was built from (`e80f404`, in-use
+volume) read 1088542 / 20900 / 8590 / 56520 / 83800 / 56000 µs — the same
+numbers to within a tick.
 
 ## Raw UART capture — `flash_area`
 
@@ -173,6 +230,12 @@ nrfutil device program --firmware build/mc/zephyr/zephyr.hex \
     --serial-number <your-jlink-sn>
 ```
 
+That build takes the UBI backend from the Kconfig default, with the PEB pool
+sized for this geometry in `boards/nrf5340dk_nrf5340_cpuapp.conf`. For the
+`flash_area` column add `-DCONFIG_BLOB_DB_BACKEND_FLASH_AREA=y`, and **erase
+the partition raw when switching between backends** — the two layouts are not
+interchangeable, and UBI only formats a partition it finds erased.
+
 Start the console capture *before* programming and let the reset above
 start the run. Resolve the port with `nrfutil device list` and take the one
 labelled `vcom: 2` — the `/dev/ttyACM*` number is not stable. Attach
@@ -184,5 +247,8 @@ mount a store left behind by `app_perf` (format major 2 against major 1)
 and will fail `-ENOTSUP`. Erase the partition first; see the
 "Downgrading" section of `app_perf/RESULTS.md`.
 
-Full run ≈ 2.3 min prepare + ~2.3 s of timed phases. The prepare is now
-98% of the wall clock.
+Wall clock depends entirely on what state the volume is in. On a raw-erased
+partition the whole run is **~4 s** (0.15 s prepare + ~3.8 s of timed phases);
+on a volume already in use it is **~2.2 min**, of which prepare is 98%. Both
+are in the captures above. Erase the partition first if you want the numbers
+to be comparable between sessions.
