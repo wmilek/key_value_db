@@ -192,56 +192,52 @@ cost of the fix rather than noise:
 ### Two `kvhash` instances — the sixteen shards removed
 
 The shards are gone: one person map, one credential map. Same host, same
-benchmark, 200 samples, steady state. **9 000 persons, not 10 000** — the
-headline scale no longer completes (below).
+benchmark, 200 samples, steady state, **8 000 persons** (`DESIGN.md` §6.5 —
+the constant was 10 000 and the layout's ceiling is 9 670).
 
 | Phase | µs/op | store ops/op | flash ops/op | flash bytes/op | **amplification** | vs 16 shards |
 |---|--:|--:|--:|--:|--:|--:|
-| `check` — card → person → permission (**R-D**) | **181** | 2 | 220 | 37.5 KB | **94×** | **4.1× slower** |
-| `byid` — person id → record | 94 | 1 | 104 | 19.5 KB | 51× | 4.1× |
-| `miss` — unknown card | 88 | 1 | 116 | 18.0 KB | 782× | 4.0× |
-| `put` — rewrite a record + its index entries | 939 | 4.5 | 737 | 126 KB | 291× | 0.83× |
-| `cbor` — encode + decode, no flash | **5** | 0 | 0 | 0 | — | 1.0× |
+| `check` — card → person → permission (**R-D**) | **179** | 2 | 230 | 37.4 KB | **93×** | **4.1× slower** |
+| `byid` — person id → record | 94 | 1 | 111 | 19.4 KB | 51× | 4.1× |
+| `miss` — unknown card | 89 | 1 | 120 | 18.0 KB | 782× | 4.0× |
+| `put` — rewrite a record + its index entries | 918 | 4.3 | 707 | 122 KB | 283× | 0.81× |
+| `cbor` — encode + decode, no flash | **6** | 0 | 0 | 0 | — | 1.2× |
 
-Whole-run phases, same build:
+Whole-run phases:
 
 | Phase | | |
 |---|--:|---|
-| `open` | 0 ms | one registry read + one superblock read |
-| `prepare` | 0 ms | 115 blocks formatted |
-| `fill` | 13 403 ms | 9 000 written, 36 commits |
-| `verify` | 77 ms | 256 persons, 605 cards — `VERIFY PASS` |
-| `mutate` | 55 ms | rev 0 → 1, 64 assigned |
-| `re-verify` | 77 ms | 256 persons, 609 cards — `VERIFY PASS` |
-| store | | 3 900 851 B live = **46.5 %** of the partition, **0 bucket overflows** |
+| `open` | 5 ms | one registry read + one superblock read |
+| `fill` | 11 709 ms | 8 000 written, 32 commits (first run) |
+| `verify` | 77 ms | 256 persons, 618 cards — `VERIFY PASS` |
+| `mutate` | 96 ms | 64 revoked, 64 assigned |
+| `re-verify` | 76 ms | 256 persons, 618 cards — `VERIFY PASS` |
+| store | | 3 466 801 B live = **41.3 %** of the partition, **0 bucket overflows** |
 
 **The read path costs 4.1× what the sharded build cost, and every byte of it is
-the directory.** `check` moves 37.5 KB where the sixteen-shard build moved
+the directory.** `check` moves 37.4 KB where the sixteen-shard build moved
 13.4 KB, on the same two store operations — the map got wider, not busier. A
 `kvhash` get reads the whole bucket directory before it reads a bucket (K11);
 one map means 2 047 buckets in that directory, so the read is 16 384 B whatever
 the app is looking for. `miss` shows it undisguised: 18.0 KB of flash to
 discover that a 23-byte key is not there, an amplification of 782×.
 
-`put` is the one row that improved (0.83×), and not by any virtue of the
+`put` is the one row that improved (0.81×), and not by any virtue of the
 layout: writes were already dominated by rewriting a whole bucket and its
 directory (K4, K5), and there are now two directories to keep instead of
 seventeen.
 
-**The headline scale does not complete, and the store's maximum is 9 670
-persons.** Measured: 9 670 completes fill, verify, mutate, re-verify and the
-benchmark at 4 192 710 B live = **49.9 %** of the partition with zero bucket
-overflows; person 9 671 fails with `-ENOSPC`, at the same index whatever the
-configured scale (a 20 000-person build stops there too).
+**Stability, not a single sample.** Three consecutive runs — each a full
+verify / mutate / re-verify / bench round on the store the previous one left —
+hold at 3 466 801 B live, 41.3 %, zero overflows, with no drift. That is what
+the 17 % margin under K13's 9 670-person ceiling buys, and the reason the
+constant is 8 000 rather than 9 600.
 
-The app reports it as a K2 bucket overflow and that is wrong — the fullest
-bucket is 4 621 B of a 16 384 B ceiling, 28 %. What is exhausted is the set of
-places a 16 384 B blob can go: `kvhash`'s bucket directory is rewritten whole on
-every first insert into a fresh bucket (K5), and once the store is half live no
-65 488 B erase block has 16 398 B contiguous free. A 1 KB person bucket still
-fits; the directory does not. `blob_db` is behaving to contract — the oversized
-blob is L2's (**K13**). The sixteen-shard build finished the same 10 000
-persons at 51.6 % because its largest blob was 4 096 B.
+**Comparability caveat.** §4 was taken at 10 000 persons and this table at
+8 000, because 10 000 no longer completes and the benchmark was re-sized. The
+20 % smaller store makes the buckets smaller and does not touch the directory,
+so the comparison flatters this layout. It does not flatter it by 4×: the
+directory read is 16 384 B at either scale, and it is the whole story.
 
 **What these numbers are for.** They are worse across the board and that is the
 result being reported, not a problem with the run. §4's figures were taken with
@@ -250,13 +246,8 @@ built the way the stack intends. The difference between the two tables is what
 the workaround was worth — and, per `DESIGN.md` §1, what it was concealing:
 **K12** and **K13** are both reachable only from this side of it.
 
-**Comparability caveat.** §4 was taken at 10 000 persons and this table at
-9 000, because 10 000 no longer completes. The 10 % smaller store makes the
-buckets slightly smaller and does not touch the directory, so the comparison
-flatters this layout a little. It does not flatter it by 4×.
-
 Reproduce: `west build -p -b native_sim app_cbor_persondb` (defaults are the
-two-instance layout), then run the binary twice in the same directory.
+two-instance layout at 8 000), then run the binary twice in the same directory.
 
 ### Before and after the large-payload merge
 

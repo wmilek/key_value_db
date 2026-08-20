@@ -4,12 +4,13 @@ Status: **v0.7 — the sixteen person shards are removed (§12.2); the app is tw
 `kvhash` instances.** Re-measured on `native_sim`. Two consequences to read
 before the numbers:
 
-- **The benchmark's 10 000-person scale no longer completes.** The fill hits
-  `-ENOSPC` at person 9 670 on the 8 MiB part, with live content at half the
-  partition. **The store's maximum is 9 670 persons** — measured, and the
-  reason is `kvhash`'s bucket directory, not the medium (`FINDINGS.md`
-  **K13**). `RESULTS.md` §4 ("Two `kvhash` instances") reports the 9 000-person
-  run. This is a finding, not a defect to repair by sharding again.
+- **The benchmark is re-sized to 8 000 persons (§6.5).** The two-instance
+  layout's measured ceiling is **9 670** — the fill hits `-ENOSPC` there with
+  live content at half the partition, because `kvhash`'s bucket directory is a
+  16 384 B blob `blob_db` can no longer place, not because the medium is full
+  (`FINDINGS.md` **K13**). 8 000 leaves 17 % under that ceiling and holds
+  steady at 41.3 % live across repeated rounds. The ceiling itself stays a
+  finding; the shards do not come back to hide it.
 - **Every nRF5340-DK figure in `RESULTS.md` predates this change** — §5, §5a–§5d
   and the raw captures §8a/§8b, including the 5 000-person UBI run that landed
   in `main` at `98ead91`. All of them describe the *sixteen-shard* build. They
@@ -128,9 +129,10 @@ Read out of the tree and the existing hardware captures, not assumed.
 
 Consequences that drive the design:
 
-- **C2 ⇒** 10 000 person records (~3.6 MB) do not fit one map *at this payload
-  size*, and per-R-J the answer is to spread them over enough maps that every
-  bucket sits well inside 4 KB — not to add overflow handling. §6 does that
+- **C2 ⇒** the person records do not fit one map *at a 4 096 B payload* — at
+  8 000 records the fullest bucket would be 10 574 B, 258 % of it. Per-R-J the
+  answer is to raise the payload until every bucket sits well inside the
+  ceiling, not to add overflow handling and not to shard (§12.2). §6 does that
   arithmetic. Since the cap moved they *would* fit one map at a larger payload;
   §12.1 measures what that costs and why the app does not do it.
 - **C8 ⇒** a person record and its credential-index entries cannot be updated
@@ -149,7 +151,7 @@ Consequences that drive the design:
 | **F4** | The person record is the single authoritative copy of permissions. | correctness |
 | **F5** | Card assignment writes the person record **first**, the index **second**; revocation deletes the index **first**, the person **second**. Either crash point leaves a *deny*. | C8, P7 |
 | **F6** | Every record is a pure function of its index, so any record is re-derivable and verifiable without shadow state. | C1, P3 |
-| **F7** | Scale is **fixed at 10 000 persons**, spread over enough maps that no bucket approaches C2's ceiling. The count is a constant of the benchmark, never re-derived from geometry. | R-E, R-J |
+| **F7** | Scale is **fixed at 8 000 persons** (§6.5), in one map sized so no bucket approaches C2's ceiling. The count is a constant of the benchmark, never re-derived from geometry, and never raised to chase the K13 ceiling at 9 670. | R-E, R-J |
 | **F7a** | Fill percentage is an **output**, never an input. Nothing in the app is computed from the partition size. | R-E (§6.3) |
 | **F8** | Population is batched and **resumable across reboots** with committed progress; replay of an interrupted batch is idempotent. | R-E fill time, P7 |
 | **F9** | A run verifies a deterministic sample against the generator, mutates a bounded subset, and re-verifies — proving what the *previous boot* wrote. | P8 |
@@ -163,7 +165,8 @@ Consequences that drive the design:
 ## 6. Dataset sizing
 
 A realistic access-control record, then checked against R-E — not padded to hit
-a number. Averages over the 10 000 generated persons:
+a number. Averages over the generated population (the record shape is
+independent of how many are generated):
 
 ```
 person record, CBOR map with 9 integer-keyed pairs
@@ -188,12 +191,13 @@ person record, CBOR map with 9 integer-keyed pairs
 | credential entry (`4 + klen 14 + CBOR uint 5`) | 23 B | 23 B |
 | credentials per person (mean) | 2.5 | 2.49 |
 | **per person, all-in** | 420 B | **433 B** |
-| × 10 000 persons | 4.01 MiB | **4 336 158 B = 4.13 MiB** |
-| of the 8 MiB MX25R6435F | 50.1 % | **51.6 %** |
+| × 8 000 persons (§6.5) | 3.21 MiB | **3 466 801 B = 3.31 MiB** |
+| of the 8 MiB MX25R6435F | 40.1 % | **41.3 %** |
+| *(× 10 000, the pre-§6.5 constant)* | *4.01 MiB* | *4 336 158 B = 4.13 MiB — 51.6 %* |
 
 R-E is met by the realistic record — the outcome we wanted. (**The store's
-measured maximum is 9 670 persons**, 49.9 % of the part, so the 10 000-person
-benchmark scale no longer fits: §6.1 and **K13**.) (The permission
+measured maximum is 9 670 persons**, 49.9 % of the part, which is why the
+benchmark is re-sized to 8 000: §6.5 and **K13**.) (The permission
 vocabulary was lengthened once, from ~11-character names to qualified ones
 averaging ~14, after the first implementation landed at 45.8 %. Qualified
 permission identifiers are what a real facility uses; this was a correction to
@@ -229,17 +233,17 @@ available and gets whatever that arithmetic yields:
 
 | payload | buckets | directory | mean bucket | **fullest bucket** | % of ceiling |
 |---|--:|--:|--:|--:|--:|
-| 4 096 | 511 | 4 096 B | 7 362 B | **14 735 B** | **360 % — bursts** |
-| 8 192 | 1 023 | 8 192 B | 3 677 B | 7 734 B | 94 % |
-| **16 384** | **2 047** | **16 384 B** | **1 844 B** | **4 907 B** | **30 %** |
-| 32 722 | 4 089 | 32 720 B | 1 006 B | 3 533 B | 11 % — **K12** |
+| 4 096 | 511 | 4 096 B | 5 884 B | **10 574 B** | **258 % — bursts** |
+| 8 192 | 1 023 | 8 192 B | 2 939 B | 7 317 B | 89 % |
+| **16 384** | **2 047** | **16 384 B** | **1 486 B** | **4 621 B** | **28 %** |
+| 32 722 | 4 089 | 32 720 B | 854 B | 3 076 B | 9 % — **K12** |
 
-**16 384**, fullest bucket at 30 % of the ceiling. Both neighbours are
-excluded by measurement rather than preference: 8 192 leaves a bucket at 94 %
+**16 384**, fullest bucket at 28 % of the ceiling. Both neighbours are
+excluded by measurement rather than preference: 8 192 leaves a bucket at 89 %
 of a cliff that gives no warning (K2, K10), and 32 722 — the most the geometry
 sustains — makes the directory a 32 720 B blob that fills an erase block on its
-own and kills the fill at person 36 (**K12**). All 24 932 credential entries fit
-their own map comfortably at any of these: 23 B each.
+own and kills the fill at person 36 (**K12**). The credential entries fit their
+own map comfortably at any of these: 23 B each.
 
 **This symbol also decides how many persons the store holds, in the opposite
 direction.** The directory is a blob like any other, and `blob_db` has to place
@@ -263,7 +267,7 @@ that the payment exists at all.
 
 **What this costs, unhidden.** One map means the directory carries every
 bucket, and `kvhash` re-reads all of it on every operation (K11): a person
-lookup moves **18 228 B** where the sixteen-shard build moved 4 756 B — 3.8×.
+lookup moves **17 870 B** where the sixteen-shard build moved 4 756 B — 3.8×.
 Enumerating offline says ~683 buckets would be the minimum of that curve, at
 10 980 B. The application does not pass 683. Hand-tuning a bucket count against
 another layer's read amplification is precisely the workaround §1 forbids: it
@@ -271,15 +275,50 @@ would bury K11 under a magic number and make the app look faster than the stack
 is. The 3.8× is measured and recorded instead (`RESULTS.md` §4,
 "Two `kvhash` instances").
 
-**And it is not enough.** At the benchmark's fixed 10 000 persons this layout
-stops at **person 9 670** — 4.19 MiB live, 49.9 % of an 8 MiB partition. Not
+**And it caps the store.** This layout stops at **person 9 670** — 4.19 MiB
+live, 49.9 % of an 8 MiB partition — whatever scale is configured above it. Not
 because the flash is full and not because a bucket burst (the fullest is at
 28 % of its ceiling), but because the 16 384 B *directory* can no longer be
 placed: once the store is half live, no 65 488 B erase block has 16 398 B
 contiguous free, and the map cannot accept a key in a bucket it has not used
 yet. That is `kvhash`'s directory, not the storage layer — **K13**. The
-sixteen-shard build finished the same dataset at 51.6 % because its largest
-blob was 4 096 B. §12.2 is why this is not repaired by sharding again.
+sixteen-shard build reached 10 000 at 51.6 % because its largest blob was
+4 096 B. §12.2 is why this is not repaired by sharding again, and §6.5 is what
+the benchmark does about it.
+
+### 6.5 The person count is re-sized to 8 000
+
+The benchmark constant was 10 000 and is now **8 000**. This is the "someone
+deliberately re-sizes the benchmark" case §6.4 allows for, so it is recorded
+rather than simply edited.
+
+**Why it had to move.** 10 000 is above the ceiling K13 imposes. Leaving it
+there means the headline configuration cannot complete, and "the benchmark does
+not run" is a worse way to carry a finding than a benchmark that runs next to a
+recorded ceiling.
+
+**Why 8 000 and not 9 670.** The ceiling is where a *fresh* fill dies. A
+constant sitting on its own cliff fails later, on hardware, hours into a fill,
+for reasons that read as random. 8 000 is 17 % under it and was checked rather
+than assumed: three consecutive runs — fill, verify, mutate, re-verify, bench —
+hold at **41.3 % live** with no drift between runs and zero bucket overflows.
+Enumeration agrees with the device to four significant figures (3 464 369 B
+predicted, 3 466 801 B measured).
+
+**What did not change.** The record shape, the vocabulary, the hash, the key
+formats, the sampling. Only how many persons are generated. Runs at 8 000 are
+not comparable with the 10 000-person figures in this document's history or
+with `RESULTS.md`'s DK sections, and both are marked where they appear.
+
+**What this costs the probe.** Less ballast: 41.3 % of the part instead of
+51.6 %, so the store is under less pressure and the numbers are correspondingly
+kinder. §6.3's point still holds — the dataset is ballast and the result is
+time per operation — but a smaller store is a weaker probe, and that is part of
+what K13 costs, not something the re-size repairs.
+
+**The ceiling stays measured.** 9 670 is recorded in K13 and reproducible:
+build with `CONFIG_APP_CBOR_PERSONDB_N_PERSONS` above it and the fill stops
+there regardless of the value. Do not raise this constant to chase it.
 
 Two things worth stating plainly:
 
@@ -327,14 +366,15 @@ usable for other things; and small enough that a benchmark run does not demand
 the whole partition and a reformat before every run. Half the medium satisfies
 all three. It was never a level the app must maintain.
 
-**The person count is therefore frozen.** `tools/sizing.py` chose 10 000 once,
-against the record shape and the hash; from that point it is a constant of the
+**The person count is therefore frozen.** `tools/sizing.py` chose it once
+against the record shape and the hash — 10 000 then, 8 000 since §6.5 re-sized
+it against a measured ceiling; from that point it is a constant of the
 benchmark. Reruns use it unchanged, which is the only way two runs are
 comparable at all. It is *not* recomputed from the geometry at build or boot —
 nothing in the app reads the partition size except the reporting path (F7a).
 
 **A falling fill percentage is a good result.** If a component shrinks its
-overhead and the same 10 000 persons come to occupy 40 % instead of 51.6 %,
+overhead and the same 8 000 persons come to occupy 30 % instead of 41.3 %,
 that is the implementation improving, and the benchmark has just measured it.
 Holding the percentage constant would mean silently growing the dataset to
 absorb the gain — hiding exactly the improvement the app exists to detect.
@@ -345,7 +385,7 @@ independently and mean different things:
 
 | | what it is | changes when |
 |---|---|---|
-| person count | **fixed input** — 10 000 | someone deliberately re-sizes the benchmark |
+| person count | **fixed input** — 8 000 | someone deliberately re-sizes the benchmark (§6.5 is the one time it happened, and why) |
 | fill percentage | **output** | the stack's per-record overhead changes |
 
 ### 6.2 Cost of the fill
@@ -560,7 +600,7 @@ because §9 exists.
 
 | Scenario | Config | Runs? |
 |---|---|---|
-| `app.cbor_persondb.bench` | `FRONTEND_BENCH`, 10 000 persons | build only — a full fill is ~2.2 h on hardware |
+| `app.cbor_persondb.bench` | `FRONTEND_BENCH`, 8 000 persons | build only — a full fill is ~1.8 h on hardware |
 | `app.cbor_persondb.shell` | `FRONTEND_SHELL` | build only |
 | `app.cbor_persondb.smoke` | `FRONTEND_BENCH`, `N_PERSONS=200` | **runs on `native_sim`**, console harness on `VERIFY PASS` |
 
@@ -802,7 +842,7 @@ window `kvdb` itself has (`kvdb.c:118`).
 - **A1** Builds for `native_sim` and `nrf5340dk/nrf5340/cpuapp`; all three
   `sample.yaml` scenarios pass `west twister -T app_cbor_persondb -p native_sim`.
 - **A2** The `smoke` scenario runs to `VERIFY PASS` in CI.
-- **A3** On `native_sim` with the DK's geometry a full 10 000-person run reaches
+- **A3** On `native_sim` with the DK's geometry a full 8 000-person run reaches
   the target and reports `VERIFY PASS`; a second run verifies the first's
   content.
 - **A4** `RESULTS.md` carries measured nRF5340-DK numbers.
@@ -829,7 +869,7 @@ Settled during review; recorded so they are not relitigated.
 
 | # | Decision |
 |---|---|
-| D1 | **Scale is 10 000 persons**, with a realistic record rather than one sized to hit a target. It lands at 4.01 MiB ≈ 50 % of the DK's external flash. |
+| D1 | **Scale is 8 000 persons** (§6.5), with a realistic record rather than one sized to hit a target. It lands at 3.31 MiB ≈ 41 % of the DK's external flash. It was 10 000 at ≈ 50 %; the two-instance layout's measured ceiling is 9 670 (**K13**), and a benchmark constant does not sit on its own cliff. |
 | D2 | **No premature optimization.** The natural design is implemented and measured; mitigations are documented, not built. |
 | D3 | **zcbor** is the codec — Zephyr's own CBOR library (P1). Requires adding `zcbor` to the `name-allowlist` in `west.yml`. |
 | D4 | **4 MiB of the 8 MiB MX25R6435F** is the R-E target. |
@@ -839,7 +879,8 @@ Settled during review; recorded so they are not relitigated.
 | D8 | The app is **both** probe and showcase; §1 states the rule that keeps the two compatible. |
 | D9 | The person management functionality is an **internal application API** (§8), not proposed for `lib/`. |
 | D10 | It is implemented on **L2 `map_ops` + `rootreg` + `blob_db`**, not L3 `kvdb` (§12). `kvdb` is not linked into the image. **Re-checked against `main` at `1821328` (§12.1): the decision stands, none of its original reasons do.** Boot I/O expired with B1. Registry capacity is withdrawn entirely — a database takes one registry entry, so seventeen was a fact about the proposed layout, not a limit of `rootreg`. R-D (bytes per lookup) turned out to be a workaround defending itself and was retired with the shards in §12.2. What holds the app at L2 is **shape**: two collections are two containers behind one root, and L3's contribution to that would be a name the app never uses. |
-| D14 | **The dataset size is frozen; the fill percentage is an observation.** 50 % was the heuristic that picked 10 000 persons once (§6.3), leaving the board room for other uses and avoiding a reformat before each run. Nothing is scaled from geometry at run time, and a fill percentage that *falls* is a better implementation, not a regression. |
+| D14 | **The dataset size is frozen; the fill percentage is an observation.** 50 % was the heuristic that picked 10 000 persons once (§6.3), leaving the board room for other uses and avoiding a reformat before each run. Nothing is scaled from geometry at run time, and a fill percentage that *falls* is a better implementation, not a regression. **Frozen is not immutable:** §6.5 re-sized it to 8 000 against a measured ceiling, deliberately and on the record. That is the mechanism this decision describes, exercised once — not an exception to it. |
+| D15 | **8 000 sits 17 % below the ceiling, not on it** (§6.5). The measured maximum is 9 670; a constant at the cliff fails hours into a fill on hardware, for reasons that read as random. The margin was verified over three consecutive fill/mutate/bench rounds holding at 41.3 % live with no drift. The cost is a weaker probe — less ballast, kinder numbers — and that cost belongs to **K13**, not to the re-size. |
 | D11 | **Size to fit, do not fight C2** (R-J): a 16 384 B payload puts the fullest bucket at 30 % of the ceiling, a number obtained by enumerating the population rather than by modelling its tail — the model was tried, and was wrong (§6.1). Sizing now picks a payload rather than a map count, because the app is two containers (§12.2). `-ENOSPC` is not an expected path and the app does not provoke it — but it now arrives anyway, from the medium rather than a bucket, and the app cannot tell which (**K13**). |
 | D12 | **The sixteen person shards are removed** (§12.2). They were a workaround for a 4 KB payload cap that has since lifted, and §1 forbids keeping one because the app runs better with it. The app is two `kvhash` instances. This cost real performance (K11, 3.8× per lookup) and cost the app its headline scale (**K13**: the store tops out at 9 670 persons), and exposed **K12** and **K13**, neither of which was reachable while the shards were there. A probe that only reports what its workarounds let through is not probing. |
 | D12 | A **scenario layer** (§9) holds every operation on a population, and never prints. |

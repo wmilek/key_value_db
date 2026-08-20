@@ -826,6 +826,13 @@ mutate, re-verify and the benchmark with zero bucket overflows, and person
 9 671 fails with `-ENOSPC` at any configured scale (a run set to 20 000 stops at
 the same index).
 
+**The benchmark was re-sized because of this finding**, to 8 000 persons
+(`DESIGN.md` §6.5) — 17 % under the ceiling, holding at 41.3 % live across
+repeated rounds. The ceiling is the finding; 8 000 is what lets the app keep
+reporting it instead of failing to run. Raising the constant back toward 9 670
+does not test anything this entry does not already record, and puts a
+multi-hour fill on the DK next to a cliff.
+
 Half the medium is free and the store cannot take another record. What is full
 is not the flash and not a bucket — it is the set of places a **16 384 B blob**
 can go.

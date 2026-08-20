@@ -62,7 +62,12 @@ def person_cbor_len(i, vocab, nperm_lo, nperm_span):
     n += 2 + 15*ncards
     return n, ncards
 
-def run(nmaps, vocab, lo, span, N=10000, buckets=511, cap=4096):
+# The benchmark's person count (CONFIG_APP_CBOR_PERSONDB_N_PERSONS). Keep in
+# step with Kconfig; DESIGN.md §6.5 records why it is 8 000 and not 10 000.
+N_PERSONS = 8000
+
+
+def run(nmaps, vocab, lo, span, N=N_PERSONS, buckets=511, cap=4096):
     load = {}
     tot = 0
     for i in range(N):
@@ -83,7 +88,7 @@ for nmaps in (8, 12, 16, 20, 24, 32):
     print(f"{nmaps:>4} {tot/1048576:>10.2f} {100*tot/8388608:>6.1f} {mean:>9.0f} {mx:>8} {over:>5}")
 
 # credential map: one shard, 23 B entries
-def cred_run(N=10000, buckets=511, cap=4096):
+def cred_run(N=N_PERSONS, buckets=511, cap=4096):
     load = {}
     for i in range(N):
         ncards = 1 + (mix(i,3) % 4)
@@ -132,7 +137,9 @@ def l3_recheck():
                            (32746, 2, 4092)):
         if nb > (pay - 8) // 8:
             continue
-        tot, mx, over, mean = run(nmaps, VOCAB_NEW, 10, 13, buckets=nb, cap=pay)
+        # N=10000: this table reproduces the D10 argument at the scale it
+        # was argued at, before §6.5 re-sized the benchmark to 8 000.
+        tot, mx, over, mean = run(nmaps, VOCAB_NEW, 10, 13, N=10000, buckets=nb, cap=pay)
         dirb = 8 + 8 * nb
         getb = dirb + mean
         base = base or getb
@@ -182,7 +189,7 @@ def two_instance():
         print(f"{pay:>7} {nb:>7} {dirb:>6} {mean:>8.0f} {mx:>7} "
               f"{100*mx/pay:>5.0f}% {getb:>6.0f} {getb/4756:>10.1f}x{note}")
 
-    print("\nShipped: 16384 -- fullest bucket 30 % of the ceiling, and the only")
+    print("\nShipped: 16384 -- fullest bucket 28 % of the ceiling, and the only")
     print("row that neither bursts a bucket nor hands an erase block to a")
     print("directory. Costs 3.8x the bytes per lookup of the 16-shard build;")
     print("that is FINDINGS.md K11, measured in RESULTS.md section 4, not tuned away.")
