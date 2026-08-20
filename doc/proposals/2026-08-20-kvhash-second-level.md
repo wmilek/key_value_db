@@ -582,13 +582,19 @@ giving it a second level costs a transaction for nothing. So the map must
 start one-level and grow a level, which means the promote path must be
 correct from the first release.
 
-**9.4 A format break**, guarded by the `version` byte §4.3 reserves — but a
-narrower one than first stated, given D3e. A one-level map is unchanged, on
-flash and in code, so every store that exists today and every future undeclared
-map stays on the current format and needs no migration. The new depth field and
-the two-level layout are reached only by declaring a population past
-`ONE_LEVEL_MAX_BUCKETS`. `app_cbor_persondb` is the store that must be rebuilt,
-and it is rebuilt from `dataset/` on every run anyway.
+**9.4 The format is free to change — nothing is deployed.** Earlier drafts
+treated this as a break to be guarded and migrated. It is neither. No store
+exists outside this tree, so on-flash compatibility is not a constraint on any
+decision in this proposal: the layout, the header fields and the `map_config`
+struct can all be changed outright rather than extended around.
+
+Two consequences worth taking: **D3a can replace `initial_capacity` instead of
+coexisting with it** (§7.2), and the depth field needs no compatibility story.
+The `version` byte §4.3 reserves stays useful for evolution *after* something
+ships — it is simply not doing any work here.
+
+D3e still means a one-level map is unchanged in practice, which keeps the diff
+small. That is now a convenience rather than a compatibility requirement.
 
 **9.5 RAM is unchanged — an earlier draft of this section was wrong.** It
 claimed two directory buffers instead of one. Walking the access path shows one
@@ -660,27 +666,39 @@ D4 settled the shape. What remains is not design: it is one missing piece of
 test infrastructure, one unspecified detail, and two decisions. Listed because
 "the design is agreed" and "someone can start" are not the same state.
 
-### 11.1 `kvhash` has no test suite — prerequisite, not a nicety
+### 11.1 Test coverage — not a prerequisite, with one exception
 
 `tests/lib/containers/` is a skeleton: a README saying "planned but not yet
-implemented", no `testcase.yaml`, so `west twister` skips the directory. The
-only coverage `kvhash` has is indirect, through `tests/lib/kvdb`.
+implemented", no `testcase.yaml`, so `west twister` skips it. An earlier draft
+of this section called that a blocking prerequisite. **It is not**, and the
+reason is worth stating rather than assumed:
 
-This proposal rewrites an on-flash format. Doing that against no direct contract
-tests is the largest practical risk in the plan, and it is larger than anything
-in §9. The suite has to exist first, and it has to cover at minimum:
+- **Nothing is deployed.** No store exists in the field, so on-flash
+  compatibility is not a constraint and there is no migration to protect. §9.4
+  shrinks to nothing on the same grounds.
+- **Coverage exists, indirectly and end to end.** `tests/lib/kvdb` exercises
+  `kvhash` through L3. More usefully, `app_cbor_persondb` is a correctness
+  harness in its own right: a fill of 8 000 records followed by `VERIFY PASS`
+  compares sampled persons field by field against the generator and resolves
+  every one of their cards back through the credential index, then does it
+  again after a mutation round. A two-level map that put a key somewhere it
+  could not find again would fail that on the first run.
 
-- every `map_ops` entry point against the §4.3 contract, including the error
-  returns (`-ENOSPC`, `-ENOENT`, `-EEXIST`) that callers branch on;
-- persistence across a remount, since the format is the thing changing;
-- the K2 boundary — a bucket taken to the payload ceiling — because that is the
-  failure this design is meant to make cheap to avoid, and it must keep
-  behaving identically in v1, which does not retire it;
-- key distribution across both levels (§11.2).
+So a dedicated suite is worth having and is not worth blocking on. Write it when
+convenient; it is not what stands between this proposal and a first commit.
 
-Writing it against the *current* implementation first is worth the extra step:
-it establishes that the tests describe the contract rather than the new code,
-and it gives a before/after on identical assertions.
+**The exception is distribution, and it does not need a test suite.** A
+correlated hash (§11.2) is the one defect this coverage would *not* catch: every
+key is still found, so `VERIFY PASS` passes, and the damage shows up only as
+clustering — a bucket bursting early (K2), or a lookup cost quietly worse than
+the tables in §5. Silent degradation is exactly the failure mode this proposal
+exists to remove, so it needs a check.
+
+The cheap one already exists: **`tools/sizing.py` enumerates the real population
+through the real hash**, which is what it was built for. Extending it to model
+the two-level split — top index and sub index, reporting the fullest bucket
+across both — costs a few lines and answers the question offline, before any
+firmware runs. That is the check to write, in preference to a Zephyr test suite.
 
 ### 11.2 Two independent indices from one key — unspecified
 
@@ -702,7 +720,7 @@ for free.
 
 This needs specifying in the contract and a distribution test in §11.1's suite.
 
-### 11.3 The two decisions that gate code
+### 11.3 The decision that gates code
 
 **D3a (config shape)** decides the interface and, with it, whether v1 needs a
 promote path at all: if the container is told the expected population at
@@ -710,10 +728,13 @@ promote path at all: if the container is told the expected population at
 transition to build. §7 argues this is choosing between two contradictory
 existing specifications rather than inventing an API.
 
-**D1 (contract revision or second provider)** sets the module name, the Kconfig
-symbol, whether existing stores break, and whether `kvdb` needs a translation
-where it passes `initial_capacity` through (`kvdb.c:100`). Cheap to decide,
-but it precedes the first commit.
+**D1 is decided** (contract revision, §7.2), and with nothing deployed it no
+longer carries a compatibility question either. What remains under it is
+mechanical: five call sites, one provider.
+
+So D3a is the last thing between this proposal and a first commit — and §7.2
+argues it is mostly pre-empted, since a revision lets the declarative fields
+replace the field rather than coexist with it.
 
 ### 11.4 What D4 already cleared
 
@@ -729,10 +750,18 @@ For the record, so these are not re-opened as blockers:
 
 ## 12. Decisions this proposal needs from review
 
-- **D0. The `kvhash` test suite is a prerequisite** (§11.1). `tests/lib/
-  containers/` is an empty skeleton and the only coverage is indirect via
-  `tests/lib/kvdb`. Is writing it — against the current implementation first —
-  accepted as the first commit of this work rather than part of it?
+- **D0. DECIDED: no, the test suite does not gate this.** Nothing is deployed,
+  so on-flash compatibility is not a constraint; `tests/lib/kvdb` covers
+  `kvhash` indirectly; and `app_cbor_persondb`'s `VERIFY PASS` over 8 000
+  records and their credentials would catch a map that lost track of a key on
+  the first run (§11.1). Write `tests/lib/containers/` when convenient.
+
+  **What still needs a check is distribution** — a correlated two-level hash
+  (D3d) passes every functional test and shows up only as clustering, which is
+  the silent-degradation failure this proposal exists to remove.
+  `tools/sizing.py`, extended to model the two-level split, answers that
+  offline. That is the residue of this decision, and it is a few lines rather
+  than a suite.
 - **D1. DECIDED: contract revision.** `kvhash` evolves in place; no `kvhash2`,
   no parallel Kconfig symbol, no duplicated bucket code. §7.2 is the impact
   list. (§11.3)
