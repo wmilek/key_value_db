@@ -418,7 +418,46 @@ cannot help a population that outgrows what was declared, because `n_buckets` is
 fixed after create (**K3**). Only splitting makes being wrong survivable. The
 two are complementary, and neither substitutes for the other.
 
-### 7.2 Per-map bucket sizing
+### 7.2 What a contract revision touches (D1)
+
+Revising rather than forking is the cheaper option here, and the reason is that
+the contract has one real implementation:
+
+| | state |
+|---|---|
+| `kvhash` | the only implemented provider — this is the work |
+| `kvlist`, `kvtree` | **9-line skeletons**, build-wired behind `default n`. Nothing to update |
+| `kvdb` | passes the field through unchanged (`kvdb.c:100`) and re-exports it (`kvdb.h:74`) |
+| `app_perf_kvdb:452` | asks for `N_KEYS / 2` = 384, silently gets 127 — K9(b)'s live in-tree example |
+| `tests/lib/kvdb:186` | asks for 16 |
+| `app_cbor_persondb` | passes `SIZE_MAX`; §7.1 removes that idiom |
+
+Five call sites, one provider. That is what makes replacing the field
+tractable rather than a migration, and it is why D1 partly settles **D3a**: with
+a revision on the table, the declarative fields can *replace* `initial_capacity`
+instead of coexisting with it. Coexistence would leave two ways to say
+overlapping things, which is how the current contradiction arose.
+
+**One sentence in the contract has to go, and it is not the field.**
+`shape_map.h:32-38` describes `map_config` as:
+
+> These are hints, not a contract: a container applies what is meaningful to it
+> and ignores the rest (a hash uses `initial_capacity` to size its **bucket
+> directory**; a linear list ignores it).
+
+Two problems in one comment block. It says **hints, not a contract** — which is
+exactly what §7.1's rule reverses: a field that is set must be honoured or
+refused, never quietly ignored or clamped. And the parenthesis says the hash
+uses the field to size its *bucket directory*, while the field's own doc comment
+four lines below says *expected entry count*. **The struct's documentation
+contradicts itself inside a single comment block**, which is the cleanest
+evidence that K9(a) is a contract defect rather than an implementation bug.
+
+The revision therefore has to state, in the shape's own words: what each field
+means, that unset is the container's choice, that set is binding, and that a
+provider which cannot honour a set field fails rather than proceeding.
+
+### 7.3 Per-map bucket sizing
 
 A related question, and the answer bounds it: can bucket *size* be per-map
 rather than one global `CONFIG_BLOB_DB_MAX_PAYLOAD_LEN`?
@@ -684,7 +723,7 @@ For the record, so these are not re-opened as blockers:
 |---|---|
 | **D2** `alloc_id_range()` | v1 stores child ids in directories; Option A is not on the v1 path |
 | **D3** promotion | disappears if D3a is declarative — depth is chosen at `create` |
-| **D3c** per-map bucket sizing | redundant once the container derives bucket size from a declared population (§7.2) |
+| **D3c** per-map bucket sizing | redundant once the container derives bucket size from a declared population (§7.3) |
 | p99 write measurement | moves to v2 with the splitting it was meant to characterise |
 | RAM for a second directory | not needed — one `dir_buf` suffices (§9.5) |
 
@@ -694,8 +733,9 @@ For the record, so these are not re-opened as blockers:
   containers/` is an empty skeleton and the only coverage is indirect via
   `tests/lib/kvdb`. Is writing it — against the current implementation first —
   accepted as the first commit of this work rather than part of it?
-- **D1.** Is the bucket-id array leaving the `kvhash` contract (§4.3), or is
-  this a second provider (`kvhash2`) beside it? (§11.3)
+- **D1. DECIDED: contract revision.** `kvhash` evolves in place; no `kvhash2`,
+  no parallel Kconfig symbol, no duplicated bucket code. §7.2 is the impact
+  list. (§11.3)
 - **D2.** Does `blob_db` gain `alloc_id_range()`? If not, Option A and Option C
   are both off the table and B is the only route.
 - **D3.** Fixed two-level, or one-level promoted on growth? §8 answers the
@@ -720,10 +760,11 @@ For the record, so these are not re-opened as blockers:
   opted into by declaring a population that needs one (§7.1). Nothing regresses
   for callers who say nothing, and v1's lack of promotion therefore introduces
   no new way to be wrong — the undeclared map is served exactly as it is today.
-  What review still owns is the **value of `ONE_LEVEL_MAX_BUCKETS`**, proposed
-  at 255: a 2 048 B directory and one blob at `create`. It is set by create cost
-  (B7, ~1.1 s per fresh bucket on the DK), not by lookup bytes, whose crossover
-  is near 25 entries. A tunable constant, not a format field.
+  **`ONE_LEVEL_MAX_BUCKETS` = 255**, confirmed: a 2 048 B directory and one blob
+  at `create`. Set by create cost (B7, ~1.1 s per fresh bucket on the DK), not
+  by lookup bytes, whose crossover is near 25 entries. A tunable constant, not a
+  format field, so it can be revisited with measurements without invalidating
+  any store.
 
   The rest of §7.1's rule is not offered as a choice, because it is what makes
   the field meanings enforceable: `NULL` ≡ `{0}` ≡ no information; each field
