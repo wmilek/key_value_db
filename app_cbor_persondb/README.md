@@ -56,7 +56,7 @@ sixteen of anything, but because a bucket burst at a 4 KB payload cap. That is
 a workaround for the layer below, and it made the application faster: sixteen
 small maps move 4 756 B per lookup against 18 228 B for one. It was removed
 anyway, and the app is 4.1× slower on its read path and no longer completes its
-own headline scale. Two findings (**K12**, **B13**) were sitting underneath it,
+own headline scale. Two findings (**K12**, **K13**) were sitting underneath it,
 unreachable while it was there. A model application does not get to keep a
 workaround because the workaround wins the benchmark.
 

@@ -132,9 +132,23 @@ static int map_set(struct persondb *db, uint64_t root, const char *key,
 	db->st.map_sets++;
 	rc = db->ops->set(root, key, strlen(key), val, len);
 	if (rc == -ENOSPC) {
-		/* A single bucket overflowed while the medium is nearly empty
-		 * (K2). DESIGN.md §6.1 sizes this away; if it fires, that
-		 * sizing rule was wrong (A8). */
+		/* Two different walls arrive here as the same errno, and the
+		 * application cannot tell them apart:
+		 *
+		 *   K2   a single bucket overflowed while the medium is nearly
+		 *        empty — the sizing rule of DESIGN.md §6.1 was wrong (A8)
+		 *   K13  the bucket directory can no longer be placed in any
+		 *        erase block, so the map cannot take a key in a bucket
+		 *        it has not used yet — at the shipped payload this is
+		 *        the store's real ceiling, 9 670 persons
+		 *
+		 * The message below names K2 because that is the one an
+		 * application can act on. It is wrong for K13, and there is no
+		 * query that would let it be right: no per-bucket occupancy
+		 * (K10), no physical occupancy (B3), no fill level (V3). The
+		 * misdiagnosis is left in place, and recorded in K13, because
+		 * it is what the stack leaves an application able to say.
+		 */
 		db->st.enospc_hits++;
 		LOG_ERR("bucket overflow on key '%s' — see FINDINGS.md K2", key);
 	}

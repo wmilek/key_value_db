@@ -25,10 +25,10 @@ remaining open ones are listed in the summary below.
 | | |
 |---|---|
 | **Closed by `main`** | B1, B5 (partly), B9, B10, B3 (partly) |
-| **Still open** | B2, B4, B6, B7, B8, B11, B12, **B13**, K1–K11, **K12**, V1–V4, X1 |
+| **Still open** | B2, B4, B6, B7, B8, B11, B12, K1–K11, **K12**, **K13**, V1–V4, X1 |
 | **Withdrawn** | R1 — `ROOTREG_MAX_ROOTS`'s default was never the problem; the layout that wanted seventeen entries was (`DESIGN.md` §12.1) |
 | **Newly observed** | N1 — transaction count rose sharply as byte count fell (closed on hardware: ~65 µs per transaction) · B12 — compaction lowers the durable id ceiling ([issue #14](https://github.com/wmilek/key_value_db/issues/14)) |
-| **Found by removing a workaround** | **K12** — the largest map the geometry allows cannot be written to · **B13** — a dataset that fits at 4 KB blobs does not fit at 16 KB blobs. Both were invisible while the app sharded its person records over sixteen maps; both appeared in the first hour after it stopped (`DESIGN.md` §12.2). |
+| **Found by removing a workaround** | **K12** — the largest map the geometry allows cannot be written to · **K13** — the directory blob caps the store at 9 670 persons, half the partition. Both were invisible while the app sharded its person records over sixteen maps; both appeared in the first hour after it stopped (`DESIGN.md` §12.2). |
 
 This is the *probe* output of `app_cbor_persondb` (see `DESIGN.md` §1). Every
 drawback the app trips over on its way to a working 4 MiB person database is
@@ -453,50 +453,6 @@ implemented.
 
 ---
 
-### B13 — A dataset that fits at 4 KB blobs does not fit at 16 KB blobs (major, **`hit`**)
-
-The same 10 000 persons, the same 8 MiB partition, the same 4.13 MiB of live
-content. Sixteen person maps at a 4 096 B payload fill to 51.6 % and finish.
-**One** person map at a 16 384 B payload — the two-container layout of
-`DESIGN.md` §12 — dies at **person 9 670** with `-ENOSPC`, 96.7 % of the way
-through, with live content around half the partition.
-
-Nothing about the data changed. What changed is the granularity `blob_db`
-reclaims at. Every `kvhash` set rewrites its whole bucket (K4) and the old copy
-becomes garbage, so the fill's write volume is a multiple of the live bytes
-either way. But a 4 KB bucket leaves sixteen recoverable slots per erase block
-and a 16 KB one leaves four, and each of the two 16 384 B directories (K5,
-rewritten on every first insert into a bucket) needs half a block to itself.
-Compaction has to find a free block to work into; the coarser the slots, the
-more of the partition is stranded as garbage that cannot be consolidated.
-
-Dropping to 9 000 persons completes: 46.5 % live, `VERIFY PASS`, zero bucket
-overflows. So the cliff is between 46.5 % and 51.6 % live — for a store whose
-nominal capacity is the whole partition.
-
-Two things make this worse than a capacity limit:
-
-- **The application cannot see it coming.** Physical occupancy — live plus
-  uncompacted garbage — is not observable through the API (B3), and there is no
-  fill or capacity query (V3). The store reports 46.5 % right up to the run
-  that fails.
-- **The error is indistinguishable from a bucket overflow.** Both arrive as
-  `-ENOSPC` from `map_ops->set`. This app prints *"bucket overflow on key … see
-  FINDINGS.md K2"*, which is wrong here — `tools/sizing.py` puts the fullest
-  bucket at 4 907 B of a 16 384 B ceiling and the completed 9 000-person run
-  reports zero overflows. The app has no way to tell the two apart, so it
-  reports the one it was expecting. That misattribution is the finding as much
-  as the exhaustion is: a wrong diagnosis is worse than none, and this stack
-  hands out exactly one errno for "your bucket is full" and "the medium cannot
-  stage another write".
-
-The 16-shard build did not hit this. It was not designed not to — it hid it, by
-keeping every blob small. That is the argument for `DESIGN.md` §1's rule stated
-as a measurement: the workaround was concealing a limitation of the layer
-below, and removing the workaround is what exposed it.
-
----
-
 ## L2 — `kvhash` and the Map shape
 
 ### K1 — `MAX_BUCKETS` caps a map near 2.09 MB nominal, ~450 KB usable (major, `read`)
@@ -811,8 +767,9 @@ instead of two — R-D's cost halves**, with no denormalization, no index, and n
 change to the on-flash format beyond the root record's own layout.
 
 This is the strongest single conclusion in this register: `MAX_BUCKETS` (K1),
-the directory rewrites (K5), and half of every read (K11) are all the same
-decision — storing bucket ids that could have been computed.
+the directory rewrites (K5), half of every read (K11) — and half the usable
+medium (K13) — are all the same decision: storing bucket ids that could have
+been computed.
 
 ---
 
@@ -860,6 +817,73 @@ compiles, mounts, passes `create`, and fails 36 records into a multi-hour fill.
 
 The app ships `16384` instead, and prj.conf carries this arithmetic beside the
 symbol so the next person to raise it finds out here rather than there.
+
+### K13 — The directory blob caps how much of the medium a store can use (major, **`hit`**)
+
+**The application's maximum is 9 670 persons** — 4 192 710 B live, **49.9 % of
+an 8 MiB partition** — measured, not projected: 9 670 completes fill, verify,
+mutate, re-verify and the benchmark with zero bucket overflows, and person
+9 671 fails with `-ENOSPC` at any configured scale (a run set to 20 000 stops at
+the same index).
+
+Half the medium is free and the store cannot take another record. What is full
+is not the flash and not a bucket — it is the set of places a **16 384 B blob**
+can go.
+
+**Why a blob is that big.** `kvhash` stores a directory of bucket ids,
+`8 + 8n` bytes in one blob (K1), and rewrites it whole on every first insert
+into a fresh bucket (K5). At the shipped payload that is 2 047 buckets = 16 384
+B. `blob_db` appends each new copy into an erase block that has room for it,
+and once the store is around half live, compaction can no longer leave any
+65 488 B block with 16 398 B contiguous:
+
+```
+compact bid=3: new bucket has 53456 B (was up to 65488 B)   -> 12 032 B free
+put person 9670: -28
+```
+
+A 1 KB person bucket still fits in that 12 032 B. The directory does not, so
+the map cannot accept a key in a bucket it has not used yet, and the store is
+finished.
+
+**This is an L2 limit, and the layer below is behaving.** `blob_db` promised
+that a blob up to `MAX_PAYLOAD` can be written and rebound within a sector, and
+it delivers exactly that; it never promised that an arbitrarily large blob
+remains placeable in a fragmented store, and no storage layer can. The 16 KB
+blob is `kvhash`'s: nothing in the Map *shape* requires a directory. The bucket
+ids are stored because they are allocated one at a time and could be anything —
+allocate them as a range and they are computable from the root, the directory
+disappears, and with it this ceiling. `n_buckets` is already a u16 on flash
+(K1), so the format does not stand in the way.
+
+**It is the fourth consequence of one decision.** K1 (capacity cap), K5
+(rewrite traffic), K11 (half of every read) and this are all *storing bucket
+ids that could have been computed*. The first three cost speed and space. This
+one costs **half the part**.
+
+**Two ceilings, moving in opposite directions.** `MAX_PAYLOAD` sets the bucket
+ceiling *and* the directory size, so an application sizing a `kvhash` store is
+between two walls:
+
+| `MAX_PAYLOAD` | buckets | directory | **max persons** | which wall | fullest bucket at the wall |
+|---|--:|--:|--:|---|--:|
+| 8 192 | 1 023 | 8 192 B | **11 787** | K2 — a bucket burst | 8 141 B = **99 %** |
+| 16 384 (shipped) | 2 047 | 16 384 B | **9 670** | K13 — this one | 4 621 B = 28 % |
+
+Both measured on `native_sim`. Raising the payload to give one map enough
+capacity is what lowers the usable fraction of the medium — and the app cannot
+see either wall coming, because there is no per-bucket occupancy (K10), no
+physical-occupancy query (B3) and no fill query (V3).
+
+**And it is misreported.** Both walls arrive as `-ENOSPC` from
+`map_ops->set`, so the application prints *"bucket overflow on key … see
+FINDINGS.md K2"* for both. At 8 192 that message is correct. At 16 384 it is
+wrong — the fullest bucket is at 28 % of its ceiling — and there is no way for
+the caller to tell the difference. A wrong diagnosis is worse than none.
+
+**The sixteen-shard build did not hit this**, because its largest blob was
+4 096 B. It was not designed to avoid it; it hid it. Removing the workaround is
+what exposed it (`DESIGN.md` §12.2).
 
 ---
 

@@ -6,9 +6,10 @@ before the numbers:
 
 - **The benchmark's 10 000-person scale no longer completes.** The fill hits
   `-ENOSPC` at person 9 670 on the 8 MiB part, with live content at half the
-  partition (`FINDINGS.md` **B13**). Nine thousand persons complete and are
-  what `RESULTS.md` §4b reports. This is a finding, not a defect to repair by
-  sharding again.
+  partition. **The store's maximum is 9 670 persons** — measured, and the
+  reason is `kvhash`'s bucket directory, not the medium (`FINDINGS.md`
+  **K13**). `RESULTS.md` §4b reports the 9 000-person run. This is a finding,
+  not a defect to repair by sharding again.
 - **The nRF5340-DK figures in `RESULTS.md` §5 predate this change** and
   describe the sixteen-shard build. They are kept, and marked, because the
   before/after is the measurement. A4 was already open for a full-scale board
@@ -187,7 +188,9 @@ person record, CBOR map with 9 integer-keyed pairs
 | × 10 000 persons | 4.01 MiB | **4 336 158 B = 4.13 MiB** |
 | of the 8 MiB MX25R6435F | 50.1 % | **51.6 %** |
 
-R-E is met by the realistic record — the outcome we wanted. (The permission
+R-E is met by the realistic record — the outcome we wanted. (**The store's
+measured maximum is 9 670 persons**, 49.9 % of the part, so the 10 000-person
+benchmark scale no longer fits: §6.1 and **K13**.) (The permission
 vocabulary was lengthened once, from ~11-character names to qualified ones
 averaging ~14, after the first implementation landed at 45.8 %. Qualified
 permission identifiers are what a real facility uses; this was a correction to
@@ -235,6 +238,26 @@ sustains — makes the directory a 32 720 B blob that fills an erase block on it
 own and kills the fill at person 36 (**K12**). All 24 932 credential entries fit
 their own map comfortably at any of these: 23 B each.
 
+**This symbol also decides how many persons the store holds, in the opposite
+direction.** The directory is a blob like any other, and `blob_db` has to place
+each rewritten copy in one erase block; the bigger it is, the earlier the store
+runs out of places to put it. So the app sits between two walls that move
+apart, and the maximum is whichever is nearer — both measured on `native_sim`:
+
+| payload | buckets | directory | **max persons** | the wall it hits | fullest bucket there |
+|---|--:|--:|--:|---|--:|
+| 8 192 | 1 023 | 8 192 B | **11 787** | K2 — a bucket bursts | 8 141 B = **99 %** |
+| **16 384** | **2 047** | **16 384 B** | **9 670** | **K13** — the directory cannot be placed | 4 621 B = 28 % |
+
+**The shipped configuration is not the one that holds the most records**, and
+that is a deliberate choice rather than an oversight. 8 192 holds 22 % more
+persons, by running the fullest bucket at 99 % of a ceiling that gives no
+warning before it is crossed (K2), cannot be queried (K10), and cannot be
+recovered from short of a reformat — for a dataset whose tail this design has
+already mis-estimated once (§6.1's opening). 16 384 buys a 28 % bucket and pays
+for it in capacity. Both numbers belong in the record; **K13** is the finding
+that the payment exists at all.
+
 **What this costs, unhidden.** One map means the directory carries every
 bucket, and `kvhash` re-reads all of it on every operation (K11): a person
 lookup moves **18 228 B** where the sixteen-shard build moved 4 756 B — 3.8×.
@@ -245,11 +268,14 @@ would bury K11 under a magic number and make the app look faster than the stack
 is. The 3.8× is measured and recorded instead (`RESULTS.md` §4b).
 
 **And it is not enough.** At the benchmark's fixed 10 000 persons this layout
-runs out of medium at person 9 670 — 4.13 MiB of live content on an 8 MiB
-partition — because coarser blobs strand more of the partition as garbage
-compaction cannot consolidate (**B13**). Nine thousand persons complete at
-46.5 % live. The sixteen-shard build finished the same dataset at 51.6 %. That
-regression is the finding; §12.2 is why it is not repaired by sharding again.
+stops at **person 9 670** — 4.19 MiB live, 49.9 % of an 8 MiB partition. Not
+because the flash is full and not because a bucket burst (the fullest is at
+28 % of its ceiling), but because the 16 384 B *directory* can no longer be
+placed: once the store is half live, no 65 488 B erase block has 16 398 B
+contiguous free, and the map cannot accept a key in a bucket it has not used
+yet. That is `kvhash`'s directory, not the storage layer — **K13**. The
+sixteen-shard build finished the same dataset at 51.6 % because its largest
+blob was 4 096 B. §12.2 is why this is not repaired by sharding again.
 
 Two things worth stating plainly:
 
@@ -258,8 +284,8 @@ Two things worth stating plainly:
 - **Choosing this number offline, up front and blind, is what the API's lack
   of introspection costs.** The penalty for getting it wrong is an `-ENOSPC`
   partway through a multi-hour fill with no repair short of a reformat — and
-  as B13 shows, the same `-ENOSPC` also means "the medium is exhausted", which
-  the application cannot distinguish. This app can size by enumeration only
+  as K13 shows, the same `-ENOSPC` also means "the directory can no longer be
+  placed", which the application cannot distinguish — and misreports. This app can size by enumeration only
   because its dataset is a pure function of an index (F6). One whose data
   arrives from outside could not.
 
@@ -740,11 +766,11 @@ reason the rule exists to reject.
 | | |
 |---|---|
 | **K12** | Asking for the largest map the geometry sustains (32 722 B payload) builds a 32 720 B bucket directory — two copies plus headers are 65 484 B of a 65 488 B erase block. The directory owns a block, `blob_db` compacts on nearly every write, and the fill dies at **person 36**. Legal at every layer; checked by none. |
-| **B13** | At the shipped 16 384 B payload the fill dies at **person 9 670** of 10 000, with live content at half the partition. The same dataset, the same partition, finished at 51.6 % when the blobs were 4 KB. Coarser blobs strand more of the medium as garbage compaction cannot consolidate. |
+| **K13** | At the shipped 16 384 B payload the store tops out at **9 670 persons**, 49.9 % of the partition. The wall is `kvhash`'s 16 384 B bucket directory: `blob_db` cannot find 16 398 B contiguous in any erase block once the store is half live, so a first insert into a fresh bucket fails while 1 KB blobs still fit. K1, K5, K11 and this are one decision — storing bucket ids that could have been computed. |
 | **K11, measured** | A person lookup moves **18 228 B** against the sixteen-shard build's 4 756 B — 3.8×, all of it the whole-directory read. |
 | **B5 job 3** | `append_slot` builds every slot in a `MAX_PAYLOAD + 46` byte *stack* frame. Four times the payload is four times the frame: 4 200 B → 16 430 B, and the app's stack went from 12 KB to 28 KB. |
 
-None of these were visible while the app sharded. K12 and B13 are new findings;
+None of these were visible while the app sharded. K12 and K13 are new findings;
 K11 and B5 were `read` findings that are now `measured` and `hit`. The
 application got slower and now fails its own headline scale — and that is the
 correct outcome, because the stack was always going to do this to a product
@@ -810,7 +836,7 @@ Settled during review; recorded so they are not relitigated.
 | D9 | The person management functionality is an **internal application API** (§8), not proposed for `lib/`. |
 | D10 | It is implemented on **L2 `map_ops` + `rootreg` + `blob_db`**, not L3 `kvdb` (§12). `kvdb` is not linked into the image. **Re-checked against `main` at `1821328` (§12.1): the decision stands, none of its original reasons do.** Boot I/O expired with B1. Registry capacity is withdrawn entirely — a database takes one registry entry, so seventeen was a fact about the proposed layout, not a limit of `rootreg`. R-D (bytes per lookup) turned out to be a workaround defending itself and was retired with the shards in §12.2. What holds the app at L2 is **shape**: two collections are two containers behind one root, and L3's contribution to that would be a name the app never uses. |
 | D14 | **The dataset size is frozen; the fill percentage is an observation.** 50 % was the heuristic that picked 10 000 persons once (§6.3), leaving the board room for other uses and avoiding a reformat before each run. Nothing is scaled from geometry at run time, and a fill percentage that *falls* is a better implementation, not a regression. |
-| D11 | **Size to fit, do not fight C2** (R-J): a 16 384 B payload puts the fullest bucket at 30 % of the ceiling, a number obtained by enumerating the population rather than by modelling its tail — the model was tried, and was wrong (§6.1). Sizing now picks a payload rather than a map count, because the app is two containers (§12.2). `-ENOSPC` is not an expected path and the app does not provoke it — but it now arrives anyway, from the medium rather than a bucket, and the app cannot tell which (**B13**). |
-| D12 | **The sixteen person shards are removed** (§12.2). They were a workaround for a 4 KB payload cap that has since lifted, and §1 forbids keeping one because the app runs better with it. The app is two `kvhash` instances. This cost real performance (K11, 3.8× per lookup) and cost the app its headline scale (**B13**: `-ENOSPC` at person 9 670 of 10 000), and exposed **K12** and **B13**, neither of which was reachable while the shards were there. A probe that only reports what its workarounds let through is not probing. |
+| D11 | **Size to fit, do not fight C2** (R-J): a 16 384 B payload puts the fullest bucket at 30 % of the ceiling, a number obtained by enumerating the population rather than by modelling its tail — the model was tried, and was wrong (§6.1). Sizing now picks a payload rather than a map count, because the app is two containers (§12.2). `-ENOSPC` is not an expected path and the app does not provoke it — but it now arrives anyway, from the medium rather than a bucket, and the app cannot tell which (**K13**). |
+| D12 | **The sixteen person shards are removed** (§12.2). They were a workaround for a 4 KB payload cap that has since lifted, and §1 forbids keeping one because the app runs better with it. The app is two `kvhash` instances. This cost real performance (K11, 3.8× per lookup) and cost the app its headline scale (**K13**: the store tops out at 9 670 persons), and exposed **K12** and **K13**, neither of which was reachable while the shards were there. A probe that only reports what its workarounds let through is not probing. |
 | D12 | A **scenario layer** (§9) holds every operation on a population, and never prints. |
 | D13 | **Two frontends** — automatic benchmark and interactive shell — selected by Kconfig, shipped as separate `sample.yaml` scenarios, plus a small `smoke` scenario that actually runs in CI. |

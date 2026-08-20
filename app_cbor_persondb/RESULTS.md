@@ -228,21 +228,27 @@ layout: writes were already dominated by rewriting a whole bucket and its
 directory (K4, K5), and there are now two directories to keep instead of
 seventeen.
 
-**The headline scale does not complete.** At the benchmark's fixed 10 000
-persons the fill stops at **person 9 670** with `-ENOSPC` — reported by the app
-as a K2 bucket overflow, which it is not: enumeration puts the fullest bucket at
-4 907 B of a 16 384 B ceiling, and the 9 000-person run that does complete
-reports zero overflows. The medium is exhausted at roughly half the partition's
-live content, because coarser blobs strand more of it as garbage compaction
-cannot consolidate (**B13**). The sixteen-shard build finished the same 10 000
-persons at 51.6 %.
+**The headline scale does not complete, and the store's maximum is 9 670
+persons.** Measured: 9 670 completes fill, verify, mutate, re-verify and the
+benchmark at 4 192 710 B live = **49.9 %** of the partition with zero bucket
+overflows; person 9 671 fails with `-ENOSPC`, at the same index whatever the
+configured scale (a 20 000-person build stops there too).
+
+The app reports it as a K2 bucket overflow and that is wrong — the fullest
+bucket is 4 621 B of a 16 384 B ceiling, 28 %. What is exhausted is the set of
+places a 16 384 B blob can go: `kvhash`'s bucket directory is rewritten whole on
+every first insert into a fresh bucket (K5), and once the store is half live no
+65 488 B erase block has 16 398 B contiguous free. A 1 KB person bucket still
+fits; the directory does not. `blob_db` is behaving to contract — the oversized
+blob is L2's (**K13**). The sixteen-shard build finished the same 10 000
+persons at 51.6 % because its largest blob was 4 096 B.
 
 **What these numbers are for.** They are worse across the board and that is the
 result being reported, not a problem with the run. §4's figures were taken with
 sixteen person maps hiding a 4 KB payload cap; these were taken with the app
 built the way the stack intends. The difference between the two tables is what
 the workaround was worth — and, per `DESIGN.md` §1, what it was concealing:
-**K12** and **B13** are both reachable only from this side of it.
+**K12** and **K13** are both reachable only from this side of it.
 
 **Comparability caveat.** §4 was taken at 10 000 persons and this table at
 9 000, because 10 000 no longer completes. The 10 % smaller store makes the
