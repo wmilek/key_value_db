@@ -17,8 +17,9 @@
 #
 #     python3 tools/sizing.py
 #
-# Rerun it whenever the record shape, the person count, the shard count or
-# CONFIG_BLOB_DB_MAX_PAYLOAD_LEN changes. Keep the constants below in step with
+# Rerun it whenever the record shape, the person count or
+# CONFIG_BLOB_DB_MAX_PAYLOAD_LEN changes. The app no longer shards (DESIGN.md
+# §12.2), so what this picks is the payload, not a map count. Keep the constants below in step with
 # src/dataset.c and src/person_cbor.c — nothing enforces that they match, which
 # is itself a consequence of the missing introspection.
 
@@ -143,3 +144,50 @@ def l3_recheck():
               f"{traffic/1048576:>9.1f} MiB{flag}")
 
 l3_recheck()
+
+
+# ---------------------------------------------------------------------------
+# The two-instance layout (DESIGN.md §12).
+#
+# The app is one people map + one credential map. Sharding is gone, so the
+# bucket count is no longer "as many as fit" — kvhash's initial_capacity IS the
+# bucket count, and the two costs it drives move in opposite directions:
+#
+#   directory   8 + 8*n_buckets, read by dir_load on EVERY get/set/del (K11)
+#   bucket      total_bytes / n_buckets, the second read
+#
+# so bytes-per-get has a minimum in n. The fullest bucket must also stay well
+# under CONFIG_BLOB_DB_MAX_PAYLOAD_LEN, because it overflows with no warning
+# (K2) and the count cannot change afterwards (K3). Report both.
+
+# The app asks kvhash for the largest map it can build, so the bucket count is
+# not chosen directly -- MAX_PAYLOAD chooses it, via (MAX_PAYLOAD - 8) / 8.
+# This is the sweep DESIGN.md §6.1 reports, and the reason 16384 ships.
+
+def two_instance():
+    print(f"\n{'payload':>7} {'buckets':>7} {'dir B':>6} {'mean bkt':>8} "
+          f"{'max bkt':>7} {'%ceil':>6} {'get B':>6} {'vs 16-shard':>11}")
+    for pay in (4096, 8192, 16384, 32722):
+        nb = (pay - 8) // 8
+        tot, mx, over, mean = run(1, VOCAB_NEW, 10, 13, buckets=nb, cap=1 << 30)
+        dirb = 8 + 8 * nb
+        getb = dirb + mean
+        note = ''
+        if mx > pay:
+            note = '  BURSTS'
+        # K12: two copies of the directory plus slot headers must leave room in
+        # an erase block, or blob_db compacts on every write and the fill dies.
+        if 16 + 2 * (dirb + 14) > 65488 - 1024:
+            note += '  DIRECTORY OWNS AN ERASE BLOCK (K12)'
+        print(f"{pay:>7} {nb:>7} {dirb:>6} {mean:>8.0f} {mx:>7} "
+              f"{100*mx/pay:>5.0f}% {getb:>6.0f} {getb/4756:>10.1f}x{note}")
+
+    print("\nShipped: 16384 -- fullest bucket 30 % of the ceiling, and the only")
+    print("row that neither bursts a bucket nor hands an erase block to a")
+    print("directory. Costs 3.8x the bytes per lookup of the 16-shard build;")
+    print("that is FINDINGS.md K11, measured in RESULTS.md §4b, not tuned away.")
+
+    mx, over, used = cred_run(buckets=2047, cap=1 << 30)
+    print(f"\ncredential map (2047 buckets): max bucket {mx} B, used {used}/2047")
+
+two_instance()

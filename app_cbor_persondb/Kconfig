@@ -56,21 +56,29 @@ config APP_CBOR_PERSONDB_N_PERSONS
 	  Lower it for a quick run; the smoke scenario in sample.yaml uses 200.
 
 config APP_CBOR_PERSONDB_PEOPLE_MAPS
-	int "Number of person map shards"
-	default 16
+	int "Number of person maps"
+	default 1
 	range 1 64
 	help
-	  A kvhash map holds at most (MAX_PAYLOAD-8)/8 buckets, so the person
-	  records must be spread over several maps. Sixteen puts the fullest
-	  bucket at 66 % of the 4 KB ceiling for the default dataset.
+	  ONE. The application is two kvhash instances — one people map, one
+	  credential map — whose roots live in the 'PADB' superblock
+	  (DESIGN.md §12). That is the shape the stack intends, and a model
+	  application is supposed to be built in it.
 
-	  This number was arrived at by enumerating the whole population
-	  offline (tools/sizing.py) after an analytic tail estimate got it
-	  wrong and the fill hit -ENOSPC — see DESIGN.md §6.1 and
-	  FINDINGS.md K2. If you change the person count, the record shape, or
-	  CONFIG_BLOB_DB_MAX_PAYLOAD_LEN, rerun that script: there is no
-	  per-bucket occupancy query to warn you (FINDINGS.md K10), and the
-	  failure is a local -ENOSPC partway through a fill.
+	  It was sixteen until DESIGN.md §12.2. Not because the domain has
+	  sixteen of anything: a bucket overflows at
+	  CONFIG_BLOB_DB_MAX_PAYLOAD_LEN, that was 4 KB, and one map could not
+	  hold 10 000 person records without bursting one. Sharding was the way
+	  around it. The cap has since moved, one map holds the dataset, and
+	  the workaround has to go — it was concealing exactly the kind of
+	  limitation this application exists to expose (DESIGN.md §1).
+
+	  Raising this again is a way of hiding K2 and K11 rather than
+	  measuring them. If you need it for an experiment, enumerate the
+	  population offline first (tools/sizing.py): there is no per-bucket
+	  occupancy query to warn you (K10), the bucket count cannot change
+	  after create (K3), and the failure is a local -ENOSPC partway
+	  through a multi-hour fill.
 
 config APP_CBOR_PERSONDB_FILL_BATCH
 	int "Persons per resumable fill batch"

@@ -189,6 +189,69 @@ cost of the fix rather than noise:
   compaction timing — and this store has one more mutation round in its past.
   The byte column moved 0.8 %, and the amplification factor not at all.
 
+### 4b. Measured — two `kvhash` instances (`DESIGN.md` §12.2)
+
+The shards are gone: one person map, one credential map. Same host, same
+benchmark, 200 samples, steady state. **9 000 persons, not 10 000** — the
+headline scale no longer completes (below).
+
+| Phase | µs/op | store ops/op | flash ops/op | flash bytes/op | **amplification** | vs 16 shards |
+|---|--:|--:|--:|--:|--:|--:|
+| `check` — card → person → permission (**R-D**) | **181** | 2 | 220 | 37.5 KB | **94×** | **4.1× slower** |
+| `byid` — person id → record | 94 | 1 | 104 | 19.5 KB | 51× | 4.1× |
+| `miss` — unknown card | 88 | 1 | 116 | 18.0 KB | 782× | 4.0× |
+| `put` — rewrite a record + its index entries | 939 | 4.5 | 737 | 126 KB | 291× | 0.83× |
+| `cbor` — encode + decode, no flash | **5** | 0 | 0 | 0 | — | 1.0× |
+
+Whole-run phases, same build:
+
+| Phase | | |
+|---|--:|---|
+| `open` | 0 ms | one registry read + one superblock read |
+| `prepare` | 0 ms | 115 blocks formatted |
+| `fill` | 13 403 ms | 9 000 written, 36 commits |
+| `verify` | 77 ms | 256 persons, 605 cards — `VERIFY PASS` |
+| `mutate` | 55 ms | rev 0 → 1, 64 assigned |
+| `re-verify` | 77 ms | 256 persons, 609 cards — `VERIFY PASS` |
+| store | | 3 900 851 B live = **46.5 %** of the partition, **0 bucket overflows** |
+
+**The read path costs 4.1× what the sharded build cost, and every byte of it is
+the directory.** `check` moves 37.5 KB where the sixteen-shard build moved
+13.4 KB, on the same two store operations — the map got wider, not busier. A
+`kvhash` get reads the whole bucket directory before it reads a bucket (K11);
+one map means 2 047 buckets in that directory, so the read is 16 384 B whatever
+the app is looking for. `miss` shows it undisguised: 18.0 KB of flash to
+discover that a 23-byte key is not there, an amplification of 782×.
+
+`put` is the one row that improved (0.83×), and not by any virtue of the
+layout: writes were already dominated by rewriting a whole bucket and its
+directory (K4, K5), and there are now two directories to keep instead of
+seventeen.
+
+**The headline scale does not complete.** At the benchmark's fixed 10 000
+persons the fill stops at **person 9 670** with `-ENOSPC` — reported by the app
+as a K2 bucket overflow, which it is not: enumeration puts the fullest bucket at
+4 907 B of a 16 384 B ceiling, and the 9 000-person run that does complete
+reports zero overflows. The medium is exhausted at roughly half the partition's
+live content, because coarser blobs strand more of it as garbage compaction
+cannot consolidate (**B13**). The sixteen-shard build finished the same 10 000
+persons at 51.6 %.
+
+**What these numbers are for.** They are worse across the board and that is the
+result being reported, not a problem with the run. §4's figures were taken with
+sixteen person maps hiding a 4 KB payload cap; these were taken with the app
+built the way the stack intends. The difference between the two tables is what
+the workaround was worth — and, per `DESIGN.md` §1, what it was concealing:
+**K12** and **B13** are both reachable only from this side of it.
+
+**Comparability caveat.** §4 was taken at 10 000 persons and this table at
+9 000, because 10 000 no longer completes. The 10 % smaller store makes the
+buckets slightly smaller and does not touch the directory, so the comparison
+flatters this layout a little. It does not flatter it by 4×.
+
+Reproduce: `west build -p -b native_sim app_cbor_persondb` (defaults are the
+two-instance layout), then run the binary twice in the same directory.
+
 ### Before and after the large-payload merge
 
 The same benchmark, same host, across `main`'s slot-header walk

@@ -25,9 +25,10 @@ remaining open ones are listed in the summary below.
 | | |
 |---|---|
 | **Closed by `main`** | B1, B5 (partly), B9, B10, B3 (partly) |
-| **Still open** | B2, B4, B6, B7, B8, B11, B12, K1–K11, V1–V4, X1 |
+| **Still open** | B2, B4, B6, B7, B8, B11, B12, **B13**, K1–K11, **K12**, V1–V4, X1 |
 | **Withdrawn** | R1 — `ROOTREG_MAX_ROOTS`'s default was never the problem; the layout that wanted seventeen entries was (`DESIGN.md` §12.1) |
 | **Newly observed** | N1 — transaction count rose sharply as byte count fell (closed on hardware: ~65 µs per transaction) · B12 — compaction lowers the durable id ceiling ([issue #14](https://github.com/wmilek/key_value_db/issues/14)) |
+| **Found by removing a workaround** | **K12** — the largest map the geometry allows cannot be written to · **B13** — a dataset that fits at 4 KB blobs does not fit at 16 KB blobs. Both were invisible while the app sharded its person records over sixteen maps; both appeared in the first hour after it stopped (`DESIGN.md` §12.2). |
 
 This is the *probe* output of `app_cbor_persondb` (see `DESIGN.md` §1). Every
 drawback the app trips over on its way to a working 4 MiB person database is
@@ -452,6 +453,50 @@ implemented.
 
 ---
 
+### B13 — A dataset that fits at 4 KB blobs does not fit at 16 KB blobs (major, **`hit`**)
+
+The same 10 000 persons, the same 8 MiB partition, the same 4.13 MiB of live
+content. Sixteen person maps at a 4 096 B payload fill to 51.6 % and finish.
+**One** person map at a 16 384 B payload — the two-container layout of
+`DESIGN.md` §12 — dies at **person 9 670** with `-ENOSPC`, 96.7 % of the way
+through, with live content around half the partition.
+
+Nothing about the data changed. What changed is the granularity `blob_db`
+reclaims at. Every `kvhash` set rewrites its whole bucket (K4) and the old copy
+becomes garbage, so the fill's write volume is a multiple of the live bytes
+either way. But a 4 KB bucket leaves sixteen recoverable slots per erase block
+and a 16 KB one leaves four, and each of the two 16 384 B directories (K5,
+rewritten on every first insert into a bucket) needs half a block to itself.
+Compaction has to find a free block to work into; the coarser the slots, the
+more of the partition is stranded as garbage that cannot be consolidated.
+
+Dropping to 9 000 persons completes: 46.5 % live, `VERIFY PASS`, zero bucket
+overflows. So the cliff is between 46.5 % and 51.6 % live — for a store whose
+nominal capacity is the whole partition.
+
+Two things make this worse than a capacity limit:
+
+- **The application cannot see it coming.** Physical occupancy — live plus
+  uncompacted garbage — is not observable through the API (B3), and there is no
+  fill or capacity query (V3). The store reports 46.5 % right up to the run
+  that fails.
+- **The error is indistinguishable from a bucket overflow.** Both arrive as
+  `-ENOSPC` from `map_ops->set`. This app prints *"bucket overflow on key … see
+  FINDINGS.md K2"*, which is wrong here — `tools/sizing.py` puts the fullest
+  bucket at 4 907 B of a 16 384 B ceiling and the completed 9 000-person run
+  reports zero overflows. The app has no way to tell the two apart, so it
+  reports the one it was expecting. That misattribution is the finding as much
+  as the exhaustion is: a wrong diagnosis is worse than none, and this stack
+  hands out exactly one errno for "your bucket is full" and "the medium cannot
+  stage another write".
+
+The 16-shard build did not hit this. It was not designed not to — it hid it, by
+keeping every blob small. That is the argument for `DESIGN.md` §1's rule stated
+as a measurement: the workaround was concealing a limitation of the layer
+below, and removing the workaround is what exposed it.
+
+---
+
 ## L2 — `kvhash` and the Map shape
 
 ### K1 — `MAX_BUCKETS` caps a map near 2.09 MB nominal, ~450 KB usable (major, `read`)
@@ -768,6 +813,53 @@ change to the on-flash format beyond the root record's own layout.
 This is the strongest single conclusion in this register: `MAX_BUCKETS` (K1),
 the directory rewrites (K5), and half of every read (K11) are all the same
 decision — storing bucket ids that could have been computed.
+
+---
+
+### K12 — The largest map the geometry allows cannot be written to (major, **`hit`**)
+
+Found by building the application the way the stack intends — two containers,
+no sharding (`DESIGN.md` §12.2) — and asking `kvhash` for the largest map it
+can build, which is what this app has always asked for.
+
+Set `CONFIG_BLOB_DB_MAX_PAYLOAD_LEN` to the 32 722 B this geometry sustains and
+the arithmetic closes on itself:
+
+```
+payload            32 722 B     the most blob_db can rebind on a 65 488 B sector
+MAX_BUCKETS        4 089        (32 722 - 8) / 8
+directory blob     32 720 B     8 + 8 x 4 089  — one blob, rewritten per K5
+two copies + hdrs  65 484 B     16 + 2 x (32 720 + 14)
+erase block        65 488 B
+                   --------
+slack                  4 B
+```
+
+A blob that large is legal — `blob_db_mount()` accepts it, because it is
+exactly what the rebind rule permits — and it consumes an entire erase block
+for itself. Both maps' directories then do, so `blob_db` compacts on almost
+every write:
+
+```
+<inf> blob_db: compact bid=3: new bucket has 32750 B (was up to 65488 B)
+<dbg> blob_db.blob_db_update: update id=3 bid=3 off=0x7fee len=32720
+<inf> blob_db: compact bid=4: new bucket has 32750 B (was up to 65488 B)
+<dbg> blob_db.blob_db_update: update id=4 bid=4 off=0x7fee len=32720
+```
+
+The fill dies at **person 36** with `-ENOSPC`, on an 8 MiB partition holding
+about 15 KB of data.
+
+The defect is not the ceiling; it is that the two rules are set independently
+and their product is never checked. `blob_db` validates that one payload can be
+rebound (B9/B10, both closed by `main`). `kvhash` validates that its directory
+fits one payload. Nobody validates that a *map sized to the payload* leaves
+room for anything else in an erase block, and the application has no way to ask
+— K10 gives no bucket count, B3 no occupancy. So "ask for the biggest map"
+compiles, mounts, passes `create`, and fails 36 records into a multi-hour fill.
+
+The app ships `16384` instead, and prj.conf carries this arithmetic beside the
+symbol so the next person to raise it finds out here rather than there.
 
 ---
 
