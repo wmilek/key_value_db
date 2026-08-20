@@ -687,6 +687,58 @@ Caching the top level remains optional and is where K7 (file-scope buffers
 shared across all maps) and R1 (O(1) steady-state RAM) would start to bind — but
 v1 does not need it.
 
+**9.6 If the distribution degrades, v1 has no cure — only preventions.** Worth
+stating as a cost rather than leaving implied, because the failure is silent
+until it is fatal.
+
+*What degradation is.* Keys cluster into a subset of buckets. Nothing breaks:
+every key is still found, `VERIFY PASS` still passes, and the damage shows up
+only as buckets growing faster than they should — more bytes per `get`, more
+rewritten per `set` (K4) — until one bucket reaches the payload ceiling and
+returns `-ENOSPC` (**K2**), possibly hours into a fill. Note it need not be the
+*keys* that cluster: a skewed value-size distribution produces a hot bucket with
+perfectly spread keys, which is what the compound-Poisson estimate got wrong at
+person 9 232 (`DESIGN.md` §6.1).
+
+*Three preventions, and they are all v1 has:*
+
+1. **Independent level indices** (D3d). Disjoint bit ranges of a 64-bit hash, or
+   separate salts. Free, and the whole fix for design-caused clustering.
+2. **Offline verification.** `tools/sizing.py` through the real hash — but only
+   where the population is derivable. §6.1 already records the limit: this
+   application can enumerate only because its data is a pure function of an
+   index (F6); one whose data arrives from outside cannot.
+3. **Margin.** The strongest of the three, and the second reason §5.1 matters:
+   clustering that bursts a bucket at load 4 is harmless at load 0.5. Skew
+   cannot be fixed, but two levels make the map cheap enough to keep sparse that
+   skew need never reach the ceiling.
+
+*And nothing detects it,* because D3b excluded occupancy from `stat()` — rightly,
+since maintaining it costs a write per insert. So the only signal is the
+`-ENOSPC` that arrives too late. **§9.7 is the free exception.**
+
+*There is no repair.* The bucket count is fixed at `create` (**K3**), so the map
+cannot be re-shaped. Copying into a larger one means reading every key, and
+**K6 is "no iteration"** — the data cannot be enumerated out of the store it is
+stuck in. Unless the application can regenerate its dataset from an external
+source, passing the ceiling means reformat and data loss. In v1 a distribution
+mistake is not merely unrecoverable, it is **unmigratable**.
+
+That is the cleanest argument for v2 that this proposal contains: splitting *is*
+the in-place cure, because it re-shapes the map without needing to enumerate it.
+
+**9.7 One free warning, and it should be in v1.** Every `set` already reads its
+target bucket, so `kvhash` knows that bucket's byte size at **zero** extra cost —
+no counter, no second read, no write. It can therefore say so when a bucket
+crosses a threshold of the payload ceiling (60 % is a reasonable start),
+by log or by return value.
+
+This satisfies D3b's rule exactly: observed in passing, never stored. And it is
+the mitigation for §9.6 — it converts K2 from a surprise that arrives when
+recovery is impossible into a signal that arrives while margin still exists.
+Given that v1 deliberately has no occupancy query and no repair path, a warning
+that costs nothing is the difference between a limitation and a trap.
+
 ## 10. Recommendation
 
 **Option B, implemented so that C stays reachable**, and A folded in as the
@@ -877,8 +929,20 @@ For the record, so these are not re-opened as blockers:
   see what it decided.
 - **D3d.** How are the two level indices derived from one key (§11.2)? Split a
   64-bit hash, or salt per level? Unspecified today, and getting it wrong
-  clusters keys into exactly the failure K2 punishes.
-- **D3e. DECIDED: `{0}` builds one level, small — today's behaviour
+  clusters keys into exactly the failure K2 punishes — silently, since every key
+  is still found (§9.6).
+
+  **Folded in: the free bucket-fill warning (§9.7).** A `set` already reads its
+  bucket, so reporting that it has crossed a threshold of the ceiling costs
+  nothing — no counter, no extra read, no write. Proposed for v1 at 60 %,
+  by log or return value. It belongs with this decision because it is the
+  mitigation for this risk: v1 has three preventions against degradation, no
+  detection once D3b excluded stored occupancy, and **no repair at all** — K3
+  fixes the bucket count and K6 gives no iteration, so a degraded map cannot be
+  re-shaped *or* copied out of. A warning that costs nothing is what separates
+  that from a trap.
+
+  Settle the threshold and whether it is a log line, a return code, or both.- **D3e. DECIDED: `{0}` builds one level, small — today's behaviour
   unchanged.** The default serves the small single-level map; two levels are
   opted into by declaring a population that needs one (§7.1). Nothing regresses
   for callers who say nothing, and v1's lack of promotion therefore introduces
