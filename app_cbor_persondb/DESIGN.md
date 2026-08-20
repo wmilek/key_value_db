@@ -111,7 +111,7 @@ Read out of the tree and the existing hardware captures, not assumed.
 | **C7** | Single-threaded: the caller serializes every call across every open map — including across *different* roots, since `kvhash` scratch buffers are file-scope. | `blob_db.h`; `kvhash.c:54-55` |
 | **C8** | Each `blob_db_update`/`delete` is individually atomic; **no multi-key or multi-blob transaction**. | `blob_db.h` §atomicity |
 | **C9** | No occupancy or geometry introspection at any layer: no partition size, sector size, free space, fill level, or per-map entry count. | `blob_db.h`, `shape_map.h` |
-| **C10** | `CONFIG_ROOTREG_MAX_ROOTS` defaults to **8**. | `lib/rootreg/Kconfig` |
+| **C10** | `CONFIG_ROOTREG_MAX_ROOTS` defaults to **8** — ample, and not a constraint on this app. A structure is reachable from one root (P5) and takes **one** entry; `rootreg` is sized for "a few registered roots … a registry, not a database". A layout that wants more entries than it has structures is misusing L1.5 (§12.1). | `lib/rootreg/Kconfig`, `doc/layers/l1_root_registry.md` §1 |
 
 Consequences that drive the design:
 
@@ -548,32 +548,60 @@ key `"p%08X"`, credential key the 14-hex-char UID verbatim, shard
 `fnv1a32(id) % 16` — a hash of the id rather than the id itself, so persondb
 stays independent of how the caller numbers people (§6.1).
 
-**Why not L3, as decided.** `kvdb` was the obvious starting point and did not
-fit:
+**Why not L3.** `kvdb` was the obvious starting point and does not fit. The
+table is the *corrected* argument — §12.1 re-runs each row against `main` and
+says which of the original ones survived:
 
 | | L3 — seventeen `kvdb` instances | L2 — superblock + seventeen roots |
 |---|---|---|
-| Boot | 17 × (registry read + meta-blob read) = **34 sector reads** | registry + superblock = **2** |
-| Persistent overhead | 17 registry entries + 17 × 32 B meta blobs | 1 entry + 1 superblock |
-| Registry capacity | 17 of `ROOTREG_MAX_ROOTS`, default **8** (C10) — does not fit, twice over | 1 |
+| Boot | 17 × (registry read + meta-blob read) = **34 blob reads, ≲62 ms once** — was "34 sector reads" before B1 (§12.1) | registry + superblock = **2, ≲3.6 ms** |
+| Persistent overhead | 17 × 32 B meta blobs | 1 superblock |
+| Registry footprint | 17 entries for **one** structure — L1.5 used as an id allocator (§12.1) | 1 entry, which is what a structure costs |
 | Progress commit | `kvdb_set` = 2 reads + 1 write | `blob_db_update` = 1 read + 1 write |
 | Per-operation cost | identical — `kvdb_get` is `strlen` + `ops->get` | identical |
 | Fan-out, naming, capacity accounting | the app's problem | the app's problem |
 | What it buys | named instances; backend recorded per instance | direct control of the root graph |
 
-### 12.1 The L3 re-check — two of those five reasons have expired
+### 12.1 The L3 re-check — one reason expired, one was never a reason
 
-Re-run against `main` at `1821328`, because two of the numbers above were
-consequences of a Kconfig cap that has since been lifted, and a decision that
-rests on an expired number should not stand on it.
+Re-run against `main` at `1821328`. A decision should not rest on a number that
+has since moved, nor on an argument that was never sound — and this one had one
+of each. The table above is the corrected argument; what it used to say, and
+why, is below.
 
 | row | verdict | evidence today |
 |---|---|---|
 | Boot — 34 **sector** reads | **expired.** 34 *blob* reads, but B1's slot walk means a read is no longer a 64 KB sector. At §5's fitted cost — 28 flash transactions per `blob_db_get`, 65 µs each, derived from `check`'s 112 over four calls and therefore an upper bound for a 280 B registry image — the L3 route costs **≲62 ms once at boot** against L2's ≲3.6 ms. A 58 ms one-time difference, next to an `open` phase measured in tens of seconds. | `RESULTS.md` §5, B1 |
-| Persistent overhead | **stands, and never mattered.** 17 entries + 17 × 32 B is 816 B on a 4 MiB dataset. | — |
-| Registry capacity | **expired.** `ROOTREG_MAX_ROOTS` is `range 1 1000`, and rootreg's `BUILD_ASSERT` allows 255 at this payload size (`8 + 16 × 17 = 280 B`). Seventeen instances is one `prj.conf` line, not a wall. It is a **default**, which is finding **R1** — a sharp edge, not a limit. | `lib/rootreg/rootreg.c:45-48`, `lib/rootreg/Kconfig` |
+| Persistent overhead | **stands, and never mattered.** 17 meta blobs of 32 B is 544 B on a 4 MiB dataset. (The 17 *registry entries* are not overhead — see the withdrawal below.) | — |
 | Progress commit | **stands.** `kvdb_set` is still `dir_load` + bucket read + bucket write (K11); `blob_db_update` on an app-owned superblock is still one read and one write. Progress commits are per batch, so this is small. | `kvhash.c:256-330`, `kvdb.c:189-195` |
 | Per-operation cost identical | **stands.** `kvdb_get` is `strlen` + `ops->get`, no extra flash op. | `kvdb.c:197-203` |
+
+**The registry-capacity row is withdrawn — it was never a reason.** Earlier
+editions of this table argued that seventeen instances "overrun
+`ROOTREG_MAX_ROOTS`, default 8, twice over". That is a real symptom pointed at
+the wrong module. `rootreg` maps compile-time keys to **structure roots**, and
+its own contract sets the scale: *"a few registered roots … it is a registry,
+not a database"* (`l1_root_registry.md` §1). **A database is one structure and
+takes one entry** — which is what this app's layout does, and what the L3
+layout would have to do too if it were shaped correctly.
+
+So the seventeen-entry figure never measured a shortage of registry capacity.
+It measured a layout using L1.5 as an id allocator, one entry per shard, for a
+structure that has exactly one root. Two consequences, and neither is a cost to
+put in this table:
+
+- **Raising `ROOTREG_MAX_ROOTS` would be the wrong fix.** The bound is not the
+  problem; a design that needs seventeen entries is. Sizing the registry to
+  absorb a misuse is how a registry becomes a database.
+- **The number to judge a layout on is entries-per-structure, and it is one.**
+  This app registers one. The L3 route registers seventeen for the same single
+  structure, and cannot do otherwise, because a `kvdb` instance *is* a registry
+  key — which is V4 seen from L1.5.
+
+The row is therefore gone from the table above, replaced by the thing it was
+really observing: seventeen entries for one structure. Finding **R1** is
+withdrawn on the same grounds — it was raised from this argument, and the
+argument does not survive it.
 
 **What actually moved was C2.** `CONFIG_BLOB_DB_MAX_PAYLOAD_LEN` was `range 1
 4096` when D10 was taken and is now `range 1 65535`, bounded at mount by the
@@ -606,15 +634,18 @@ of them, and *both* are on the read path. Sharding is what keeps both small.
 **The conclusion changes shape, not direction.** D10 stands, but for the third
 reason rather than the first two:
 
-- Boot I/O and registry capacity are no longer arguments. They were artifacts
-  of a payload cap and a default, and both are gone.
+- Boot I/O is no longer an argument — B1 retired it. Registry capacity never
+  was one: a database is one registry entry, and seventeen said something about
+  the layout, not about `rootreg`.
 - **The argument that survives is R-D.** Sixteen small person maps are not
   over-provisioning against C2 that a bigger payload would retire (§6.1) — it
   is what makes a lookup read 4 756 B instead of 18 228 B. `kvdb` cannot
   express seventeen-maps-behind-one-name, so an application that needs it holds
   the roots itself.
-- The cheap L3 route — seventeen *named* instances, one per shard — is now
-  affordable (58 ms of boot, one `prj.conf` line) and still buys nothing:
+- The cheap L3 route — seventeen *named* instances, one per shard — costs
+  little now (≈58 ms of boot) and still buys nothing. It also asks `rootreg`
+  for seventeen entries where the structure has one root, which is reason
+  enough on its own not to ship it:
   `persondb.c` would keep the same shard table, the same fan-out and the same
   capacity accounting, with `kvdb_t` handles in place of root ids. Per-op cost
   is provably identical. It would, however, turn **V4** from an argument into a
@@ -676,7 +707,7 @@ Settled during review; recorded so they are not relitigated.
 | D7 | The app is `app_cbor_persondb/` and **all its documentation lives inside it**. |
 | D8 | The app is **both** probe and showcase; §1 states the rule that keeps the two compatible. |
 | D9 | The person management functionality is an **internal application API** (§8), not proposed for `lib/`. |
-| D10 | It is implemented on **L2 `map_ops` + `rootreg` + `blob_db`**, not L3 `kvdb` (§12). `kvdb` is not linked into the image. **Re-checked against `main` at `1821328` (§12.1): the decision stands, two of its three reasons do not.** Boot I/O and registry capacity were artifacts of a payload cap and a Kconfig default and are gone; what holds the app at L2 is R-D — sixteen small maps move 4 756 B per lookup where any single-instance layout moves 11 458–33 748 B, and `kvdb` cannot name sixteen maps. |
+| D10 | It is implemented on **L2 `map_ops` + `rootreg` + `blob_db`**, not L3 `kvdb` (§12). `kvdb` is not linked into the image. **Re-checked against `main` at `1821328` (§12.1): the decision stands, its stated reasons largely do not.** Boot I/O expired with B1; registry capacity is withdrawn as a reason entirely — a database takes one registry entry, so seventeen was a fact about the proposed layout, not a limit of `rootreg`. What holds the app at L2 is R-D — sixteen small maps move 4 756 B per lookup where any single-instance layout moves 11 458–33 748 B, and `kvdb` cannot name sixteen maps. |
 | D14 | **The dataset size is frozen; the fill percentage is an observation.** 50 % was the heuristic that picked 10 000 persons once (§6.3), leaving the board room for other uses and avoiding a reformat before each run. Nothing is scaled from geometry at run time, and a fill percentage that *falls* is a better implementation, not a regression. |
 | D11 | **Size to fit, do not fight C2** (R-J): sixteen person maps put the fullest bucket at 66 % of the ceiling, a number obtained by enumerating the population rather than by modelling its tail — the model was tried, and was wrong (§6.1). `-ENOSPC` is not an expected path, and the app does not provoke it; the over-provisioning it forces *is* the visible cost. |
 | D12 | A **scenario layer** (§9) holds every operation on a population, and never prints. |

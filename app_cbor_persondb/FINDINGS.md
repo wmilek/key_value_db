@@ -25,7 +25,8 @@ remaining open ones are listed in the summary below.
 | | |
 |---|---|
 | **Closed by `main`** | B1, B5 (partly), B9, B10, B3 (partly) |
-| **Still open** | B2, B4, B6, B7, B8, B11, B12, K1–K11, V1–V4, R1, X1 |
+| **Still open** | B2, B4, B6, B7, B8, B11, B12, K1–K11, V1–V4, X1 |
+| **Withdrawn** | R1 — `ROOTREG_MAX_ROOTS`'s default was never the problem; the layout that wanted seventeen entries was (`DESIGN.md` §12.1) |
 | **Newly observed** | N1 — transaction count rose sharply as byte count fell (closed on hardware: ~65 µs per transaction) · B12 — compaction lowers the durable id ceiling ([issue #14](https://github.com/wmilek/key_value_db/issues/14)) |
 
 This is the *probe* output of `app_cbor_persondb` (see `DESIGN.md` §1). Every
@@ -772,21 +773,32 @@ decision — storing bucket ids that could have been computed.
 
 ## L1½ — `rootreg`
 
-### R1 — `ROOTREG_MAX_ROOTS` defaults to 8 (minor, `read`)
+### R1 — ~~`ROOTREG_MAX_ROOTS` defaults to 8~~ — **WITHDRAWN, not a finding**
 
-Eight registered roots is below what a sharded dataset needs if each shard is a
-named `kvdb` instance — the seventeen-instance L3 variant in `DESIGN.md` §12 does not
-fit the default. The app's L2 layout uses one entry, so it never trips this, but
-it is a sharp edge for the L3 route: the failure is `-ENOSPC` from
-`kvdb_open`, at a layer that says nothing about registry capacity.
+Raised as: *"eight registered roots is below what a sharded dataset needs if
+each shard is a named `kvdb` instance — the seventeen-instance L3 variant in
+`DESIGN.md` §12 does not fit the default"*, with the failure being `-ENOSPC`
+from `kvdb_open` at a layer that says nothing about registry capacity.
 
-**A default, not a limit** (re-checked, `DESIGN.md` §12.1). `ROOTREG_MAX_ROOTS`
-is `range 1 1000`, and the `BUILD_ASSERT` that bounds the registry image to one
-payload allows 255 roots at `BLOB_DB_MAX_PAYLOAD_LEN=4096`. Seventeen instances
-is one `prj.conf` line. That keeps this a finding — a default that silently
-sizes the registry for a use case smaller than the one the layer above enables,
-reported as `-ENOSPC` mid-open — but it is not the reason the app is on L2, and
-`DESIGN.md` no longer claims it is.
+**Withdrawn on re-check (`DESIGN.md` §12.1). The number eight was never the
+problem; needing seventeen was.** `rootreg` registers **structure roots**, and
+every structure in the stack is reachable from one root (P5) — so a database is
+*one* entry. Its own contract sets the scale and says so outright: "a few
+registered roots (Kconfig-bounded, must fit one i-node payload). **It is a
+registry, not a database**" (`l1_root_registry.md` §1). Eight is ample for what
+the module is; this app registers one, and a correctly shaped L3 layout would
+also register one.
+
+What the seventeen-entry figure actually showed is that the L3 route reaches
+for L1.5 as an **id allocator** — one entry per shard, for a structure that has
+a single root. That is a defect in the route, and it is already recorded where
+it belongs: **V4**, nothing at L3 composes shards, so an application that must
+shard has no way to keep its shards behind one root without dropping to L2.
+
+Left in the register rather than deleted, because a withdrawn finding is part
+of the record: the original wording would have sent a reader to raise
+`ROOTREG_MAX_ROOTS`, which is precisely the wrong fix — sizing a registry to
+absorb a misuse is how a registry becomes a database.
 
 ---
 
@@ -801,19 +813,26 @@ current reach.
 K1 makes sharding mandatory past ~2.09 MB, and `kvdb` offers no help: the
 application invents instance naming, the key→shard hash, read fan-out and
 per-shard capacity accounting regardless. What `kvdb` still charges for that is
-seventeen registry entries, seventeen meta blobs, thirty-four sector reads at boot, and a
-collision with R1's default — in exchange for a naming feature a sharded app
-does not need, because it has one superblock and knows its own shards.
+seventeen registry entries, seventeen meta blobs and thirty-four sector reads at
+boot — in exchange for a naming feature a sharded app does not need, because it
+has one superblock and knows its own shards.
+
+The seventeen **registry** entries are the sharpest of those, and not because of
+their size: a structure is reachable from one root (P5), so a database is one
+entry. Asking `rootreg` for seventeen is using a registry as an id allocator —
+the module's own contract says "a registry, not a database" — and there is no
+way to avoid it at L3, because a `kvdb` instance *is* a registry key. That is
+this finding, stated at its own layer.
 
 L3's current audience is therefore **small stores of a few named instances**.
 Every application larger than one map drops to L2, as this one does.
 
-**Re-stated after the payload cap moved** (`DESIGN.md` §12.1). Two of those
-charges have shrunk to nothing: B1 made the thirty-four reads slot walks rather
-than sector reads (≈62 ms once, at §5's fitted cost), and R1's default is a
-`prj.conf` line. The `~2.09 MB` threshold in this finding's title is also
-obsolete — at the 32 746 B payload the DK's geometry now sustains, one map
-reaches 4 092 buckets, and this app's 3.6 MB dataset fits in **one** `kvdb`.
+**Re-stated after the payload cap moved** (`DESIGN.md` §12.1). One of those
+charges has shrunk to nothing: B1 made the thirty-four reads slot walks rather
+than sector reads (≈62 ms once, at §5's fitted cost). The `~2.09 MB` threshold
+in this finding's title is also obsolete — at the 32 746 B payload the DK's
+geometry now sustains, one map reaches 4 092 buckets, and this app's 3.6 MB
+dataset fits in **one** `kvdb`.
 
 The finding survives the correction and gets sharper, because sharding turns
 out not to be a capacity workaround at all. `kvhash`'s directory must fit one

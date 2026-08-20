@@ -59,10 +59,13 @@ and, in the other direction, mistaking a capacity workaround for a design.
 
 *And re-check it.* This decision was first argued from boot I/O (thirty-four
 sector reads against two) and from `CONFIG_ROOTREG_MAX_ROOTS` defaulting to 8.
-Both arguments have since expired — one to the streaming slot walk, one to a
-Kconfig line — while the decision itself held for a reason neither of them
-named. A rationale is a claim about the code as it is today; `DESIGN.md` §12.1
-re-runs this one and records which parts survived.
+Neither argument stands: the first expired when `blob_db` learned to walk
+buckets by slot header, and the second was never valid — a database is
+reachable from one root, so it takes **one** registry entry, and a layout that
+wants seventeen is misusing the registry rather than outgrowing it. The
+decision held anyway, for the reason above, which neither of them named. A
+rationale is a claim about the code as it is today; `DESIGN.md` §12.1 re-runs
+this one and records which parts survived.
 
 ### 3. Make every persistent structure reachable from one integer
 
