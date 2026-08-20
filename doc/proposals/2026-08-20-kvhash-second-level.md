@@ -382,17 +382,40 @@ So the threshold is set by create cost, not lookup cost, and it sits far above
 the byte crossover. The proposed rule:
 
 ```
-buckets_needed = expected_entries / target_entries_per_bucket   /* ~1, §5.2 */
+/* Small maps: write traffic is negligible, so pack buckets and stay flat.
+ * The load is capped by entry size so a bucket cannot approach K2's ceiling. */
+load  = min(SMALL_MAP_LOAD, safe_bucket_bytes / max_entry_bytes)
+small = ceil(expected_entries / load)
 
-buckets_needed <= ONE_LEVEL_MAX_BUCKETS  ->  one level, that many buckets
-otherwise                                ->  two levels, m = n = ceil(sqrt(buckets_needed))
+small <= ONE_LEVEL_MAX_BUCKETS
+        ->  one level, `small` buckets
+otherwise
+        ->  two levels, ~1 entry per bucket (§5.2):
+            buckets = expected_entries, m = n = ceil(sqrt(buckets))
 ```
 
-with `ONE_LEVEL_MAX_BUCKETS` recommended at **255** — a 2 048 B directory, one
-blob at `create`, and comfortably inside every existing use. `app_cbor_persondb`
-declaring 8 000 persons lands well past it and gets two levels at m = n ≈ 90;
-a settings store declaring 50 keys stays one level with a 408 B directory; an
-application that declares nothing stays at 8 buckets.
+**The load factor has two regimes, and conflating them was a bug in an earlier
+draft of this rule.** §5.2's "~1 entry per bucket" minimises *write* traffic,
+and write traffic is what dominates a store being filled with thousands of
+records. It is irrelevant to a map holding a few hundred. Applying it
+everywhere sent anything over `ONE_LEVEL_MAX_BUCKETS` entries to two levels —
+so a 300-key settings store would have paid 28 sub-map creations at ~1.1 s each
+on the DK (**B7**) to optimise write traffic it does not have.
+
+With `SMALL_MAP_LOAD` at **4**, one level covers roughly a thousand entries:
+
+| caller | declares | gets |
+|---|---|---|
+| nothing (`{0}`) | — | one level, 8 buckets — today's behaviour |
+| a settings store | 50 entries | one level, 13 buckets |
+| `app_perf_kvdb` | 768 entries | one level, 192 buckets |
+| `app_cbor_persondb` | 8 000 persons | **two levels**, m = n ≈ 90 |
+
+The `safe_bucket_bytes / max_entry_bytes` term is what stops the load factor
+being a trap for large records: four 4 KB entries would be a 16 KB bucket, so a
+map declaring those gets a lower load and more buckets instead. It is also the
+only place `max_entry_bytes` does work at one level, which is why it is not
+optional.
 
 `ONE_LEVEL_MAX_BUCKETS` is a **tunable constant, not a format field**. Each map
 records its own depth, so moving the threshold later changes only maps created
@@ -410,8 +433,15 @@ Two more pieces make it a contract rather than a hint:
   and entry count. That closes the "cannot be read back" half of **K9** and much
   of **K10** — `app_cbor_persondb`'s store report currently prints "bucket count
   not observable — FINDINGS.md K10" where the number should be.
-- **An override, named as one.** `bucket_count_override` for the caller who
-  genuinely knows better, kept out of the path a naive caller reaches for first.
+- **No override, and this is deliberate.** An earlier draft of this section
+  proposed `bucket_count_override` "for the caller who genuinely knows better".
+  That is `initial_capacity` under a friendlier name, and it is struck. It
+  contradicts D5's first criterion — that an application stops computing a
+  geometry — and §7.2's warning that two ways to say overlapping things is how
+  the present contradiction arose. With nothing deployed there is no caller to
+  preserve, so an escape hatch would preserve only the habit. If a genuine
+  tuning need appears the contract can change again, which is cheap now and
+  will not be later.
 
 **What this does not fix.** Declarative config makes the *first* guess right; it
 cannot help a population that outgrows what was declared, because `n_buckets` is
