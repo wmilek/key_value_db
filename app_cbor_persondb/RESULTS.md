@@ -10,12 +10,16 @@ re-taken at `338ec24` (which contains all of `e80f404`). They were taken at a
 tenth of the target scale, so §5's per-operation numbers are directly
 comparable to the rest of this file, while its whole-run numbers (fill
 duration, occupancy) are *not* the 10 000-person figures and are marked where
-they appear. A full-scale DK run remains outstanding for `A4`; §5 gives a
-revised floor of ≈2.2 h for it.
+they appear. A full-scale DK run remains
+outstanding for `A4`, but §5d now measures **5 000 persons on hardware** — half
+scale — and puts the `A4` range at 2.0–2.4 h.
 
-**`blob_db` now defaults to the UBI backend; §5 and §5b are `flash_area`.**
-§5c measures the default on the same board: reads cost ~1.9× more, `fill` is
-1.10× *cheaper*, and the `A4` floor improves slightly to ≈2.0 h.
+**`blob_db` now defaults to the UBI backend; §4a, §5 and §5b are
+`flash_area`.** §5c measures the default's *timings* on the same board: reads
+cost ~1.9× more, `fill` is 1.10× *cheaper*, and the `A4` floor improves
+slightly to ≈2.0 h. §4b measures its *footprint*: **+23 032 B FLASH and
++3 408 B RAM**, which is 2.1% of this image's RAM and leaves §4a's B6 finding
+— that two sector buffers own 83% of it — completely unchanged.
 
 ---
 
@@ -131,6 +135,11 @@ An access decision costs **38 % more** at half-full than on a near-empty store,
 and throughput falls **30 %**. Benchmark a nearly-empty store and you publish a
 number the product never sees.
 
+**The flash-op column transfers to hardware.** This table predicts 351 flash ops
+per `check` at 5 000 persons; the DK measured **344** on the UBI backend (§5d).
+Two percent apart, across a different platform, backend and build — which is the
+§1 claim holding at a scale where it could plausibly have broken.
+
 Note the flash-operation column is **not monotonic** — it peaks at 5 000 and
 falls again at 10 000. Per-operation cost tracks how much superseded data sits
 in the sectors being walked, and that is a function of *write history and when
@@ -235,6 +244,10 @@ Cross-built with Zephyr SDK 1.0.1 (`arm-zephyr-eabi`) for
 `nrf5340dk/nrf5340/cpuapp`. These are real target numbers, as are the timings
 in §5.
 
+**This section is the `flash_area` backend.** `blob_db` now defaults to UBI,
+which adds 23 KB of ROM and 3.4 KB of RAM — see §4b for the default build's
+numbers and for which conclusions below survive the change.
+
 | | FLASH | of 1 MB | RAM | of 448 KB |
 |---|--:|--:|--:|--:|
 | benchmark frontend | 59 072 B | 5.6 % | **157 584 B** | **34.4 %** |
@@ -313,6 +326,92 @@ docker run --rm -v "$PWD/..:/ws" -w /ws ghcr.io/zephyrproject-rtos/ci:latest bas
 
 Swap `ram_report` for `rom_report`, or drop `-t` for a plain build. The numbers
 above were taken with a local SDK 1.0.1 install, which gives identical results.
+
+## 4b. Footprint on the UBI backend (the default)
+
+§4a is `flash_area`. `blob_db` now defaults to `CONFIG_BLOB_DB_BACKEND_UBI`, so
+these are the numbers a default build of this app actually produces. Both
+columns were rebuilt at the same commit with the same method — `text + data`
+from `arm-zephyr-eabi-size`, which is what Zephyr reports as the FLASH region —
+so the delta is attributable to the backend and nothing else.
+
+| | FLASH | of 1 MB | RAM | of 448 KB |
+|---|--:|--:|--:|--:|
+| `flash_area` | 61 316 B | 5.8 % | 157 695 B | 34.4 % |
+| **UBI (default)** | **84 348 B** | **8.0 %** | **161 103 B** | **35.1 %** |
+| **Δ** | **+23 032 B** | +2.2 pp | **+3 408 B** | +0.7 pp |
+
+`app_perf/RESULTS.md` measures the same delta independently at **+23 036 /
++3 408 B** on a different application. Four bytes apart on ROM and exact on
+RAM, which is what it should be: the cost is the library, not the caller.
+
+The `flash_area` column above is 2.2 KB larger than §4a's 59 072 B because the
+tree has moved since that section was taken; §4a's *breakdown* still holds, and
+this table is the one to diff against.
+
+### ROM — where the 23 KB goes
+
+| Component | Δ bytes | share |
+|---|--:|--:|
+| `ubi/lib` — the UBI library itself | **+13 982** | 60.7 % |
+| linker/build artefacts not attributed to a path | +6 216 | 27.0 % |
+| `zephyr/lib/utils` — CRC and helpers UBI pulls in | +1 474 | 6.4 % |
+| `kernel/mutex.c` + `mem_slab.c` + `sched.c` | +944 | 4.1 % |
+| `blob_db_store_ubi.c` against `blob_db_store_flash_area.c` | +412 | 1.8 % |
+| `zephyr/subsys/storage` — flash_map partly dropped | −120 | −0.5 % |
+| libc `memmove`/`memcpy` variant shifts | +124 | 0.5 % |
+
+The store seam itself is nearly free: swapping the backend implementation costs
+**412 bytes**. Everything else is UBI and what UBI depends on. Note the app,
+`kvhash`, `rootreg` and `zcbor` are **byte-identical** across the two builds —
+the abstraction holds, and nothing above L0 knows which backend it has.
+
+### RAM — where the 3.4 KB goes
+
+All of it is UBI's own state, in four `k_mem_slab` pools:
+
+| Symbol | Bytes | |
+|---|--:|---|
+| `_k_mem_slab_buf_leaf_slab` | **2 176** | **the PEB pool — 16 B per PEB** |
+| `_k_mem_slab_buf_scratch_slab` | 512 | |
+| `_k_mem_slab_buf_volume_slab` | 440 | |
+| `_k_mem_slab_buf_device_slab` | 136 | |
+| four slab descriptors + `guard_mutex` + `active_partitions` | 136 | |
+| **total** | **3 400** | `blob_db` itself grows by 8 B |
+
+**The dominant term scales with `CONFIG_UBI_MAX_NR_OF_DATA_PEBS`**, which this
+board's conf sets to 126 — the DK's 8 MiB partition in 64 KB blocks, less the 2
+UBI reserves. That is the whole reason PR #20 sized the pool per geometry
+instead of picking one generous default: `native_sim`'s 4 KB blocks need 2 046
+PEBs, and the same symbol would then cost ~32 KB of RAM on a board that has
+128 blocks.
+
+### It does not move the needle on this app, and here is why
+
+Against §4a's finding B6 — that `blob_db`'s two 64 KB sector buffers own 83 % of
+this image's RAM — UBI's 3.4 KB is **2.1 %** of the total and 2.6 % of what
+`g_bbuf` alone costs. The RAM problem in this application is unchanged by the
+backend and remains the sector buffers.
+
+ROM is a different story only in proportion: +23 KB takes the storage stack from
+5.4 KB to roughly 19.4 KB, so what was 9.1 % of the image is now about 23 %.
+The image is still 8 % of a 1 MB part, so §4a's conclusion stands — **nothing
+about this application is ROM-constrained** — but the statement "the whole
+storage stack is 5.4 KB of ROM" is now specific to `flash_area` and should not
+be quoted for a default build.
+
+### Reproducing
+
+```
+west build -p always -b nrf5340dk/nrf5340/cpuapp -d build/pdb_ubi app_cbor_persondb
+west build -p always -b nrf5340dk/nrf5340/cpuapp -d build/pdb_fa  app_cbor_persondb \
+      -- -DCONFIG_BLOB_DB_BACKEND_FLASH_AREA=y
+$ZEPHYR_SDK_INSTALL_DIR/gnu/arm-zephyr-eabi/bin/arm-zephyr-eabi-size \
+      build/pdb_{fa,ubi}/zephyr/zephyr.elf
+```
+
+For the attribution tables, `-t rom_report` / `-t ram_report` on each build and
+diff the generated `rom.json` / `ram.json` by path.
 
 ## 5. Measured timings — nRF5340-DK
 
@@ -399,8 +498,11 @@ the ~80% estimated pre-merge, and it is the only remaining lever on
 fill time.
 
 Extrapolating fill linearly to 10 000 persons gives **≈2.2 h** (down from
-≈2.7 h), still a floor for the same reason as before: occupancy and compaction
-both worsen with scale.
+≈2.7 h), described here as a floor on the reasoning that occupancy and
+compaction both worsen with scale. **§5d measured that and it is wrong for
+`fill`:** at 5 000 persons `fill` costs *less* per person than at 1 000, because
+early writes into a growing store are cheap. The reasoning does hold for the
+steady-state write path, which §5d finds compaction-bound.
 
 ### A counter was renamed — do not diff it against the old table
 
@@ -662,6 +764,11 @@ The practical consequence is that the full-scale `A4` estimate does **not**
 get worse on the new default. Extrapolating this fill linearly to 10 000
 persons gives **≈2.0 h**, against ≈2.2 h on flash_area.
 
+§5d has since measured 5 000 persons on the board and reaches the same ≈2.0 h by
+a different route — but also shows the linear extrapolation is not the *floor*
+this file kept calling it. Read the `A4` number as 2.0–2.4 h, and see §5d for
+why `fill` is sublinear while the write path is not.
+
 ### `prepare` does not get kvdb's discount
 
 `app_perf_kvdb/RESULTS.md` reports its `prepare` phase 909× faster on UBI,
@@ -674,6 +781,133 @@ it does not remove it.**
 
 Note also `prepare` formats **100** buckets here against 106 on flash_area:
 UBI reserves 2 PEBs for its own headers, so the volume is smaller.
+
+## 5d. The 5 000-person run — what scale actually does
+
+The first DK run above 1 000 persons. It exists because every hardware number
+in this file was taken at a tenth of the `A4` target, and §5c's `A4` projection
+was a linear extrapolation from that single point. Same board, same default UBI
+backend, `FRESH_START=y`, partition raw-erased first. Raw capture in §8b.
+
+**Whole run: 15.5 min at 1 000 persons → 63.5 min at 5 000.** That is ×4.10 for
+×5 the data — sublinear overall, but the aggregate hides two opposite movements.
+
+| phase | @1 000 | @5 000 | ratio | per-unit |
+|---|--:|--:|--:|---|
+| `open` | 26.0 s | 148.2 s | ×5.70 | — |
+| `prepare` | 110.0 s | **0.13 s** | ×0.001 | 100 buckets both |
+| **`open` + `prepare`** | **136.0 s** | **148.3 s** | **×1.09** | — |
+| `fill` | 732.6 s | 3 376.8 s | ×4.61 | **732.6 → 675.4 ms/person** |
+| `verify` (256) | 11.4 s | 30.9 s | ×2.71 | 44.5 → 120.5 ms/person |
+| `mutate` (64) | 5.3 s | 30.6 s | ×5.75 | **83.2 → 478.7 ms/card** |
+| `re-verify` (256) | 12.0 s | 31.0 s | ×2.58 | 46.9 → 121.1 ms/person |
+| `check` | 27.66 ms | 67.69 ms | ×2.45 | |
+| `byid` | 14.06 ms | 34.14 ms | ×2.43 | |
+| `miss` | 13.72 ms | 34.40 ms | ×2.51 | |
+| **`put`** | **107.41 ms** | **811.39 ms** | **×7.55** | |
+| `cbor` | 0.945 ms | 0.940 ms | ×0.99 | the control — touches no flash |
+
+`VERIFY PASS` both passes, **0 bucket overflows**, 12 550 credentials, mean
+entry 433 B, live content 2 169 730 B = 25.8 % of the partition (33.1 % of the
+UBI volume's 100 × 65 488 B). The `tools/sizing.py` geometry holds at five times
+the scale it was checked at.
+
+### Reads scale with transactions; writes scale with erase
+
+The `app_perf` UBI constants — 178 µs per flash transaction, 0.616 µs/B, fitted
+on a different app at a different scale — applied to this run's own counters
+with no refitting:
+
+| | flash ops | bytes | predicted | measured | error |
+|---|--:|--:|--:|--:|--:|
+| `check` | 344.0 | 13 494 | 70.48 ms | **67.69 ms** | +4.1 % |
+| `byid` | 170.8 | 6 758 | 34.57 ms | **34.14 ms** | +1.2 % |
+| `miss` | 175.7 | 6 734 | 35.42 ms | **34.40 ms** | +3.0 % |
+| `put` | 1 086.6 | 76 619 | 240.61 ms | **811.39 ms** | **−70.3 %** |
+
+**Three reads within 4 %, and the write off by a factor of 3.4.** The model has
+no erase term, and that is now the whole story of the write path. The residual
+is 570.8 ms per `put`, which at 1.069 s per 64 KB sector is **0.53 erases per
+`put`** — against 0.035 at 1 000 persons, a ×15 rise for ×5 the data. Writes at
+this scale are compaction-bound: roughly every second `put` pays a sector erase.
+`mutate` says the same thing from the other direction, at 478.7 ms per card
+assigned.
+
+So the two-constant model is not wrong, it is incomplete, and the boundary is
+sharp: **it predicts reads at any scale and cannot predict writes at any scale.**
+`FINDINGS.md` B2 (five erases per compaction) is where the missing term lives.
+
+### Transactions triple, bytes barely move
+
+| per op | flash ops ×  | bytes × |
+|---|--:|--:|
+| `check` | ×3.07 | ×1.35 |
+| `byid` | ×3.18 | ×1.32 |
+| `miss` | ×3.09 | ×1.39 |
+| `put` | ×3.41 | ×3.67 |
+
+A deeper bucket costs more *transactions* because the slot walk visits more
+headers; it does not cost proportionally more *bytes*, because the payload it
+finally reads is the same 433 B record. Anything that reduces transaction count
+therefore pays off at scale roughly three times better than at 1 000 persons —
+which is `FINDINGS.md` N1, sharpened again.
+
+The write row is the exception and it is diagnostic: `put` is the one operation
+whose bytes grow with its transactions, because compaction copies live data.
+
+### §3b's scaling law transferred to hardware
+
+§3b predicted 351 flash ops per `check` at 5 000 persons, measured on
+`native_sim`. **The DK measured 344.** Two percent apart, on a counter taken
+from a different platform, a different backend and a different build. §1's claim
+that structure transfers and wall-clock does not now has a second confirmation
+at a scale where the two could plausibly have diverged.
+
+### `fill` is sublinear — the standing "floor" claim was wrong
+
+§5 and §5c both say extrapolating `fill` linearly is a **floor**, on the
+reasoning that occupancy and compaction worsen with scale. Measured, it is
+closer to a ceiling: **732.6 ms per person at 1 000, 675.4 ms at 5 000.** Taking
+the whole store-creation path together — the honest unit, see below — 868.6 ms
+per person becomes 705.0 ms, **19 % cheaper at five times the scale.**
+
+This does not contradict the `put` blow-up; the two measure different things.
+`fill` is the *average* cost of writing person *n* as the store grows from empty
+to 25.8 % occupancy, and the early writes are cheap. Bench `put` is the
+*steady-state* cost of a replace at the final occupancy, which is the expensive
+end of that same curve. A store filled to 51.6 % will have a more expensive
+second half than this one did — so `fill`'s per-person cost should eventually
+turn back up, and two points cannot say where.
+
+### `open` and `prepare` are one erase budget, not two
+
+They traded places completely: `prepare` went from 110.0 s to **0.13 s** while
+`open` went from 26.0 s to 148.2 s, for a combined change of +9 %. At 5 000
+persons the store-creation path erases essentially the whole device up front,
+which hands `prepare` a full pool of pre-erased PEBs and makes it free; at
+1 000 it did not, and `prepare` paid a sector erase per bucket.
+
+This is the third app to show it. `app_perf_kvdb/RESULTS.md` sees `prepare` 909×
+faster on its `FRESH_START` path; `app_perf_mc/RESULTS.md` measures both halves
+from one binary run twice (×861). **Quote `open` + `prepare` as a single figure
+for this app, never either alone** — the split is an artefact of which phase
+happened to find erased blocks.
+
+### Revised `A4` projection
+
+Linear from this run's `fill` gives ≈1.88 h, and the whole run ≈**2.0 h** — the
+same number §5c reached from the 1 000-person point, by a different route. But
+`fill`'s per-person cost should rise over the second half as occupancy goes
+25.8 % → 51.6 %, so **treat 2.0 h as the optimistic end and 2.0–2.4 h as the
+range.**
+
+The bench phases are the part that will not extrapolate. §3b's flash-op count
+per `check` is **non-monotonic** — 351 at 5 000, falling to 261 at 10 000 —
+because per-operation cost tracks uncompacted garbage rather than live fill. If
+that holds on hardware, decisions at 10 000 persons will be *faster* than the
+67.69 ms measured here, and this 5 000-person run is the worst point in the
+range rather than a midpoint. `put`, being erase-bound, will not get that
+reprieve.
 
 ## 6. What the numbers say
 
@@ -841,6 +1075,54 @@ Note the store report also changed between editions — it no longer claims "511
 buckets each" or restates the sector size, because neither is observable through
 the API (`FINDINGS.md` K10). That is a reporting-honesty change, not a
 geometry change.
+
+## 8b. Raw capture — nRF5340-DK, 5 000 persons, UBI (the default)
+
+Board 960115021, `N_PERSONS=5000`, `FRESH_START=y`, backend from Kconfig with no
+override, partition raw-erased beforehand. UBI's volume-probe lines are elided;
+it logs them at `<err>` level.
+
+```
+*** Booting Zephyr OS build 4a405846193f ***
+
+persondb 1.0.0 — CBOR person/credential database
+[00:02:28.446,258] <inf> persondb: created store: 16 people maps + 1 credential map, max buckets each, 5000 persons planned
+open         : 148197 ms
+prepare      :    132 ms (100 buckets formatted)
+fill         : 3376771 ms  5000 written, 5000/5000 total, 20 commits
+verify       :  30851 ms  256 persons, 654 cards
+VERIFY PASS
+mutate       :  30637 ms  rev 0 -> 1  (0 revoked, 64 assigned)
+re-verify    :  31008 ms  256 persons, 662 cards
+VERIFY PASS
+
+bench check :   200 ops in 13537000 us ->      14 ops/s    67685 us/op   400 store ops  68803 flash ops   2698789 B  amp 33x
+             : 200 granted, 0 denied, 0 unknown, 0 expired
+bench byid  :   200 ops in  6828000 us ->      29 ops/s    34140 us/op   200 store ops  34164 flash ops   1351636 B  amp 18x
+bench miss  :   200 ops in  6880000 us ->      29 ops/s    34400 us/op   200 store ops  35143 flash ops   1346830 B  amp 292x
+bench put   :   200 ops in 162277000 us ->       1 ops/s   811385 us/op   874 store ops  217315 flash ops  15323722 B  amp 178x
+bench cbor  :   200 ops in   188000 us ->    1063 ops/s      940 us/op     0 store ops      0 flash ops         0 B  amp 0x
+
+store
+  partition   : 8388608 B (8192 KiB)
+  maps        : 16 person + 1 credential (bucket count not observable — FINDINGS.md K10)
+  persons     : 5000 of 5000   credentials: 12550
+  mean entry  : 433 B
+  live content: 2169730 B = 25.8 % of the partition
+  bucket overflows: 0
+  NOTE: physical occupancy (live + uncompacted garbage) is not
+        observable through the API — see FINDINGS.md B3.
+
+persondb: done — store at rev 1; rerun to prove persistence
+```
+
+Wall clock 63.5 min. Reproduce with:
+
+```
+west build -p always -b nrf5340dk/nrf5340/cpuapp app_cbor_persondb \
+      -- -DCONFIG_APP_CBOR_PERSONDB_N_PERSONS=5000 \
+         -DCONFIG_APP_CBOR_PERSONDB_FRESH_START=y
+```
 
 ### A note on running this after `app_perf`
 
