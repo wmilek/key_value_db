@@ -802,15 +802,38 @@ For the record, so these are not re-opened as blockers:
   at two.** What review must confirm is that promotion is in v1 rather than
   deferred — a fixed two-level map is cheaper to build and forecloses the third
   level (§8) and the small-map case (§9.3).
-- **D3a.** Does `map_config` become declarative (§7) — `expected_entries`,
-  `typical_entry_bytes`, `max_entry_bytes` — or does `initial_capacity` stay and
-  merely get documented as the bucket count it is? Note this is **not** a choice
-  about whether to change an API: `shape_map.h` and `kvdb.h` already document
-  the field as an entry count and the implementation already treats it as a
-  bucket count, so one of the two is being corrected either way (§7).
-  Declarative is what lets `tools/sizing.py` be deleted; keeping the current
-  field means every application keeps doing that arithmetic offline, and every
-  `kvdb` caller keeps reading "entry-count hint" and getting a bucket count.
+- **D3a. DECIDED: declarative, and `initial_capacity` is removed.** Not
+  deprecated, not documented-as-buckets, not kept beside the new fields —
+  removed. Its two readings are both absorbed: "expected entry count" *is*
+  `expected_entries`, and "bucket count" is derived (§7.1). Nothing in the
+  proposed implementation reads it.
+
+  The `bucket_count_override` an earlier draft proposed is struck on the same
+  grounds — it was the same field renamed, and it would have re-opened exactly
+  what D5's first criterion closes.
+
+  Migration is two call sites, and both say something truer afterwards:
+
+  | today | becomes |
+  |---|---|
+  | `app_perf_kvdb:452` — `.initial_capacity = N_KEYS / 2` (384 asked, 127 delivered) | `.expected_entries = N_KEYS` |
+  | `tests/lib/kvdb:186` — `.initial_capacity = 16` | `.expected_entries = 16` |
+
+  The first was expressing "about two entries per bucket" through a field the
+  container reads as buckets, then silently receiving a third of it — K9(b)
+  live in the tree. A declared population cannot be clamped away.
+
+- **D3f.** Confirm `SMALL_MAP_LOAD` (§7.1), proposed at **4**, which puts the
+  one-level/two-level boundary near a thousand entries. It exists because
+  §5.2's ~1-entry-per-bucket target is a write-traffic optimisation and small
+  maps have no write traffic to optimise; without it a 300-key store pays 28
+  sub-map creations (B7) for nothing. A constant, not a format field.
+
+  **With `initial_capacity` gone, the derivation rule is the entire sizing
+  interface** — no caller can correct it. That raises the stakes on getting it
+  right, and is the strongest argument for **D3b** (`kvhash_info()`): if the
+  container decides the geometry alone, an application must at least be able to
+  see what it decided.
 - **D3d.** How are the two level indices derived from one key (§11.2)? Split a
   64-bit hash, or salt per level? Unspecified today, and getting it wrong
   clusters keys into exactly the failure K2 punishes.
