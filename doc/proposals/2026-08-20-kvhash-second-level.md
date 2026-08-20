@@ -132,6 +132,18 @@ O(N^⅓), which is not worth a transaction at this scale but is worth 2× at
 ~65 000 buckets — §8 bounds when it matters and what that implies for the
 format.
 
+**The write side moves further than the read side, and by more.** K5 rewrites a
+directory whenever a bucket is touched for the first time. Over a full fill:
+
+| | directory-rewrite traffic |
+|---|--:|
+| one level | 2 047 × 16 384 B = **32.0 MiB** |
+| two levels | 2 047 × 376 B = **752 KiB** + one 368 B top-level write |
+
+**44× less**, on a medium whose erase blocks are the scarce resource and whose
+compaction cost is what caps the store (K13). This is a bigger effect than the
+7× on reads and was missing from the first draft of this proposal.
+
 **The reason to prefer this over A is not the bytes. It is that a two-level map
 can split.** Bucket overflow stops being `-ENOSPC` and becomes "split this
 sub-map and rehash it". That retires **K2**, and with it the reason
@@ -296,12 +308,45 @@ a third level is a rewrite. Ship at two; state that three is unnecessary below
 
 ## 9. Costs and open questions
 
-**9.1 Crash consistency is the real work, not the hashing.** A split touches
-several blobs and `blob_db` has no multi-blob atomicity — that is **B8**'s
-leak window, currently hit once at store creation and now hit on every
-split. §2.2's stage/prepare/commit protocol is the intended answer; whether
-it covers a split without a reachability GC is the first thing review should
-settle.
+**9.1 Crash consistency is a property of the split path, not of the second
+level.** An earlier draft of this section said crash consistency was "the real
+work" of Option B. That was wrong, and the correction changes the staging of the
+whole proposal.
+
+**A fixed two-level map has no new crash exposure at all.** The top level holds
+*m* sub-map root ids. If the sub-maps are created eagerly at `create`, the top
+directory is written **once** and never again — every subsequent `set` touches a
+leaf bucket and, on that bucket's first touch, its own sub-map's directory. The
+top level is exactly as stable as `app_cbor_persondb`'s superblock, which is
+written once and read at boot.
+
+The multi-blob `create` is **B8**'s existing window, hit once per store. It is
+the same window `persondb`'s `create_store()` already has today — allocate the
+roots, create the maps, bind the superblock last. Not a new risk: the same risk,
+in the same place, at the same frequency.
+
+**Eager creation is therefore a design requirement, and it is cheap.** Creating
+sub-maps lazily would rewrite the top directory once per sub-map — K5 one level
+up. Eager creation costs 45 directories of 376 B, about 16.9 KB and ~2.9 ms at
+65 µs per transaction, once in the life of the store.
+
+**What actually carries the risk is splitting.** A split allocates a sub-map,
+rehashes entries into it, and repoints a top-level slot — several blobs, no
+multi-blob atomicity, and B8's window moves from once per store to once per
+split. §2.2's stage/prepare/commit protocol is the intended answer; whether it
+covers a split without a reachability GC is what review must settle.
+
+**So the two halves stage cleanly, and should:**
+
+| | retires | crash-consistency work |
+|---|---|---|
+| **v1** fixed two levels, eager sub-maps | K1, K5, K11, K12, K13 | **none beyond today** |
+| **v2** split on overflow | K2, K3, and the sizing ritual | the whole of it |
+
+That is a better shape than the one this proposal originally argued for. v1 is
+close to mechanical, delivers every byte-count and capacity result in §1 and §5,
+and can ship while the split protocol is still being designed. What it does not
+do is remove the need to size a map correctly in advance — see D4.
 
 **9.2 Split latency.** Rehashing a sub-map lands in the middle of a `set`, on a
 device where rewriting one bucket is already the expensive operation (K4).
@@ -325,6 +370,11 @@ argument leads. `blob_db` contract R1 (O(1) steady-state RAM) bounds it.
 
 **Option B, implemented so that C stays reachable**, and A folded in as the
 leaf-level id scheme if `blob_db` gains the range call.
+
+**Staged in two releases** (§9.1): a fixed two-level map with eagerly created
+sub-maps first, which carries no crash-consistency work beyond what the stack
+already does once per store, then split-on-overflow. The first stage delivers
+every number in §1 and §5; the second is what makes the map self-sizing.
 
 The ordering that matters: A is a performance fix, B is a capability fix. A
 makes this application fast; B makes `kvhash` a map rather than a fixed-size
@@ -369,8 +419,20 @@ proposal does not merge them.
 - **D3c.** Per-map bucket sizing (§7.1) — worth it, or does declarative config
   make it redundant by deriving bucket size from the declared entry size?
 - **D4.** Is split-on-overflow in the first revision, or does v1 ship the
-  two-level layout with `-ENOSPC` retained and splitting deferred? Only the
-  former retires K2.
+  two-level layout with `-ENOSPC` retained and splitting deferred?
+
+  §9.1 makes this the central question rather than a detail. **v1 without
+  splitting is close to mechanical** — the top level is written once and never
+  again, so there is no crash-consistency work beyond what the stack already
+  does at store creation — and it still delivers the 7× on reads, the 44× on
+  directory-rewrite traffic, and the end of K13's capacity wall. **v2 with
+  splitting is where the hard part is**, and it is also the only thing that
+  retires K2 and K3 and lets `tools/sizing.py` be deleted.
+
+  Shipping v1 alone would leave the interface question (§7) half-answered: an
+  application would still declare a population up front and still be unable to
+  survive being wrong about it. The recommendation is to ship v1 early and
+  commit to v2, not to treat v1 as sufficient.
 - **D5.** What is the acceptance measurement? Proposed, in order of how much
   each one proves:
 
