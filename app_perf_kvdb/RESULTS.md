@@ -9,6 +9,12 @@ in this file predated PR 2's lookup change and are superseded — the
 reference to app_perf's "16.9 ms per blob_db read" no longer describes
 this library at all; a small-blob read is now 460 µs.
 
+**The two-level `kvhash` is measured on the DK in "On the two-level
+`kvhash`".** `populate` is 2.08× faster and a rerun's `mount+open` 2.89×
+faster, but steady-state reads cost ~1.65× more, so this app's rerun goes
+12.8 s → 19.7 s. It lands the opposite way from `app_cbor_persondb`, and the
+reason is read/write mix.
+
 **`blob_db` now defaults to the UBI backend, and the tables below are
 `flash_area`.** Both are measured — see "On the UBI backend", which is also
 where this app's most interesting result lives: **UBI halves the cost of
@@ -127,6 +133,53 @@ So on the default backend the "one-minute steady-state test" is a
 ~13-second test rather than a ~6-second one — still far from the minute the
 `N_KEYS` help text assumes.
 
+## On the two-level `kvhash`
+
+`kvhash` gained a second bucket level (`doc/proposals/2026-08-20-kvhash-second-level.md`).
+This app goes through `kvdb` to reach it, so it is measured here as well.
+Same board, same defaults, same UBI backend; only the container differs. The
+proposal's §13.2 notes nothing had run on the DK — this is that run.
+
+`VERIFY PASS` at every generation, so the change is behaviour-preserving through
+`kvdb`.
+
+| phase | one level (UBI) | **two level** | |
+|---|--:|--:|--:|
+| `mount+open` (first, incl. format) | 145 366 ms | 143 781 ms | ×1.01 faster |
+| `prepare` | 1 275 µs/op (116 buckets) | 1 310 µs/op (100 buckets) | ×1.03 slower |
+| **`populate`** | **29 770 µs/op** | **14 340 µs/op** | **×2.08 faster** |
+| `verify` (first) | 5 531 µs/op | 9 088 µs/op | ×1.64 slower |
+| `modify` (first) | 15 352 µs/op | 15 331 µs/op | ×1.00 |
+| `reverify` (first) | 6 045 µs/op | 9 846 µs/op | ×1.63 slower |
+| **`mount+open`** (rerun) | **1 518 ms** | **526 ms** | **×2.89 faster** |
+| `verify` (rerun) | 6 083 µs/op | 9 923 µs/op | ×1.63 slower |
+| `modify` (rerun) | 16 122 µs/op | 16 423 µs/op | ×1.02 slower |
+| `reverify` (rerun) | 6 401 µs/op | 10 793 µs/op | ×1.69 slower |
+| **rerun total** | **≈12.8 s** | **≈19.7 s** | **×1.54 slower** |
+
+The shape matches `app_cbor_persondb/RESULTS.md` §5e exactly, which is the
+useful part: two applications, different access patterns, same verdict.
+
+**Writes and boot get faster; steady-state reads get slower.** `populate` halves
+and `mount+open` on a rerun is nearly three times quicker, because both are
+dominated by writing or reading map structure whose largest blob just got much
+smaller. `verify` and `reverify` are pure `kvdb_get` and cost ~1.65× more,
+because a two-level lookup is an extra flash transaction and UBI charges 178 µs
+for one against 0.616 µs per byte (`app_perf/RESULTS.md`).
+
+`modify` is unchanged to within 2 % in both runs, which is the tell: it is a get
+plus an update, so the read regression and the write improvement land on top of
+each other and cancel.
+
+**So the trade is not free here, and unlike persondb this app does not come out
+ahead on the whole run** — its steady-state loop is read-dominated, and 12.8 s
+becomes 19.7 s. persondb's whole run improves 2.31× because it is fill-dominated.
+Which way the change lands depends entirely on the read/write mix, and these two
+apps bracket it.
+
+Note `prepare` formats **100** buckets against 116: the two-level container's
+structure occupies more of the volume up front.
+
 ## Raw UART capture — UBI, first run (`FRESH_START`, gen 1 -> 2)
 
 UBI's volume-probe lines are elided; it logs them at `<err>` level.
@@ -205,6 +258,39 @@ The first run's own verify/modify/reverify (2.43 / 10.1 / 2.66 ms) run
 slightly faster than the rerun's (2.71 / 11.1 / 2.82 ms) because that
 store was populated moments earlier in bucket order; the rerun reads it
 back cold from a fresh mount.
+
+## Raw UART capture — two-level `kvhash`, first run (gen 1 -> 2)
+
+```
+*** Booting Zephyr OS build 4a405846193f ***
+kvdb perf 1.0.0  (N_KEYS=768  VAL_LEN=16  STRIDE=4  val=24 B)
+[00:02:23.903,320] <inf> rootreg: virgin store — registry bootstrapped at id 1
+mount+open   :         143781 ms
+state: empty store -> initial population
+bench prepare  :  100 ops in    131 ms  ->   763.358 ops/s  (   1310 us/op)
+bench populate :  770 ops in  11042 ms  ->    69.733 ops/s  (  14340 us/op)
+bench verify   :  769 ops in   6989 ms  ->   110.030 ops/s  (   9088 us/op)
+VERIFY PASS (gen 1)
+bench modify   :  196 ops in   3005 ms  ->    65.224 ops/s  (  15331 us/op)
+bench reverify :  769 ops in   7572 ms  ->   101.558 ops/s  (   9846 us/op)
+VERIFY PASS (gen 2)
+done — store at gen 2; rerun to verify persistence
+```
+
+## Raw UART capture — two-level `kvhash`, rerun (gen 2 -> 3)
+
+```
+*** Booting Zephyr OS build 4a405846193f ***
+kvdb perf 1.0.0  (N_KEYS=768  VAL_LEN=16  STRIDE=4  val=24 B)
+mount+open   :            526 ms
+state: rerun, store at gen 2
+bench verify   :  769 ops in   7631 ms  ->   100.773 ops/s  (   9923 us/op)
+VERIFY PASS (gen 2)
+bench modify   :  196 ops in   3219 ms  ->    60.888 ops/s  (  16423 us/op)
+bench reverify :  769 ops in   8300 ms  ->    92.650 ops/s  (  10793 us/op)
+VERIFY PASS (gen 3)
+done — store at gen 3; rerun to verify persistence
+```
 
 ## Reproducing
 

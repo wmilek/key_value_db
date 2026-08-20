@@ -14,6 +14,12 @@ they appear. A full-scale DK run remains
 outstanding for `A4`, but §5d now measures **5 000 persons on hardware** — half
 scale — and puts the `A4` range at 2.0–2.4 h.
 
+**The two-level `kvhash` is measured on the DK in §5e.** Whole run 2.31×
+faster than the sixteen-shard build it replaces and 19.2× faster than the
+one-level container, with `fill` 4.52× faster than shards; reads and `put` cost
+1.3–1.7× more, all of it transaction count. The proposal's §13 `native_sim`
+timings do not transfer in either direction — see §5e.
+
 **`blob_db` now defaults to the UBI backend; §4a, §5 and §5b are
 `flash_area`.** §5c measures the default's *timings* on the same board: reads
 cost ~1.9× more, `fill` is 1.10× *cheaper*, and the `A4` floor improves
@@ -969,6 +975,111 @@ that holds on hardware, decisions at 10 000 persons will be *faster* than the
 range rather than a midpoint. `put`, being erase-bound, will not get that
 reprieve.
 
+## 5e. The two-level `kvhash` on hardware
+
+The proposal's §13.2 says plainly that nothing had run on the DK. This is that
+run, at **1 000 persons** — the scale §5/§5c hold sixteen-shard DK numbers at,
+so all three builds compare like for like. Default UBI backend, `FRESH_START`,
+partition raw-erased first. Raw capture in §8c.
+
+It builds for ARM, boots, and passes both verifies with `VERIFY PASS`, 2 479
+credentials, mean entry 432 B, **0 bucket overflows and 0 buckets past
+near-full**. `stat()` reports **people map depth 1, 250 buckets; credential map
+depth 2, 256 buckets.**
+
+The middle column is the one-level build this proposal replaces
+(`0904b8f`, `DESIGN.md` §12.2), measured on the same board at the same scale.
+
+| phase | sixteen shards | one level | **two level** | vs shards | vs one level |
+|---|--:|--:|--:|--:|--:|
+| `open` + `prepare` | 136.0 s | 147.4 s | 146.0 s | ×1.07 | ×1.01 faster |
+| **`fill`** | 732.6 s | 7 430.4 s | **162.1 s** | **×4.52 faster** | **×45.8 faster** |
+| `verify` (256) | 11.4 s | 19.3 s | 16.4 s | ×1.44 slower | ×1.18 faster |
+| `mutate` (64) | 5.3 s | 54.5 s | 9.2 s | ×1.72 slower | ×5.95 faster |
+| `re-verify` (256) | 12.0 s | 20.1 s | 17.4 s | ×1.44 slower | ×1.16 faster |
+| `check` | 27.66 ms | 46.50 ms | 36.04 ms | ×1.30 slower | ×1.29 faster |
+| `byid` | 14.06 ms | 23.99 ms | **14.11 ms** | **×1.00** | ×1.70 faster |
+| `miss` | 13.72 ms | 21.47 ms | 22.35 ms | ×1.63 slower | ×1.04 slower |
+| `put` | 107.41 ms | 145.14 ms | 179.69 ms | ×1.67 slower | ×1.24 slower |
+| `cbor` | 0.945 ms | 0.950 ms | 0.985 ms | control — no flash |
+| **whole run** | **15.5 min** | **2.14 h** | **6.69 min** | **×2.31 faster** | **×19.2 faster** |
+
+**The container beats the workaround it replaces, on the whole run and by a
+wide margin on `fill`.** That is a stronger claim than `native_sim` could make,
+where `fill` was still slower than sharded. It is not uniformly better: reads
+and `put` cost more than the sixteen-shard build did, and the reason is
+specific.
+
+### The trade is bytes for transactions, and UBI prices those apart
+
+| per op | flash ops | | | bytes | | |
+|---|--:|--:|--:|--:|--:|--:|
+| | shards | one level | **two level** | shards | one level | **two level** |
+| `check` | 115.6 | 120.9 | **176.2** | 10 073 | 34 736 | **6 330** |
+| `byid` | 53.8 | 60.6 | **57.5** | 5 135 | 17 614 | **4 432** |
+| `miss` | 56.8 | 51.5 | **118.5** | 4 846 | 16 998 | **1 860** |
+| `put` | 318.4 | 402.2 | **555.8** | 20 870 | 77 326 | **17 636** |
+
+Every byte column improves — `miss` moves **2.6× fewer bytes than the sharded
+build and 9.1× fewer than one level**, and amplification falls from 210× and
+739× to **80×**. Every transaction column rises. On UBI a transaction costs
+178 µs and a byte 0.616 µs, so the axis that got better is the cheap one.
+
+§5c's constants, with no refitting, price the result exactly:
+
+| | predicted | measured | error |
+|---|--:|--:|--:|
+| `check` | 36.25 ms | 36.04 ms | **+0.6 %** |
+| `miss` | 22.24 ms | 22.35 ms | **−0.5 %** |
+| `byid` | 12.97 ms | 14.11 ms | −8.1 % |
+| `put` | 109.80 ms | 179.69 ms | −38.9 % |
+
+Reads land within a percent. `put`'s residual is 69.9 ms, or **0.065 sector
+erases per operation** — against 0.035 for the sharded build and 0.024 for one
+level, so writes still carry a little more erase than either.
+
+### `byid` is the control that identifies the cost as *depth*
+
+`byid` is a dead heat with the sixteen-shard build — 14.11 ms against 14.06 —
+and it is the one lookup that goes to the people map, which `stat()` reports at
+**depth 1**. `check` is two lookups, one into the **depth-2** credential map,
+and it costs ×1.30. `miss` is a single depth-2 lookup and costs ×1.63.
+
+So the read regression is not the second level *existing*; it is the second
+level being *traversed*. A depth-1 map performs exactly as the sharded build
+did. That also predicts the regression shrinks as maps get wider relative to
+their contents, and grows wherever depth 2 is reached.
+
+### What `native_sim` got wrong, in both directions again
+
+| claim (§13, `native_sim`) | on the DK |
+|---|---|
+| `fill` 3.3× faster than one level | **45.8× faster** — understated ~14× |
+| `check` 2.6× faster than one level | **1.29× faster** — overstated ~2× |
+| 4.5× fewer bytes per `check` | **5.49× fewer** — beaten |
+
+The byte counters transfer and are if anything conservative. The *timings*
+transfer in neither direction, and both errors have one root, as in §5d and in
+the one-level measurement: `native_sim` counts bytes and models no erase
+latency. It therefore cannot see the compaction this change removes — which is
+where nearly all of the `fill` win lives — and it cannot see that the
+transactions this change adds are the expensive axis on real flash.
+
+**This is §1 earning its place for the third time in this file.** Structure
+transferred; the ranking did not.
+
+### What this means for the proposal
+
+On hardware the change is a clear net win at this scale: the whole run is 2.31×
+faster than the build it replaces, capacity is restored, amplification falls
+everywhere, and nothing regressed by more than ×1.7. The costs are real and
+worth stating without softening — `put` is the slowest of the three builds, and
+`miss` is marginally slower than one level despite moving a ninth of the bytes.
+
+Both are transaction-count costs, which `FINDINGS.md` N1 identifies as the
+dominant term on this stack. **The lever that would pay best here is reducing
+transactions per traversal, not bytes** — the bytes are already good.
+
 ## 6. What the numbers say
 
 *Rewritten after the large-payload merge. The previous version of this section
@@ -1206,6 +1317,48 @@ while the app is mid-QSPI-erase can leave the MX25R6435F answering JEDEC id
 `00 00 00` on the next boot, needing `nrfutil device recover`. The console is
 VCOM 2; resolve its `/dev/ttyACM*` node with `nrfutil device list` rather than
 assuming, since it shifts with USB enumeration order.
+
+## 8c. Raw capture — nRF5340-DK, two-level `kvhash`, 1 000 persons, UBI
+
+Board 960115021, `ade6a3e`, `N_PERSONS=1000`, `FRESH_START=y`, default UBI
+backend, partition raw-erased beforehand. UBI's volume-probe lines are elided.
+
+```
+*** Booting Zephyr OS build 4a405846193f ***
+
+persondb 1.0.0 — CBOR person/credential database
+[00:02:26.082,214] <inf> persondb: created store for 1000 persons: people map depth 1, 250 buckets; credential map depth 2, 256 buckets
+open         : 145837 ms
+prepare      :    130 ms (99 buckets formatted)
+fill         : 162071 ms  1000 written, 1000/1000 total, 4 commits
+verify       :  16385 ms  256 persons, 602 cards
+VERIFY PASS
+mutate       :   9157 ms  rev 0 -> 1  (0 revoked, 64 assigned)
+re-verify    :  17354 ms  256 persons, 618 cards
+VERIFY PASS
+
+bench check :   200 ops in  7208000 us ->      27 ops/s    36040 us/op   400 store ops  35245 flash ops   1266097 B  amp 15x
+             : 200 granted, 0 denied, 0 unknown, 0 expired
+bench byid  :   200 ops in  2821000 us ->      70 ops/s    14105 us/op   200 store ops  11503 flash ops    886418 B  amp 11x
+bench miss  :   200 ops in  4469000 us ->      44 ops/s    22345 us/op   200 store ops  23705 flash ops    372059 B  amp 80x
+bench put   :   200 ops in 35937000 us ->       5 ops/s   179685 us/op   864 store ops 111164 flash ops   3527182 B  amp 40x
+bench cbor  :   200 ops in   197000 us ->    1015 ops/s      985 us/op     0 store ops      0 flash ops         0 B  amp 0x
+
+store
+  partition   : 8388608 B (8192 KiB)
+  maps        : 1 person (depth 1, 250 buckets) + 1 credential (depth 2, 256 buckets)
+  persons     : 1000 of 1000   credentials: 2479
+  mean entry  : 432 B
+  live content: 432759 B = 5.1 % of the partition
+  bucket overflows: 0
+  buckets past near-full: 0
+
+persondb: done — store at rev 1; rerun to prove persistence
+```
+
+Wall clock 6.69 min, of which `open` is 36 % and `fill` 40 %. Footprint on this
+build is FLASH 86 032 B and RAM 202 064 B — within 1.6 % and 16 B of the
+one-level build, so the second level costs essentially nothing in either.
 
 ## 9. Sizing history
 
