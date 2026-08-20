@@ -102,3 +102,44 @@ for nmaps in (12, 16):
     tot, mx, over, mean = run(nmaps, VOCAB_NEW, 10, 13)
     print(f"{nmaps} maps: max {mx} B = {100*mx/4096:.0f}% of a bucket; "
           f"non-empty buckets ~{int(nmaps*511*(1-2.718**(-10000/(nmaps*511))))}")
+
+# ---------------------------------------------------------------------------
+# The L3 re-check (DESIGN.md §12).
+#
+# CONFIG_BLOB_DB_MAX_PAYLOAD_LEN was capped at 4096 when D10 was taken; the
+# range is now 1..65535, bound at mount by the geometry to
+# (sector - 16) / 2 - 14 = 32 746 B on the DK's 64 KB sectors. That lifts C2's
+# 2.09 MB per map, so "does the dataset fit ONE map?" has to be re-asked — a
+# one-map dataset is one kvdb instance, and the whole D10 argument was that
+# seventeen of them do not fit.
+#
+# Two costs move in opposite directions and both land on R-D, so the sweep
+# reports both:
+#   directory  - read by dir_load on EVERY get/set/del (K11), 8 + 8*n_buckets
+#   bucket     - the second read, and the whole rewrite on a set (K4)
+# Fewer maps means fewer buckets to spread the same bytes over, so one of the
+# two must grow. Column "get B" is their sum: the bytes one map get moves.
+
+def l3_recheck():
+    print(f"\n{'payload':>7} {'maps':>4} {'buckets':>7} {'dir B':>6} {'mean bkt':>8} "
+          f"{'max bkt':>7} {'%ceil':>5} {'get B':>6} {'vs now':>6} {'dir traffic':>11}")
+    base = None
+    for pay, nmaps, nb in ((4096, 16, 511),      # as built
+                           (4096,  8, 511),
+                           (16384, 1, 511), (16384, 1, 1023), (16384, 1, 2047),
+                           (32746, 1, 511), (32746, 1, 2047), (32746, 1, 4092),
+                           (32746, 2, 4092)):
+        if nb > (pay - 8) // 8:
+            continue
+        tot, mx, over, mean = run(nmaps, VOCAB_NEW, 10, 13, buckets=nb, cap=pay)
+        dirb = 8 + 8 * nb
+        getb = dirb + mean
+        base = base or getb
+        # Every fresh bucket rewrites the whole directory (K5), once per bucket.
+        traffic = nmaps * nb * dirb
+        flag = '' if over == 0 else f'  OVER x{over}'
+        print(f"{pay:>7} {nmaps:>4} {nb:>7} {dirb:>6} {mean:>8.0f} {mx:>7} "
+              f"{100*mx/pay:>4.0f}% {getb:>6.0f} {getb/base:>5.1f}x "
+              f"{traffic/1048576:>9.1f} MiB{flag}")
+
+l3_recheck()

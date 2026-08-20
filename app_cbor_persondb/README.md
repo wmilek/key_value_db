@@ -41,16 +41,28 @@ above it. Acceptance criterion **A7** checks this rather than trusting it.
 
 ### 2. Use the highest layer whose *shape* matches — then drop down
 
-`kvdb` (L3) is the ergonomic interface and it does not fit a sharded dataset:
-one instance per name means **seventeen** registry entries, seventeen meta blobs
-and thirty-four sector reads at boot, and it overruns
-`CONFIG_ROOTREG_MAX_ROOTS` (default 8) twice over. Dropping to the L2 Map shape
-— one registry key, one app-owned superblock, seventeen map roots — costs
-**two** sector reads at boot.
+`kvdb` (L3) is the ergonomic interface, and its unit — one named instance —
+is not this application's unit of structure. This dataset is sixteen person
+maps plus a credential index, and `kvdb` cannot put sixteen maps behind one
+name, so an application that needs them holds the roots itself: one registry
+key, one app-owned superblock, seventeen map roots.
 
-*What it prevents:* paying for an abstraction whose shape you are fighting. The
-comparison is tabulated in `DESIGN.md` §12; the decision is not "L2 is faster",
-it is "L3's unit of naming is not this application's unit of structure".
+*Why sixteen maps.* Not capacity. `kvhash`'s bucket directory must fit one
+payload, so bucket **count** and bucket **size** are the same knob, and a map
+get reads one of each. Sixteen small maps move **4 756 B** per lookup; every
+single-instance layout that holds the same data moves **11 458 B or more**,
+because it has to fatten the directory or the buckets and both are on the read
+path. Sharding is a latency decision that L3 has no way to express.
+
+*What it prevents:* paying for an abstraction whose shape you are fighting —
+and, in the other direction, mistaking a capacity workaround for a design.
+
+*And re-check it.* This decision was first argued from boot I/O (thirty-four
+sector reads against two) and from `CONFIG_ROOTREG_MAX_ROOTS` defaulting to 8.
+Both arguments have since expired — one to the streaming slot walk, one to a
+Kconfig line — while the decision itself held for a reason neither of them
+named. A rationale is a claim about the code as it is today; `DESIGN.md` §12.1
+re-runs this one and records which parts survived.
 
 ### 3. Make every persistent structure reachable from one integer
 

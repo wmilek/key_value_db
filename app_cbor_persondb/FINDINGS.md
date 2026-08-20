@@ -780,6 +780,14 @@ fit the default. The app's L2 layout uses one entry, so it never trips this, but
 it is a sharp edge for the L3 route: the failure is `-ENOSPC` from
 `kvdb_open`, at a layer that says nothing about registry capacity.
 
+**A default, not a limit** (re-checked, `DESIGN.md` §12.1). `ROOTREG_MAX_ROOTS`
+is `range 1 1000`, and the `BUILD_ASSERT` that bounds the registry image to one
+payload allows 255 roots at `BLOB_DB_MAX_PAYLOAD_LEN=4096`. Seventeen instances
+is one `prj.conf` line. That keeps this a finding — a default that silently
+sizes the registry for a use case smaller than the one the layer above enables,
+reported as `-ENOSPC` mid-open — but it is not the reason the app is on L2, and
+`DESIGN.md` no longer claims it is.
+
 ---
 
 ## L3 — `kvdb`
@@ -788,7 +796,7 @@ The app does not link `kvdb` (`DESIGN.md` D10). These come from evaluating it as
 the implementation route and rejecting it, which is itself a finding about L3's
 current reach.
 
-### V4 — Nothing composes shards, so L3 stops being useful past ~2 MB (major, `read`)
+### V4 — Nothing composes shards, so L3 cannot hold a low-latency dataset (major, `read`)
 
 K1 makes sharding mandatory past ~2.09 MB, and `kvdb` offers no help: the
 application invents instance naming, the key→shard hash, read fan-out and
@@ -799,6 +807,27 @@ does not need, because it has one superblock and knows its own shards.
 
 L3's current audience is therefore **small stores of a few named instances**.
 Every application larger than one map drops to L2, as this one does.
+
+**Re-stated after the payload cap moved** (`DESIGN.md` §12.1). Two of those
+charges have shrunk to nothing: B1 made the thirty-four reads slot walks rather
+than sector reads (≈62 ms once, at §5's fitted cost), and R1's default is a
+`prj.conf` line. The `~2.09 MB` threshold in this finding's title is also
+obsolete — at the 32 746 B payload the DK's geometry now sustains, one map
+reaches 4 092 buckets, and this app's 3.6 MB dataset fits in **one** `kvdb`.
+
+The finding survives the correction and gets sharper, because sharding turns
+out not to be a capacity workaround at all. `kvhash`'s directory must fit one
+payload (K1), so bucket count and bucket size are one knob, and a map get reads
+one of each (K11). Sixteen maps of 511 small buckets move **4 756 B** per get;
+every single-instance layout that holds the same data moves **11 458–33 748 B**,
+because it has to fatten the directory or the buckets and both are on the read
+path. So the reason to shard is *latency*, and the reason `kvdb` cannot serve
+this app is that it cannot put sixteen maps behind one name — not that the app
+outgrew a map.
+
+> That makes the proposed L3 addition more valuable, not less: a sharded-map
+> interface would not be relieving a capacity ceiling, it would be owning the
+> fan-out that keeps a lookup cheap.
 
 > The finding most likely to justify an L3 addition rather than an L1/L2 fix: a
 > sharded-map interface over N `kvhash` maps, owning the fan-out, the capacity
