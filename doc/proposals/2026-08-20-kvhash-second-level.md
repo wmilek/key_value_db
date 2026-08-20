@@ -703,7 +703,9 @@ person 9 232 (`DESIGN.md` §6.1).
 *Three preventions, and they are all v1 has:*
 
 1. **Independent level indices** (D3d). Disjoint bit ranges of a 64-bit hash, or
-   separate salts. Free, and the whole fix for design-caused clustering.
+   separate salts — equivalent, and both require finalizing the hash first,
+   since FNV-1a's avalanche is too weak to split naively. Free, and the whole
+   fix for design-caused clustering.
 2. **Offline verification.** `tools/sizing.py` through the real hash — but only
    where the population is derivable. §6.1 already records the limit: this
    application can enumerate only because its data is a pure function of an
@@ -927,22 +929,39 @@ For the record, so these are not re-opened as blockers:
   right, and is the strongest argument for **D3b** (`kvhash_info()`): if the
   container decides the geometry alone, an application must at least be able to
   see what it decided.
-- **D3d.** How are the two level indices derived from one key (§11.2)? Split a
-  64-bit hash, or salt per level? Unspecified today, and getting it wrong
-  clusters keys into exactly the failure K2 punishes — silently, since every key
-  is still found (§9.6).
+- **D3d. DECIDED (mostly): any independent derivation; the choice does not
+  matter, the check does.** Splitting a 64-bit hash and salting per level are
+  statistically equivalent, so the mechanism is left to implementation. Two
+  things are binding:
 
-  **Folded in: the free bucket-fill warning (§9.7).** A `set` already reads its
-  bucket, so reporting that it has crossed a threshold of the ceiling costs
-  nothing — no counter, no extra read, no write. Proposed for v1 at 60 %,
-  by log or return value. It belongs with this decision because it is the
-  mitigation for this risk: v1 has three preventions against degradation, no
-  detection once D3b excluded stored occupancy, and **no repair at all** — K3
-  fixes the bucket count and K6 gives no iteration, so a degraded map cannot be
-  re-shaped *or* copied out of. A warning that costs nothing is what separates
-  that from a trap.
+  **(1) Not from one modulus source.** `h % m` and `h % n` from the same value
+  correlate whenever *m* and *n* share factors, and the container derives both,
+  so it cannot be left to luck. This is the only genuinely wrong answer.
 
-  Settle the threshold and whether it is a log line, a return code, or both.- **D3e. DECIDED: `{0}` builds one level, small — today's behaviour
+  **(2) Finalize the hash.** FNV-1a has weak avalanche, particularly in the low
+  bits and particularly for short keys, so naively splitting an FNV-1a result
+  into two halves does *not* give two independent indices — which would make an
+  otherwise correct design correlate. The tree already knows this: this
+  application's own generator does not use FNV alone where spread matters, it
+  runs a salted xor-shift-multiply finalizer (`tools/sizing.py`, `mix()`),
+  because FNV was not good enough for the job. The container needs the same
+  treatment, whichever of the two mechanisms it picks.
+
+  **What actually settles this is verification, not the choice.** Whichever
+  derivation lands, D0 put the distribution check in `tools/sizing.py` extended
+  to model the two-level split — enumerating the real population through the
+  real hash. That check catches a correlated derivation regardless of how it was
+  arrived at, which is why the decision above can be left loose and this one
+  cannot.
+
+  **Still open under this decision: §9.7's warning threshold**, folded in here
+  because it is the mitigation for this risk. Proposed at 60 % of the bucket
+  ceiling, reported **both** ways — a log line for an interactive or
+  bring-up build, and a return code so a fill loop can throttle or stop on its
+  own terms rather than discovering `-ENOSPC` later. The cost is nil either way:
+  a `set` has already read the bucket.
+
+- **D3e. DECIDED: `{0}` builds one level, small — today's behaviour
   unchanged.** The default serves the small single-level map; two levels are
   opted into by declaring a population that needs one (§7.1). Nothing regresses
   for callers who say nothing, and v1's lack of promotion therefore introduces
