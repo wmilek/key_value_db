@@ -640,9 +640,17 @@ caller's job to notice and call `create`. The shape offers no
 `blob_db_get(root) == -ENOENT` probe — reaching *past* L2 into L1 to do it,
 which breaks the layering the shape is supposed to provide.
 
-### K9 — Requested capacity is reinterpreted, then silently clamped, and cannot be read back (moderate alone; **major** with K2+K3, `read`)
+### K9 — Requested capacity is reinterpreted, then silently clamped, and cannot be read back (moderate alone; **major** with K2+K3, **`hit`**)
 
-Three separate problems stack on one field.
+Three separate problems stack on one field, and the specifications disagree
+about which field it is.
+
+**Reclassified from `read` to `hit`.** This was a code-reading finding until the
+app stopped sharding. The clamp is what makes `initial_capacity = SIZE_MAX`
+expressible, that is what this application passes, and at the geometry's largest
+payload it builds a map that cannot be written to (**K12**, fill dead at person
+36). The reinterpretation in (a) is no longer a latent hazard here — it is the
+mechanism behind a finding of its own.
 
 **(a) The units do not match the contract.** `shape_map.h` documents
 `initial_capacity` as *"expected entry count"* and `kvdb.h` repeats it as
@@ -661,8 +669,47 @@ static uint16_t buckets_for(size_t initial_capacity)
 > `kvhash.c:97-109`, `shape_map.h:40`, `kvdb.h:74`
 
 Entries and buckets differ by the load factor — the one number that decides
-whether K2's 4 KB bucket ceiling is ever reached. Saying "I expect 10 000
+whether K2's bucket ceiling is ever reached. Saying "I expect 10 000
 entries" is read as "give me 10 000 buckets".
+
+**And the specifications disagree with each other, not just with the code.**
+This is the part that makes (a) a defect in the contract rather than a bug in
+one provider:
+
+| | says `initial_capacity` is |
+|---|---|
+| `shape_map.h:40` | `/**< expected entry count (0 = provider default) */` |
+| `kvdb.h:74` | `/**< entry-count hint (0 = default) */` |
+| `l2_containers.md:171` | "`nbuckets` comes from `map_config.initial_capacity` at `create`" |
+| `kvhash.c:100` | `size_t n = initial_capacity ? initial_capacity : DEFAULT_BUCKETS;` |
+
+Two API headers promise an entry count. The L2 contract document says it is the
+bucket count. The implementation agrees with the contract document and
+contradicts both headers — and the headers are what a caller reads. So
+`kvhash` cannot be called simply non-conforming: it honours one of two
+specifications that were never reconciled, and picked the one nobody sees.
+
+**The exposure is not confined to applications that reach L2 directly.**
+`kvdb_create` passes the field through unchanged:
+
+```c
+struct map_config mc = {
+        .initial_capacity = cfg ? cfg->initial_capacity : 0,
+};
+```
+
+> `kvdb.c:99-101`
+
+So every `kvdb` caller who reads `kvdb.h`, believes "entry-count hint", and
+passes a population is sizing a bucket directory without being told. The trap
+propagates to L3 with the header text that misdescribes it.
+
+**What it costs is now measured, not hypothetical.** At this application's
+shipped 16 384 B payload, "I expect 8 000 entries" is clamped to 2 047 buckets
+— by luck a workable map. At the 32 722 B payload the geometry sustains it is
+clamped to 4 089, which builds a 32 720 B directory that owns an entire erase
+block and kills a fill at person 36 (**K12**). The same sentence, honestly
+meant, is harmless at one Kconfig value and fatal at another.
 
 **(b) The clamp is silent.** `MAX_BUCKETS = (MAX_PAYLOAD − 8)/8` = 511 at
 `MAX_PAYLOAD` 4096. Anything larger is clamped with no error, no warning, and
@@ -717,13 +764,29 @@ ordinary way to accept defaults.
 kvhash's private formula in application source. That is now **deleted** — the
 app passes `initial_capacity = SIZE_MAX` to mean "as large as you can build",
 which is what it wanted all along, and the clamp in (b) is what makes that
-expressible. See X1 row 5. The formula never needed to be in the application;
+expressible. See X1 row 5.
+
+That workaround has since acquired a cost. "As large as you can build" is not a
+safe request once the payload is large: it is what produces K12's unbuildable
+map, and at the shipped payload it hands the credential map 2 047 buckets to
+index 19 969 entries of 23 B — a 16 384 B directory over buckets averaging
+224 B, four times the bytes per lookup that 255 buckets would cost. The clamp
+made an unsayable intent sayable, and the intent turned out to be the wrong one
+to have. The formula never needed to be in the application;
 only the *intent* did, and the API had no word for it.
 
 Direction, cheapest first: return `-ENOSPC` (or at minimum `LOG_WRN`) instead of
 clamping; export the capacity formula from `kvhash.h`; add the `map_ops.stat()`
-of K10 so the delivered count is readable; and settle whether the field means
-entries or buckets, in the shape's own words.
+of K10 so the delivered count is readable; and **resolve the contradiction
+above** — not "document what the code does", since two published
+specifications already say opposite things and one of them has to be corrected
+either way.
+
+`doc/proposals/2026-08-20-kvhash-second-level.md` §7 argues for resolving it
+toward the headers — the caller declares its population
+(`expected_entries`, `typical_entry_bytes`, `max_entry_bytes`) and the container
+derives the geometry — on the grounds that it is the reading a caller is given
+and the only one that lets `tools/sizing.py` be deleted.
 
 ### K10 — No entry count or size on a map (moderate, `read`)
 
