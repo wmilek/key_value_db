@@ -355,14 +355,11 @@ static int create_store(struct persondb *db, uint32_t n_persons)
 		if (sb->people_root[i] == 0) {
 			return -EIO;
 		}
-		struct map_info info;
-		int rc = db->ops->create(sb->people_root[i], &people_cfg, &info);
+		int rc = db->ops->create(sb->people_root[i], &people_cfg);
 
 		if (rc != 0) {
 			return rc;
 		}
-		LOG_INF("people map: depth %u, %u buckets, entries up to %zu B",
-			info.depth, info.buckets, info.entry_bytes_limit);
 	}
 
 	sb->cred_root = blob_db_alloc_id();
@@ -370,18 +367,23 @@ static int create_store(struct persondb *db, uint32_t n_persons)
 		return -EIO;
 	}
 
-	struct map_info cred_info;
-	int rc = db->ops->create(sb->cred_root, &cred_cfg, &cred_info);
+	int rc = db->ops->create(sb->cred_root, &cred_cfg);
 
 	if (rc != 0) {
 		return rc;
 	}
-	LOG_INF("credential map: depth %u, %u buckets",
-		cred_info.depth, cred_info.buckets);
 
-	LOG_INF("created store: %u people map(s) + 1 credential map, "
-		"max buckets each, %u persons planned",
-		sb->n_people_maps, n_persons);
+	struct map_info people_info, cred_info;
+
+	if (db->ops->stat && db->ops->stat(sb->people_root[0], &people_info) == 0 &&
+	    db->ops->stat(sb->cred_root, &cred_info) == 0) {
+		LOG_INF("created store for %u persons: people map depth %u, "
+			"%u buckets; credential map depth %u, %u buckets",
+			n_persons, people_info.depth, people_info.buckets,
+			cred_info.depth, cred_info.buckets);
+	} else {
+		LOG_INF("created store for %u persons", n_persons);
+	}
 
 	return sb_commit(db);   /* the commit point */
 }

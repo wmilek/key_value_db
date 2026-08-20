@@ -97,9 +97,11 @@ struct map_ops {
 	 * @brief Build a fresh, empty map at @p root.
 	 *
 	 * Called exactly once, when the structure does not yet exist. @p cfg
-	 * may be NULL for provider defaults. @p out may be NULL; when given, it
-	 * receives the geometry the provider chose, at no extra cost — create
-	 * already has every value in hand.
+	 * may be NULL for provider defaults. To learn what the provider built,
+	 * call @ref stat — create deliberately does not also report it. A store
+	 * is created once in its life, so an out-parameter here would save one
+	 * blob read, ever, at the price of two code paths producing the same
+	 * facts and being able to disagree.
 	 *
 	 * A set @p cfg field that cannot be satisfied fails the call, and the
 	 * provider must not have written anything: validation is arithmetic, so
@@ -116,8 +118,7 @@ struct map_ops {
 	 *                  on a fresh device.
 	 * @retval -EIO     flash error
 	 */
-	int (*create)(uint64_t root, const struct map_config *cfg,
-		      struct map_info *out);
+	int (*create)(uint64_t root, const struct map_config *cfg);
 
 	/**
 	 * @brief Report the geometry this map was built with.

@@ -101,7 +101,7 @@ static int create_instance(kvdb_t *db, uint64_t meta_id, const char *name,
 		.typical_entry_bytes = cfg ? cfg->typical_entry_bytes : 0,
 		.max_entry_bytes = cfg ? cfg->max_entry_bytes : 0,
 	};
-	int rc = ops->create(struct_root, &mc, NULL);
+	int rc = ops->create(struct_root, &mc);
 
 	if (rc != 0) {
 		LOG_ERR("backend create: %d", rc);

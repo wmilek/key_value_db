@@ -522,9 +522,14 @@ Two more pieces make it a contract rather than a hint:
   It would also duplicate a value that v2's splitting makes non-uniform, so the
   redundancy would have to be maintained or become wrong.
 
-  `create(root, cfg, &info)` fills the same struct at **zero** cost, since
-  `create` has every value in RAM already. That is the path an application would
-  actually use; `stat()` serves reopen and reporting.
+  **`stat()` is the only way to get this, and an earlier draft was wrong to
+  add a second.** That draft had `create(root, cfg, &info)` fill the same struct
+  "at zero cost, since create has every value in RAM" — which is true and beside
+  the point. A store is created **once in its life**, so the out-parameter
+  saved one blob read, ever, in exchange for two code paths producing the same
+  facts: one from RAM at create, one from flash at `stat`. Two sources for one
+  fact that can disagree is the shape of defect this proposal exists to remove
+  (§7, `initial_capacity`'s two meanings). Struck.
 
   This closes the "cannot be read back" half of **K9** and the geometry half of
   **K10** — `app_cbor_persondb`'s store report prints "bucket count not
@@ -1103,9 +1108,9 @@ For the record, so these are not re-opened as blockers:
   independently unset at zero; and **a field that is set is honoured or
   refused, never silently clamped** — which closes K9(b) as well as K9(a).
 - **D3b. DECIDED: geometry readback in v1, and nothing that costs a write.**
-  `map_ops.stat()` plus a `create()` out-param, reporting only what the map
-  already persists to function: depth, fan-out, bucket count, entry-size ceiling
-  (§7). One or two blob reads on the reopen path, zero through `create`.
+  `map_ops.stat()` alone — no `create()` out-param (§7) — reporting only what
+  the map already persists to function: depth, fan-out, bucket count, entry-size
+  ceiling. One or two blob reads, on demand.
 
   **Entry count is excluded**, because maintaining it means rewriting a
   directory on every insert and delete — reintroducing the K5 traffic this

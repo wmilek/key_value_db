@@ -399,8 +399,7 @@ static void fill_info(struct map_info *out, uint8_t depth, uint16_t n_top,
 
 /* ---- map_ops ---- */
 
-static int kvhash_create(uint64_t root, const struct map_config *cfg,
-			 struct map_info *out)
+static int kvhash_create(uint64_t root, const struct map_config *cfg)
 {
 	uint8_t depth;
 	uint16_t n_top, n_sub;
@@ -416,7 +415,6 @@ static int kvhash_create(uint64_t root, const struct map_config *cfg,
 		if (rc == 0) {
 			LOG_DBG("created map root=%llu depth=1 buckets=%u",
 				(unsigned long long)root, n_top);
-			fill_info(out, depth, n_top, n_sub);
 		}
 		return rc;
 	}
@@ -451,7 +449,6 @@ static int kvhash_create(uint64_t root, const struct map_config *cfg,
 		LOG_DBG("created map root=%llu depth=2 fanout=%u buckets=%u",
 			(unsigned long long)root, n_top,
 			(unsigned int)n_top * n_sub);
-		fill_info(out, depth, n_top, n_sub);
 	}
 	return rc;
 }
