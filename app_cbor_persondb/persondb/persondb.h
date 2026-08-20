@@ -73,6 +73,7 @@ struct persondb_stat {
 	uint32_t populated;          /* persons written so far */
 	uint32_t rev;                /* mutation revision */
 	uint8_t  n_people_maps;
+	uint8_t  n_cred_maps;
 	/* The bucket count is deliberately absent: the app asks for the largest
 	 * map kvhash can build and there is no way to read back what it got
 	 * (FINDINGS.md K9(c), K10). Reporting a number the firmware cannot

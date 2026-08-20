@@ -49,6 +49,8 @@ instructions live in the repository ``README.md``.
    proposals/2026-08-09-kvhash-impact
    proposals/2026-08-09-rootreg-kvdb-impact
    proposals/2026-08-09-implementation-plan
+   proposals/2026-08-16-persondb-case-performance
+   proposals/2026-08-16-blob-db-on-ubi
 
 .. toctree::
    :maxdepth: 1

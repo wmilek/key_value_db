@@ -72,6 +72,41 @@ config APP_CBOR_PERSONDB_PEOPLE_MAPS
 	  per-bucket occupancy query to warn you (FINDINGS.md K10), and the
 	  failure is a local -ENOSPC partway through a fill.
 
+config APP_CBOR_PERSONDB_CRED_MAPS
+	int "Number of credential index shards"
+	default 1
+	range 1 16
+	help
+	  The credential index carries ~2.5 entries per person in one map by
+	  default. Sharding it shrinks the directory kvhash re-reads on every
+	  lookup, which is where the `miss` case spends most of its bytes.
+
+	  persondb.c mixes the card hash before taking it modulo this number,
+	  because the map provider hashes the same string to pick a bucket: use
+	  the raw hash for both and the shard collapses into a function of the
+	  bucket index, quietly running the map at this many times the intended
+	  load until a fill hits -ENOSPC.
+
+config APP_CBOR_PERSONDB_MAP_BUCKETS
+	int "Buckets per map (0 = as many as the provider can build)"
+	default 0
+	range 0 2047
+	help
+	  0 asks kvhash for the largest map it can build, which is what this
+	  app did unconditionally before this option existed.
+
+	  The maximum is not free. A kvhash directory is 8 + 8*buckets bytes
+	  and is read in full on every get, set and delete, so the largest map
+	  also has the most expensive lookup — 4 KB per operation at the 4 KB
+	  payload ceiling, for a structure that never changes after the fill.
+
+	  The capacity rule that made "as large as possible" attractive
+	  (DESIGN.md 6.1) constrains the TOTAL cell count, maps x buckets, not
+	  the buckets per map. Splitting the same total over more maps keeps
+	  the same margin and shrinks the directory. Rerun tools/sizing.py, or
+	  doc/proposals/persondb-perf/measure.sh, before changing it: there is
+	  still no per-bucket occupancy query (FINDINGS.md K10).
+
 config APP_CBOR_PERSONDB_FILL_BATCH
 	int "Persons per resumable fill batch"
 	default 256

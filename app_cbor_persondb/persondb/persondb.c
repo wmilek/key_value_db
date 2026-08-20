@@ -35,9 +35,13 @@ LOG_MODULE_REGISTER(persondb, CONFIG_APP_CBOR_PERSONDB_LOG_LEVEL);
 
 #define PADB_MAGIC        0x50414442u /* 'PADB' */
 #define PADB_ROOTREG_KEY  ROOTREG_KEY(PADB_MAGIC, 1)
-#define SUPERBLOCK_VERSION 1
+/* v2 adds the credential shard list and the chosen bucket count. A v1 store
+ * cannot be read by this build and says so rather than guessing. */
+#define SUPERBLOCK_VERSION 2
 
 #define N_PEOPLE_MAPS CONFIG_APP_CBOR_PERSONDB_PEOPLE_MAPS
+#define N_CRED_MAPS   CONFIG_APP_CBOR_PERSONDB_CRED_MAPS
+#define N_BUCKETS     CONFIG_APP_CBOR_PERSONDB_MAP_BUCKETS
 
 /* Person keys are "pXXXXXXXX": fixed width, so every key is 9 bytes and the
  * entry-size arithmetic in DESIGN.md §6 has no variance from key length. */
@@ -97,6 +101,41 @@ static uint64_t people_root(struct persondb *db, uint32_t id)
 	return db->sb.people_root[fnv1a32(&id, sizeof(id)) % db->sb.n_people_maps];
 }
 
+/*
+ * Which credential shard a card belongs to.
+ *
+ * The shard hash must be INDEPENDENT of the one the map provider will apply to
+ * the same bytes. Persons get that for free — this function hashes the raw id
+ * while the provider hashes the formatted "pXXXXXXXX" key — but a card is its
+ * own key, so both would see the same string. When the provider's bucket count
+ * is a multiple of the shard count (every power-of-two split), the shard then
+ * becomes a function of the bucket index: only n_buckets of the
+ * n_maps * n_buckets cells are reachable and the map runs at n_maps times the
+ * intended load. It fails as -ENOSPC partway through a fill, which is K2's
+ * symptom for an entirely different cause.
+ *
+ * The extra avalanche step below is what keeps the two independent. It cannot
+ * be checked from here: the provider's hash is private (FINDINGS.md X1).
+ */
+static uint32_t mix32(uint32_t x)
+{
+	x ^= x >> 16;
+	x *= 0x7feb352du;
+	x ^= x >> 15;
+	x *= 0x846ca68bu;
+	x ^= x >> 16;
+	return x;
+}
+
+static uint64_t cred_root(struct persondb *db, const char *card)
+{
+	if (db->sb.n_cred_maps == 1) {
+		return db->sb.cred_root[0];
+	}
+	return db->sb.cred_root[mix32(fnv1a32(card, strlen(card))) %
+				db->sb.n_cred_maps];
+}
+
 static void person_key(char *buf, uint32_t id)
 {
 	snprintf(buf, PERSON_KEY_SZ, "p%08X", (unsigned)id);
@@ -145,7 +184,7 @@ static int cred_put(struct persondb *db, const char *card, uint32_t person_id)
 	if (rc != 0) {
 		return rc;
 	}
-	return map_set(db, db->sb.cred_root, card, buf, len);
+	return map_set(db, cred_root(db, card), card, buf, len);
 }
 
 /* Encode a person and write it to its shard. One map set, so one atomic write:
@@ -272,27 +311,38 @@ static int create_store(struct persondb *db, uint32_t n_persons)
 	memset(sb, 0, sizeof(*sb));
 	sb->version = SUPERBLOCK_VERSION;
 	sb->n_people_maps = N_PEOPLE_MAPS;
+	sb->n_cred_maps = N_CRED_MAPS;
+	sb->n_buckets = N_BUCKETS;
 	sb->n_persons = n_persons;
 
 	/*
-	 * "Give me the largest map you can build."
+	 * "Give me the largest map you can build" — SIZE_MAX — or a bucket
+	 * count this build chose.
 	 *
-	 * This app wants every bucket it can get — more buckets means a lower
-	 * load factor and more distance from K2's per-bucket cliff — and there
-	 * is no way to *ask* for the maximum. But kvhash clamps any request
-	 * above its capacity down to it, so asking for more than could possibly
-	 * fit expresses the intent exactly, and the application never learns the
-	 * formula.
+	 * SIZE_MAX is still the only way to *ask* for the maximum: kvhash
+	 * clamps any request above its capacity down to it, so asking for more
+	 * than could possibly fit expresses the intent exactly and the
+	 * application never learns the formula. This used to restate
+	 * `(MAX_PAYLOAD - 8) / 8` here, which was a private constant from
+	 * another layer, wrong by 8x after one Kconfig edit, and bought
+	 * nothing.
 	 *
-	 * This used to restate `(MAX_PAYLOAD - 8) / 8` here. That was a private
-	 * constant from another layer, wrong by 8x after one Kconfig edit, and
-	 * it bought nothing: the number was only ever passed straight back down.
-	 *
-	 * Note what this does to K9. The silent clamp is a defect when you ask
+	 * Note what that does to K9. The silent clamp is a defect when you ask
 	 * for a specific size and quietly get less — and it is the very thing
 	 * that makes "as much as possible" expressible. Both are true.
+	 *
+	 * It is no longer the only thing this app says, because the maximum is
+	 * not free. The bucket count also sets the directory size, and kvhash
+	 * re-reads the whole directory on every get, set and delete: at the
+	 * maximum that is CONFIG_BLOB_DB_MAX_PAYLOAD_LEN bytes per operation
+	 * for a structure that never changes after the fill. K2's capacity rule
+	 * constrains maps x buckets, not buckets per map, so the two can be
+	 * chosen separately — see
+	 * doc/proposals/2026-08-16-persondb-case-performance.md.
 	 */
-	const struct map_config cfg = { .initial_capacity = SIZE_MAX };
+	const struct map_config cfg = {
+		.initial_capacity = N_BUCKETS ? (size_t)N_BUCKETS : SIZE_MAX,
+	};
 
 	for (uint8_t i = 0; i < sb->n_people_maps; i++) {
 		sb->people_root[i] = blob_db_alloc_id();
@@ -306,20 +356,22 @@ static int create_store(struct persondb *db, uint32_t n_persons)
 		}
 	}
 
-	sb->cred_root = blob_db_alloc_id();
-	if (sb->cred_root == 0) {
-		return -EIO;
+	for (uint8_t i = 0; i < sb->n_cred_maps; i++) {
+		sb->cred_root[i] = blob_db_alloc_id();
+		if (sb->cred_root[i] == 0) {
+			return -EIO;
+		}
+		int rc = db->ops->create(sb->cred_root[i], &cfg);
+
+		if (rc != 0) {
+			return rc;
+		}
 	}
 
-	int rc = db->ops->create(sb->cred_root, &cfg);
-
-	if (rc != 0) {
-		return rc;
-	}
-
-	LOG_INF("created store: %u people maps + 1 credential map, "
-		"max buckets each, %u persons planned",
-		sb->n_people_maps, n_persons);
+	LOG_INF("created store: %u people maps + %u credential maps, "
+		"%s buckets each, %u persons planned",
+		sb->n_people_maps, sb->n_cred_maps,
+		N_BUCKETS ? STRINGIFY(N_BUCKETS) : "max", n_persons);
 
 	return sb_commit(db);   /* the commit point */
 }
@@ -387,15 +439,20 @@ int persondb_open(struct persondb **out, uint32_t n_persons)
 				db->sb.version, SUPERBLOCK_VERSION);
 			rc = -EIO;
 		}
-		if (rc == 0 && db->sb.n_people_maps != N_PEOPLE_MAPS) {
+		if (rc == 0 && (db->sb.n_people_maps != N_PEOPLE_MAPS ||
+				db->sb.n_cred_maps != N_CRED_MAPS ||
+				db->sb.n_buckets != N_BUCKETS)) {
 			/* The shard count is baked into where every key lives,
 			 * so a build that disagrees cannot read the store.
 			 * kvhash cannot rehash (K3) and cannot be iterated
 			 * (K6), so there is no migration path — say so plainly
 			 * rather than returning wrong answers. */
-			LOG_ERR("store has %u people maps, this build has %u — "
-				"reformat required (FINDINGS.md K3/K6)",
-				db->sb.n_people_maps, N_PEOPLE_MAPS);
+			LOG_ERR("store has %u/%u maps at %u buckets, this build "
+				"has %u/%u at %u — reformat required "
+				"(FINDINGS.md K3/K6)",
+				db->sb.n_people_maps, db->sb.n_cred_maps,
+				db->sb.n_buckets, N_PEOPLE_MAPS, N_CRED_MAPS,
+				N_BUCKETS);
 			rc = -ENOTSUP;
 		}
 	}
@@ -497,7 +554,7 @@ int persondb_person_put(struct persondb *db, const struct persondb_person *p)
 			if (person_lists_card(p, old.card[i])) {
 				continue;
 			}
-			rc = map_del(db, db->sb.cred_root, old.card[i]);
+			rc = map_del(db, cred_root(db, old.card[i]), old.card[i]);
 			if (rc != 0 && rc != -ENOENT) {
 				return rc;
 			}
@@ -549,7 +606,7 @@ int persondb_person_delete(struct persondb *db, uint32_t id)
 	/* Credentials first (F5): after each delete the card already resolves
 	 * to nothing, so every crash point in this loop denies. */
 	for (uint8_t i = 0; i < p.n_cards; i++) {
-		rc = map_del(db, db->sb.cred_root, p.card[i]);
+		rc = map_del(db, cred_root(db, p.card[i]), p.card[i]);
 		if (rc != 0 && rc != -ENOENT) {
 			return rc;
 		}
@@ -640,7 +697,7 @@ int persondb_card_revoke_from(struct persondb *db, uint32_t person_id,
 
 	/* Index first, person second — the mirror of assignment, fail-safe for
 	 * the same reason: after this write the card resolves to nothing. */
-	rc = map_del(db, db->sb.cred_root, card);
+	rc = map_del(db, cred_root(db, card), card);
 	if (rc != 0 && rc != -ENOENT) {
 		return rc;
 	}
@@ -702,7 +759,7 @@ int persondb_card_owner(struct persondb *db, const char *card,
 {
 	uint8_t buf[CRED_CBOR_MAX];
 	size_t len = 0;
-	int rc = map_get(db, db->sb.cred_root, card, buf, sizeof(buf), &len);
+	int rc = map_get(db, cred_root(db, card), card, buf, sizeof(buf), &len);
 
 	if (rc != 0) {
 		return rc;
@@ -952,6 +1009,7 @@ int persondb_stat(struct persondb *db, struct persondb_stat *out)
 	out->populated = db->sb.populated;
 	out->rev = db->sb.rev;
 	out->n_people_maps = db->sb.n_people_maps;
+	out->n_cred_maps = db->sb.n_cred_maps;
 	return 0;
 }
 

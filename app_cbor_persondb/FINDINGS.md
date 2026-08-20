@@ -178,9 +178,37 @@ DK.
 Impact: the ~37 MB appended during the fill drives ~1 250 compactions — about
 2 h of the ≈ 2.2 h one-time population.
 
-Direction: two of the five are the double-buffered master; one is a post-hoc
-scratch erase that could be deferred into the next compaction's
-erase-before-write.
+Breakdown, and what each erase buys:
+
+| # | erase | why it exists |
+|---|---|---|
+| 1 | master (inactive slot) | arms recovery: `state=COMPACTING`, `compacting_bid`. A master is a 64 B header in a 64 KB sector, so rewriting it erases the sector; A/B alternation keeps the old one readable throughout |
+| 2 | scratch | must be blank to receive the compacted image, which has to be durable *before* step 3 destroys the only copy |
+| 3 | **bucket** | the actual reclaim. NOR clears bits only, so dropping superseded slots means erasing the sector and rewriting the live remainder. This is the irreducible one |
+| 4 | scratch | see below |
+| 5 | master (inactive slot) | disarms recovery: `state=CLEAN` |
+
+So: **one erase of work, two to make it survivable, two to record that it is in
+progress** — and four of the five are fixed per compaction, independent of how
+much the compaction reclaims. 5 × 64 KB is erased to reclaim at most 64 KB.
+
+Direction, **corrected**: an earlier revision of this entry suggested deferring
+erase 4 into the next compaction's erase-before-write. **That is unsafe as the
+code stands**, and the reason is worth keeping. `recover_compaction()` restores
+any sealed scratch image whose bucket header matches `compacting_bid`, and
+`bucket_hdr_valid()` compares magic, CRC and `bucket_id` — nothing that
+distinguishes *which* compaction of that bucket the image came from. Leave
+scratch sealed, compact the same bucket again, and crash after step 1: recovery
+finds the previous compaction's image, accepts it as this bucket's, and
+restores it over every append made in between. Silent loss of acknowledged
+writes.
+
+The header already carries the field that would close it: `gen`, which
+`build_compacted_image()` increments on every compaction. Recovery reading the
+live bucket's header — 16 bytes, once per crash — and restoring only when the
+scratch image's `gen` is strictly greater would make the deferral safe, taking
+compaction from five erases to four. That is the fix this entry should ask for;
+removing the erase on its own is not.
 
 ### B3 — No occupancy or geometry introspection (major, `read`)
 
