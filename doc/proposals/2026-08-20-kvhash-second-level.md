@@ -144,6 +144,33 @@ directory whenever a bucket is touched for the first time. Over a full fill:
 compaction cost is what caps the store (K13). This is a bigger effect than the
 7× on reads and was missing from the first draft of this proposal.
 
+### 5.1 Margin against K2 stops being expensive
+
+This is the result that decides whether v1 is enough on its own, so it belongs
+beside the byte counts rather than in the discussion.
+
+In a one-level map, buying safety against K2 means more buckets, and more
+buckets means a proportionally larger directory read on **every** operation. In
+a two-level map the directory grows as √N while the buckets shrink as 1/N, so
+over-provisioning is free — and for a while it is better than free:
+
+| buckets | one level: bytes per `get` | two levels: bytes per `get` |
+|--:|--:|--:|
+| 2 070 (≈ what this app needs) | 18 076 B | 2 418 B |
+| 4 096 (2× margin) | 33 606 B — and **unbuildable**, K12 | 1 886 B |
+| 8 100 (4× margin) | — | **1 884 B** |
+| 16 384 (8× margin) | — | 2 275 B |
+
+**Eight times more buckets than the population needs costs nothing**, and four
+times is the cheapest point on the curve. The same margin in a one-level map
+doubles the cost of every lookup and, past 2×, cannot be built at all.
+
+That changes what K2 means in practice. The reason `DESIGN.md` §6.1 enumerates
+a whole population offline, and the reason it targets 28 % of a bucket ceiling
+rather than 60 %, is that margin is expensive and being wrong is unrecoverable.
+Two levels removes the first half of that. It does not remove the second — see
+§9.1 and D4.
+
 **The reason to prefer this over A is not the bytes. It is that a two-level map
 can split.** Bucket overflow stops being `-ENOSPC` and becomes "split this
 sub-map and rehash it". That retires **K2**, and with it the reason
@@ -343,10 +370,10 @@ covers a split without a reachability GC is what review must settle.
 | **v1** fixed two levels, eager sub-maps | K1, K5, K11, K12, K13 | **none beyond today** |
 | **v2** split on overflow | K2, K3, and the sizing ritual | the whole of it |
 
-That is a better shape than the one this proposal originally argued for. v1 is
-close to mechanical, delivers every byte-count and capacity result in §1 and §5,
-and can ship while the split protocol is still being designed. What it does not
-do is remove the need to size a map correctly in advance — see D4.
+**v1 is the decision (D4).** It is close to mechanical, delivers every
+byte-count and capacity result in §1 and §5, and leaves K2 and K3 open — which
+§5.1 argues is affordable, because two levels make the margin that guards
+against K2 essentially free.
 
 **9.2 Split latency.** Rehashing a sub-map lands in the middle of a `set`, on a
 device where rewriting one bucket is already the expensive operation (K4).
@@ -371,10 +398,15 @@ argument leads. `blob_db` contract R1 (O(1) steady-state RAM) bounds it.
 **Option B, implemented so that C stays reachable**, and A folded in as the
 leaf-level id scheme if `blob_db` gains the range call.
 
-**Staged in two releases** (§9.1): a fixed two-level map with eagerly created
-sub-maps first, which carries no crash-consistency work beyond what the stack
-already does once per store, then split-on-overflow. The first stage delivers
-every number in §1 and §5; the second is what makes the map self-sizing.
+**Ship v1 only** (D4, decided): a fixed two-level map with eagerly created
+sub-maps, no splitting. It carries no crash-consistency work beyond what the
+stack already does once per store, and it delivers every number in §1 and §5.
+
+K2 and K3 stay open as findings, and §5.1 is why that is acceptable rather than
+a compromise: two levels make bucket margin free, so the sizing question stops
+being a calculation an application can get fatally wrong and becomes a generous
+default. Splitting is deferred until an application needs a genuinely unbounded
+population, or until B8 gains a multi-blob commit.
 
 The ordering that matters: A is a performance fix, B is a capability fix. A
 makes this application fast; B makes `kvhash` a map rather than a fixed-size
@@ -418,31 +450,45 @@ proposal does not merge them.
   independent of everything else here.
 - **D3c.** Per-map bucket sizing (§7.1) — worth it, or does declarative config
   make it redundant by deriving bucket size from the declared entry size?
-- **D4.** Is split-on-overflow in the first revision, or does v1 ship the
-  two-level layout with `-ENOSPC` retained and splitting deferred?
+- **D4. DECIDED: v1 — fixed two levels, splitting deferred.**
 
-  §9.1 makes this the central question rather than a detail. **v1 without
-  splitting is close to mechanical** — the top level is written once and never
-  again, so there is no crash-consistency work beyond what the stack already
-  does at store creation — and it still delivers the 7× on reads, the 44× on
-  directory-rewrite traffic, and the end of K13's capacity wall. **v2 with
-  splitting is where the hard part is**, and it is also the only thing that
-  retires K2 and K3 and lets `tools/sizing.py` be deleted.
+  Rationale, recorded because the decision closes the proposal's largest open
+  question: v1 carries **no crash-consistency work beyond what the stack already
+  does once per store** (§9.1), and it delivers every result in §1 and §5 — 7×
+  on reads, 44× on directory-rewrite traffic, and the end of K13's capacity
+  wall. Splitting carries all of the risk and none of those numbers.
 
-  Shipping v1 alone would leave the interface question (§7) half-answered: an
-  application would still declare a population up front and still be unable to
-  survive being wrong about it. The recommendation is to ship v1 early and
-  commit to v2, not to treat v1 as sufficient.
-- **D5.** What is the acceptance measurement? Proposed, in order of how much
-  each one proves:
+  **What v1 does not do, stated plainly.** K2 and K3 remain open as findings. A
+  bucket can still burst, the bucket count is still fixed at create, and an
+  application whose population grows past what it declared still has no recovery
+  short of a reformat.
+
+  **Why that is tolerable here, and what makes it so.** §5.1 is the load-bearing
+  reason: in a two-level map, 8× more buckets than the population needs costs
+  nothing per lookup, and 4× is cheaper than sizing exactly. Margin against K2
+  becomes free. K2 stops dictating the design even though it is not retired —
+  the sizing question turns from "compute the tail correctly or lose the fill"
+  into "declare generously and stop thinking about it".
+
+  **v2 is deferred, not dropped.** Revisit it when an application appears whose
+  population is genuinely unbounded at create time, or when B8 gains a
+  multi-blob commit that makes a split cheap to make correct.
+
+- **D5.** What is the acceptance measurement? For v1, in order of how much each
+  one proves:
 
   1. **`app_cbor_persondb` deletes `tools/sizing.py`** and passes its two
-     populations to `map_config` instead. This is the sharpest criterion in the
-     proposal: if the application still needs offline enumeration to choose a
-     safe geometry, the interface did not land, whatever the latency numbers
-     say.
+     populations to `map_config` instead (§7). Still the sharpest criterion,
+     and still reachable without splitting — not because the container can prove
+     its sizing is right, but because §5.1 makes a generous default affordable,
+     which is what the offline enumeration was buying.
   2. **10 000 persons completes** — no configuration currently reaches it
      (**K13**), and the benchmark had to be re-sized to 8 000 because of it
-     (`DESIGN.md` §6.5).
-  3. **p99 write with splitting enabled**, measured over the fill, because
-     §9.2's spike is the cost this design trades for.
+     (`DESIGN.md` §6.5). This is the direct test of whether the capacity wall
+     is gone.
+  3. **Directory-rewrite traffic over a full fill falls from 32.0 MiB to under
+     1 MiB** (§5). It is the largest single number in this proposal and the
+     easiest to verify with `CONFIG_BLOB_DB_IOSTATS`.
+
+  The p99-write measurement moves to v2 with the splitting it was meant to
+  characterise.
