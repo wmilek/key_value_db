@@ -731,8 +731,12 @@ the in-place cure, because it re-shapes the map without needing to enumerate it.
 **9.7 One free warning, and it should be in v1.** Every `set` already reads its
 target bucket, so `kvhash` knows that bucket's byte size at **zero** extra cost —
 no counter, no second read, no write. It can therefore say so when a bucket
-crosses a threshold of the payload ceiling (60 % is a reasonable start),
-by log or by return value.
+crosses **60 %** of the payload ceiling (D3d), reported **both** ways: a log
+line, and a positive return from `set` — 0 = stored, >0 = stored and this
+bucket is now past the threshold. Positive matters: every existing caller reads
+`rc != 0` as failure, so a negative code would turn a warning into an error at
+each of them, while a positive one is safely ignored by callers that do not
+care.
 
 This satisfies D3b's rule exactly: observed in passing, never stored. And it is
 the mitigation for §9.6 — it converts K2 from a surprise that arrives when
@@ -920,17 +924,24 @@ For the record, so these are not re-opened as blockers:
   container reads as buckets, then silently receiving a third of it — K9(b)
   live in the tree. A declared population cannot be clamped away.
 
-- **D3f.** Confirm `SMALL_MAP_LOAD` (§7.1), proposed at **4**, which puts the
-  one-level/two-level boundary near a thousand entries. It exists because
-  §5.2's ~1-entry-per-bucket target is a write-traffic optimisation and small
-  maps have no write traffic to optimise; without it a 300-key store pays 28
-  sub-map creations (B7) for nothing. A constant, not a format field.
+- **D3f. DECIDED: `SMALL_MAP_LOAD` = 4.** One level covers roughly a thousand
+  entries, which is the boundary D3e asked for: a small map stays flat, and two
+  levels are reached by declaring a population that needs them.
 
-  **With `initial_capacity` gone, the derivation rule is the entire sizing
-  interface** — no caller can correct it. That raises the stakes on getting it
-  right, and is the strongest argument for **D3b** (`kvhash_info()`): if the
-  container decides the geometry alone, an application must at least be able to
-  see what it decided.
+  It exists because §5.2's ~1-entry-per-bucket target is a *write-traffic*
+  optimisation and small maps have no write traffic to optimise; without it a
+  300-key store would pay 28 sub-map creations at ~1.1 s each on the DK (**B7**)
+  for nothing. The load is additionally capped by
+  `safe_bucket_bytes / max_entry_bytes`, so a map of large records gets a lower
+  load and more buckets rather than a bucket sitting near K2's ceiling.
+
+  A constant, not a format field: each map records its own geometry, so moving
+  it later changes only maps created afterwards and never invalidates a store.
+
+  **With `initial_capacity` gone this derivation rule is the entire sizing
+  interface**, and no caller can correct it — which is what D3b's readback
+  exists to make observable.
+
 - **D3d. DECIDED: `crc32_ieee`, split 16/16.** The top index is
   `(crc >> 16) % m`, the sub index `(crc & 0xffff) % n`. FNV-1a is retired from
   `kvhash`.
@@ -980,12 +991,18 @@ For the record, so these are not re-opened as blockers:
   **Freeze point.** The hash decides where every key lives, so it is free to
   change now (nothing is deployed, D0) and becomes a reformat once v1 ships.
 
-  **Still open under this decision: §9.7's warning threshold**, folded in here
-  because it is the mitigation for this risk. Proposed at 60 % of the bucket
-  ceiling, reported **both** ways — a log line for bring-up, and a return code
-  so a fill loop can throttle or stop on its own terms rather than meeting
-  `-ENOSPC` later. The cost is nil either way: a `set` has already read the
-  bucket.
+  **DECIDED with it: §9.7's warning fires at 60 % of the bucket ceiling,
+  reported as both a log line and a return code.** Folded in here because it is
+  the mitigation for this risk. The log line serves bring-up and the interactive
+  shell; the return code lets a fill loop throttle, re-plan or stop on its own
+  terms instead of meeting `-ENOSPC` hours later with no recovery (§9.6). Cost
+  is nil either way — a `set` has already read the bucket, so the size is in
+  hand.
+
+  One constraint on the return value, since most callers will ignore it: make it
+  **positive** — 0 = stored, >0 = stored and this bucket is now past the
+  threshold. Every existing caller tests `rc != 0` for failure, so a negative
+  code would turn a warning into an error at every one of them.
 
 - **D3e. DECIDED: `{0}` builds one level, small — today's behaviour
   unchanged.** The default serves the small single-level map; two levels are
