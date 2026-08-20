@@ -702,10 +702,9 @@ person 9 232 (`DESIGN.md` §6.1).
 
 *Three preventions, and they are all v1 has:*
 
-1. **Independent level indices** (D3d). Disjoint bit ranges of a 64-bit hash, or
-   separate salts — equivalent, and both require finalizing the hash first,
-   since FNV-1a's avalanche is too weak to split naively. Free, and the whole
-   fix for design-caused clustering.
+1. **Independent level indices** (D3d): `crc32_ieee` split 16/16. Free, and the
+   whole fix for design-caused clustering — the naive alternative puts 8 000
+   keys into 90 buckets at the recommended geometry.
 2. **Offline verification.** `tools/sizing.py` through the real hash — but only
    where the population is derivable. §6.1 already records the limit: this
    application can enumerate only because its data is a pure function of an
@@ -825,25 +824,28 @@ the two-level split — top index and sub index, reporting the fullest bucket
 across both — costs a few lines and answers the question offline, before any
 firmware runs. That is the check to write, in preference to a Zephyr test suite.
 
-### 11.2 Two independent indices from one key — unspecified
+### 11.2 Two independent indices from one key — specified (D3d)
 
 Today there is one hash and one index: `fnv1a(key, klen) % n`
-(`kvhash.c:225`). Two levels need a top index and a sub index that do not
-correlate. Naive `h % m` and `h % n` from a single 32-bit `h` cluster keys
-whenever *m* and *n* share factors — and clustering is precisely what **K2**
-punishes, on a structure whose whole argument is that it makes margin cheap.
+(`kvhash.c:225`). Two levels need two indices that do not correlate, and D3d
+settles it: **`crc32_ieee`, top = `(crc >> 16) % m`, sub = `(crc & 0xffff) % n`.**
 
-Options, in the order this proposal would try them: split a 64-bit hash into
-disjoint bit ranges; or salt `fnv1a` differently per level; or mix the level
-index into the seed. Any of them is fine; leaving it to chance is not.
+The reason this is a contract requirement and not a note is that the failure is
+maximal at the *recommended* geometry. §7.1 sizes two-level maps square, so
+`m == n` — and then `h % m` and `h % n` are the same number and every key lands
+on the diagonal. Enumerated over this application's 8 000 keys at 90 × 90: **90
+buckets of 8 100 in use, fullest 43 220 B**, against 2 718 B done correctly.
+That bursts a 16 384 B ceiling on contact, and it does so silently — every key
+is still found (§9.6).
 
-Worth noting that `app_cbor_persondb`'s hand-built two-level version avoided
-this **by accident** — it hashed *different inputs* at each level, `fnv1a` over
-the person-id bytes to pick a shard and `fnv1a` over the key string to pick a
-bucket (`tools/sizing.py`). A container hashing one key twice does not get that
-for free.
+Note the trap this replaces. `app_cbor_persondb`'s hand-built two-level layout
+avoided correlation **by accident**, because it hashed *different inputs* at each
+level — `fnv1a` over the person-id bytes to choose a shard, `fnv1a` over the key
+string to choose a bucket (`tools/sizing.py`). A container hashing one key twice
+gets no such luck.
 
-This needs specifying in the contract and a distribution test in §11.1's suite.
+The check is `tools/sizing.py` extended to model the split (D0), which is exact
+because `crc32_ieee` and `zlib.crc32` are the same function.
 
 ### 11.3 The decision that gates code
 
@@ -929,37 +931,61 @@ For the record, so these are not re-opened as blockers:
   right, and is the strongest argument for **D3b** (`kvhash_info()`): if the
   container decides the geometry alone, an application must at least be able to
   see what it decided.
-- **D3d. DECIDED (mostly): any independent derivation; the choice does not
-  matter, the check does.** Splitting a 64-bit hash and salting per level are
-  statistically equivalent, so the mechanism is left to implementation. Two
-  things are binding:
+- **D3d. DECIDED: `crc32_ieee`, split 16/16.** The top index is
+  `(crc >> 16) % m`, the sub index `(crc & 0xffff) % n`. FNV-1a is retired from
+  `kvhash`.
 
-  **(1) Not from one modulus source.** `h % m` and `h % n` from the same value
-  correlate whenever *m* and *n* share factors, and the container derives both,
-  so it cannot be left to luck. This is the only genuinely wrong answer.
+  **Measured on the real keys** — this application's 8 000 person keys through
+  the enumerator at the recommended 90 × 90 geometry:
 
-  **(2) Finalize the hash.** FNV-1a has weak avalanche, particularly in the low
-  bits and particularly for short keys, so naively splitting an FNV-1a result
-  into two halves does *not* give two independent indices — which would make an
-  otherwise correct design correlate. The tree already knows this: this
-  application's own generator does not use FNV alone where spread matters, it
-  runs a salted xor-shift-multiply finalizer (`tools/sizing.py`, `mix()`),
-  because FNV was not good enough for the job. The container needs the same
-  treatment, whichever of the two mechanisms it picks.
+  | derivation | fullest bucket | buckets used |
+  |---|--:|--:|
+  | `FNV(FNV(k))` split 16/16 | 2 353 B | 5 079 / 8 100 |
+  | FNV + salted `mix()` | 2 427 B | 5 087 / 8 100 |
+  | **`crc32` split 16/16** | **2 718 B** | **5 051 / 8 100** |
+  | naive `h % m`, `h % n` | **43 220 B** | **90 / 8 100** |
 
-  **What actually settles this is verification, not the choice.** Whichever
-  derivation lands, D0 put the distribution check in `tools/sizing.py` extended
-  to model the two-level split — enumerating the real population through the
-  real hash. That check catches a correlated derivation regardless of how it was
-  arrived at, which is why the decision above can be left loose and this one
-  cannot.
+  The first three are indistinguishable — a 15 % spread in the tail on one
+  population, with bucket occupancy matching the theoretical value for random
+  assignment in every case. The choice was therefore made on other grounds:
+
+  - **The verification model cannot drift from the code.** D0 made
+    `tools/sizing.py` the distribution check, and it must replicate the firmware
+    hash exactly. Zephyr's `crc32_ieee` is bit-identical to Python's
+    `zlib.crc32` — verified against its nibble-table implementation — so the
+    model calls a standard library function. A hand-rolled FNV variant is
+    hand-rolled twice and kept matching by hand, including the byte order of the
+    intermediate round-trip in `FNV(FNV(k))`, which is precisely the sort of
+    detail that differs silently. A check that can disagree with the code is
+    worth less than one that cannot.
+  - **One hash primitive in the stack, not two.** `blob_db` already uses
+    `crc32_ieee` for header integrity (`blob_db.c:117`), so the code is linked
+    either way and FNV-1a leaves the tree entirely.
+  - Cost is not a factor. A 9-byte key is ~0.2 µs against a ~1.5 ms lookup —
+    about 0.01 %. Both are free, which is what allowed the choice to be made on
+    quality and drift instead.
+
+  `FNV(FNV(k))` was considered and is a sound answer, not a rejected one: FNV-1a
+  has no right-shift step, so high bits never reach low bits, and re-hashing the
+  result supplies exactly that missing diffusion. It lost on drift alone.
+
+  **The binding constraint, and why it is not advisory.** Never derive both
+  indices as two moduli of one value. §7.1 recommends square fan-out, so
+  `m == n` is the *normal* geometry — and there `h % m` and `h % n` are literally
+  the same number. Every key lands on the diagonal: **90 buckets of 8 100 and a
+  43 KB bucket**, which bursts a 16 384 B ceiling immediately. The default
+  geometry is where the naive derivation is worst, which is why this is a
+  contract requirement rather than a note.
+
+  **Freeze point.** The hash decides where every key lives, so it is free to
+  change now (nothing is deployed, D0) and becomes a reformat once v1 ships.
 
   **Still open under this decision: §9.7's warning threshold**, folded in here
   because it is the mitigation for this risk. Proposed at 60 % of the bucket
-  ceiling, reported **both** ways — a log line for an interactive or
-  bring-up build, and a return code so a fill loop can throttle or stop on its
-  own terms rather than discovering `-ENOSPC` later. The cost is nil either way:
-  a `set` has already read the bucket.
+  ceiling, reported **both** ways — a log line for bring-up, and a return code
+  so a fill loop can throttle or stop on its own terms rather than meeting
+  `-ENOSPC` later. The cost is nil either way: a `set` has already read the
+  bucket.
 
 - **D3e. DECIDED: `{0}` builds one level, small — today's behaviour
   unchanged.** The default serves the small single-level map; two levels are
