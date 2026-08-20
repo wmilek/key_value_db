@@ -255,14 +255,38 @@ remove.
 A structure that sizes itself is only reachable through an interface that
 accepts the facts it needs. Today's does not.
 
-**The defect is that `initial_capacity` is a bucket count wearing the name of a
-capacity.** `buckets_for()` takes it as the bucket count and clamps it to
-`(MAX_PAYLOAD − 8) / 8`. So the plain reading — "I have 8 000 entries" — asks
-for 8 000 buckets, is clamped to the maximum, and produces the most expensive
-map the geometry can build. `app_cbor_persondb` passes `SIZE_MAX` instead,
-meaning "the largest you can build", and at a 32 722 B payload that is a map
-whose directory owns an erase block and whose fill dies at person 36 (**K12**).
-Both readings are defensible and both are traps.
+**This is not a redesign. `kvhash` does not conform to the contract it already
+has.** The field is documented as an entry count in two headers and used as a
+bucket count in the implementation:
+
+| | says |
+|---|---|
+| `shape_map.h:40` | `size_t initial_capacity; /**< expected entry count (0 = provider default) */` |
+| `kvdb.h:74` | `size_t initial_capacity; /**< entry-count hint (0 = default) */` |
+| `l2_containers.md:171` | "`nbuckets` comes from `map_config.initial_capacity` at `create`" |
+| `kvhash.c:100` | `size_t n = initial_capacity ? initial_capacity : DEFAULT_BUCKETS;` |
+
+The two API headers promise an entry count. The L2 contract document says it is
+the bucket count. The implementation uses it as the bucket count and clamps it
+to `(MAX_PAYLOAD − 8) / 8`. **The documents disagree with each other**, and the
+code follows the one a caller is least likely to read.
+
+So the plain reading — "I have 8 000 entries", which is what both headers invite
+— asks for 8 000 buckets, is clamped to the maximum, and produces the most
+expensive map the geometry can build. `app_cbor_persondb` passes `SIZE_MAX`
+instead, meaning "the largest you can build", and at a 32 722 B payload that is
+a map whose directory owns an erase block and whose fill dies at person 36
+(**K12**). Both readings are defensible and both are traps.
+
+**And the exposure is not this application's.** `kvdb_create` passes the field
+straight through (`kvdb.c:100`), so every `kvdb` caller who reads its own header
+and passes an entry count is sizing a bucket directory without knowing it. This
+is **K9** — "requested capacity is reinterpreted" — with the contract text now
+showing which way round the reinterpretation goes.
+
+Fixing D3a therefore is not "change the API". It is choosing which of two
+existing, contradictory specifications the code should honour. Declaring the
+population is the reading both headers already give a caller.
 
 **Rejected: per-level fields.** The obvious extension —
 `initial_capacity_L1`, `initial_capacity_L2` — is the current mistake
@@ -438,9 +462,25 @@ correct from the first release.
 **9.4 A format break**, guarded by the `version` byte §4.3 reserves. Existing
 stores need a reformat; there is no in-place migration and none is proposed.
 
-**9.5 RAM.** Two directory buffers instead of one, unless the top level is
-cached — and K7 (file-scope buffers shared across all maps) says where that
-argument leads. `blob_db` contract R1 (O(1) steady-state RAM) bounds it.
+**9.5 RAM is unchanged — an earlier draft of this section was wrong.** It
+claimed two directory buffers instead of one. Walking the access path shows one
+still suffices:
+
+- `get`: read the top directory into `dir_buf`, copy out the 8-byte child root,
+  then reuse the **same** `dir_buf` for the sub-directory. The top level is not
+  needed again.
+- `set`: identical, and the directory that may need rewriting is the
+  sub-directory — which is what `dir_buf` holds at that point, because the top
+  level is never modified after `create` (§9.1).
+
+So `dir_buf` and `bkt_buf` stay as they are, at `MAX_PAYLOAD` each. **The cost
+is one extra blob read per operation, not extra RAM.** Both levels share the
+directory format and the same `dir_load()` path, which is what "uniform levels"
+(§8) buys in code as well as in format.
+
+Caching the top level remains optional and is where K7 (file-scope buffers
+shared across all maps) and R1 (O(1) steady-state RAM) would start to bind — but
+v1 does not need it.
 
 ## 10. Recommendation
 
@@ -484,10 +524,87 @@ hash is ~3. They answer different questions — if you need order, use the tree;
 if you need point lookups at scale, the hash should stop being one level. This
 proposal does not merge them.
 
-## 11. Decisions this proposal needs from review
+## 11. What blocks implementation
 
+D4 settled the shape. What remains is not design: it is one missing piece of
+test infrastructure, one unspecified detail, and two decisions. Listed because
+"the design is agreed" and "someone can start" are not the same state.
+
+### 11.1 `kvhash` has no test suite — prerequisite, not a nicety
+
+`tests/lib/containers/` is a skeleton: a README saying "planned but not yet
+implemented", no `testcase.yaml`, so `west twister` skips the directory. The
+only coverage `kvhash` has is indirect, through `tests/lib/kvdb`.
+
+This proposal rewrites an on-flash format. Doing that against no direct contract
+tests is the largest practical risk in the plan, and it is larger than anything
+in §9. The suite has to exist first, and it has to cover at minimum:
+
+- every `map_ops` entry point against the §4.3 contract, including the error
+  returns (`-ENOSPC`, `-ENOENT`, `-EEXIST`) that callers branch on;
+- persistence across a remount, since the format is the thing changing;
+- the K2 boundary — a bucket taken to the payload ceiling — because that is the
+  failure this design is meant to make cheap to avoid, and it must keep
+  behaving identically in v1, which does not retire it;
+- key distribution across both levels (§11.2).
+
+Writing it against the *current* implementation first is worth the extra step:
+it establishes that the tests describe the contract rather than the new code,
+and it gives a before/after on identical assertions.
+
+### 11.2 Two independent indices from one key — unspecified
+
+Today there is one hash and one index: `fnv1a(key, klen) % n`
+(`kvhash.c:225`). Two levels need a top index and a sub index that do not
+correlate. Naive `h % m` and `h % n` from a single 32-bit `h` cluster keys
+whenever *m* and *n* share factors — and clustering is precisely what **K2**
+punishes, on a structure whose whole argument is that it makes margin cheap.
+
+Options, in the order this proposal would try them: split a 64-bit hash into
+disjoint bit ranges; or salt `fnv1a` differently per level; or mix the level
+index into the seed. Any of them is fine; leaving it to chance is not.
+
+Worth noting that `app_cbor_persondb`'s hand-built two-level version avoided
+this **by accident** — it hashed *different inputs* at each level, `fnv1a` over
+the person-id bytes to pick a shard and `fnv1a` over the key string to pick a
+bucket (`tools/sizing.py`). A container hashing one key twice does not get that
+for free.
+
+This needs specifying in the contract and a distribution test in §11.1's suite.
+
+### 11.3 The two decisions that gate code
+
+**D3a (config shape)** decides the interface and, with it, whether v1 needs a
+promote path at all: if the container is told the expected population at
+`create`, depth is a create-time choice and there is no one-level → two-level
+transition to build. §7 argues this is choosing between two contradictory
+existing specifications rather than inventing an API.
+
+**D1 (contract revision or second provider)** sets the module name, the Kconfig
+symbol, whether existing stores break, and whether `kvdb` needs a translation
+where it passes `initial_capacity` through (`kvdb.c:100`). Cheap to decide,
+but it precedes the first commit.
+
+### 11.4 What D4 already cleared
+
+For the record, so these are not re-opened as blockers:
+
+| | why it is not blocking v1 |
+|---|---|
+| **D2** `alloc_id_range()` | v1 stores child ids in directories; Option A is not on the v1 path |
+| **D3** promotion | disappears if D3a is declarative — depth is chosen at `create` |
+| **D3c** per-map bucket sizing | redundant once the container derives bucket size from a declared population (§7.1) |
+| p99 write measurement | moves to v2 with the splitting it was meant to characterise |
+| RAM for a second directory | not needed — one `dir_buf` suffices (§9.5) |
+
+## 12. Decisions this proposal needs from review
+
+- **D0. The `kvhash` test suite is a prerequisite** (§11.1). `tests/lib/
+  containers/` is an empty skeleton and the only coverage is indirect via
+  `tests/lib/kvdb`. Is writing it — against the current implementation first —
+  accepted as the first commit of this work rather than part of it?
 - **D1.** Is the bucket-id array leaving the `kvhash` contract (§4.3), or is
-  this a second provider (`kvhash2`) beside it?
+  this a second provider (`kvhash2`) beside it? (§11.3)
 - **D2.** Does `blob_db` gain `alloc_id_range()`? If not, Option A and Option C
   are both off the table and B is the only route.
 - **D3.** Fixed two-level, or one-level promoted on growth? §8 answers the
@@ -497,9 +614,16 @@ proposal does not merge them.
   level (§8) and the small-map case (§9.3).
 - **D3a.** Does `map_config` become declarative (§7) — `expected_entries`,
   `typical_entry_bytes`, `max_entry_bytes` — or does `initial_capacity` stay and
-  merely get documented as the bucket count it is? Declarative is what lets
-  `tools/sizing.py` be deleted; keeping the current field means every
-  application keeps doing that arithmetic offline.
+  merely get documented as the bucket count it is? Note this is **not** a choice
+  about whether to change an API: `shape_map.h` and `kvdb.h` already document
+  the field as an entry count and the implementation already treats it as a
+  bucket count, so one of the two is being corrected either way (§7).
+  Declarative is what lets `tools/sizing.py` be deleted; keeping the current
+  field means every application keeps doing that arithmetic offline, and every
+  `kvdb` caller keeps reading "entry-count hint" and getting a bucket count.
+- **D3d.** How are the two level indices derived from one key (§11.2)? Split a
+  64-bit hash, or salt per level? Unspecified today, and getting it wrong
+  clusters keys into exactly the failure K2 punishes.
 - **D3b.** Is `kvhash_info()` (readback of depth, fan-out, bucket count, entry
   count) in scope? It closes half of **K9** and much of **K10**, and it is
   independent of everything else here.
