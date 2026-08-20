@@ -1,10 +1,12 @@
 # Design change proposal — a second level for `kvhash`
 
-Status: **proposal / for review** · 2026-08-20
+Status: **implemented — v1 built, measured, and correcting this document
+where it was wrong** · 2026-08-20
+· What shipped and what it measured: §13
 · Target contract: `doc/layers/l2_containers.md` §4.3 (and §5 invariants)
 · Target implementation: `lib/containers/kvhash/kvhash.c`
 · Evidence: `app_cbor_persondb/FINDINGS.md` K1, K2, K3, K5, K10, K11, K12, K13
-  · measurements in `app_cbor_persondb/RESULTS.md` §4b
+  · measurements in `app_cbor_persondb/RESULTS.md` §4 and §13 below
 · Governed by `doc/principles.md`
 
 **The ask.** `kvhash`'s root holds one bucket id per bucket. That array is read
@@ -207,19 +209,47 @@ the medium, which is the K13 mechanism running in the favourable direction, so
 the same choice buys capacity as well.
 
 **The design rule that falls out is roughly one entry per bucket, floored at
-`MIN_BUCKET_BYTES`** (D3f: 256) — not a comfortably full bucket, and not a
-bucket smaller than the slot header carrying it. That is the opposite of what a one-level map forces,
-where few buckets is the only affordable choice and each therefore holds many
-entries and is rewritten whole on every touch.
+`MIN_BUCKET_BYTES`** (D3f) — not a comfortably full bucket. That is the
+opposite of what a one-level map forces, where few buckets is the only
+affordable choice and each therefore holds many entries and is rewritten whole
+on every touch.
 
-**The floor is per-blob overhead**, and it is what stops "more buckets" from
-being free forever: a 14 B slot header on a 211 B bucket is 7 %, on a 53 B
-bucket 26 %, plus a blob id and bookkeeping each. Somewhere below a few hundred
-bytes per bucket the overhead wins — **`tools/sizing.py` puts that point at
-about 256 B**, measured over this application's credential population, which is
-where D3f's `MIN_BUCKET_BYTES` comes from. For this application the useful band is
-**8 100–16 384 buckets**, and the curve is flat enough across it that the choice
-is not delicate — which is §5.1's point restated on the axis that matters.
+### 5.2a The floor was wrong twice, and only the built container said so
+
+This section originally said the limit on "more buckets" is per-blob overhead —
+a 14 B slot header on a 53 B bucket is 26 % — and left it unquantified.
+`tools/sizing.py` then quantified *that* and set the floor at **256 B**. Both
+were the wrong quantity, and the correction is the most useful thing in this
+document.
+
+**Measured, a 256 B floor made reads slower than the one-level map it
+replaced**: 228 µs per access decision against 179, while moving a third of the
+bytes. Fewer bytes and worse.
+
+The cost of more buckets is not what a bucket carries. It is **how many blobs
+the store ends up holding**, because `blob_db` finds a blob by walking slot
+headers in its erase block, and that walk grows with the block's population. A
+256 B floor put 10 082 blobs in the store, and `check` went from 230 flash
+operations to **787** — at 16 B each, which is header-sized. Those operations
+*are* the walk.
+
+| floor | buckets | blobs | bytes/`check` | flash ops | µs |
+|--:|--:|--:|--:|--:|--:|
+| 256 | 8 100 | 10 082 | 12 565 | 787 | 228 |
+| 1 024 | 3 025 | 3 586 | 7 369 | 325 | 108 |
+| **4 096** | **784** | **1 084** | 8 384 | **135** | **70** |
+| 8 192 | 400 | 694 | — | — | buckets past the 60 % warning |
+| *one level* | *2 047* | *2 048* | *37 384* | *230* | *179* |
+
+**4 096 is the knee, and bytes per get are not minimised there.** That is the
+point: 256 moves fewer bytes and runs 3.3× slower. Above 8 192 the container
+declines the geometry, because the fullest bucket passes the §9.7 warning line —
+which is the warning doing its job at create time rather than at person 9 670.
+
+Two things follow for the model rather than the code. `tools/sizing.py` now
+reports **blob count beside bytes**, because bytes alone cannot see this knee.
+And the lesson generalises past this constant: a container's cost is not only
+what it moves, it is what it makes the layer beneath it hold.
 
 **The reason to prefer this over A is not the bytes. It is that a two-level map
 can split.** Bucket overflow stops being `-ENOSPC` and becomes "split this
@@ -971,18 +1001,21 @@ For the record, so these are not re-opened as blockers:
   `safe_bucket_bytes / max_entry_bytes`, so a map of large records gets a lower
   load and more buckets rather than a bucket sitting near K2's ceiling.
 
-  **Also decided, and found by building the check: `MIN_BUCKET_BYTES` = 256.**
-  §5.2 said the limit on "more buckets" is per-blob overhead and left it
-  unquantified. The model quantified it on the first run: targeting ~1 entry per
-  bucket gave this application's credential map **20 164 buckets for 23 B
-  entries** — a blob per entry, 14 B of slot header carrying 23 B of data, 62 %
-  overhead, 2 311 B per `get`. With a 256 B floor on the target bucket size:
-  1 849 buckets, 6 % overhead, **952 B per `get`**. The floor never binds for
-  entries larger than itself, so the people map is unchanged at 90 × 90.
+  **Also decided, and revised twice: `MIN_BUCKET_BYTES` = 4096.** §5.2 said the
+  limit on "more buckets" is per-blob overhead and left it unquantified. Writing
+  the model quantified that as slot-header waste inside a bucket and set the
+  floor at 256. Building the container showed both were the wrong quantity: at
+  256 the store held 10 082 blobs and an access decision cost **787 flash
+  operations against the one-level build's 230**, running 3.3× slower while
+  moving a third of the bytes. The cost of more buckets is how many blobs the
+  store holds, not what each one carries — `blob_db` walks slot headers to find
+  a blob, and that walk grows with the block's population. §5.2a has the sweep;
+  4 096 is the knee, and 8 192 is refused because the fullest bucket passes the
+  §9.7 warning line.
 
   So the two-level target is `max(typical_entry_bytes, MIN_BUCKET_BYTES)`, not
   one entry per bucket. §5.2's rule was right about the direction and wrong at
-  the small-entry end, which is exactly what a check is for.
+  both ends — which is what a check, and then a build, are for.
 
   Both are constants, not format fields: each map records its own geometry, so
   moving either later changes only maps created afterwards and never invalidates
@@ -1156,3 +1189,63 @@ For the record, so these are not re-opened as blockers:
 
   The p99-write measurement moves to v2 with the splitting it was meant to
   characterise.
+
+---
+
+## 13. Measured — v1 as built
+
+`lib/containers/kvhash/kvhash.c`, run by `app_cbor_persondb` at its 8 000-person
+scale on `native_sim`. Steady state, 200 samples, `CONFIG_BLOB_DB_IOSTATS`.
+
+| | one level | two levels | |
+|---|--:|--:|---|
+| `check` — card → person → permission | 179 µs | **70 µs** | 2.6× faster |
+| bytes per `check` | 37 384 B | **8 384 B** | 4.5× fewer |
+| flash ops per `check` | 230 | **135** | 1.7× fewer |
+| `byid` | 94 µs | **42 µs** | 2.2× |
+| `miss` | 89 µs | **31 µs** | 2.9× |
+| `put` | 918 µs | **722 µs** | 1.3× |
+| fill, 8 000 records | 11 709 ms | **3 530 ms** | **3.3× faster** |
+
+Geometry, reported by the container itself through `stat()` rather than
+modelled: the people map is **depth 2, 28 × 28 = 784 buckets**; the credential
+map **depth 2, 16 × 16 = 256**. At the smoke scale of 200 persons both stay
+**depth 1**, 50 and 125 buckets — the default path is untouched, as D3e
+requires. `VERIFY PASS` and zero bucket overflows at both scales.
+
+### 13.1 What the build changed about the proposal
+
+**§5.2's model was wrong, and §5.2a is the correction.** It is the substantive
+one: bytes moved are not the objective, because a container's cost includes what
+it makes the layer below it hold. The bucket floor moved 256 → 4 096.
+
+**The positive return from `set()` is a real migration hazard, not a
+theoretical one.** `app_cbor_persondb` read `rc != 0` as failure and aborted its
+fill on the first near-full warning. Every caller of a `set` that gains a
+warning return has to be audited; there is no way to add one compatibly. Worth
+weighing against the alternative of a log line alone — this document chose both
+(§9.7), and the cost of "both" is this audit.
+
+**The check and the code diverged immediately, in two places.** Running them
+side by side caught it: `tools/sizing.py` was missing the
+`buckets >= ONE_LEVEL_MAX_BUCKETS` floor that `kvhash.c` applies, and it modelled
+the dataset's own 433 B mean where the application declares 380. It put the
+credential map at 121 buckets where the device built 256. Both are fixed and the
+model now reproduces the device exactly. This is the drift D3d chose `crc32_ieee`
+to avoid, appearing in the arithmetic instead of the hash — a check has to be the
+code's twin or it is checking something else.
+
+### 13.2 What is still unmeasured
+
+- **The nRF5340-DK.** CI cross-builds it; nothing has run on the board. Every
+  ratio above is `native_sim`, where a flash operation is not a QSPI
+  transaction. The DK is where the operation-count win should matter *more*
+  than it does here, since each operation carries a fixed ~65 µs — but that is
+  a prediction, and predictions in this document have not had a good record.
+- **10 000 persons**, D5's second criterion. K13's ceiling was 9 670 with the
+  one-level container; the two-level one holds a fraction of the blobs and
+  should clear it, but it has not been tried.
+- **`tools/sizing.py` as a sizing prerequisite** (D5's first criterion) is met
+  in the sense that matters — the application declares populations and the
+  container derives geometry — but the script survives with a changed job, as
+  §11.1 said it should.
