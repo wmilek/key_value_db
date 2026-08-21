@@ -19,9 +19,13 @@
  *                     with the 1.5x midpoints in between. Each sweep prints a
  *                     matrix — size, ops, us/op, KiB/s, ns/B, and the
  *                     MARGINAL ns/B against the row above — because that last
- *                     column is what answers "is this relationship linear":
+ *                     column is what answers "can one slope describe this":
  *                     it is constant iff the cost is affine, whatever the
- *                     fixed cost happens to be.
+ *                     fixed cost happens to be. Note that affine is not
+ *                     proportional: a non-zero fixed cost is charged on every
+ *                     call whatever it carries, so throughput still depends
+ *                     on transfer size, which is what the KiB/s column is
+ *                     there to show.
  *   write_pg        — the same write, each transfer pinned to a program-page
  *                     boundary, so a part that programs by page shows a clean
  *                     ceil(n/page) staircase instead of the average of two
@@ -168,8 +172,14 @@ static void raw_erase(const char *op, uint32_t blocks, uint32_t ops,
  *
  * For an affine cost t(n) = a + b·n this is b at every row — constant, and
  * equal to the fitted slope, whatever the fixed cost a is. So a column of
- * near-identical numbers IS the linearity check, and a column that steps is a
- * cost that a single slope cannot describe.
+ * near-identical numbers IS the check that one slope suffices, and a column
+ * that steps is a cost that a single slope cannot describe.
+ *
+ * It is NOT a claim that speed is size-independent. a is paid on every call
+ * however few bytes it carries, so throughput rises with transfer size and
+ * only flattens well past a/b — measured on the MX25R64, 12.9 B for write and
+ * 254 B for read. The KiB/s column is what says that; the marginal column
+ * says only that each extra byte costs the same as the last.
  *
  * That is not a hypothetical for writes. A NOR part programs whole pages, so
  * the true write cost is ceil(n / page) page programs — a staircase, not a

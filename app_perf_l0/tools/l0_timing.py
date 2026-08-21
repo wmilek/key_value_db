@@ -916,14 +916,21 @@ def show_model(model, verbose=False):
     # Derived numbers a human actually reasons with.
     r = m["read"]
     w = m["write"]
-    if r["per_byte_ns"] > 0:  # zero means the sweep resolved no size term
-        print(f"\n  read  throughput ceiling: "
-              f"{1e9 / r['per_byte_ns'] / 1024:.0f} KB/s; a transfer pays its "
-              f"fixed cost until {_breakeven(r, 'per_byte_ns'):.0f} B")
-    if w["per_byte_ns"] > 0:
-        print(f"  write throughput ceiling: "
-              f"{1e9 / w['per_byte_ns'] / 1024:.0f} KB/s; a transfer pays its "
-              f"fixed cost until {_breakeven(w, 'per_byte_ns'):.0f} B")
+    # Throughput is a consequence of BOTH terms, and saying so here is the
+    # guard against reading a constant marginal cost as a constant speed. The
+    # fixed cost is charged on every call whatever it carries, so a caller
+    # below the break-even size gets a fraction of the ceiling.
+    for label, cls in (("read ", r), ("write", w)):
+        if cls["per_byte_ns"] <= 0:  # the sweep resolved no size term
+            continue
+        ceil_kib = 1e9 / cls["per_byte_ns"] / 1024
+        be = _breakeven(cls, "per_byte_ns")
+        small = 64.0
+        got = small / ((cls["fixed_ns"] + cls["per_byte_ns"] * small) / 1e9) / 1024
+        print(f"\n  {label} ceiling {ceil_kib:.0f} KiB/s, but only for large "
+              f"transfers: the fixed cost\n        dominates below "
+              f"{be:.0f} B, so a {small:.0f} B transfer gets "
+              f"{got:.0f} KiB/s ({got / ceil_kib * 100:.0f} % of it)")
 
     # The linearity evidence, which is the part of the capture the single
     # fitted slope replaces. Printed next to the fit so the two are read

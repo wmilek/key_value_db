@@ -38,8 +38,8 @@ Each size sweep prints a table, and every row is also emitted as a machine-reada
      4096     4096         2.000      2000000       0.48        0.00
 ```
 
-`us/op` and `KiB/s` say how fast it is. The column that says whether the
-relationship is **linear** is the last one — the marginal cost, the extra
+`us/op` and `KiB/s` say how fast it is. The column that says whether one
+slope can describe the cost is the last one — the marginal cost, the extra
 nanoseconds each extra byte cost between this row and the one above:
 
 ```
@@ -47,11 +47,23 @@ d(ns)/d(B) = (t(n) - t(n_prev)) / (n - n_prev)
 ```
 
 For an affine cost `t(n) = a + b·n` this is `b` at *every* row, regardless of
-the fixed cost `a`. So a column of near-identical numbers **is** the linearity
-proof, and a column that steps is a cost a single slope cannot describe. The
-app prints the range and its verdict at the end of each sweep; the tool repeats
-both next to the fitted slope, so nobody reads a slope without seeing what it
-averaged over.
+the fixed cost `a`. So a column of near-identical numbers **is** the proof that
+the cost is affine, and a column that steps is a cost a single slope cannot
+describe. The app prints the range and its verdict at the end of each sweep;
+the tool repeats both next to the fitted slope, so nobody reads a slope without
+seeing what it averaged over.
+
+**Affine is not the same as proportional, and the tables are careful to keep
+them apart.** A constant marginal cost does *not* mean constant throughput —
+`a` is charged in full on every call, however few bytes it carries, so `KiB/s`
+climbs with transfer size and only flattens well past `a/b`. On the DK both are
+true at once: write's marginal cost is flat to 1.02 % across 8 B…64 KB while
+its throughput still varies 4× (19 → 80 KiB/s), and read's varies **64×**
+(59 → 3 766 KiB/s) because its fixed term dominates until 254 B. Read the two
+columns together: the marginal column tells you the *shape*, the KiB/s column
+tells you what a caller at that transfer size actually gets. `RESULTS.md` §5b
+works through both, including why `blob_db`'s 14 B mean read lands at 5 % of
+the flash's achievable bandwidth.
 
 Two details exist because of writes specifically:
 

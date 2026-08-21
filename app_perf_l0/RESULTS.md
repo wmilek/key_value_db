@@ -249,7 +249,7 @@ board could have produced:
 - `update` is 69–74 % write on 4800 B — 100 slot writes, each paying a fixed
   cost plus a page program.
 
-### 4b. Is write linear? What the existing data already says
+### 4b. Does write cost scale with bytes or with pages? What the existing data already says
 
 The matrix exists to answer this on the board, but the three captures already
 constrain the answer, because they contain writes at two very different sizes.
@@ -409,7 +409,7 @@ take bytes 2.5× faster than that. Likewise reads: 3 781 kB/s at L0 against the
 Both errors point the same way — cost measured at the top of a stack was
 attributed to the bottom of it — and both were only visible once the bottom was
 measured on its own.
-### 5b. Is the relationship linear? The board's answer
+### 5b. Does the cost scale with bytes, or with pages? The board's answer
 
 The scorecard above is about coefficients. This is about *shape* — the question
 the matrix exists to answer. Both tables below are computed from the same
@@ -433,12 +433,52 @@ against the row above, which is constant iff the cost is affine.
 | 16384 | 200988.8 |     80 | 12267.38 |     12 256.21 |
 | 65536 | 803588.9 |     80 | 12261.79 |     12 259.00 |
 
-**Write is linear in bytes. It is not a page staircase.** The marginal cost
-sits between 12 060 and 12 273 ns/B for every step from 8 B to 64 KB — a 1.02×
-spread once the single noisy 32 B point is set aside, 1.13× including it. A
-4 B write costs 208 µs and a 256 B write costs 3 251 µs: **15.6× more for 64×
-the bytes**. If the part charged one page program regardless of size those two
-numbers would be equal.
+**Each extra byte costs the same, so there is no page staircase.** The
+marginal cost sits between 12 060 and 12 273 ns/B for every step from 8 B to
+64 KB — a 1.02× spread once the single noisy 32 B point is set aside, 1.13×
+including it. A 4 B write costs 208 µs and a 256 B write costs 3 251 µs:
+**15.6× more for 64× the bytes**. If the part charged one page program
+regardless of size those two numbers would be equal.
+
+#### Affine, not proportional — and the difference is not pedantry
+
+That result is easy to state too strongly, so: **the cost is affine, `t(n) =
+a + b·n`, with a fixed term that is not zero.**
+
+```
+write  t(n) = 157.1 µs + 12.156 µs/B · n
+read   t(n) =  65.7 µs +  0.258 µs/B · n
+```
+
+What is constant is `b`, the *marginal* cost — the price of one more byte. That
+is the property that rules out a staircase, and the property the prediction
+identity in the README needs.
+
+What is **not** constant is throughput, and the `KiB/s` column says so plainly:
+
+| transfer | write KiB/s | fixed share | read KiB/s | fixed share |
+|---:|---:|---:|---:|---:|
+| 4 B | 19.0 | 76 % | 58.6 | 98 % |
+| 16 B | 44.4 | 45 % | 197 | 95 % |
+| 64 B | 66.8 | 17 % | 760 | 80 % |
+| 256 B | 76.5 | 4.8 % | 1 897 | 50 % |
+| 4 KB | 80.0 | 0.3 % | 3 560 | 5.8 % |
+| 64 KB | 80.3 | 0.0 % | 3 766 | 0.4 % |
+
+So "linear" in the everyday sense — *time proportional to size, speed the same
+at every size* — is **false here, for both classes**. Write speed varies 4×
+across the sweep and read speed varies 64×. A transfer pays its fixed cost in
+full whether it moves 1 byte or 1 000, and that cost only stops mattering above
+`a/b`: **12.9 B for write, 254.3 B for read**.
+
+The read figure is the one with teeth. `blob_db`'s reads on this board average
+8 650 B / 605 = **14.3 B**, which is deep inside the fixed-cost-dominated
+regime: 201 KiB/s, or **5.3 % of the 3 781 KiB/s the same flash delivers to
+large transfers**. Its writes average 48 B and fare much better at 79 % of
+their asymptote, because write's fixed term is small next to its per-byte cost.
+Reads are where batching would pay, and this is the measurement that says so —
+not the slope, but the slope *together with* the fixed term the KiB/s column
+exposes.
 
 That is §4b's prediction (**H1**) confirmed by direct measurement rather than
 inferred from two mean sizes, and it settles the modelling question the whole
@@ -458,7 +498,10 @@ Read is the same story with a noisier small end:
 | 65536 | 16677.86 |   3837 |   254.48 |        253.60 |
 
 From 64 B upward the marginal cost is **252.9–253.9 ns/B, a 1.004× spread** —
-about as linear as a measurement gets. Below 64 B it scatters (the 16 B step
+about as constant as a measurement gets, so read has no size structure either.
+Its throughput still climbs 64× across the sweep, for the reason above: the
+65.7 µs fixed term dwarfs the per-byte term until 254 B. Below 64 B the marginal
+column scatters (the 16 B step
 reads 1 022 ns/B), which is per-call variance showing through a difference
 between two nearly equal numbers, not structure: the underlying `µs/op` values
 there differ by a few microseconds on a ~65 µs fixed cost. This is why the fit
