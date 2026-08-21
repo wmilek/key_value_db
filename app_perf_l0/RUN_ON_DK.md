@@ -46,8 +46,8 @@ a silent console is usually the wrong node, not a dead board.
 
 ## What to expect while it runs
 
-**About six minutes, most of it silence.** A 64 KB block erase on this part is
-~1.07 s and the sweep performs roughly 220 of them; the erase phase alone is
+**About seven minutes, most of it silence.** A 64 KB block erase on this part
+is ~1.07 s and the sweep performs roughly 220 of them; the erase phase alone is
 around four minutes of apparent quiet between lines. That silence *is* the
 measurement.
 
@@ -57,11 +57,17 @@ a human-readable line:
 1. `-- erase: cost vs erase size --` — the long one. Spans of 1, 2, 4, 8, 16
    and 32 blocks, three repetitions each, then 32 single-block calls.
 2. `-- read: cost vs transfer size --` — seconds. Programs two blocks first
-   (untimed), then sweeps 4 B … 64 KB.
-3. `-- write: cost vs transfer size --` — about a minute; each sweep point
+   (untimed), then sweeps 1 B … 64 KB in 32 rows.
+3. `-- write: cost vs transfer size --` — a minute or two; each sweep point
    erases the space it is about to consume.
-4. `-- write: page-straddle penalty --` — seconds to tens of seconds.
-5. A final erase of the working region, then `l0end status=0`.
+4. `-- write: page-program staircase --` — page-aligned transfers around the
+   256 B boundary; twenty seconds or so.
+5. `-- write: page-straddle penalty --` — seconds to tens of seconds.
+6. A final erase of the working region, then `l0end status=0`.
+
+Each of 2–5 prints a matrix: size, ops, µs/op, KiB/s, ns/B and the marginal
+cost. The last column is the one to read — see `README.md`. Sweeps 2 and 3
+also print a one-line verdict on whether their curve is affine.
 
 The app never exits — Zephyr's idle loop runs forever once `main()` returns —
 so stop capturing after `l0end status=0`. A non-zero status means a phase
@@ -85,7 +91,7 @@ numbers; they are echoed in the `l0geom` line.
 The first two lines of output are the whole basis of the run:
 
 ```
-l0geom part_bytes=8388608 block_bytes=65536 blocks=128 write_align=4 erased_val=0xff region_blocks=32 max_xfer=65536 cycles_per_s=32768 source=hardware timing=real board=nrf5340dk/nrf5340/cpuapp
+l0geom part_bytes=8388608 block_bytes=65536 blocks=128 write_align=4 erased_val=0xff region_blocks=32 max_xfer=65536 program_page=256 cycles_per_s=32768 source=hardware timing=real board=nrf5340dk/nrf5340/cpuapp
 partition 8388608 B, 128 blocks of 65536 B, write align 4, erased 0xff
 ```
 
@@ -108,8 +114,25 @@ python3 key_value_db/app_perf_l0/tools/l0_timing.py fit dk_l0.log \
 Read the residual table `-v` prints before using the model. Then:
 
 - Check it against `RESULTS.md` §4, which states what the derived model
-  predicts each coefficient will be and what a disagreement would mean. The
-  write-per-byte row is the one to look at first.
+  predicts each coefficient will be and what a disagreement would mean.
+- Check the write tables against `RESULTS.md` §4b, which predicts from the
+  existing captures that **write on this part is affine in bytes** and that
+  `write_pg` will therefore show *no* staircase. A clean staircase there
+  falsifies the model in §3 and everything predicted from it, so it is the
+  first thing to look at, not the last.
+- Check it against the datasheet, which also tells you which mode the part
+  powered up in:
+
+  ```bash
+  python3 …/l0_timing.py spec -m …/mx25r64_nrf5340dk.json \
+      --spec key_value_db/app_perf_l0/models/mx25r6435f_datasheet.json
+  ```
+
+  `RESULTS.md` §5 has the expected outcome: everything inside the Ultra Low
+  Power envelope, and the page program over the High Performance maximum. An
+  `OVER MAX` in *both* modes means the measurement is picking up time that is
+  not the part's — a driver retry or a busy-poll interval — and the model
+  should not be published until that is understood.
 - Re-check the model against reality on a workload it was not fitted to:
 
   ```bash

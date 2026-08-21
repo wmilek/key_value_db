@@ -19,43 +19,67 @@ reproducible from this repository today.
 
 ---
 
-## 1. The fitter, checked against a substrate whose costs are known exactly
+## 1. The size matrix, and what a flat substrate proves
 
 The flash simulator charges one flat cost per call — `k_busy_wait()` of
 `CONFIG_FLASH_SIMULATOR_MIN_{READ,WRITE,ERASE}_TIME_US`, with no per-byte and
-no per-block term. That makes a `native_sim` run a test with a known answer:
-whatever the sweep does, the fit must come back with exactly those three
-constants and three zero slopes.
+no per-block term. That makes a `native_sim` run a test with a known answer.
 
 ```
 west build -b native_sim key_value_db/app_perf_l0 && ./build/zephyr/zephyr.exe > l0_sim.log
-python3 app_perf_l0/tools/l0_timing.py fit l0_sim.log --name native_sim_default -v
 ```
 
 ```
-model: native_sim_default   source=flash_simulator timing=simulated board=native_sim/native
-geometry: partition 8388608 B, 2048 blocks of 4096 B, write align 1 B
+-- read: cost vs transfer size --
+     size      ops         us/op        KiB/s       ns/B   marginal ns/B
+        1     4096         2.000          488    2000.00         -
+        2     4096         2.000          976    1000.00         0.00
+        3     4096         2.000         1464     666.66         0.00
+        4     4096         2.000         1953     500.00         0.00
+        6     4096         2.000         2929     333.33         0.00
+        8     4096         2.000         3906     250.00         0.00
+       12     4096         2.000         5859     166.66         0.00
+       16     4096         2.000         7812     125.00         0.00
+       24     4096         2.000        11718      83.33         0.00
+       32     4096         2.000        15625      62.50         0.00
+       48     4096         2.000        23437      41.66         0.00
+       64     4096         2.000        31250      31.25         0.00
+       96     4096         2.000        46875      20.83         0.00
+      128     4096         2.000        62500      15.62         0.00
+      192     4096         2.000        93750      10.41         0.00
+      256     4096         2.000       125000       7.81         0.00
+      384     4096         2.000       187500       5.20         0.00
+      512     4096         2.000       250000       3.90         0.00
+      768     4096         2.000       375000       2.60         0.00
+     1024     4096         2.000       500000       1.95         0.00
+     1536     4096         2.000       750000       1.30         0.00
+     2048     4096         2.000      1000000       0.97         0.00
+     3072     4096         2.000      1500000       0.65         0.00
+     4096     4096         2.000      2000000       0.48         0.00
+  marginal cost 0.00 .. 0.00 ns/B
+  -> cost does not grow with size at all: this substrate charges per call.
+```
 
+Read the columns as a set. `us/op` is flat, `KiB/s` rises linearly with size
+and `ns/B` falls as `1/n` — three different-looking curves that are all the
+same statement, *cost does not depend on size*, which the marginal column says
+outright. The write table is identical in shape at 100 µs/op, and the fit
+recovers exactly what the simulator was configured with:
+
+```
   class   fixed per call        per unit            points  max rel err
-  read         2.000 us         0.0 ns/B       13       0.0 %
-  write      100.000 us         0.0 ns/B       13       0.0 %
+  read         2.000 us         0.0 ns/B       24       0.0 %
+  write      100.000 us         0.0 ns/B       24       0.0 %
   erase     2000.000 us       0.000 ms/blk      7       0.0 %
-  note (read): per-unit cost fitted negative; clamped to a flat per-call cost
-  note (write): per-unit cost fitted negative; clamped to a flat per-call cost
+  note (write): per-unit cost is below what this sweep can resolve; clamped to a flat per-call cost
 ```
-
-Exact, at 0.0 % residual on all 33 points, against the configured
-`READ=2 / WRITE=100 / ERASE=2000` µs. The two clamp notes are the mechanism
-working as intended: on a perfectly flat curve the slope fits to a tiny
-negative number, and a negative cost per byte would silently subtract time from
-every prediction, so it is clamped and the model refitted as flat.
 
 The erase sweep says something else worth reading:
 
 ```
-l0raw op=erase  blocks=1  ops=3  ns_per_op=2000000  ns_per_block=2000000
-l0raw op=erase  blocks=32 ops=3  ns_per_op=2000000  ns_per_block=62500
-l0raw op=erase1 blocks=1  ops=32 ns_per_op=2000000
+  erase                 1 blk x3              2.000 ms/call         2.000 ms/block
+  erase                32 blk x3              2.000 ms/call         0.062 ms/block
+  erase1                1 blk x32             2.000 ms/call  (spread 2.000..2.000 ms)
 ```
 
 Erasing 32 blocks in one call costs the same as erasing one — the simulator
@@ -63,7 +87,60 @@ charges per *call*. That is a true statement about the simulator and a
 dangerous one to carry to hardware, which is exactly why the sweep measures
 erase span rather than assuming it.
 
-**Run time**: 2.2 s, exits on its own.
+**Run time**: 2.9 s, exits on its own.
+
+### 1b. What a flat substrate cannot prove
+
+A flat curve only shows that the fitter does not *invent* structure. It cannot
+show that the fitter finds structure that is there — and in fact, while this
+was being written, it did not: with relative weights spanning ten decades the
+raw normal equations lost enough precision that a slope fitted to data lying
+exactly on a line came out **negative**, tripped the non-negativity clamp, and
+produced a flat model with 99.8 % error. The native_sim run above passed
+throughout, because on a flat curve the wrong answer and the right one are the
+same. The fit is now solved in centered form and the failure is a regression
+test.
+
+`tools/selftest.py` is that test. It generates captures from two synthetic
+devices with identical read and erase costs and different write shapes, then
+checks both the recovered coefficients and the reported verdict:
+
+| device | write cost | must recover | must report |
+|---|---|---|---|
+| (a) affine | 90 µs + 29.53 µs/B | all four coefficients to ≤ 2 % | read **and** write affine; no staircase claimed; write residual < 5 % |
+| (b) page-quantised | 90 µs + 7.56 ms per 256 B page touched, simulated over the app's actual access pattern | read and erase still exact | write **NOT affine**; staircase detected; write residual > 10 % |
+
+Both pass. On device (b) the tool prints:
+
+```
+  marginal cost across the sweep (d ns / d B) — constant iff the cost is affine:
+    read      631.00 ..    631.00 ns/B   -> affine
+    write  -59062.50 ..  59062.50 ns/B   -> NOT affine: flat over part of the sweep, stepped elsewhere
+
+  page-program staircase (page-aligned transfers, page = 256 B):
+      size        us/op   programs  expected  verdict
+        64 B     7650.000       1.00         1  step
+       128 B     7650.000       1.00         1  step
+       252 B     7650.000       1.00         1  step
+       256 B     7650.000       1.00         1  step
+       260 B    15210.000       1.99         2  step
+       384 B    15210.000       1.99         2  step
+       512 B    15210.000       1.99         2  step
+       516 B    22770.000       2.98         3  step
+       768 B    22770.000       2.98         3  step
+      1024 B    30330.000       3.96         4  step
+    -> write cost tracks ceil(size / page): it is a staircase, and the fitted
+       per-byte slope is an average over it.
+```
+
+Note what the affine fit does to device (b) if read alone: **25 570 ns/B with a
+66 % worst residual**. The slope is not meaningless — it is the correct average
+over the staircase — but it misprices a 4 B write by a factor of 60. That is
+the failure the marginal column exists to make visible, and it is why the fit's
+residual is printed next to every model rather than filed away.
+
+This is synthetic data and says nothing about any part. What it establishes is
+that the analysis reports the shape it is given.
 
 ## 2. The geometry correspondence, verified
 
@@ -166,6 +243,53 @@ board could have produced:
 - `update` is 69–74 % write on 4800 B — 100 slot writes, each paying a fixed
   cost plus a page program.
 
+### 4b. Is write linear? What the existing data already says
+
+The matrix exists to answer this on the board, but the three captures already
+constrain the answer, because they contain writes at two very different sizes.
+Two hypotheses, both consistent with "NOR programs by page":
+
+- **H1** — program time scales with the bytes actually written, so the cost is
+  affine and the page structure does not show.
+- **H2** — a page program costs the same whatever fraction of the page it
+  writes, so the cost is `ceil(n/page)` programs: a staircase.
+
+Subtract the modelled read and erase time from two measured phases and what is
+left is the write time:
+
+| phase | writes | mean size | write time left over |
+|---|---:|---:|---:|
+| `update` (prepend) | 100 | 48 B | 174.0 ms → **1.740 ms** each |
+| `lg rewrite` | 277 | 974 B | 7883 ms → **28.46 ms** each |
+
+H1 predicts both from one line:
+
+| size | H1 predicts | measured | |
+|---:|---:|---:|---|
+| 48 B | 1.733 ms | 1.740 ms | **1.00×** |
+| 974 B | 29.101 ms | 28.459 ms | **1.02×** |
+
+H2 cannot. Calibrated on the 48 B write — one page, so one program costs
+1.740 ms — a 974 B write touches 4 or 5 pages and should cost 6.96–8.70 ms. It
+costs 28.46 ms: **4.1× more than the staircase allows.**
+
+So the prediction for the board run is that **write on this part is affine in
+bytes, not a staircase**, and specifically:
+
+| table | predicted | what a different result would mean |
+|---|---|---|
+| `write` marginal column | roughly constant near 29.5 ns/B ×10³, verdict `-> affine` | if it is flat below 256 B and then steps, H2 is right and the model in §3 is fitting an artefact of the sizes those captures happened to use |
+| `write_pg` staircase | **no staircase**: implied programs ≈ `n/page`, not `ceil(n/page)`, so the tool prints *"cost does NOT track ceil(size / page)"* | a clean staircase here falsifies H1 outright |
+| `write` fixed term | ≲ 314 µs (§3's value includes `blob_db`'s CPU) | — |
+
+Worth being clear about the status of this: it is an inference from two mean
+transfer sizes, not a measurement of the curve. The whole point of the matrix
+is that it samples 28 sizes with the midpoints in between, so it can see
+structure that two points average over. **If the board run disagrees with the
+table above, the board run is right** — and the disagreement is more
+interesting than the agreement, because §3's model and every prediction built
+on it assume H1.
+
 ### The falsifiable part
 
 When `app_perf_l0` is run on the DK, its direct fit must agree with §3 on the
@@ -185,7 +309,100 @@ typical page-program figure, and `derive` cannot tell whether that is the part,
 the driver, or `blob_db` — only a direct sweep can. It is the clearest reason
 to run this app on hardware rather than to keep deriving.
 
-## 5. Feeding the simulator back
+## 5. Measured against the datasheet
+
+`tools/l0_timing.py spec` compares a model against a part's specified
+envelope. The spec lives in a file, not in the app — the app measures, and
+what the numbers are supposed to be is a separate, citable claim:
+[`models/mx25r6435f_datasheet.json`](models/mx25r6435f_datasheet.json),
+transcribed from **Macronix MX25R6435F Rev. 1.6, August 08 2022, §15
+(Erase and Programming Performance), p.75**.
+
+```
+python3 tools/l0_timing.py spec -m models/mx25r64_nrf5340dk_derived.json \
+    --spec models/mx25r6435f_datasheet.json
+```
+
+```
+  measured: erase 1106.3 ms per 65536 B block; program 7.566 ms per 256 B page;
+            29.55 us per byte
+
+  ultra_low_power  (Configuration Register-2 bit 1 = 0)
+    parameter            measured        typ        max   verdict
+    block erase 65536 B   1106.32ms   800.00ms  3500.00ms   typ..max (1.38x typ)
+    page program 256 B       7.57ms     3.20ms    10.00ms   typ..max (2.36x typ)
+    per byte programmed     29.55us    40.00us   100.00us   under typ (0.74x typ)
+
+  high_performance  (Configuration Register-2 bit 1 = 1)
+    block erase 65536 B   1106.32ms   480.00ms  3000.00ms   typ..max (2.30x typ)
+    page program 256 B       7.57ms     0.85ms     4.00ms   OVER MAX (1.89x max)
+    per byte programmed     29.55us    32.00us   100.00us   under typ (0.92x typ)
+
+  -> consistent with ultra_low_power only
+```
+
+Three things come out of this.
+
+**Reality matches the specification, but only in one of the two modes.**
+Nothing exceeds an Ultra Low Power maximum. Against High Performance the page
+program is **1.89× over max**, which is not a "slower than typical" — max is
+quoted at 85 °C and minimum VCC, so a room-temperature measurement above it
+cannot be explained by conditions.
+
+**So the part is running in Ultra Low Power mode, and that was measured, not
+assumed.** The mode is Configuration Register-2 bit 1, the L/H switch. It is a
+*volatile* bit whose power-on value comes from the part's ordering code, Rev
+1.6 removed the generic default from the datasheet, and Zephyr's
+`nordic,qspi-nor` driver never writes CR2 — so a board runs whatever the part
+powers up as, and nothing in the schematic or the devicetree says which that
+is. The timing does.
+
+This is worth knowing beyond bookkeeping: High Performance mode would cut the
+64 KB erase from a typical 0.8 s to 0.48 s and the page program from 3.2 ms to
+0.85 ms. `blob_db_prepare()` of 100 buckets is ~110 s of erase on this board;
+the same work in High Performance mode is specified at ~48 s. Whether that
+trade against idle current is worth making is a product decision, but it is
+not currently *being* made — it is being defaulted into.
+
+**Erase is unremarkable and the write path is not.** 1.106 s against a typical
+0.8 s is the ordinary gap between a datasheet's 25 °C all-zero-pattern figure
+and a real one. The write path is the interesting column, and it is where §4b's
+question gets a second, independent answer:
+
+- Per byte, the measurement is **0.74× the Byte Program typ** (29.55 µs vs
+  40 µs). That is the right direction — one page-program command covering N
+  bytes should beat N individual byte programs — but only by a quarter.
+- Per page, the measurement is **2.36× the Page Program typ**. A full 256 B
+  page program is specified at 3.2 ms typical and measures ~7.6 ms.
+
+Those two facts together say the part is behaving much more like "40 µs per
+byte" than like "3.2 ms per page, whatever the size" — which is exactly what
+§4b concluded from the two mean write sizes, arrived at independently. If the
+part charged a flat page program the 48 B write in `update` would cost 3.2 ms
+typical; it costs 1.740 ms, *less than a typical full-page program*. A part
+cannot program a partial page faster than a full one if the cost is per page.
+
+The `write` and `write_pg` matrices settle it directly on the board, and §4b
+says what each must show.
+
+### What this does not check
+
+The datasheet specifies the part's *internal* erase and program times. It says
+nothing about the SPI bus time to shift data in, nor about the driver's
+per-call overhead — and those are exactly the model's **fixed** terms (read
+67.7 µs, write 314.5 µs), which is why `spec` refuses to compare them against
+anything. The read slope (631 ns/B ≈ 1.55 MB/s, against 4 MB/s theoretical at
+8 MHz Quad-SPI) is a bus-and-driver figure too, and §15 has no row for it.
+
+One more datasheet row worth carrying into the erase-span sweep: **chip erase
+is typ 120 s** in Ultra Low Power, while erasing the same 8 MB as 128 separate
+64 KB blocks is 128 × 0.8 = 102 s typical. On this part a whole-device erase is
+*not* a shortcut, so the answer to "is a 32-block erase cheaper than 32
+one-block erases" is predicted to be **no** — and if the sweep finds a large
+win, the driver is doing something the datasheet's command times do not
+predict, which is worth knowing.
+
+## 6. Feeding the simulator back
 
 `simconf` turns a model into flash-simulator knobs, picking the operating point
 from a run's actual operation mix:
@@ -207,8 +424,10 @@ which uses the whole model.
 
 ## Raw capture — `native_sim`, simulator defaults
 
+Machine-readable records only; the human tables are in §1.
+
 ```
-l0geom part_bytes=8388608 block_bytes=4096 blocks=2048 write_align=1 erased_val=0xff region_blocks=32 max_xfer=4096 cycles_per_s=1000000 source=flash_simulator timing=simulated board=native_sim/native
+l0geom part_bytes=8388608 block_bytes=4096 blocks=2048 write_align=1 erased_val=0xff region_blocks=32 max_xfer=4096 program_page=256 cycles_per_s=1000000 source=flash_simulator timing=simulated board=native_sim/native
 l0raw op=erase blocks=1 ops=3 total_ns=6000000 ns_per_op=2000000 ns_per_block=2000000 min_ns=2000000 max_ns=2000000
 l0raw op=erase blocks=2 ops=3 total_ns=6000000 ns_per_op=2000000 ns_per_block=1000000 min_ns=2000000 max_ns=2000000
 l0raw op=erase blocks=4 ops=3 total_ns=6000000 ns_per_op=2000000 ns_per_block=500000 min_ns=2000000 max_ns=2000000
@@ -217,11 +436,18 @@ l0raw op=erase blocks=16 ops=3 total_ns=6000000 ns_per_op=2000000 ns_per_block=1
 l0raw op=erase blocks=32 ops=3 total_ns=6000000 ns_per_op=2000000 ns_per_block=62500 min_ns=2000000 max_ns=2000000
 l0raw op=erase1 blocks=1 ops=32 total_ns=64000000 ns_per_op=2000000 ns_per_block=2000000 min_ns=2000000 max_ns=2000000
 l0raw op=read size=1 ops=4096 total_ns=8192000 ns_per_op=2000
-... (sizes 2 .. 4096, all 2000 ns/op)
+... 24 read rows: 1 2 3 4 6 8 12 16 24 32 48 64 96 128 192 256 384 512 768 1024 1536 2048 3072 4096, all 2000 ns/op
+l0lin op=read cmarg_min=0 cmarg_max=0
 l0raw op=write size=1 ops=500 total_ns=50000000 ns_per_op=100000
-... (sizes 2 .. 4096, all 100000 ns/op)
+... 24 write rows over the same sizes, all 100000 ns/op
+l0lin op=write cmarg_min=0 cmarg_max=0
+l0raw op=write_pg size=64 ops=32 total_ns=3200000 ns_per_op=100000
+... 10 page-aligned rows: 64 128 255 256 257 384 512 513 768 1024, all 100000 ns/op
 l0raw op=write_unaligned size=256 ops=64 total_ns=6400000 ns_per_op=100000
 l0raw op=write_unaligned size=512 ops=64 total_ns=6400000 ns_per_op=100000
 l0raw op=write_unaligned size=4096 ops=31 total_ns=3100000 ns_per_op=100000
 l0end status=0
 ```
+
+Every row is flat because the simulator is flat. §1b is where the analysis is
+exercised against curves that are not.

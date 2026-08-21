@@ -18,11 +18,55 @@ is the one parameter each L0 call has.
 
 | phase | swept parameter | question |
 |---|---|---|
-| `read` | transfer size, `write_align` → one erase block | what does a small transfer cost against a large one, and how much of it is per-call overhead a caller pays again on every extra transaction? |
-| `write` | transfer size, same range | same question on the program path, where the fixed cost is much larger |
+| `read` | transfer size, **1 B → one erase block** | what does a small transfer cost against a large one, and how much of it is per-call overhead a caller pays again on every extra transaction? |
+| `write` | transfer size, `write_align` → one erase block, transfers packed back to back as `blob_db` writes them | the same question on the program path — and whether the cost is a line at all |
+| `write_pg` | transfer size, each transfer **pinned to a program-page boundary** | the page-program staircase, isolated: is one byte past a page boundary a whole extra program? |
 | `write_unaligned` | fixed size, offset by one alignment unit | the page-straddle penalty: one transfer, two program pages |
 | `erase` | **erase size** — blocks covered by one call | is a 16-block erase cheaper than sixteen 1-block erases? `blob_db_prepare()` does the latter, `blob_db_erase_all()` the former |
 | `erase1` | one block, repeated | the per-block anchor, and the spread — NOR erase time is not a constant |
+
+### The matrix, and the column that answers the question
+
+Each size sweep prints a table, and every row is also emitted as a machine-readable `l0raw` record:
+
+```
+     size      ops         us/op        KiB/s       ns/B   marginal ns/B
+        1     4096         2.000          488    2000.00         -
+        2     4096         2.000          976    1000.00        0.00
+        3     4096         2.000         1464     666.66        0.00
+      ...
+     4096     4096         2.000      2000000       0.48        0.00
+```
+
+`us/op` and `KiB/s` say how fast it is. The column that says whether the
+relationship is **linear** is the last one — the marginal cost, the extra
+nanoseconds each extra byte cost between this row and the one above:
+
+```
+d(ns)/d(B) = (t(n) - t(n_prev)) / (n - n_prev)
+```
+
+For an affine cost `t(n) = a + b·n` this is `b` at *every* row, regardless of
+the fixed cost `a`. So a column of near-identical numbers **is** the linearity
+proof, and a column that steps is a cost a single slope cannot describe. The
+app prints the range and its verdict at the end of each sweep; the tool repeats
+both next to the fitted slope, so nobody reads a slope without seeing what it
+averaged over.
+
+Two details exist because of writes specifically:
+
+- **The sizes are not only powers of two.** Each is followed by its 1.5×
+  midpoint (1, 2, 3, 4, 6, 8, 12, 16, 24 …). Powers of two are exactly the
+  wrong sample points for a cost that steps at a power-of-two boundary: every
+  sample lands on a step, the staircase looks like a line through its corners,
+  and the sweep concludes "linear" about a function that is not.
+- **`write_pg` pins each transfer to a page boundary.** The packed `write`
+  sweep answers *what `blob_db` pays*, because `blob_db` writes back to back —
+  but a packed transfer touches `ceil(n/page)` or one more depending on where
+  the previous one ended, and averaging those two smooths the steps. Pinning to
+  the boundary makes the cost exactly `ceil(n/page)` programs, so the table is a
+  staircase if the part programs by page and a line if it does not. The tool
+  prints the implied program count against `ceil(n/page)` and says which.
 
 > **This benchmark destroys `storage_partition`.** It erases and rewrites the
 > first `CONFIG_APP_PERF_L0_REGION_BLOCKS` blocks of it, repeatedly. Do not run
@@ -58,12 +102,30 @@ simulator has no latency to model — but it counts every operation exactly. Fee
 those counts through the model and a run that took no time on a host becomes a
 number of seconds on a part it never touched.
 
-Where the real device is *not* affine, the error is visible rather than
-hidden: a NOR page program is a step function of transfer size, not a line, and
-`fit -v` prints the residual at every swept size. The `write_unaligned` points
-measure the largest single source of that non-linearity and are deliberately
-**excluded** from the fit — folding them in would make every prediction
-slightly pessimistic and the residuals slightly prettier.
+### When it is not a line
+
+Affine is an assumption, so the sweep is built to break it rather than to
+flatter it. A NOR page program is a step function of transfer size, and if the
+part behaves that way the marginal column goes flat across each tread and jumps
+between them, `write_pg` shows the staircase directly, and the fit reports a
+large residual instead of a tidy slope. `fit -v` prints the residual at every
+swept size.
+
+What to do when that happens depends on which sweep steps:
+
+- **The packed `write` sweep is affine and only `write_pg` is a staircase.**
+  This is the good case: `blob_db` writes back to back, so its transfers
+  straddle pages at every offset and the staircase averages out. The affine
+  model then describes what `blob_db` actually pays, and `write_pg` explains
+  where the slope comes from — `per-byte ≈ page-program / page`.
+- **The packed sweep steps too.** Then a single slope misprices small writes,
+  and the prediction is only as good as the size mix it was fitted over. Refit
+  with `--size-range` around the sizes the workload really writes, and say so
+  with the numbers.
+
+`write_unaligned` is reported and deliberately **excluded** from the fit —
+folding it in would make every prediction slightly pessimistic and the
+residuals slightly prettier.
 
 ## The workflow
 
@@ -75,7 +137,7 @@ west flash
 # capture the console; see RUN_ON_DK.md
 ```
 
-Roughly six minutes on the nRF5340-DK, most of it erase. The capture carries
+Roughly seven minutes on the nRF5340-DK, most of it erase. The capture carries
 machine-readable `l0geom` / `l0raw` / `l0end` records alongside the
 human-readable tables.
 
@@ -141,12 +203,37 @@ That decomposition is not available from a stopwatch on the board.
 | `predict -m M.json RUN` | a run's I/O counters → predicted milliseconds, split by class |
 | `verify -m M.json RUN` | for a capture with *both* counters and wall-clock: predicted vs measured, per phase |
 | `derive CAPTURES --block-bytes N` | a **provisional** model solved from stack-level captures, for a board with no L0 run yet |
+| `spec -m M.json --spec S.json` | measured against the part's datasheet: in spec, and in **which mode**? |
 | `simconf -m M.json [--run R]` | `CONFIG_FLASH_SIMULATOR_*` knobs that make `native_sim` tick at roughly the target's rate |
 | `show M.json` | print a saved model and its residuals |
+| `selftest.py` | fit two synthetic devices with known costs — one affine, one page-quantised — and check the tool recovers each and reports the right shape |
 
 `predict` also takes counters directly (`--reads`, `--bytes-read`, …), so
 anything that can call `blob_db_iostats_get()` can be predicted without this
 tool having to learn its output format.
+
+### `spec` — does reality match the datasheet?
+
+A measured cost is more useful next to what the part is specified to do, so
+`models/` also carries a **part spec** — the erase and program envelope
+transcribed from the datasheet, with its citation
+(`mx25r6435f_datasheet.json`, Macronix Rev. 1.6 §15). `spec` puts the two side
+by side and reports where each measurement falls: under typ, between typ and
+max, or over max.
+
+The verdict that matters is usually not pass/fail but **which mode**. On the
+MX25R6435F the Ultra Low Power and High Performance columns differ by 2–4×,
+the mode is a *volatile* Configuration-Register-2 bit whose power-on value
+comes from the part's ordering code, and Zephyr's `nordic,qspi-nor` driver
+never writes it — so nothing in the schematic or the devicetree says which
+mode a board is in. The timing does. See `RESULTS.md` §5, where the DK's
+numbers come out over the High Performance maximum and inside Ultra Low
+Power.
+
+Only the model's **per-unit** terms are compared. The fixed terms are bus time
+and driver overhead; the datasheet's figures are the part's internal erase and
+program times and do not include them, so comparing those would be a category
+error rather than a finding.
 
 ### `derive`, and what a provisional model is worth
 
@@ -195,6 +282,7 @@ captures it came from and a leave-one-out cross-validation of it.
 | `CONFIG_APP_PERF_L0_TARGET_MS` | how long one sweep point should last; precision against run time |
 | `CONFIG_APP_PERF_L0_MAX_REPS` | repetition ceiling, so a cheap operation cannot ask for millions |
 | `CONFIG_APP_PERF_L0_ERASE_REPS` | repeats per erase span — the dominant term in total run time |
+| `CONFIG_APP_PERF_L0_PROGRAM_PAGE` | the part's program page (256 B on most SPI NOR); chooses the sizes for the page-program sweep. `flash_area` does not report it, so it has to be told; `0` skips that phase |
 
 On `native_sim` the app builds and runs in seconds, and
 `boards/native_sim.conf` turns on the simulator's own timing model so the sweep

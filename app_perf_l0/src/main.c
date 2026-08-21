@@ -14,11 +14,19 @@
  * `storage_partition` and times flash_area_read(), flash_area_write() and
  * flash_area_erase() as functions of the one parameter each of them has:
  *
- *   read  / write   — TRANSFER SIZE, swept in powers of two from the write
- *                     alignment up to one erase block. This is the "block
- *                     size" question: what does a small transfer cost versus
- *                     a large one, and how much of that is per-call overhead
- *                     that a caller pays again on every extra transaction?
+ *   read  / write   — TRANSFER SIZE, from one byte (one write alignment unit
+ *                     for writes) up to one erase block, in powers of two
+ *                     with the 1.5x midpoints in between. Each sweep prints a
+ *                     matrix — size, ops, us/op, KiB/s, ns/B, and the
+ *                     MARGINAL ns/B against the row above — because that last
+ *                     column is what answers "is this relationship linear":
+ *                     it is constant iff the cost is affine, whatever the
+ *                     fixed cost happens to be.
+ *   write_pg        — the same write, each transfer pinned to a program-page
+ *                     boundary, so a part that programs by page shows a clean
+ *                     ceil(n/page) staircase instead of the average of two
+ *                     straddle cases. This is the phase that says whether the
+ *                     write cost has page structure at all.
  *   erase           — ERASE SIZE, swept as the number of erase blocks covered
  *                     by one call. This is the question blob_db_prepare() and
  *                     blob_db_erase_all() ask: is a 16-block erase cheaper
@@ -58,6 +66,7 @@
 
 #include <errno.h>
 #include <inttypes.h>
+#include <stdlib.h>
 #include <stdint.h>
 #include <string.h>
 
@@ -133,13 +142,6 @@ static inline uint64_t span_end(struct span *s)
  * names. Everything else is for the human watching the UART and may change
  * freely. Keeping them apart is what lets a capture be re-parsed years later.
  */
-static void raw_rw(const char *op, size_t size, uint32_t ops, uint64_t total_ns)
-{
-	printk("l0raw op=%s size=%zu ops=%u total_ns=%llu ns_per_op=%llu\n",
-	       op, size, ops, (unsigned long long)total_ns,
-	       (unsigned long long)(ops ? total_ns / ops : 0));
-}
-
 static void raw_erase(const char *op, uint32_t blocks, uint32_t ops,
 		      uint64_t total_ns, uint64_t min_ns, uint64_t max_ns)
 {
@@ -153,19 +155,183 @@ static void raw_erase(const char *op, uint32_t blocks, uint32_t ops,
 	       (unsigned long long)min_ns, (unsigned long long)max_ns);
 }
 
-/* Human line: µs per operation and the throughput it implies. Printed next to
- * every raw line so the console is readable without the tool. */
-static void human_rw(const char *op, size_t size, uint32_t ops,
-		     uint64_t total_ns)
+/* --- the size matrix ---------------------------------------------------- */
+
+/*
+ * The table each size sweep prints, and the reason the sweep exists.
+ *
+ * Cost per operation and throughput answer "how fast is it". The column that
+ * answers "is it a line" is the last one: the MARGINAL cost, the extra
+ * nanoseconds each extra byte cost between this row and the one above it,
+ *
+ *     d(ns)/d(B) = (t(n) - t(n_prev)) / (n - n_prev)
+ *
+ * For an affine cost t(n) = a + b·n this is b at every row — constant, and
+ * equal to the fitted slope, whatever the fixed cost a is. So a column of
+ * near-identical numbers IS the linearity check, and a column that steps is a
+ * cost that a single slope cannot describe.
+ *
+ * That is not a hypothetical for writes. A NOR part programs whole pages, so
+ * the true write cost is ceil(n / page) page programs — a staircase, not a
+ * line. Between two doublings a staircase can look perfectly linear, which is
+ * why the sweep also measures the 1.5x midpoints, and why the `write_pg`
+ * phase pins each transfer to a page boundary to show the steps directly.
+ */
+struct sweep {
+	const char *op;
+	size_t   prev_size;
+	uint64_t prev_ns;
+	bool     have_prev;
+	/* Marginal cost range across the sweep, in centi-ns per byte, so the
+	 * spread can be reported without floating point. */
+	int64_t  marg_min;
+	int64_t  marg_max;
+	bool     have_marg;
+};
+
+static void sweep_begin(struct sweep *s, const char *op, const char *title)
+{
+	memset(s, 0, sizeof(*s));
+	s->op = op;
+	printk("\n-- %s --\n", title);
+	printk("     size      ops         us/op        KiB/s       ns/B   "
+	       "marginal ns/B\n");
+}
+
+static void sweep_row(struct sweep *s, size_t size, uint32_t ops,
+		      uint64_t total_ns)
 {
 	const uint64_t ns_op = ops ? total_ns / ops : 0;
-	/* KB/s from ns/op, in integer arithmetic: size * 1e9 / ns / 1024. */
-	const uint64_t kbs = ns_op ? (uint64_t)size * 1000000ULL / ns_op * 1000ULL / 1024ULL
-				   : 0;
 
-	printk("  %-16s %6zu B  x%-6u  %8llu.%03llu us/op  %8llu KB/s\n",
-	       op, size, ops, (unsigned long long)(ns_op / 1000),
-	       (unsigned long long)(ns_op % 1000), (unsigned long long)kbs);
+	printk("l0raw op=%s size=%zu ops=%u total_ns=%llu ns_per_op=%llu\n",
+	       s->op, size, ops, (unsigned long long)total_ns,
+	       (unsigned long long)ns_op);
+
+	/* KiB/s = size / (ns_op / 1e9) / 1024, staged to keep the intermediate
+	 * inside 64 bits for a 64 KiB transfer. */
+	const uint64_t kibs =
+		ns_op ? (uint64_t)size * 1000000ULL / ns_op * 1000ULL / 1024ULL
+		      : 0;
+	/* Average cost per byte, in centi-ns. */
+	const uint64_t cns_b = size ? ns_op * 100ULL / size : 0;
+
+	printk("  %7zu  %7u  %8llu.%03llu  %11llu  %6llu.%02llu",
+	       size, ops, (unsigned long long)(ns_op / 1000),
+	       (unsigned long long)(ns_op % 1000), (unsigned long long)kibs,
+	       (unsigned long long)(cns_b / 100),
+	       (unsigned long long)(cns_b % 100));
+
+	if (s->have_prev && size > s->prev_size) {
+		/* Signed: noise on a flat curve puts this below zero, and
+		 * hiding that would misrepresent a curve with no slope at all
+		 * as one with a small positive one. */
+		const int64_t d_ns = (int64_t)ns_op - (int64_t)s->prev_ns;
+		const int64_t d_b = (int64_t)size - (int64_t)s->prev_size;
+		const int64_t cmarg = d_ns * 100 / d_b;
+
+		printk("  %8lld.%02llu\n", (long long)(cmarg / 100),
+		       (unsigned long long)(llabs(cmarg) % 100));
+
+		if (!s->have_marg) {
+			s->marg_min = s->marg_max = cmarg;
+			s->have_marg = true;
+		} else {
+			s->marg_min = MIN(s->marg_min, cmarg);
+			s->marg_max = MAX(s->marg_max, cmarg);
+		}
+	} else {
+		printk("         -\n");
+	}
+
+	s->prev_size = size;
+	s->prev_ns = ns_op;
+	s->have_prev = true;
+}
+
+/* The verdict the matrix supports, stated rather than left to the reader. */
+static void sweep_end(struct sweep *s)
+{
+	if (!s->have_marg) {
+		return;
+	}
+
+	printk("l0lin op=%s cmarg_min=%lld cmarg_max=%lld\n", s->op,
+	       (long long)s->marg_min, (long long)s->marg_max);
+
+	printk("  marginal cost %lld.%02llu .. %lld.%02llu ns/B",
+	       (long long)(s->marg_min / 100),
+	       (unsigned long long)(llabs(s->marg_min) % 100),
+	       (long long)(s->marg_max / 100),
+	       (unsigned long long)(llabs(s->marg_max) % 100));
+
+	if (s->marg_max <= 0) {
+		printk("\n  -> cost does not grow with size at all: this "
+		       "substrate charges per call.\n");
+		return;
+	}
+	if (s->marg_min <= 0) {
+		/* Zero here is a signal, not a gap in the measurement: a cost
+		 * that is flat across a range of sizes and then jumps — one
+		 * page program covering every transfer up to a page — has
+		 * exactly this shape. Calling it noise would report the most
+		 * interesting thing the sweep found as an absence. */
+		printk("\n  -> NOT affine: the marginal cost is zero or "
+		       "negative over part of the sweep\n     and clearly "
+		       "positive elsewhere. A cost that is flat across a range "
+		       "and\n     then steps looks exactly like this; the "
+		       "page-program table below says\n     whether that is "
+		       "what this is.\n");
+		return;
+	}
+
+	/* Spread as a ratio, in hundredths, so "1.08x" prints without a FPU. */
+	const uint64_t spread = (uint64_t)s->marg_max * 100 / (uint64_t)s->marg_min;
+
+	printk("  (%llu.%02llux spread)\n", (unsigned long long)(spread / 100),
+	       (unsigned long long)(spread % 100));
+	if (spread <= 125) {
+		printk("  -> affine: one fixed cost plus one cost per byte "
+		       "describes this sweep.\n");
+	} else {
+		printk("  -> NOT affine: the per-byte cost varies %llu.%02llux "
+		       "across the sweep, so a\n     single slope misprices "
+		       "some sizes. The fit's residuals say by how much.\n",
+		       (unsigned long long)(spread / 100),
+		       (unsigned long long)(spread % 100));
+	}
+}
+
+/*
+ * Sizes to sweep: powers of two, each followed by its 1.5x midpoint.
+ *
+ * Powers of two alone are exactly the wrong sample points for a cost that
+ * steps at a power-of-two boundary — every sample lands on a step, the
+ * staircase looks like a line through its corners, and the sweep concludes
+ * "linear" about a function that is not. The midpoints break that.
+ *
+ * Returns 0 when the sweep is done.
+ */
+static size_t sweep_first(size_t base)
+{
+	return base;
+}
+
+static size_t sweep_next(size_t size, size_t base, size_t align, size_t max)
+{
+	/* A midpoint is only reachable when it is still a whole number of
+	 * write-alignment units. */
+	if (size >= base && (size & (size - 1)) == 0) {
+		const size_t mid = size + size / 2;
+
+		if (mid <= max && size / 2 >= align && (size / 2) % align == 0) {
+			return mid;
+		}
+	}
+	/* Back to the next power of two: from a midpoint 1.5s, that is 2s. */
+	const size_t pow2 = ((size & (size - 1)) == 0) ? size : (size / 3) * 2;
+	const size_t next = pow2 * 2;
+
+	return (next <= max) ? next : 0;
 }
 
 /* --- sweep helpers ------------------------------------------------------ */
@@ -307,7 +473,7 @@ static int phase_erase(void)
  */
 static int phase_read(void)
 {
-	printk("\n-- read: cost vs transfer size --\n");
+	struct sweep sw;
 
 	/* Program the read region once, untimed. */
 	const uint32_t rd_blocks = MIN(g.region, 2u);
@@ -338,7 +504,13 @@ static int phase_read(void)
 
 	const size_t region_bytes = (size_t)rd_blocks * g.block;
 
-	for (size_t size = g.align; size <= g.max_xfer; size *= 2) {
+	sweep_begin(&sw, "read", "read: cost vs transfer size");
+
+	/* Reads start at one byte. Unlike a write, a read has no alignment
+	 * floor to respect, and the single-byte row is the one that shows the
+	 * per-call overhead almost undiluted. */
+	for (size_t size = sweep_first(1); size;
+	     size = sweep_next(size, 1, 1, g.max_xfer)) {
 		struct span s;
 
 		/* Probe one operation to size the batch. */
@@ -369,9 +541,9 @@ static int phase_read(void)
 		}
 		uint64_t total = span_end(&s);
 
-		raw_rw("read", size, reps, total);
-		human_rw("read", size, reps, total);
+		sweep_row(&sw, size, reps, total);
 	}
+	sweep_end(&sw);
 
 	return 0;
 }
@@ -391,9 +563,12 @@ static int phase_read(void)
  */
 static int phase_write(void)
 {
-	printk("\n-- write: cost vs transfer size --\n");
+	struct sweep sw;
 
-	for (size_t size = g.align; size <= g.max_xfer; size *= 2) {
+	sweep_begin(&sw, "write", "write: cost vs transfer size");
+
+	for (size_t size = sweep_first(g.align); size;
+	     size = sweep_next(size, g.align, g.align, g.max_xfer)) {
 		struct span s;
 		int rc;
 
@@ -438,9 +613,95 @@ static int phase_write(void)
 		}
 		uint64_t total = span_end(&s);
 
-		raw_rw("write", size, reps, total);
-		human_rw("write", size, reps, total);
+		sweep_row(&sw, size, reps, total);
 	}
+	sweep_end(&sw);
+
+	return 0;
+}
+
+/*
+ * The same write, with every transfer starting on a program-page boundary.
+ *
+ * The packed sweep above answers "what does blob_db pay", because blob_db
+ * writes back to back. It cannot answer "why", because a packed transfer of n
+ * bytes touches ceil(n/page) or ceil(n/page)+1 pages depending on where the
+ * previous one ended, and the average of those two is a smooth-looking curve.
+ *
+ * Pinning each transfer to a page boundary removes that ambiguity: the cost
+ * becomes exactly ceil(n / page) page programs, and the table below is a
+ * staircase if the part programs by page and a line if it does not. The sizes
+ * are chosen to sit either side of the boundary — one byte over a page should
+ * cost a whole extra program, and if it does, that is the non-linearity the
+ * affine model cannot carry, measured rather than argued.
+ */
+static int phase_write_pages(void)
+{
+	const size_t pg = CONFIG_APP_PERF_L0_PROGRAM_PAGE;
+	const size_t sizes[] = {
+		pg / 4, pg / 2, pg - g.align, pg,
+		pg + g.align, pg + pg / 2, 2 * pg,
+		2 * pg + g.align, 3 * pg, 4 * pg,
+	};
+	struct sweep sw;
+
+	if (pg == 0 || pg % g.align != 0 || pg > g.max_xfer) {
+		printk("\n(page-program sweep skipped: page %zu does not fit "
+		       "align %zu / max transfer %zu)\n",
+		       pg, g.align, g.max_xfer);
+		return 0;
+	}
+
+	sweep_begin(&sw, "write_pg",
+		    "write: page-program staircase (each transfer page-aligned)");
+
+	for (size_t i = 0; i < ARRAY_SIZE(sizes); i++) {
+		const size_t size = sizes[i];
+		/* Stride to the next page boundary at or after the transfer,
+		 * so every operation starts on one. */
+		const size_t stride = ROUND_UP(size, pg);
+		struct span s;
+		int rc;
+
+		if (size == 0 || size > g.max_xfer || size % g.align != 0) {
+			continue;
+		}
+
+		const uint32_t cap =
+			(uint32_t)(((uint64_t)g.region * g.block) / stride);
+		uint32_t reps = MIN(cap, 32u);
+
+		if (reps == 0) {
+			continue;
+		}
+
+		const uint32_t need_blocks = (uint32_t)DIV_ROUND_UP(
+			(uint64_t)reps * stride, g.block);
+
+		rc = flash_area_erase(g_fa, 0, (size_t)need_blocks * g.block);
+		if (rc < 0) {
+			LOG_ERR("write_pg erase: %d", rc);
+			return rc;
+		}
+
+		fill_pattern(size, (uint8_t)i);
+
+		span_start(&s);
+		for (uint32_t r = 0; r < reps; r++) {
+			rc = flash_area_write(g_fa, (off_t)r * stride, g_buf,
+					      size);
+			if (rc < 0) {
+				LOG_ERR("write_pg size=%zu: %d", size, rc);
+				return rc;
+			}
+		}
+		uint64_t total = span_end(&s);
+
+		sweep_row(&sw, size, reps, total);
+	}
+	/* Deliberately no linearity verdict: a staircase is not supposed to
+	 * have a constant marginal cost, and calling it "NOT affine" would
+	 * report the intent of the phase as a finding. */
 
 	return 0;
 }
@@ -458,9 +719,13 @@ static int phase_write(void)
  */
 static int phase_write_unaligned(void)
 {
-	const size_t sizes[] = { 256, 512, 4096 };
+	const size_t pg = CONFIG_APP_PERF_L0_PROGRAM_PAGE;
+	const size_t sizes[] = { pg, 2 * pg, 16 * pg };
+	struct sweep sw;
 
-	printk("\n-- write: page-straddle penalty --\n");
+	sweep_begin(&sw, "write_unaligned",
+		    "write: page-straddle penalty (same size, offset by one "
+		    "align unit)");
 
 	for (size_t i = 0; i < ARRAY_SIZE(sizes); i++) {
 		const size_t size = sizes[i];
@@ -504,9 +769,10 @@ static int phase_write_unaligned(void)
 		}
 		uint64_t total = span_end(&s);
 
-		raw_rw("write_unaligned", size, reps, total);
-		human_rw("write_unalign", size, reps, total);
+		sweep_row(&sw, size, reps, total);
 	}
+	/* No verdict here either: three points offset from the grid are a
+	 * comparison against the aligned rows, not a curve. */
 
 	return 0;
 }
@@ -563,9 +829,11 @@ static int geometry(void)
 	 * from a model whose source is not `hardware`. */
 	printk("l0geom part_bytes=%zu block_bytes=%zu blocks=%u write_align=%zu "
 	       "erased_val=0x%02x region_blocks=%u max_xfer=%zu "
-	       "cycles_per_s=%u source=%s timing=%s board=%s\n",
+	       "program_page=%u cycles_per_s=%u source=%s timing=%s board=%s\n",
 	       g.part_bytes, g.block, g.blocks, g.align, g.erased_val,
-	       g.region, g.max_xfer, (unsigned)sys_clock_hw_cycles_per_sec(),
+	       g.region, g.max_xfer,
+	       (unsigned)CONFIG_APP_PERF_L0_PROGRAM_PAGE,
+	       (unsigned)sys_clock_hw_cycles_per_sec(),
 	       IS_ENABLED(CONFIG_FLASH_SIMULATOR) ? "flash_simulator"
 						 : "hardware",
 	       IS_ENABLED(CONFIG_FLASH_SIMULATOR)
@@ -610,6 +878,9 @@ int main(void)
 	}
 	if (rc == 0) {
 		rc = phase_write();
+	}
+	if (rc == 0) {
+		rc = phase_write_pages();
 	}
 	if (rc == 0) {
 		rc = phase_write_unaligned();

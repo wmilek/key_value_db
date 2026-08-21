@@ -62,3 +62,19 @@ config APP_PERF_L0_ERASE_REPS
 	  the mean. Each repetition costs a full erase of the span — on a part
 	  with 1 s block erases and a 16-block span, that is 16 s per
 	  repetition.
+
+config APP_PERF_L0_PROGRAM_PAGE
+	int "Program-page size of the part, in bytes"
+	default 256
+	range 0 65536
+	help
+	  The unit a NOR part programs in — 256 B on the MX25R64 and on most
+	  SPI NOR. It is not discoverable through the flash_area API, which
+	  reports the erase block and the write alignment but not this, so it
+	  has to be told.
+
+	  It is used only to choose sizes for the page-program sweep, which
+	  pins each transfer to a page boundary so the staircase in write cost
+	  is visible directly rather than averaged away. Set it to 0 to skip
+	  that phase; setting it wrong costs nothing but a badly chosen set of
+	  sample points.

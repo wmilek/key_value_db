@@ -78,7 +78,9 @@ def parse_l0_capture(text):
     up. Only lines that *start* with a known record name are read.
     """
     geom = None
-    rows = {"read": [], "write": [], "write_unaligned": [], "erase": [], "erase1": []}
+    rows = {"read": [], "write": [], "write_unaligned": [], "write_pg": [],
+            "erase": [], "erase1": []}
+    lin = {}
     status = None
 
     for raw in text.splitlines():
@@ -106,6 +108,21 @@ def parse_l0_capture(text):
             else:
                 rec["size"] = _int(d, "size", 0)
             rows[op].append(rec)
+        elif line.startswith("l0lin "):
+            # The device's own linearity summary: the range of the marginal
+            # cost column, in centi-ns per byte. Kept because it is the
+            # measurement the fit's single slope replaces, and a reader of the
+            # model should be able to see what was averaged away.
+            d = _kv(line)
+            op = d.get("op")
+            lo = _int(d, "cmarg_min", 0)
+            hi = _int(d, "cmarg_max", 0)
+            if op:
+                lin[op] = {
+                    "marginal_min_ns_per_b": lo / 100.0,
+                    "marginal_max_ns_per_b": hi / 100.0,
+                    "spread": (hi / lo) if lo > 0 else None,
+                }
         elif line.startswith("l0end "):
             status = _int(_kv(line), "status", None)
 
@@ -113,7 +130,7 @@ def parse_l0_capture(text):
         raise SystemExit(
             "no l0geom line in the capture — is this an app_perf_l0 log?"
         )
-    return geom, rows, status
+    return geom, rows, lin, status
 
 
 # --- the fit -------------------------------------------------------------
@@ -143,24 +160,57 @@ def wls(points, weight="rel"):
         return (y, 0.0, "single point: all cost attributed to the fixed term")
 
     def solve(pts):
-        s = sx = sy = sxx = sxy = 0.0
+        """Centered normal equations, not the textbook raw-moment ones.
+
+        The raw form computes b as (S*Sxy - Sx*Sy) / (S*Sxx - Sx^2). Here the
+        weights span ten decades (1/y^2 over a cost range of 67 us to 41 ms)
+        and x spans five, so both halves of each difference are enormous and
+        nearly equal: the subtraction cancels away most of the significant
+        digits and the recovered slope comes out as noise — in the case that
+        found this, a *negative* slope on data lying exactly on a line, which
+        then tripped the clamp and produced a flat model with 99.8 % error.
+
+        Centering on the weighted mean removes the cancellation: the sums
+        being subtracted are already the deviations.
+        """
+        sw = sx = sy = 0.0
         for x, y in pts:
             w = 1.0 / (y * y) if (weight == "rel" and y > 0) else 1.0
-            s += w
+            sw += w
             sx += w * x
             sy += w * y
-            sxx += w * x * x
-            sxy += w * x * y
-        det = s * sxx - sx * sx
-        if abs(det) < 1e-12:
-            return (sy / s if s else 0.0), 0.0
-        b = (s * sxy - sx * sy) / det
-        a = (sy - b * sx) / s
-        return a, b
+        if sw <= 0:
+            return 0.0, 0.0
+        xbar, ybar = sx / sw, sy / sw
+
+        sxx = sxy = 0.0
+        for x, y in pts:
+            w = 1.0 / (y * y) if (weight == "rel" and y > 0) else 1.0
+            dx = x - xbar
+            sxx += w * dx * dx
+            sxy += w * dx * (y - ybar)
+        if sxx <= 0:
+            return ybar, 0.0
+        b = sxy / sxx
+        return ybar - b * xbar, b
 
     a, b = solve(points)
     note = ""
-    if b < 0:
+
+    # Snap a slope that is indistinguishable from zero. On a flat curve the
+    # fit lands on a tiny positive number rather than a negative one, which
+    # survives the clamp below and then shows up downstream as a throughput
+    # "ceiling" of 10^20 KB/s. If the per-unit term contributes less than 1 %
+    # of the cheapest measured operation across the WHOLE swept range, the
+    # sweep did not measure it.
+    max_x = max(x for x, _ in points)
+    min_y = min(y for _, y in points)
+    if 0 < b * max_x < 0.01 * min_y:
+        b = 0.0
+        note = ("per-unit cost is below what this sweep can resolve; "
+                "clamped to a flat per-call cost")
+
+    if b <= 0:
         # Cost does not grow with size at all (the flash simulator, or a part
         # whose per-call overhead swamps the transfer). Flat model.
         num = den = 0.0
@@ -169,7 +219,9 @@ def wls(points, weight="rel"):
             num += w * y
             den += w
         a, b = (num / den if den else 0.0), 0.0
-        note = "per-unit cost fitted negative; clamped to a flat per-call cost"
+        if not note:
+            note = ("per-unit cost fitted negative; clamped to a flat "
+                    "per-call cost")
     elif a < 0:
         # Pure throughput, no measurable per-call overhead.
         num = den = 0.0
@@ -193,7 +245,8 @@ def residuals(points, a, b):
     return out, worst
 
 
-def build_model(geom, rows, name=None, weight="rel", size_range=None):
+def build_model(geom, rows, lin=None, name=None, weight="rel",
+                size_range=None):
     block = _int(geom, "block_bytes", 0)
 
     def pts_rw(op):
@@ -251,6 +304,27 @@ def build_model(geom, rows, name=None, weight="rel", size_range=None):
             }
         )
 
+    # The page-program staircase: page-aligned transfers, so the cost is
+    # exactly ceil(size/page) programs if the part programs by page. Reported,
+    # never fitted — it is a different operation from the packed sweep, and it
+    # exists to explain the packed sweep's residuals rather than to improve
+    # them.
+    page = _int(geom, "program_page", 0) or 0
+    pg_rows = sorted(((r["size"], r["ns_per_op"]) for r in rows["write_pg"]))
+    one_page = None
+    for sz, ns in pg_rows:
+        if sz <= page:
+            one_page = ns if one_page is None else min(one_page, ns)
+    staircase = []
+    for sz, ns in pg_rows:
+        expect = -(-sz // page) if page else 0
+        staircase.append({
+            "size": sz,
+            "ns": ns,
+            "expected_programs": expect,
+            "implied_programs": (ns / one_page) if one_page else None,
+        })
+
     out = {
         "schema": SCHEMA,
         "name": name or geom.get("board", "unnamed"),
@@ -267,6 +341,9 @@ def build_model(geom, rows, name=None, weight="rel", size_range=None):
         "fit": {"weight": weight, "size_range": list(size_range) if size_range else None},
         "model": model,
         "page_straddle": straddle,
+        "program_page": page,
+        "page_program": staircase,
+        "linearity": lin or {},
         "curve": curve,
     }
     return out
@@ -621,12 +698,137 @@ def cmd_derive(args):
     return 0
 
 
+
+# --- measured against the datasheet ---------------------------------------
+
+SPEC_SCHEMA = "l0-part-spec/1"
+
+
+def verdict(measured, typ, mx):
+    """Where a measured value falls in the part's specified envelope.
+
+    Typ is not a limit — it is one operating point (25 C, typical VCC), and a
+    part sitting above it is normal. Max IS a limit, quoted at 85 C and
+    minimum VCC, so a room-temperature measurement above max is the part or
+    the driver doing something the datasheet does not allow for.
+    """
+    if mx and measured > mx:
+        return "OVER MAX", f"{measured / mx:.2f}x max"
+    if typ and measured < typ:
+        return "under typ", f"{measured / typ:.2f}x typ"
+    if typ:
+        return "typ..max", f"{measured / typ:.2f}x typ"
+    return "?", ""
+
+
+def cmd_spec(args):
+    """Compare a fitted model against a part's datasheet.
+
+    The interesting output is not the pass/fail. It is which MODE the numbers
+    are consistent with: on this part the two modes differ by 2-4x, the mode
+    bit is volatile with a part-code-dependent power-on value, and Zephyr's
+    driver never writes it — so which one a board is actually running in is
+    not knowable from the schematic, only from a measurement.
+    """
+    model = load_model(args.model)
+    spec = json.loads(Path(args.spec).read_text())
+    if spec.get("schema") != SPEC_SCHEMA:
+        raise SystemExit(f"{args.spec}: not a {SPEC_SCHEMA} file")
+
+    block = model["geometry"]["block_bytes"]
+    page = spec.get("page_bytes") or model.get("program_page") or 256
+    m = model["model"]
+
+    # What the model says the part does, reduced to the two quantities the
+    # datasheet specifies. The fixed terms are deliberately not compared:
+    # they are bus time and driver overhead, which the datasheet's internal
+    # erase/program figures do not include.
+    meas_erase = m["erase"]["per_block_ns"]
+    meas_page = m["write"]["per_byte_ns"] * page
+    meas_byte = m["write"]["per_byte_ns"]
+    page_src = "per-byte slope x page"
+
+    # A directly measured page-aligned point beats the slope, when there is
+    # one: it is the same operation the datasheet is specifying.
+    for st in (model.get("page_program") or []):
+        if st["size"] == page and st["ns"]:
+            meas_page = st["ns"] - m["write"]["fixed_ns"]
+            page_src = "write_pg row at one page, less the fixed term"
+            break
+
+    print(f"\nmodel '{model['name']}' vs {spec['part']}")
+    print(f"  {spec['source']}")
+    if model["source"] != "hardware":
+        print(f"  !! the model's source is '{model['source']}', so what is "
+              "being checked against the datasheet\n     is not a direct "
+              "measurement of the part")
+    print(f"\n  measured: erase {meas_erase / 1e6:.1f} ms per {block} B "
+          f"block; program {meas_page / 1e6:.3f} ms per {page} B page "
+          f"({page_src});\n            {meas_byte / 1000:.2f} us per byte")
+
+    viable = []
+    for mode, sp in spec["modes"].items():
+        eb = (sp.get("erase_block_ns") or {}).get(str(block))
+        pp = sp.get("page_program")
+        bp = sp.get("byte_program")
+        print(f"\n  {mode}  ({sp['config']})")
+        print("    parameter            measured        typ        max   "
+              "verdict")
+        ok = True
+        rows = []
+        if eb:
+            rows.append((f"block erase {block} B", meas_erase,
+                         eb.get("typ_ns"), eb.get("max_ns"), 1e6, "ms"))
+        if pp:
+            rows.append((f"page program {page} B", meas_page,
+                         pp.get("typ_ns"), pp.get("max_ns"), 1e6, "ms"))
+        if bp:
+            rows.append(("per byte programmed", meas_byte,
+                         bp.get("typ_ns"), bp.get("max_ns"), 1e3, "us"))
+        for label, val, typ, mx, sc, unit in rows:
+            v, how = verdict(val, typ, mx)
+            if v == "OVER MAX":
+                ok = False
+            print(f"    {label:<20} {val / sc:8.2f}{unit} "
+                  f"{(typ or 0) / sc:8.2f}{unit} {(mx or 0) / sc:8.2f}{unit}   "
+                  f"{v} ({how})")
+        if ok:
+            viable.append(mode)
+
+    print()
+    if len(viable) == 1:
+        print(f"  -> consistent with {viable[0]} only: every other mode has a "
+              "maximum this\n     measurement exceeds. Since the mode bit is "
+              "volatile and nothing in the\n     firmware writes it, that is "
+              "the mode the part powers up in.")
+    elif not viable:
+        print("  -> consistent with NO mode: something exceeds a datasheet "
+              "maximum. Either the\n     part is not what the board file "
+              "says, or the measurement includes time\n     that is not the "
+              "part's (a driver retry, a busy-poll interval, a suspended\n"
+              "     erase), or it was taken far from room temperature.")
+    else:
+        print(f"  -> consistent with {' and '.join(viable)}; this measurement "
+              "does not separate them.\n     Compare against typ rather than "
+              "max to see which it sits closer to.")
+
+    print("\n  Not compared: the model's fixed per-call terms "
+          f"(read {m['read']['fixed_ns'] / 1000:.1f} us, "
+          f"write {m['write']['fixed_ns'] / 1000:.1f} us). Those are bus\n"
+          "  time and driver overhead; the datasheet figures above are the "
+          "part's internal\n  erase and program times and do not include "
+          "them.")
+    for n in spec.get("notes", [])[:2]:
+        print(f"\n  note: {n}")
+    return 0
+
+
 # --- commands ------------------------------------------------------------
 
 
 def cmd_fit(args):
     text = Path(args.capture).read_text(errors="replace")
-    geom, rows, status = parse_l0_capture(text)
+    geom, rows, lin, status = parse_l0_capture(text)
 
     if status not in (0, None):
         print(f"warning: capture reports l0end status={status}; the sweep did "
@@ -647,8 +849,8 @@ def cmd_fit(args):
         lo, _, hi = args.size_range.partition(":")
         rng = (int(lo, 0), int(hi, 0))
 
-    model = build_model(geom, rows, name=args.name, weight=args.weight,
-                        size_range=rng)
+    model = build_model(geom, rows, lin, name=args.name,
+                        weight=args.weight, size_range=rng)
 
     if model["source"] != "hardware":
         model.setdefault("notes", []).append(
@@ -699,7 +901,7 @@ def show_model(model, verbose=False):
     # Derived numbers a human actually reasons with.
     r = m["read"]
     w = m["write"]
-    if r["per_byte_ns"] > 0:
+    if r["per_byte_ns"] > 0:  # zero means the sweep resolved no size term
         print(f"\n  read  throughput ceiling: "
               f"{1e9 / r['per_byte_ns'] / 1024:.0f} KB/s; a transfer pays its "
               f"fixed cost until {_breakeven(r, 'per_byte_ns'):.0f} B")
@@ -707,6 +909,60 @@ def show_model(model, verbose=False):
         print(f"  write throughput ceiling: "
               f"{1e9 / w['per_byte_ns'] / 1024:.0f} KB/s; a transfer pays its "
               f"fixed cost until {_breakeven(w, 'per_byte_ns'):.0f} B")
+
+    # The linearity evidence, which is the part of the capture the single
+    # fitted slope replaces. Printed next to the fit so the two are read
+    # together: a slope with a 10x marginal spread behind it is an average,
+    # not a description.
+    lin = model.get("linearity") or {}
+    if lin:
+        print("\n  marginal cost across the sweep (d ns / d B) — constant "
+              "iff the cost is affine:")
+        for op in ("read", "write"):
+            if op not in lin:
+                continue
+            e = lin[op]
+            sp = e.get("spread")
+            if e["marginal_max_ns_per_b"] <= 0:
+                verdict = "flat: cost does not depend on size"
+            elif sp is None:
+                # The marginal touches zero or goes negative somewhere while
+                # being positive elsewhere. That is the signature of a cost
+                # that is flat across a range and then steps — a page program
+                # — not of a missing measurement.
+                verdict = ("NOT affine: flat over part of the sweep, "
+                           "stepped elsewhere")
+            elif sp <= 1.25:
+                verdict = "affine"
+            else:
+                verdict = f"NOT affine, {sp:.2f}x spread"
+            print(f"    {op:<6} {e['marginal_min_ns_per_b']:9.2f} .. "
+                  f"{e['marginal_max_ns_per_b']:9.2f} ns/B   -> {verdict}")
+
+    stair = model.get("page_program") or []
+    if stair:
+        page = model.get("program_page") or 0
+        print(f"\n  page-program staircase (page-aligned transfers, "
+              f"page = {page} B):")
+        print("      size        us/op   programs  expected  verdict")
+        agree = 0
+        for st in stair:
+            imp = st["implied_programs"]
+            exp = st["expected_programs"]
+            if imp is None:
+                continue
+            near = abs(imp - exp) <= 0.25
+            agree += 1 if near else 0
+            print(f"    {st['size']:6d} B  {st['ns'] / 1000:11.3f}  "
+                  f"{imp:9.2f}  {exp:8d}  {'step' if near else 'off'}")
+        if agree == len([x for x in stair if x['implied_programs']]):
+            print("    -> write cost tracks ceil(size / page): it is a "
+                  "staircase, and the fitted\n       per-byte slope is an "
+                  "average over it. A transfer one byte past a page\n"
+                  "       boundary costs a whole extra program.")
+        else:
+            print("    -> cost does NOT track ceil(size / page); the part or "
+                  "driver is not\n       programming a page at a time.")
 
     for s in model.get("page_straddle", []):
         if s["penalty"]:
@@ -1013,6 +1269,15 @@ def main():
     p.add_argument("run", help="a capture with BOTH counters and wall-clock")
     p.add_argument("--strict-geometry", action="store_true")
     p.set_defaults(func=cmd_verify)
+
+    p = sub.add_parser(
+        "spec", help="measured model vs a part datasheet: in spec, and in "
+                     "which mode?")
+    p.add_argument("-m", "--model", required=True)
+    p.add_argument("--spec", required=True,
+                   help="an l0-part-spec/1 file, e.g. "
+                        "models/mx25r6435f_datasheet.json")
+    p.set_defaults(func=cmd_spec)
 
     p = sub.add_parser("simconf", help="model -> CONFIG_FLASH_SIMULATOR_*")
     p.add_argument("-m", "--model", required=True)
