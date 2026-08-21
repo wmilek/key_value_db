@@ -363,7 +363,7 @@ algorithmic waste as the explanation:
 | per 64 KB object | warm (`lg rewrite`) | cold (`lg write`) |
 |---|--:|--:|
 | erases | 2.25 × 1.09 s = **2.45 s** | 33.25 × 1.09 s = **36.2 s** |
-| programming (≈263 NOR pages, ~7.6 ms each) | **2.0 s** | 2.0 s |
+| programming (≈263 NOR pages) | **2.0 s** | 2.0 s |
 | reads + transactions | 22 ms | 22 ms |
 | **predicted** | **4.47 s** | **38.2 s** |
 | **measured** | **4.48 s** | **38.6 s** |
@@ -374,23 +374,47 @@ bytes to reclaim, so erase is the only lever, and UBI does not move it.
 
 Read the page count per object, as the column says: the `io lg rewrite` counter
 reports **269 712 B for the whole phase**, and the phase writes `N_LARGE = 4`
-objects, so it is 67 428 B and ~263 pages each. That works out to **~7.6 ms per
-256 B page**, not the ~1.9 ms a per-phase page count would imply — this part
-programs slowly enough that it is half a warm rewrite before any erase is
-counted.
+objects, so it is 67 428 B and ~263 pages each — not the 1 054 that a per-phase
+count gives.
 
-Two figures follow from it, for anyone sizing a write path on this board:
+### What this row is, and what it is not
+
+The 2.0 s is `blob_db`'s cost of putting 67 428 B on flash. It is **not** the
+part's page-program time, and dividing one by the other to get "~7.6 ms per
+256 B page" is wrong — an earlier revision of this section did exactly that and
+concluded the MX25R64 was running ~4× slower than typical.
+
+`app_perf_l0` measures L0 directly, with no storage stack in the image, and
+settles it (`app_perf_l0/RESULTS.md` §6):
+
+| per byte written | |
+|---|--:|
+| this phase, measured through `blob_db` | 29.7 µs |
+| **flash_area alone, measured directly** | **12.16 µs** |
+| ⇒ a 256 B page program | **3.11 ms**, unremarkable for this part |
+
+**59 % of the per-byte cost in this table is CPU above L0** — slot walking,
+header parsing, CRC and memcpy — not flash. The same holds for reads: 0.63 µs/B
+here against **258 ns/B** at L0.
+
+So the throughput figures this table supports are stack figures, and should be
+labelled as such:
 
 | sequential write to pre-erased blocks | |
 |---|--:|
-| per byte | ~29.7 µs |
-| **throughput** | **~32 kiB/s** |
-| the same with one 64 KB erase included | ~21 kiB/s |
-| as measured, warm, at 2.25 erases per object | 14 kiB/s |
+| **through `blob_db`** | **~32 kiB/s** |
+| **`flash_area` alone** | **~80 kB/s** |
+| through `blob_db`, with one 64 KB erase | ~21 kiB/s |
+| as measured warm, at 2.25 erases per object | 14 kiB/s |
 
-Reads fit at 0.63 µs/B, so **writes to erased flash are ~48× slower than
-reads** here, and the 8 MHz quad bus — good for ~4 MB/s — is nowhere near the
-constraint. The limit is the part.
+The 8 MHz quad bus, good for ~4 MB/s, is nowhere near the constraint either
+way. But the constraint is not simply "the part": for a large sequential write
+the part will take bytes 2.5× faster than this stack hands them over.
+
+None of this moves the erase/programming split above, which is computed from
+the seconds and not the pages, nor the conclusion that follows from it — `lg
+write` is still erase-bound, and erase is still the only lever that matters
+there.
 
 ### Operational notes, each of which cost a run
 
