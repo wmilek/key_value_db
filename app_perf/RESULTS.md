@@ -363,7 +363,7 @@ algorithmic waste as the explanation:
 | per 64 KB object | warm (`lg rewrite`) | cold (`lg write`) |
 |---|--:|--:|
 | erases | 2.25 × 1.09 s = **2.45 s** | 33.25 × 1.09 s = **36.2 s** |
-| programming (≈1 054 NOR pages) | **2.0 s** | 2.0 s |
+| programming (≈263 NOR pages, ~7.6 ms each) | **2.0 s** | 2.0 s |
 | reads + transactions | 22 ms | 22 ms |
 | **predicted** | **4.47 s** | **38.2 s** |
 | **measured** | **4.48 s** | **38.6 s** |
@@ -371,6 +371,26 @@ algorithmic waste as the explanation:
 **~55% erase, ~45% page programming, and write amplification of 1.02×** —
 blob_db writes almost exactly the bytes asked of it. There are no wasted
 bytes to reclaim, so erase is the only lever, and UBI does not move it.
+
+Read the page count per object, as the column says: the `io lg rewrite` counter
+reports **269 712 B for the whole phase**, and the phase writes `N_LARGE = 4`
+objects, so it is 67 428 B and ~263 pages each. That works out to **~7.6 ms per
+256 B page**, not the ~1.9 ms a per-phase page count would imply — this part
+programs slowly enough that it is half a warm rewrite before any erase is
+counted.
+
+Two figures follow from it, for anyone sizing a write path on this board:
+
+| sequential write to pre-erased blocks | |
+|---|--:|
+| per byte | ~29.7 µs |
+| **throughput** | **~32 kiB/s** |
+| the same with one 64 KB erase included | ~21 kiB/s |
+| as measured, warm, at 2.25 erases per object | 14 kiB/s |
+
+Reads fit at 0.63 µs/B, so **writes to erased flash are ~48× slower than
+reads** here, and the 8 MHz quad bus — good for ~4 MB/s — is nowhere near the
+constraint. The limit is the part.
 
 ### Operational notes, each of which cost a run
 
