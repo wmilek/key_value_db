@@ -187,8 +187,8 @@ def case_affine(failures, verbose):
          f"want {WRITE_PER_PAGE_NS / PAGE / 1000:.2f}")
 
     # ...and the tool must SAY it is a line, in both classes.
-    want(txt.count("consistent with affine") >= 2,
-         "read and write were not both reported as consistent with affine")
+    want(txt.count("-> affine") >= 2,
+         "read and write were not both reported as affine")
     want("write cost tracks ceil(size / page)" not in txt,
          "a staircase was claimed on a device that has none")
     want(m["write"]["max_rel_error"] < 0.05,
@@ -222,16 +222,12 @@ def case_pagewise(failures, verbose):
 
     # The findings that matter: write is not a line, and the reason is
     # visible as a staircase.
-    # NOT a drift assertion. A page-quantised cost sampled on a geometric
-    # ladder zigzags symmetrically — powers of two divide the page and cost
-    # one program, the midpoints straddle onto two — so the median step still
-    # matches the whole-sweep slope and the drift check correctly reports no
-    # drift. What must not happen is the reader being left with "consistent
-    # with affine" beside a 66 % residual, so the tool has to flag the
-    # disagreement itself.
-    want("departs from the line without" in txt,
-         "the tool reported the write curve as affine-consistent without "
-         "flagging that its fit residual contradicts that")
+    # The gated statistic pairs each point with one an octave away rather
+    # than with its neighbour, which is what lets it keep this capability: the
+    # secants across a page-quantised cost disagree with each other, where
+    # adjacent differences at small sizes are pure noise and a median-vs-
+    # overall drift test sees a symmetric zigzag as no drift at all.
+    want("NOT affine" in txt, "write was not reported as non-affine")
     want("write cost tracks ceil(size / page)" in txt,
          "the page-program staircase was not detected")
     want(m["write"]["max_rel_error"] > 0.10,

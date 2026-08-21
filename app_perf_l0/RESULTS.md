@@ -664,66 +664,66 @@ and 12 B measured 63.2. A first-difference test over adjacent points has no
 defence against one bad batch, and at these sizes the whole signal is smaller
 than the outlier.
 
-**So the verdict line should be gated on the points that can support it** —
-either a minimum per-op duration, or a median over repeated batches, or by
-fitting the marginal over a window rather than adjacent pairs. As printed it
-will call a perfectly affine part non-affine on any board whose small-transfer
-timings carry occasional interference, which is every board.
-
 That is a defect in the check, not in the model: the fitted coefficients are
 unaffected, because the fit is weighted least squares over all points rather
 than a first difference between neighbours.
 
-#### Fixed — and the fix needed all three suggestions
+#### Fixed: the verdict is now gated
 
-Re-running the tool on this same capture now reports:
+`gated_marginals()` replaces the adjacent-pair range with two structural gates,
+neither of them a tuned constant:
 
-```
-    read   overall    253.32 ns/B   median step    253.20   -> no drift (0.0 %): consistent with affine
-           step scatter (IQR) 251..254 ns/B over 20 of 31 informative steps.
-    write  overall  12265.42 ns/B   median step  12265.52   -> no drift (0.0 %): consistent with affine
-           step scatter (IQR) 12153..12279 ns/B over 27 of 27 informative steps.
-```
+- **only above the fixed-cost crossover, n ≥ a/b** — the same crossover the
+  throughput lines already print (266 B read, 13 B write). Below it the byte
+  term is a minority of the measurement, so a difference there is mostly noise.
+- **pair across an octave, not with the neighbour** — each surviving point pairs
+  with the first later point at ≥ 2× its size, so Δn ≥ n and noise passes
+  through at ~2ε instead of being amplified by n/Δn.
 
-Four changes, because each of the suggested gates turned out to be necessary
-and none of them sufficient alone:
+The device's ungated range is still printed beside it, because it is what the
+board measured and a reader should see what the gate removed.
 
-1. **The headline is now the slope across the whole sweep**, not the extremes
-   of the step column. Its denominator is the entire size range, so one bad
-   batch moves it by a rounding error. `read` overall 253.32 against a median
-   step of 253.20 is the evidence; the ±18 752 ns/B extremes never had any.
-2. **Steps must carry signal to be counted.** A step informs the slope only
-   where the change it measures is at least 5 % of the cost being measured.
-   On a geometric ladder most steps are at small sizes where the size moves a
-   few bytes and the cost is nearly all intercept — 11 of read's 31 steps
-   measure essentially nothing, and those were the ones deciding the verdict.
-   The device now gates on each point's **measured pass-to-pass spread**
-   instead, which is stronger; this percentile-free rule is the fallback for
-   captures taken before it recorded one.
-3. **The test is for drift, not scatter.** Comparing the median step against
-   the whole-sweep slope detects sustained curvature. Scatter around a stable
-   median is measurement noise, and rejecting on it is precisely what produced
-   the false negative — a part whose own fit residual was 3.7 %.
-4. **Each point is now measured three times** (`CONFIG_APP_PERF_L0_PASSES`),
-   with the mean reported and the extremes printed as a spread. That is what
-   gives the device the noise estimate gate 2 needs, and it turns every row
-   from a number into a number with an error bar.
+| | device, adjacent, ungated | **gated, octave pairs** | verdict |
+|---|--:|--:|---|
+| read | −18 752 … 17 075 | **244.1 … 272.0 ns/B** | affine |
+| write | 9 568 … 14 312 | **10 860.9 … 12 278.6 ns/B** | affine |
 
-**One thing the drift test cannot see, and says so.** A page-quantised cost
-sampled on a geometric ladder *zigzags symmetrically*: powers of two divide
-the page and land on one program, the 1.5× midpoints straddle onto two. The
-median step still matches the overall slope, so drift correctly reports none —
-while the fit residual is large. The tool now cross-checks the two and prints
+It reproduces on the `6ca2f7d` capture, which has no `l0lin` line at all —
+read 229.9–253.9, write 10 846.9–12 272.9, both affine. Two captures taken a day
+apart, one coarse and one fine, agreeing on the shape is worth more than either.
 
-> `BUT the fit's worst residual is 38 %: the curve departs from the line
-> without drifting — a zigzag, not a bend.`
+**A staircase still trips it**, which is the property that matters: secants
+across an octave of a page-quantised cost disagree with each other (29.5 against
+19.7 µs/B for a 256 B page), and `tools/selftest.py` covers exactly that — its
+page-wise synthetic device is still reported non-affine, and its affine device
+still reports affine.
 
-so a reader cannot take "consistent with affine" from one check while another
-contradicts it. The three signals answer different questions: **drift** sees a
-bend, the **residual table** sees any departure from the line, and
-**`write_pg`** identifies the cause. `tools/selftest.py` asserts all three
-behaviours against a synthetic page-quantised device, including that the
-cross-check fires.
+**What the device now contributes.** Each sweep point is measured
+`CONFIG_APP_PERF_L0_PASSES` times (default 3), the mean is reported and the
+extremes are printed as a `spread` column and emitted as `min_ns`/`max_ns`. The
+board can therefore gate its own adjacent-pair range on each point's measured
+pass-to-pass spread, rather than on a rule of thumb — a step counts only when
+the change it measures exceeds the noise of the two points that formed it. The
+tool reads `used`/`skipped` off the `l0lin` line and labels the device range
+accordingly, so "ungated" is said only of captures that genuinely could not
+gate.
+
+That does not replace `gated_marginals()`, and the two are not alternatives.
+The device's estimator is still a first difference between neighbours, which is
+fragile however well gated; the octave pairing changes the estimator itself.
+The device gate makes the printed range honest, and the octave pairing makes
+the verdict sound.
+
+**One capability worth being explicit about, because it was nearly lost.** An
+earlier attempt at this fix replaced the range with a drift test — median step
+against the whole-sweep slope. It removes the false negative just as well, and
+it *cannot detect a staircase*: a page-quantised cost sampled on a geometric
+ladder zigzags symmetrically, because powers of two divide the page onto one
+program while the midpoints straddle onto two, so the median still matches the
+overall slope while the fit residual runs to 66 %. Pairing across an octave
+keeps the sensitivity that drift throws away, which is why it is the one that
+shipped.
+
 
 ### What the `6ca2f7d` capture could not show
 
