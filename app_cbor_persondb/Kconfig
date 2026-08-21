@@ -3,10 +3,6 @@
 # Copyright (c) 2026
 # SPDX-License-Identifier: Apache-2.0
 
-menu "Zephyr"
-source "Kconfig.zephyr"
-endmenu
-
 module = APP_CBOR_PERSONDB
 module-str = APP_CBOR_PERSONDB
 source "subsys/logging/Kconfig.template.log_config"
@@ -33,6 +29,17 @@ config APP_CBOR_PERSONDB_FRONTEND_SHELL
 	  survived.
 
 endchoice
+
+# The shell frontend runs the scenario layer on the SHELL thread, not on main,
+# and blob_db builds every slot in a CONFIG_BLOB_DB_MAX_PAYLOAD_LEN + 46 byte
+# stack frame (FINDINGS.md B5, job 3). prj.conf sizes CONFIG_MAIN_STACK_SIZE for
+# that chain — 19 870 B measured with -fstack-usage — but Zephyr's shell thread
+# defaults to 2 048 B, so every persondb command overflowed it and halted the
+# system on the first keystroke. Give the shell thread what main gets.
+#
+# Costs ~26 KB of RAM, and only when the shell frontend is selected.
+config SHELL_STACK_SIZE
+	default 28672 if APP_CBOR_PERSONDB_FRONTEND_SHELL
 
 config APP_CBOR_PERSONDB_N_PERSONS
 	int "Number of persons in the dataset"
@@ -131,3 +138,10 @@ config APP_CBOR_PERSONDB_FRESH_START
 	  Drop everything before opening, so this run behaves like the very
 	  first one. Use once to reset a board that already holds a store; on
 	  native_sim prefer the --flash_erase command-line option.
+
+# Sourced last on purpose. Kconfig resolves a symbol's `default` to the first
+# one it parses, so any Zephyr default this app overrides — see
+# CONFIG_SHELL_STACK_SIZE above — must be stated before this line, not after.
+menu "Zephyr"
+source "Kconfig.zephyr"
+endmenu

@@ -460,6 +460,36 @@ instead of picking one generous default: `native_sim`'s 4 KB blocks need 2 046
 PEBs, and the same symbol would then cost ~32 KB of RAM on a board that has
 128 blocks.
 
+### The shell frontend, and the stack that was never sized for it
+
+§4a's shell row predates the payload bump. Rebuilt at the branch head with
+`CONFIG_APP_CBOR_PERSONDB_FRONTEND_SHELL=y`: **FLASH 121 576 B, RAM 233 432 B
+(50.9 % of the part)** against 85 724 / 202 064 for the benchmark frontend.
+
+Most of the RAM difference is a fix rather than the shell. `blob_db` builds
+every slot in a `MAX_PAYLOAD + 46` byte **stack** frame (B5 job 3), and
+`prj.conf` sizes `CONFIG_MAIN_STACK_SIZE` for the resulting 19 870 B chain — but
+the shell frontend runs that chain on the **shell thread**, which Zephyr defaults
+to 2 048 B. Every `persondb` command overflowed it and halted the system on the
+first keystroke:
+
+```
+uart:~$ persondb stat
+<err> os: ***** USAGE FAULT *****
+<err> os:   Stack overflow (context area not valid)
+<err> os: Current thread: 0x200008f0 (shell_uart)
+```
+
+`CONFIG_SHELL_STACK_SIZE` now defaults to 28 672 when that frontend is selected,
+costing ~26 KB of RAM and only in that build. The frontend was previously
+buildable but not runnable, which is how a footprint row existed for something
+that had never executed a command on hardware.
+
+Verified against the 10 000-person store: `stat`, `show`, `cardof` and `check`
+all work, and an interactive `check` costs **27.0 ms** against the 26.79 ms §5f
+measures for the same operation in the benchmark — the two frontends agree, as
+`DESIGN.md` §9 says they should.
+
 ### It does not move the needle on this app, and here is why
 
 Against §4a's finding B6 — that `blob_db`'s two 64 KB sector buffers own 83 % of
