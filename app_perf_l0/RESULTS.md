@@ -4,14 +4,20 @@ Results for the sweep implemented by `app_perf_l0/src/main.c` and the model
 fitted from it by `tools/l0_timing.py`. Keep this file honest — update it when
 the shape of the sweep changes or when regenerating on new hardware.
 
-**Status of the hardware measurement: not yet taken.** §4 states what the
-board run is predicted to produce and what would falsify it, so the run has
-something to disagree with. Everything in §1–§3 is measured or computed and
-reproducible from this repository today.
+**The hardware measurement has been taken** — §5, on the nRF5340-DK. §4 is
+kept as it was written *before* that run, so the predictions can be scored
+rather than quietly revised; §5 scores them, and two of the five failed. §5b
+answers the linearity question the matrix was built for, §6 checks the result
+against the part's datasheet, and §1–§3 remain reproducible on a host with no
+board attached.
 
 ## Setup
 
 - **Host runs**: `native_sim`, Zephyr build `5058917ea61b`, host toolchain
+- **Board run** (§5): nRF5340-DK S/N 960115021, app at `6ca2f7d`, `flash_area`,
+  capture and fitted model in
+  [`models/`](models) as `observations_nrf5340dk_l0_direct.txt` and
+  `mx25r64_nrf5340dk_direct.json`
 - **Board the derived model describes**: nRF5340-DK (PCA10095) cpuapp, with
   `storage_partition` on the on-board MX25R6435F QSPI NOR — 8 MB, 64 KB erase
   blocks, `flash_area_align()` = 4, 8 MHz Quad-SPI. Same board and same
@@ -282,6 +288,11 @@ bytes, not a staircase**, and specifically:
 | `write_pg` staircase | **no staircase**: implied programs ≈ `n/page`, not `ceil(n/page)`, so the tool prints *"cost does NOT track ceil(size / page)"* | a clean staircase here falsifies H1 outright |
 | `write` fixed term | ≲ 314 µs (§3's value includes `blob_db`'s CPU) | — |
 
+> **Scored in §5b: confirmed.** The board's write marginal cost is flat at
+> 12 060–12 273 ns/B from 8 B to 64 KB, and a 4 B write costs 208 µs against a
+> 256 B write's 3 251 µs. H1 holds; H2 is dead. The per-byte *value* predicted
+> here was wrong by 2.4× for the reason §5 gives, but the shape was right.
+
 Worth being clear about the status of this: it is an inference from two mean
 transfer sizes, not a measurement of the curve. The whole point of the matrix
 is that it samples 28 sizes with the midpoints in between, so it can see
@@ -309,100 +320,267 @@ typical page-program figure, and `derive` cannot tell whether that is the part,
 the driver, or `blob_db` — only a direct sweep can. It is the clearest reason
 to run this app on hardware rather than to keep deriving.
 
-## 5. Measured against the datasheet
+## 5. Measured on the DK — the falsification of §4
+
+Run on board 960115021 at `6ca2f7d`, `flash_area`, geometry as reported by the
+app itself: 8 388 608 B partition, 128 blocks of 65 536 B, write align 4,
+`source=hardware timing=real`. Capture and fitted model alongside this file.
+
+The direct fit, from a sweep of L0 calls with no storage stack in the image:
+
+| class | fixed per call | per unit | points | max rel err |
+|---|--:|--:|--:|--:|
+| read | **65.682 µs** | **258.3 ns/B** | 15 | 11.5 % |
+| write | **157.129 µs** | **12 156.5 ns/B** | 15 | 3.7 % |
+| erase | **51 643 µs** | **1 061.434 ms/blk** | 7 | 1.3 % |
+
+Ceilings that follow: **read 3 781 kB/s, write 80 kB/s**, and a transfer pays
+only its fixed cost below 254 B (read) or 13 B (write).
+
+### Scorecard against §4
+
+| coefficient | derived (§3) | **direct** | §4 predicted | verdict |
+|---|--:|--:|---|---|
+| erase per block | 1 106 ms | **1 061.4 ms** | within a few % | **held** (−4.0 %) |
+| read fixed | 67.7 µs | **65.7 µs** | lower | held, but only −3 % |
+| write fixed | 314 µs | **157.1 µs** | lower | **held** (−50 %) |
+| read per byte | 631 ns/B | **258.3 ns/B** | within a few % | **failed** (−59 %) |
+| write per byte | 29.6 µs/B | **12.16 µs/B** | the one to watch | **failed** (−59 %) |
+
+**§4 predicted the CPU above L0 would show up in the fixed terms. It is mostly
+in the per-byte terms.** `read fixed` barely moved, which rules out the reading
+§4 offered — that the difference is `blob_db`'s per-read CPU — as the main
+effect. The per-call overhead really is ~66 µs of QSPI.
+
+The two failures are the same failure. Both per-byte coefficients are
+overstated by almost exactly the same factor:
+
+    read   258.3 / 631    = 0.409
+    write 12 156 / 29 600 = 0.411
+
+Two independent classes landing within 0.3 % of each other is not the part
+behaving oddly; it is the *derived* fit unable to separate them. The 36
+observations it was solved from come from stack phases where reads and writes
+co-occur, so read-per-byte and write-per-byte are collinear there and the
+excess CPU was distributed across both in proportion. Only a sweep that varies
+one call at a time can break that, which is the case for this app stated as a
+measurement rather than an argument.
+
+The direct fit also finds a term the derived model does not have: **an erase
+call costs 51.6 ms before it erases anything.** A 1-block erase is therefore
+1.113 s against 1.061 s of block time, and the derived model folded that
+overhead into its per-block figure — which is most of the 4 % it sits high by.
+
+### What the model predicts about phases it never saw
+
+Feeding `app_perf`'s `flash_area` I/O counters through the **direct** model.
+This is not circular: the model comes from raw L0 calls, the counters from a
+`blob_db` stack.
+
+| phase | measured | L0 predicts | ratio | dominant term |
+|---|--:|--:|--:|---|
+| `lg pwrite` | 72.700 s | 72.343 s | **1.00×** | erase 98 % |
+| `lg write` | 154.400 s | 151.370 s | **0.98×** | erase 98 % |
+| `read` | 0.046 s | 0.042 s | 0.91× | read 100 % |
+| `lg rewrite` | 17.900 s | 13.413 s | 0.75× | erase 75 % |
+| `update` | 0.251 s | 0.144 s | **0.57×** | write 52 % |
+| `lg read` | 7.500 s | 4.278 s | **0.57×** | read 100 % |
+
+The split is exactly along the dominant term. **Where a phase is erase-bound,
+L0 accounts for all of it. Where it is transfer-bound, L0 accounts for 57 %,
+and the missing 43 % is CPU above L0** — slot walking, header parsing, CRC and
+memcpy over the payload, none of which is flash.
+
+That is the number this app was built to produce, and no stopwatch on the board
+could have separated it.
+
+### Two conclusions elsewhere in this repo are wrong because of it
+
+**`app_perf/RESULTS.md` attributes ~7.6 ms to a 256 B page program** and calls
+it ~4× the part's typical, "the limit is the part". The direct sweep says a page
+program is **12.16 µs/B × 256 = 3.11 ms**, which is unremarkable for an
+MX25R6435F. The part is behaving normally; the excess was software above L0.
+
+**Write throughput to pre-erased blocks is ~80 kB/s at L0, not ~32 kiB/s.** The
+32 kiB/s figure is what the *stack* achieves through `blob_db`; the flash will
+take bytes 2.5× faster than that. Likewise reads: 3 781 kB/s at L0 against the
+~1.55 MB/s the stack-level per-byte constant implies.
+
+Both errors point the same way — cost measured at the top of a stack was
+attributed to the bottom of it — and both were only visible once the bottom was
+measured on its own.
+### 5b. Is the relationship linear? The board's answer
+
+The scorecard above is about coefficients. This is about *shape* — the question
+the matrix exists to answer. Both tables below are computed from the same
+capture; the `marginal ns/B` column is the extra cost of each extra byte
+against the row above, which is constant iff the cost is affine.
+
+**Write — flat to within 1.13× across four orders of magnitude:**
+
+|  size |    µs/op |  KiB/s |     ns/B | marginal ns/B |
+|------:|---------:|-------:|---------:|--------------:|
+|     4 |  208.145 |     19 | 52036.25 |             — |
+|     8 |  256.716 |     30 | 32089.50 |     12 142.75 |
+|    16 |  353.196 |     44 | 22074.75 |     12 060.00 |
+|    32 |  526.746 |     59 | 16460.81 |     10 846.88 |
+|    64 |  913.831 |     68 | 14278.61 |     12 096.41 |
+|   128 | 1692.147 |     74 | 13219.90 |     12 161.19 |
+|   256 | 3251.139 |     77 | 12699.76 |     12 179.62 |
+|   512 | 6391.252 |     78 | 12482.91 |     12 266.07 |
+|  1024 | 12674.97 |     79 | 12377.90 |     12 272.88 |
+|  4096 | 50354.00 |     79 | 12293.46 |     12 263.66 |
+| 16384 | 200988.8 |     80 | 12267.38 |     12 256.21 |
+| 65536 | 803588.9 |     80 | 12261.79 |     12 259.00 |
+
+**Write is linear in bytes. It is not a page staircase.** The marginal cost
+sits between 12 060 and 12 273 ns/B for every step from 8 B to 64 KB — a 1.02×
+spread once the single noisy 32 B point is set aside, 1.13× including it. A
+4 B write costs 208 µs and a 256 B write costs 3 251 µs: **15.6× more for 64×
+the bytes**. If the part charged one page program regardless of size those two
+numbers would be equal.
+
+That is §4b's prediction (**H1**) confirmed by direct measurement rather than
+inferred from two mean sizes, and it settles the modelling question the whole
+affine approach rests on for this part.
+
+Read is the same story with a noisier small end:
+
+|  size |    µs/op |  KiB/s |     ns/B | marginal ns/B |
+|------:|---------:|-------:|---------:|--------------:|
+|     4 |   61.594 |     63 | 15398.50 |             — |
+|    16 |   71.151 |    220 |  4446.94 |      1 022.38 |
+|    64 |   83.951 |    744 |  1311.73 |        251.53 |
+|   256 |  144.081 |   1735 |   562.82 |        253.57 |
+|  1024 |  330.076 |   3030 |   322.34 |        248.34 |
+|  4096 | 1108.127 |   3610 |   270.54 |        253.28 |
+| 16384 | 4225.297 |   3787 |   257.89 |        253.88 |
+| 65536 | 16677.86 |   3837 |   254.48 |        253.60 |
+
+From 64 B upward the marginal cost is **252.9–253.9 ns/B, a 1.004× spread** —
+about as linear as a measurement gets. Below 64 B it scatters (the 16 B step
+reads 1 022 ns/B), which is per-call variance showing through a difference
+between two nearly equal numbers, not structure: the underlying `µs/op` values
+there differ by a few microseconds on a ~65 µs fixed cost. This is why the fit
+reports 11.5 % worst residual for read against 3.7 % for write, and why it is
+worth reading the residual table rather than the headline slope.
+
+**Read saturates at 3 837 KiB/s = 3.93 MB/s**, against 4 MB/s theoretical for
+8 MHz Quad-SPI at 4 bits/clock — **98 % of the bus**. There is nothing left to
+win in the L0 read path on this board; a faster `sck-frequency` is the only
+lever.
+
+### What this capture cannot show
+
+It was taken at `6ca2f7d`, before the sweep became a matrix, so it has powers
+of two only — no 1.5× midpoints and no `write_pg` phase. The tables above are
+therefore computed *from* it rather than printed *by* it, and two gaps remain:
+
+- **A staircase between two doublings would be invisible here**, which is the
+  precise failure mode the midpoints were added for. The 12 060–12 273 ns/B
+  flatness across 8→65536 makes a hidden staircase implausible — a page-quantised
+  cost cannot be flat across a 256 B boundary at all — but "implausible" is not
+  "measured".
+- **`write_pg` never ran**, so the page-aligned staircase test has no data.
+  Under this result it should show implied programs tracking `n/page`, not
+  `ceil(n/page)`, and the tool should print *"cost does NOT track
+  ceil(size / page)"*.
+
+A re-run on the current app closes both. Nothing in the fitted model changes
+with it — the coefficients come from the same 15 points either way — so this is
+a completeness item, not a correction.
+
+## 6. Measured against the datasheet
 
 `tools/l0_timing.py spec` compares a model against a part's specified
-envelope. The spec lives in a file, not in the app — the app measures, and
-what the numbers are supposed to be is a separate, citable claim:
+envelope. The spec lives in a file, not in the app — the app measures, and what
+the numbers are *supposed* to be is a separate, citable claim:
 [`models/mx25r6435f_datasheet.json`](models/mx25r6435f_datasheet.json),
-transcribed from **Macronix MX25R6435F Rev. 1.6, August 08 2022, §15
-(Erase and Programming Performance), p.75**.
+transcribed from **Macronix MX25R6435F Rev. 1.6, August 08 2022, §15 (Erase and
+Programming Performance), p.75**.
 
 ```
-python3 tools/l0_timing.py spec -m models/mx25r64_nrf5340dk_derived.json \
+python3 tools/l0_timing.py spec -m models/mx25r64_nrf5340dk_direct.json \
     --spec models/mx25r6435f_datasheet.json
 ```
 
 ```
-  measured: erase 1106.3 ms per 65536 B block; program 7.566 ms per 256 B page;
-            29.55 us per byte
+  measured: erase 1061.4 ms per 65536 B block; program 3.112 ms per 256 B page;
+            12.16 us per byte
 
   ultra_low_power  (Configuration Register-2 bit 1 = 0)
     parameter            measured        typ        max   verdict
-    block erase 65536 B   1106.32ms   800.00ms  3500.00ms   typ..max (1.38x typ)
-    page program 256 B       7.57ms     3.20ms    10.00ms   typ..max (2.36x typ)
-    per byte programmed     29.55us    40.00us   100.00us   under typ (0.74x typ)
+    block erase 65536 B   1061.43ms   800.00ms  3500.00ms   typ..max (1.33x typ)
+    page program 256 B       3.11ms     3.20ms    10.00ms   under typ (0.97x typ)
+    per byte programmed     12.16us    40.00us   100.00us   under typ (0.30x typ)
 
   high_performance  (Configuration Register-2 bit 1 = 1)
-    block erase 65536 B   1106.32ms   480.00ms  3000.00ms   typ..max (2.30x typ)
-    page program 256 B       7.57ms     0.85ms     4.00ms   OVER MAX (1.89x max)
-    per byte programmed     29.55us    32.00us   100.00us   under typ (0.92x typ)
+    block erase 65536 B   1061.43ms   480.00ms  3000.00ms   typ..max (2.21x typ)
+    page program 256 B       3.11ms     0.85ms     4.00ms   typ..max (3.66x typ)
+    per byte programmed     12.16us    32.00us   100.00us   under typ (0.38x typ)
 
-  -> consistent with ultra_low_power only
+  -> consistent with ultra_low_power and high_performance; this measurement
+     does not separate them.
 ```
 
-Three things come out of this.
+**Reality matches the specification, everywhere, with room to spare.** Nothing
+approaches a maximum in either mode. The headline is the page program: a full
+256 B page measures **3.11 ms against a 3.2 ms Ultra Low Power typical — 0.97×,
+within 3 % of the datasheet's typical figure**, taken at room temperature where
+"typ" is defined. The erase sits at 1.33× the ULP typical, which is the ordinary
+gap between a 25 °C all-zero-pattern number and a real one.
 
-**Reality matches the specification, but only in one of the two modes.**
-Nothing exceeds an Ultra Low Power maximum. Against High Performance the page
-program is **1.89× over max**, which is not a "slower than typical" — max is
-quoted at 85 °C and minimum VCC, so a room-temperature measurement above it
-cannot be explained by conditions.
+The per-byte figure is 0.30× the Byte Program typical (12.16 µs against 40 µs),
+and that is the expected direction: one page-program command covering N bytes
+should beat N individual byte programs, and here it does so by about 3×.
 
-**So the part is running in Ultra Low Power mode, and that was measured, not
-assumed.** The mode is Configuration Register-2 bit 1, the L/H switch. It is a
-*volatile* bit whose power-on value comes from the part's ordering code, Rev
-1.6 removed the generic default from the datasheet, and Zephyr's
-`nordic,qspi-nor` driver never writes CR2 — so a board runs whatever the part
-powers up as, and nothing in the schematic or the devicetree says which that
-is. The timing does.
+**Which mode? Ultra Low Power, on the weight of evidence — but this does not
+prove it.** Both modes stay inside their maxima, so neither is excluded. What
+separates them is distance from typical: on page program ULP is 0.97× and HP is
+3.66×; on erase ULP is 1.33× and HP is 2.21×. Both parameters point the same
+way, and ULP is where the part would sit if nothing set the bit — which is the
+case, since the L/H switch is a *volatile* Configuration-Register-2 bit whose
+power-on value comes from the ordering code, and Zephyr's `nordic,qspi-nor`
+driver never writes CR2.
 
-This is worth knowing beyond bookkeeping: High Performance mode would cut the
-64 KB erase from a typical 0.8 s to 0.48 s and the page program from 3.2 ms to
-0.85 ms. `blob_db_prepare()` of 100 buckets is ~110 s of erase on this board;
-the same work in High Performance mode is specified at ~48 s. Whether that
-trade against idle current is worth making is a product decision, but it is
-not currently *being* made — it is being defaulted into.
+> **Correction.** An earlier revision of this section reached the same
+> conclusion far too strongly, from the §3 *derived* model: it put the page
+> program at 7.57 ms, which is 1.89× over the High Performance maximum, and
+> concluded that HP was excluded outright. §5 shows why that was wrong — the
+> derived per-byte terms are inflated ~2.4× by `blob_db` CPU that the stack-level
+> fit could not separate from flash time. With the direct measurement the
+> exclusion disappears and only a preponderance argument remains. The lesson is
+> the one §5 draws twice: a stack-level fit must not be pointed at a datasheet,
+> because the datasheet specifies the part and the fit describes the part plus
+> everything above it.
 
-**Erase is unremarkable and the write path is not.** 1.106 s against a typical
-0.8 s is the ordinary gap between a datasheet's 25 °C all-zero-pattern figure
-and a real one. The write path is the interesting column, and it is where §4b's
-question gets a second, independent answer:
-
-- Per byte, the measurement is **0.74× the Byte Program typ** (29.55 µs vs
-  40 µs). That is the right direction — one page-program command covering N
-  bytes should beat N individual byte programs — but only by a quarter.
-- Per page, the measurement is **2.36× the Page Program typ**. A full 256 B
-  page program is specified at 3.2 ms typical and measures ~7.6 ms.
-
-Those two facts together say the part is behaving much more like "40 µs per
-byte" than like "3.2 ms per page, whatever the size" — which is exactly what
-§4b concluded from the two mean write sizes, arrived at independently. If the
-part charged a flat page program the 48 B write in `update` would cost 3.2 ms
-typical; it costs 1.740 ms, *less than a typical full-page program*. A part
-cannot program a partial page faster than a full one if the cost is per page.
-
-The `write` and `write_pg` matrices settle it directly on the board, and §4b
-says what each must show.
+Worth acting on regardless: **High Performance mode is being defaulted into
+rather than chosen.** It is specified to cut the 64 KB erase from 0.8 s typical
+to 0.48 s and the page program from 3.2 ms to 0.85 ms. `blob_db_prepare()` of
+100 buckets is ~110 s of erase on this board, and the same work in HP mode is
+specified at ~66 s. Whether that is worth the idle-current trade is a product
+decision; right now it is not being made.
 
 ### What this does not check
 
 The datasheet specifies the part's *internal* erase and program times. It says
 nothing about the SPI bus time to shift data in, nor about the driver's
-per-call overhead — and those are exactly the model's **fixed** terms (read
-67.7 µs, write 314.5 µs), which is why `spec` refuses to compare them against
-anything. The read slope (631 ns/B ≈ 1.55 MB/s, against 4 MB/s theoretical at
-8 MHz Quad-SPI) is a bus-and-driver figure too, and §15 has no row for it.
+per-call overhead — and those are exactly the model's **fixed** terms
+(read 65.7 µs, write 157.1 µs), which is why `spec` refuses to compare them
+against anything.
 
-One more datasheet row worth carrying into the erase-span sweep: **chip erase
-is typ 120 s** in Ultra Low Power, while erasing the same 8 MB as 128 separate
-64 KB blocks is 128 × 0.8 = 102 s typical. On this part a whole-device erase is
-*not* a shortcut, so the answer to "is a 32-block erase cheaper than 32
-one-block erases" is predicted to be **no** — and if the sweep finds a large
-win, the driver is doing something the datasheet's command times do not
-predict, which is worth knowing.
+The read path has no §15 row at all, and its own ceiling is the better
+yardstick: **3 837 KiB/s measured against 4 MB/s theoretical at 8 MHz
+Quad-SPI — 98 % of the bus.**
 
-## 6. Feeding the simulator back
+One more row worth carrying into the erase-span sweep: **chip erase is typ
+120 s** in Ultra Low Power, while erasing the same 8 MB as 128 separate 64 KB
+blocks is 128 × 0.8 = 102 s typical. On this part a whole-device erase is not a
+shortcut — and the board run agrees: per-block cost is 1 111 ms for a 1-block
+call and 1 059 ms within a 32-block call, a 4.7 % saving that comes from
+amortising the 51.6 ms per-call overhead, not from a cheaper erase command.
+
+## 7. Feeding the simulator back
 
 `simconf` turns a model into flash-simulator knobs, picking the operating point
 from a run's actual operation mix:
@@ -451,3 +629,4 @@ l0end status=0
 
 Every row is flat because the simulator is flat. §1b is where the analysis is
 exercised against curves that are not.
+

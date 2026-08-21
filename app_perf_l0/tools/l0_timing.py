@@ -162,16 +162,31 @@ def wls(points, weight="rel"):
     def solve(pts):
         """Centered normal equations, not the textbook raw-moment ones.
 
-        The raw form computes b as (S*Sxy - Sx*Sy) / (S*Sxx - Sx^2). Here the
-        weights span ten decades (1/y^2 over a cost range of 67 us to 41 ms)
-        and x spans five, so both halves of each difference are enormous and
-        nearly equal: the subtraction cancels away most of the significant
-        digits and the recovered slope comes out as noise — in the case that
-        found this, a *negative* slope on data lying exactly on a line, which
-        then tripped the clamp and produced a flat model with 99.8 % error.
+        The raw form computes b as (S*Sxy - Sx*Sy) / (S*Sxx - Sx^2), and it
+        failed here in two different ways before this was rewritten — both of
+        them silent.
 
-        Centering on the weighted mean removes the cancellation: the sums
-        being subtracted are already the deviations.
+        On the DK capture it failed at the *guard*: the code rejected a
+        near-singular system with `abs(det) < 1e-12`, but det carries the
+        units of the weights, and weight="rel" makes those 1/y^2. The capture
+        emits nanoseconds, so det landed at 1.2e-13 for a perfectly
+        conditioned 15-point sweep and the guard threw it away, returning the
+        weighted mean with slope zero. The same data in microseconds gives
+        det=0.12 and passes: a pure change of time unit flipped the model from
+        affine to flat.
+
+        On synthetic data it failed at the *arithmetic*: with weights spanning
+        ten decades and x spanning five, both halves of each difference are
+        enormous and nearly equal, the subtraction cancels away most of the
+        significant digits, and the slope came back NEGATIVE on points lying
+        exactly on a line — which then tripped the non-negativity clamp and
+        produced a flat model at 99.8 % error.
+
+        Centering on the weighted mean removes both. There is no det to scale
+        a guard against, and the sums being accumulated are already deviations,
+        so nothing large is subtracted from anything large. Sxx is a sum of
+        non-negative terms and is zero only when every x is identical, which
+        is the one genuinely degenerate case.
         """
         sw = sx = sy = 0.0
         for x, y in pts:

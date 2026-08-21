@@ -253,14 +253,23 @@ per-operation cost in `blob_db` — the slot scan, the CRC — lands in the fixe
 terms and inflates them. So a derived model is a stand-in that says so in every
 line of output, and an `app_perf_l0` run on the board supersedes it.
 [`models/mx25r64_nrf5340dk_derived.json`](models) is one, together with the
-captures it came from and a leave-one-out cross-validation of it.
+captures it came from and a leave-one-out cross-validation of it — and
+[`models/mx25r64_nrf5340dk_direct.json`](models) is the board run that
+superseded it. Comparing the two is instructive: the derived model's per-byte
+terms are inflated ~2.4× because the stack phases it was solved from have reads
+and writes co-occurring, so the two are collinear there and `blob_db`'s CPU was
+split across both in proportion. Only a sweep that varies one call at a time
+separates them. `RESULTS.md` §5 has the scorecard.
 
 ## What the model does not include
 
-- **CPU time between flash calls.** The prediction is the flash cost only. On a
-  part where an erase is a second and a page program is milliseconds that is
-  noise; on a fast part it is not, and `verify` is how you find out which case
-  you are in. A `verify` ratio consistently below 1.0 is that CPU time.
+- **CPU time between flash calls.** The prediction is the flash cost only, and
+  on this stack that turned out to be a large omission for transfer-bound work:
+  measured on the DK, erase-bound phases predict at 0.98–1.00× while
+  transfer-bound ones predict at 0.57×, so **43 % of a transfer-bound phase is
+  CPU above L0** — slot walking, header parsing, CRC, memcpy. `verify` is how
+  you find out which case a workload is in, and that split is the number this
+  app exists to produce.
 - **Anything under a wear-levelling layer.** UBI issues flash operations of its
   own *beneath* the seam where `CONFIG_BLOB_DB_IOSTATS` counts, so a UBI run's
   counters do not describe all the traffic its wall-clock paid for. Predictions
