@@ -122,6 +122,16 @@ jobs:
           west build -p always -b nrf5340dk/nrf5340/cpuapp -d build/nrf_perf \
             key_value_db/app_perf
 
+      # app_perf_l0 produces the L0 cost model that turns a native_sim run
+      # into a predicted hardware time, so it is flashed for exactly the same
+      # reason app_perf is. It links no storage stack, which is the point:
+      # nothing above L0 can perturb its timings, and nothing above L0 can
+      # keep it compiling either, so it needs its own build step.
+      - name: Build app_perf_l0 (ARM)
+        run: |
+          west build -p always -b nrf5340dk/nrf5340/cpuapp -d build/nrf_perf_l0 \
+            key_value_db/app_perf_l0
+
       # Same reasoning for app_cbor_persondb: both frontends, because the shell
       # one pulls in a subsystem the benchmark build never links.
       - name: Build app_cbor_persondb — benchmark frontend (ARM)

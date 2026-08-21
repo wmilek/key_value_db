@@ -1,0 +1,461 @@
+{
+  "schema": "l0-timing-model/1",
+  "name": "mx25r64_nrf5340dk_derived",
+  "source": "derived",
+  "timing": "real",
+  "board": "nrf5340dk/nrf5340/cpuapp",
+  "geometry": {
+    "part_bytes": 8388608,
+    "block_bytes": 65536,
+    "blocks": 128,
+    "write_align": 4,
+    "erased_val": 255
+  },
+  "fit": {
+    "weight": "rel",
+    "size_range": null,
+    "method": "nnls"
+  },
+  "model": {
+    "read": {
+      "fixed_ns": 67727.70642389875,
+      "per_byte_ns": 630.9489813205391,
+      "points": 36,
+      "max_rel_error": 0.08612663131294011,
+      "note": "",
+      "residuals": []
+    },
+    "write": {
+      "fixed_ns": 314454.8479045963,
+      "per_byte_ns": 29554.89239708323,
+      "points": 36,
+      "max_rel_error": 0.08612663131294011,
+      "note": "",
+      "residuals": []
+    },
+    "erase": {
+      "fixed_ns": 0.0,
+      "per_block_ns": 1106315751.555675,
+      "points": 36,
+      "max_rel_error": 0.08612663131294011,
+      "note": "",
+      "residuals": []
+    }
+  },
+  "page_straddle": [],
+  "curve": {
+    "read": [],
+    "write": [],
+    "erase": []
+  },
+  "notes": [
+    "derived from stack-level observations (counters + wall-clock), not from a direct L0 measurement",
+    "per-operation CPU time above L0 is folded into the fixed terms",
+    "every observation erased exactly one block per call, so the per-call erase term is unidentifiable; all erase cost is attributed per block"
+  ],
+  "derivation": {
+    "captures": [
+      "app_perf_l0/models/observations_nrf5340dk_flash_area.txt"
+    ],
+    "observations": [
+      {
+        "source": "app_perf_l0/models/observations_nrf5340dk_flash_area.txt",
+        "phase": "read",
+        "reads": 605,
+        "bytes_read": 8650,
+        "writes": 0,
+        "bytes_written": 0,
+        "erases": 0,
+        "bytes_erased": null,
+        "measured_ms": 46
+      },
+      {
+        "source": "app_perf_l0/models/observations_nrf5340dk_flash_area.txt",
+        "phase": "update",
+        "reads": 1000,
+        "bytes_read": 14800,
+        "writes": 100,
+        "bytes_written": 4800,
+        "erases": 0,
+        "bytes_erased": null,
+        "measured_ms": 251
+      },
+      {
+        "source": "app_perf_l0/models/observations_nrf5340dk_flash_area.txt",
+        "phase": "read",
+        "reads": 605,
+        "bytes_read": 8650,
+        "writes": 0,
+        "bytes_written": 0,
+        "erases": 0,
+        "bytes_erased": null,
+        "measured_ms": 46
+      },
+      {
+        "source": "app_perf_l0/models/observations_nrf5340dk_flash_area.txt",
+        "phase": "update",
+        "reads": 1198,
+        "bytes_read": 17176,
+        "writes": 100,
+        "bytes_written": 4800,
+        "erases": 0,
+        "bytes_erased": null,
+        "measured_ms": 265
+      },
+      {
+        "source": "app_perf_l0/models/observations_nrf5340dk_flash_area.txt",
+        "phase": "lg write",
+        "reads": 168,
+        "bytes_read": 2576,
+        "writes": 269,
+        "bytes_written": 269584,
+        "erases": 133,
+        "bytes_erased": null,
+        "measured_ms": 154408
+      },
+      {
+        "source": "app_perf_l0/models/observations_nrf5340dk_flash_area.txt",
+        "phase": "lg rewrite",
+        "reads": 1048,
+        "bytes_read": 15744,
+        "writes": 277,
+        "bytes_written": 269712,
+        "erases": 9,
+        "bytes_erased": null,
+        "measured_ms": 17918
+      },
+      {
+        "source": "app_perf_l0/models/observations_nrf5340dk_flash_area.txt",
+        "phase": "lg read",
+        "reads": 30755,
+        "bytes_read": 8742276,
+        "writes": 0,
+        "bytes_written": 0,
+        "erases": 0,
+        "bytes_erased": null,
+        "measured_ms": 7458
+      },
+      {
+        "source": "app_perf_l0/models/observations_nrf5340dk_flash_area.txt",
+        "phase": "lg pread q0",
+        "reads": 710,
+        "bytes_read": 89224,
+        "writes": 0,
+        "bytes_written": 0,
+        "erases": 0,
+        "bytes_erased": null,
+        "measured_ms": 102
+      },
+      {
+        "source": "app_perf_l0/models/observations_nrf5340dk_flash_area.txt",
+        "phase": "lg pread q1",
+        "reads": 714,
+        "bytes_read": 91270,
+        "writes": 0,
+        "bytes_written": 0,
+        "erases": 0,
+        "bytes_erased": null,
+        "measured_ms": 104
+      },
+      {
+        "source": "app_perf_l0/models/observations_nrf5340dk_flash_area.txt",
+        "phase": "lg pread q2",
+        "reads": 727,
+        "bytes_read": 91426,
+        "writes": 0,
+        "bytes_written": 0,
+        "erases": 0,
+        "bytes_erased": null,
+        "measured_ms": 116
+      },
+      {
+        "source": "app_perf_l0/models/observations_nrf5340dk_flash_area.txt",
+        "phase": "lg pread q3",
+        "reads": 727,
+        "bytes_read": 91040,
+        "writes": 0,
+        "bytes_written": 0,
+        "erases": 0,
+        "bytes_erased": null,
+        "measured_ms": 105
+      },
+      {
+        "source": "app_perf_l0/models/observations_nrf5340dk_flash_area.txt",
+        "phase": "lg pwrite",
+        "reads": 1651,
+        "bytes_read": 99708,
+        "writes": 160,
+        "bytes_written": 77912,
+        "erases": 64,
+        "bytes_erased": null,
+        "measured_ms": 72708
+      },
+      {
+        "source": "app_perf_l0/models/observations_nrf5340dk_flash_area.txt",
+        "phase": "read",
+        "reads": 605,
+        "bytes_read": 8650,
+        "writes": 0,
+        "bytes_written": 0,
+        "erases": 0,
+        "bytes_erased": null,
+        "measured_ms": 47
+      },
+      {
+        "source": "app_perf_l0/models/observations_nrf5340dk_flash_area.txt",
+        "phase": "update",
+        "reads": 800,
+        "bytes_read": 11400,
+        "writes": 100,
+        "bytes_written": 4800,
+        "erases": 0,
+        "bytes_erased": null,
+        "measured_ms": 236
+      },
+      {
+        "source": "app_perf_l0/models/observations_nrf5340dk_flash_area.txt",
+        "phase": "read",
+        "reads": 605,
+        "bytes_read": 8650,
+        "writes": 0,
+        "bytes_written": 0,
+        "erases": 0,
+        "bytes_erased": null,
+        "measured_ms": 47
+      },
+      {
+        "source": "app_perf_l0/models/observations_nrf5340dk_flash_area.txt",
+        "phase": "update",
+        "reads": 998,
+        "bytes_read": 13776,
+        "writes": 100,
+        "bytes_written": 4800,
+        "erases": 0,
+        "bytes_erased": null,
+        "measured_ms": 249
+      },
+      {
+        "source": "app_perf_l0/models/observations_nrf5340dk_flash_area.txt",
+        "phase": "lg write",
+        "reads": 168,
+        "bytes_read": 2576,
+        "writes": 269,
+        "bytes_written": 269584,
+        "erases": 133,
+        "bytes_erased": null,
+        "measured_ms": 154060
+      },
+      {
+        "source": "app_perf_l0/models/observations_nrf5340dk_flash_area.txt",
+        "phase": "lg rewrite",
+        "reads": 1040,
+        "bytes_read": 14616,
+        "writes": 277,
+        "bytes_written": 269712,
+        "erases": 9,
+        "bytes_erased": null,
+        "measured_ms": 18145
+      },
+      {
+        "source": "app_perf_l0/models/observations_nrf5340dk_flash_area.txt",
+        "phase": "lg read",
+        "reads": 30755,
+        "bytes_read": 8742276,
+        "writes": 0,
+        "bytes_written": 0,
+        "erases": 0,
+        "bytes_erased": null,
+        "measured_ms": 7501
+      },
+      {
+        "source": "app_perf_l0/models/observations_nrf5340dk_flash_area.txt",
+        "phase": "lg pread q0",
+        "reads": 710,
+        "bytes_read": 89224,
+        "writes": 0,
+        "bytes_written": 0,
+        "erases": 0,
+        "bytes_erased": null,
+        "measured_ms": 103
+      },
+      {
+        "source": "app_perf_l0/models/observations_nrf5340dk_flash_area.txt",
+        "phase": "lg pread q1",
+        "reads": 714,
+        "bytes_read": 91270,
+        "writes": 0,
+        "bytes_written": 0,
+        "erases": 0,
+        "bytes_erased": null,
+        "measured_ms": 105
+      },
+      {
+        "source": "app_perf_l0/models/observations_nrf5340dk_flash_area.txt",
+        "phase": "lg pread q2",
+        "reads": 727,
+        "bytes_read": 91426,
+        "writes": 0,
+        "bytes_written": 0,
+        "erases": 0,
+        "bytes_erased": null,
+        "measured_ms": 117
+      },
+      {
+        "source": "app_perf_l0/models/observations_nrf5340dk_flash_area.txt",
+        "phase": "lg pread q3",
+        "reads": 727,
+        "bytes_read": 91040,
+        "writes": 0,
+        "bytes_written": 0,
+        "erases": 0,
+        "bytes_erased": null,
+        "measured_ms": 105
+      },
+      {
+        "source": "app_perf_l0/models/observations_nrf5340dk_flash_area.txt",
+        "phase": "lg pwrite",
+        "reads": 1651,
+        "bytes_read": 99708,
+        "writes": 160,
+        "bytes_written": 77912,
+        "erases": 64,
+        "bytes_erased": null,
+        "measured_ms": 74050
+      },
+      {
+        "source": "app_perf_l0/models/observations_nrf5340dk_flash_area.txt",
+        "phase": "read",
+        "reads": 605,
+        "bytes_read": 8650,
+        "writes": 0,
+        "bytes_written": 0,
+        "erases": 0,
+        "bytes_erased": null,
+        "measured_ms": 46
+      },
+      {
+        "source": "app_perf_l0/models/observations_nrf5340dk_flash_area.txt",
+        "phase": "update",
+        "reads": 800,
+        "bytes_read": 11400,
+        "writes": 100,
+        "bytes_written": 4800,
+        "erases": 0,
+        "bytes_erased": null,
+        "measured_ms": 235
+      },
+      {
+        "source": "app_perf_l0/models/observations_nrf5340dk_flash_area.txt",
+        "phase": "read",
+        "reads": 605,
+        "bytes_read": 8650,
+        "writes": 0,
+        "bytes_written": 0,
+        "erases": 0,
+        "bytes_erased": null,
+        "measured_ms": 46
+      },
+      {
+        "source": "app_perf_l0/models/observations_nrf5340dk_flash_area.txt",
+        "phase": "update",
+        "reads": 998,
+        "bytes_read": 13776,
+        "writes": 100,
+        "bytes_written": 4800,
+        "erases": 0,
+        "bytes_erased": null,
+        "measured_ms": 248
+      },
+      {
+        "source": "app_perf_l0/models/observations_nrf5340dk_flash_area.txt",
+        "phase": "lg write",
+        "reads": 168,
+        "bytes_read": 2576,
+        "writes": 269,
+        "bytes_written": 269584,
+        "erases": 133,
+        "bytes_erased": null,
+        "measured_ms": 153981
+      },
+      {
+        "source": "app_perf_l0/models/observations_nrf5340dk_flash_area.txt",
+        "phase": "lg rewrite",
+        "reads": 1040,
+        "bytes_read": 14616,
+        "writes": 277,
+        "bytes_written": 269712,
+        "erases": 9,
+        "bytes_erased": null,
+        "measured_ms": 18249
+      },
+      {
+        "source": "app_perf_l0/models/observations_nrf5340dk_flash_area.txt",
+        "phase": "lg read",
+        "reads": 92135,
+        "bytes_read": 11623044,
+        "writes": 0,
+        "bytes_written": 0,
+        "erases": 0,
+        "bytes_erased": null,
+        "measured_ms": 13331
+      },
+      {
+        "source": "app_perf_l0/models/observations_nrf5340dk_flash_area.txt",
+        "phase": "lg pread q0",
+        "reads": 710,
+        "bytes_read": 89224,
+        "writes": 0,
+        "bytes_written": 0,
+        "erases": 0,
+        "bytes_erased": null,
+        "measured_ms": 102
+      },
+      {
+        "source": "app_perf_l0/models/observations_nrf5340dk_flash_area.txt",
+        "phase": "lg pread q1",
+        "reads": 714,
+        "bytes_read": 91270,
+        "writes": 0,
+        "bytes_written": 0,
+        "erases": 0,
+        "bytes_erased": null,
+        "measured_ms": 104
+      },
+      {
+        "source": "app_perf_l0/models/observations_nrf5340dk_flash_area.txt",
+        "phase": "lg pread q2",
+        "reads": 727,
+        "bytes_read": 91426,
+        "writes": 0,
+        "bytes_written": 0,
+        "erases": 0,
+        "bytes_erased": null,
+        "measured_ms": 116
+      },
+      {
+        "source": "app_perf_l0/models/observations_nrf5340dk_flash_area.txt",
+        "phase": "lg pread q3",
+        "reads": 727,
+        "bytes_read": 91040,
+        "writes": 0,
+        "bytes_written": 0,
+        "erases": 0,
+        "bytes_erased": null,
+        "measured_ms": 105
+      },
+      {
+        "source": "app_perf_l0/models/observations_nrf5340dk_flash_area.txt",
+        "phase": "lg pwrite",
+        "reads": 1651,
+        "bytes_read": 99708,
+        "writes": 160,
+        "bytes_written": 77912,
+        "erases": 64,
+        "bytes_erased": null,
+        "measured_ms": 74761
+      }
+    ],
+    "loo_median_abs_error": 0.014260693155728756,
+    "loo_worst_abs_error": 0.09059250609894594
+  }
+}

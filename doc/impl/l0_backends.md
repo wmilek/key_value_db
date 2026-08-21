@@ -158,8 +158,13 @@ choice BLOB_DB_BACKEND                        # in lib/blob_db/Kconfig
   shipped default with those cases skipping themselves.
 - Every other suite (`blob_db_contract`, `kvdb`, `rootreg`) runs on the
   default, i.e. UBI.
-- CI builds `app` on both backends on both targets, and `app_perf` on the DK
-  so the benchmark binary cannot rot.
+- CI builds `app` on both backends on both targets, and `app_perf` and
+  `app_perf_l0` on the DK so the benchmark binaries cannot rot.
+- `app_perf_l0` measures the `flash_area` provider directly — no blob_db in
+  the image — sweeping transfer size and erase span. The cost model fitted
+  from it (`app_perf_l0/tools/l0_timing.py`) converts the seam's I/O counters
+  into predicted wall-clock, which is what makes a `native_sim` run at the
+  target's geometry a statement about the target.
 
 ## 7. Open items
 
@@ -168,7 +173,9 @@ choice BLOB_DB_BACKEND                        # in lib/blob_db/Kconfig
 2. **`blob_db_iostats` undercounts on UBI** — the counters instrument the
    blob_db→store seam, above UBI's own header reads (§1). Either document the
    figure as blob_db-level only (it is, today) or push accounting into the
-   provider.
+   provider. This now costs more than an inaccurate ratio: the L0 timing model
+   consumes those counters, so a predicted time for a UBI build is a lower
+   bound by exactly the traffic they miss.
 3. **The `ubi` module tracks a fork branch** — `feature/leb-partial-update`,
    for `ubi_leb_write_at()`, which is still pending upstream. `west.yml`
    records the condition for moving back to a release tag.

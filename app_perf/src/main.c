@@ -230,11 +230,17 @@ static void io_line(const char *what, size_t useful_bytes)
 	const uint32_t er = now.erases - io_mark.erases;
 	const uint64_t brd = now.bytes_read - io_mark.bytes_read;
 	const uint64_t bwr = now.bytes_written - io_mark.bytes_written;
+	/* Erase BYTES, not just calls: one call may cover one erase block or
+	 * the whole partition (blob_db_erase_all() does exactly that), and a
+	 * cost model fed only the call count cannot tell those apart. This is
+	 * the field app_perf_l0/tools/l0_timing.py needs to charge an erase
+	 * per block; captures older than it carry the count alone. */
+	const uint64_t ber = now.bytes_erased - io_mark.bytes_erased;
 
 	printk("   io %-10s: rd %6u ops/%8llu B   wr %5u ops/%8llu B   "
-	       "er %4u",
+	       "er %4u ops/%8llu B",
 	       what, rd, (unsigned long long)brd, wr,
-	       (unsigned long long)bwr, er);
+	       (unsigned long long)bwr, er, (unsigned long long)ber);
 
 	/* Amplification against the bytes the caller actually asked for. */
 	if (useful_bytes > 0) {

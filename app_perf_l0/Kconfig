@@ -1,0 +1,64 @@
+# L0 flash_area timing benchmark — Kconfig entry point.
+
+menu "Zephyr"
+source "Kconfig.zephyr"
+endmenu
+
+module = APP_PERF_L0
+module-str = APP_PERF_L0
+source "subsys/logging/Kconfig.template.log_config"
+
+config APP_PERF_L0_MAX_XFER
+	int "Largest transfer size swept, in bytes"
+	default 65536
+	range 16 262144
+	help
+	  Upper end of the read/write size sweep, clamped at runtime to one
+	  erase block. Sets the size of the app's single static buffer, so it
+	  is also the app's RAM cost — lower it on a small-RAM board.
+
+	  The layers above read and write whole sectors during compaction, so
+	  a model fitted from a sweep that stops short of the erase block has
+	  to extrapolate for exactly those operations.
+
+config APP_PERF_L0_REGION_BLOCKS
+	int "Erase blocks the benchmark may destroy"
+	default 32
+	range 2 1024
+	help
+	  The benchmark works in the first N erase blocks of
+	  storage_partition and erases them repeatedly. Everything in them is
+	  lost. Clamped at runtime to the partition's block count.
+
+	  This also bounds the erase-size sweep, which doubles its span up to
+	  half this number, and the write sweep, which may not write past it.
+
+config APP_PERF_L0_TARGET_MS
+	int "Target duration of one sweep point, in milliseconds"
+	default 50
+	range 1 10000
+	help
+	  Each read/write sweep point repeats its operation until roughly this
+	  much time has passed, so that the cycle counter's resolution and any
+	  one-off jitter are negligible against the batch. Raising it buys
+	  precision at a linear cost in run time.
+
+config APP_PERF_L0_MAX_REPS
+	int "Repetition ceiling for one sweep point"
+	default 4096
+	range 1 1000000
+	help
+	  Bounds the batch for operations so cheap that TARGET_MS would ask
+	  for millions of them — on the flash simulator a small read is
+	  nanoseconds, and without this the sweep would never finish.
+
+config APP_PERF_L0_ERASE_REPS
+	int "How many times each erase span is repeated"
+	default 3
+	range 1 100
+	help
+	  Erase time on NOR varies with wear and with the block's contents, so
+	  a span is erased several times and the spread is reported alongside
+	  the mean. Each repetition costs a full erase of the span — on a part
+	  with 1 s block erases and a 16-block span, that is 16 s per
+	  repetition.
