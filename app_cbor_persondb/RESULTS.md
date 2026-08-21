@@ -485,10 +485,30 @@ costing ~26 KB of RAM and only in that build. The frontend was previously
 buildable but not runnable, which is how a footprint row existed for something
 that had never executed a command on hardware.
 
-Verified against the 10 000-person store: `stat`, `show`, `cardof` and `check`
-all work, and an interactive `check` costs **27.0 ms** against the 26.79 ms §5f
-measures for the same operation in the benchmark — the two frontends agree, as
-`DESIGN.md` §9 says they should.
+Verified against the 10 000-person store: `stat`, `show`, `cardof`, `card` and
+`check` all work.
+
+The shell also exposed that `scenario_now_us()` was reading `k_uptime_get()` —
+whole milliseconds, multiplied by 1 000 to look like microseconds. Invisible in
+the benchmark, where every phase averages over 200 samples, and ±3.7 % on the
+shell's single-shot `check`. It now reads `k_uptime_ticks()`, which on this SoC
+is 32 768 Hz, so ~30.5 µs. The difference:
+
+```
+before:  GRANTED in 27000 us   DENIED in 28000 us   (1 ms quantisation)
+after:   GRANTED in 27314 us   DENIED in 27314 us
+```
+
+Five consecutive decisions measured 27 313–27 314 µs, so **an access decision is
+deterministic to ~1 µs** and the apparent 27/28 ms jitter was entirely the clock.
+Against §5f's 26.785 ms (run 1) and 27.350 ms (run 2) for the same operation
+under the benchmark frontend, the interactive path lands inside the run-to-run
+spread — the two frontends agree, as `DESIGN.md` §9 says they should.
+
+It also sharpens §6's point about denials: **GRANTED and DENIED cost the same to
+the microsecond** when the card is real, because both resolve card → person →
+record and only the permission match differs. Only an *unknown card* is cheap
+(§5f's `miss`, 12.5 ms), because it stops after one lookup.
 
 ### It does not move the needle on this app, and here is why
 
