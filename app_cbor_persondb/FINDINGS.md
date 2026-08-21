@@ -881,20 +881,47 @@ compiles, mounts, passes `create`, and fails 36 records into a multi-hour fill.
 The app ships `16384` instead, and prj.conf carries this arithmetic beside the
 symbol so the next person to raise it finds out here rather than there.
 
-### K13 — The directory blob caps how much of the medium a store can use (major, **`hit`**)
+### K13 — The largest blob caps how much of the medium a store can use (major, **`hit`** — **relieved, not retired**)
 
-**The application's maximum is 9 670 persons** — 4 192 710 B live, **49.9 % of
+**Relieved by the two-level `kvhash`.** The mechanism below is unchanged and
+still binds; what changed is the size of the blob it binds on. With one level
+the largest blob was the 16 384 B bucket directory and the store stopped at
+9 670 persons. With two levels the directory is a few hundred bytes and the
+largest blob is a ~4–8 KB *bucket*, so the same rule bites much later:
+
+| | one level | two levels |
+|---|--:|--:|
+| largest blob | 16 384 B (directory) | ~4–8 KB (a bucket) |
+| ceiling | **9 670 persons** | **~13 900** |
+| usable partition | 49.9 % | **67.2 % measured at 13 000; ~72 % at the ceiling** |
+| 10 000 persons | `-ENOSPC` at 9 670 | **completes**, 51.6 % live, zero overflows |
+
+The ceiling is a property of the medium, not of the declared geometry: a store
+declared at 14 000 stops at person 13 844 and one declared at 20 000 stops at
+14 048 — nearly the same number from very different bucket counts. That is the
+signature of this finding rather than K2's.
+
+**It is not retired, and the reason matters.** There is still a largest blob,
+it still has to fit the free space of one erase block, and the store still
+reports `-ENOSPC` with no warning first — the near-full signal of §9.7 is a
+*bucket* signal and stayed silent through every run above, correctly, because
+this is a medium wall. An application still cannot see it coming (B3, V3) and
+still cannot recover from it (K3, K6).
+
+**Below is the finding as first measured, on the one-level container.**
+
+**The application's maximum was 9 670 persons** — 4 192 710 B live, **49.9 % of
 an 8 MiB partition** — measured, not projected: 9 670 completes fill, verify,
 mutate, re-verify and the benchmark with zero bucket overflows, and person
 9 671 fails with `-ENOSPC` at any configured scale (a run set to 20 000 stops at
 the same index).
 
 **The benchmark was re-sized because of this finding**, to 8 000 persons
-(`DESIGN.md` §6.5) — 17 % under the ceiling, holding at 41.3 % live across
-repeated rounds. The ceiling is the finding; 8 000 is what lets the app keep
-reporting it instead of failing to run. Raising the constant back toward 9 670
-does not test anything this entry does not already record, and puts a
-multi-hour fill on the DK next to a cliff.
+(`DESIGN.md` §6.5) — 17 % under the then-ceiling, holding at 41.3 % live across
+repeated rounds. That re-size was correct for the one-level container and is now
+conservative for the two-level one, which completes 10 000 with room to spare.
+Whether to restore 10 000 is a benchmark decision (D14/D15), not a consequence
+of this finding, and it is deliberately left open here.
 
 Half the medium is free and the store cannot take another record. What is full
 is not the flash and not a bucket — it is the set of places a **16 384 B blob**

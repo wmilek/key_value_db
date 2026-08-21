@@ -36,7 +36,29 @@ int64_t scenario_now_us(void)
 	 * work; it is not comparable to hardware, and RESULTS.md says so. */
 	return (int64_t)native_rtc_gettime_us(RTC_CLOCK_PSEUDOHOSTREALTIME);
 #else
-	return k_uptime_get() * 1000;
+	/* Ticks, not k_uptime_get(): the millisecond clock was reporting whole
+	 * milliseconds and multiplying by 1000 to look like microseconds, which
+	 * is invisible when a phase averages over 200 samples and useless for
+	 * the shell's single-shot `check` — 27 ms quantised to 1 ms is +-3.7 %,
+	 * and it cannot separate the 26.79 and 27.35 ms two benchmark runs
+	 * measured for the same operation (RESULTS.md §5f).
+	 *
+	 * On this SoC CONFIG_SYS_CLOCK_TICKS_PER_SEC is 32 768, so this reads
+	 * to ~30.5 us — the same resolution k_cycle_get_32() offers here,
+	 * because the RTC is both the tick and the cycle source.
+	 *
+	 * k_uptime_ticks() rather than k_cycle_get_32() because this function
+	 * returns an ABSOLUTE time that scenario_since_us() subtracts, and the
+	 * 32-bit cycle counter wraps every 36 h at 32 768 Hz — the nRF5340 does
+	 * not set CONFIG_TIMER_HAS_64BIT_CYCLE_COUNTER, so there is no 64-bit
+	 * cycle counter to reach for. Ticks are int64 and monotonic.
+	 *
+	 * For sub-microsecond work the portable escape is CONFIG_TIMING_FUNCTIONS
+	 * (timing_counter_get(), DWT-backed at 128 MHz on Cortex-M), but it
+	 * needs explicit init and its 32-bit counters wrap in 33.5 s there —
+	 * shorter than a single fill phase.
+	 */
+	return k_ticks_to_us_floor64(k_uptime_ticks());
 #endif
 }
 

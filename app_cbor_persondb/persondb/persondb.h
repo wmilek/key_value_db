@@ -73,15 +73,26 @@ struct persondb_stat {
 	uint32_t populated;          /* persons written so far */
 	uint32_t rev;                /* mutation revision */
 	uint8_t  n_people_maps;
-	/* The bucket count is deliberately absent: the app asks for the largest
-	 * map kvhash can build and there is no way to read back what it got
-	 * (FINDINGS.md K9(c), K10). Reporting a number the firmware cannot
-	 * observe would be inventing one — tools/sizing.py models it instead. */
+
+	/* The geometry the container chose, read back through map_ops.stat().
+	 * This used to be absent with an apology: the app asked for the largest
+	 * map kvhash could build and had no way to learn what it got (K9(c),
+	 * K10), so the report printed "bucket count not observable" and
+	 * tools/sizing.py modelled it instead. The app now declares a
+	 * population and the container derives the shape — which makes reading
+	 * it back the only way to see what that derivation did. */
+	uint8_t  people_depth;
+	uint32_t people_buckets;
+	uint8_t  cred_depth;
+	uint32_t cred_buckets;
 
 	size_t   partition_bytes;    /* read from devicetree — see B3, X1 row 7.
 				      * Wrong on the UBI backend, undetectably. */
 
 	uint32_t enospc_hits;        /* F11: bucket overflows, never expected */
+	uint32_t near_full_hits;     /* sets whose bucket passed the container's
+				      * near-full threshold — the early warning
+				      * that a geometry is tighter than declared */
 
 	/* Map-level work this module performed. */
 	uint64_t map_gets;
