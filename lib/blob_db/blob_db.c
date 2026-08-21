@@ -1228,10 +1228,22 @@ static int compact_commit(uint16_t bid, const uint8_t *new_buf, size_t new_len)
 		return -ENOSPC;
 	}
 
-	/* Step 1: enter atomic window. */
+	/* Step 1: enter atomic window.
+	 *
+	 * Every master this function stamps carries st.next_id_hint, not
+	 * st.next_id. The field is a leading ceiling (§13.1), and alloc_id
+	 * batches its master writes: it persists a ceiling BLOB_DB_ID_HINT_STEP
+	 * ids ahead, then hands ids out from RAM until it reaches that ceiling.
+	 * Writing the allocation pointer here would publish a master below the
+	 * ceiling alloc_id is still allocating against — lowering the durable
+	 * bound without lowering the RAM copy alloc_id compares to, so nothing
+	 * would re-persist it before the next mount. Mount's bucket scan would
+	 * repair the bound ids, but the ceiling exists to cover the ids a scan
+	 * cannot see: allocated-but-unbound. Carry the ceiling forward instead.
+	 */
 	uint8_t inactive = !st.active_master;
 	int rc = write_master(inactive, st.master_gen + 1,
-			      BLOB_DB_STATE_COMPACTING, bid, st.next_id);
+			      BLOB_DB_STATE_COMPACTING, bid, st.next_id_hint);
 	if (rc < 0) {
 		return rc;
 	}
@@ -1284,7 +1296,7 @@ static int compact_commit(uint16_t bid, const uint8_t *new_buf, size_t new_len)
 	/* Step 5: leave atomic window. */
 	inactive = !st.active_master;
 	COMPACT_OR_WEDGE(write_master(inactive, st.master_gen + 1,
-				      BLOB_DB_STATE_CLEAN, 0, st.next_id));
+				      BLOB_DB_STATE_CLEAN, 0, st.next_id_hint));
 #undef COMPACT_OR_WEDGE
 	st.active_master = inactive;
 	st.master_gen++;
@@ -1373,8 +1385,12 @@ static int recover_compaction(uint16_t bid)
 
 	const uint8_t inactive = !st.active_master;
 
+	/* The ceiling, for the reason given in compact_commit(). Only mount
+	 * calls this, and mount has just set next_id = next_id_hint, so the two
+	 * are equal here today; naming the ceiling keeps that an observation
+	 * rather than something this write depends on. */
 	rc = write_master(inactive, st.master_gen + 1,
-			  BLOB_DB_STATE_CLEAN, 0, st.next_id);
+			  BLOB_DB_STATE_CLEAN, 0, st.next_id_hint);
 	if (rc < 0) {
 		return rc;
 	}
