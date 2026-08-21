@@ -587,15 +587,39 @@ and 12 B measured 63.2. A first-difference test over adjacent points has no
 defence against one bad batch, and at these sizes the whole signal is smaller
 than the outlier.
 
-**So the verdict line should be gated on the points that can support it** —
-either a minimum per-op duration, or a median over repeated batches, or by
-fitting the marginal over a window rather than adjacent pairs. As printed it
-will call a perfectly affine part non-affine on any board whose small-transfer
-timings carry occasional interference, which is every board.
-
 That is a defect in the check, not in the model: the fitted coefficients are
 unaffected, because the fit is weighted least squares over all points rather
 than a first difference between neighbours.
+
+#### Fixed: the verdict is now gated
+
+`gated_marginals()` replaces the adjacent-pair range with two structural gates,
+neither of them a tuned constant:
+
+- **only above the fixed-cost crossover, n ≥ a/b** — the same crossover the
+  throughput lines already print (266 B read, 13 B write). Below it the byte
+  term is a minority of the measurement, so a difference there is mostly noise.
+- **pair across an octave, not with the neighbour** — each surviving point pairs
+  with the first later point at ≥ 2× its size, so Δn ≥ n and noise passes
+  through at ~2ε instead of being amplified by n/Δn.
+
+The device's ungated range is still printed beside it, because it is what the
+board measured and a reader should see what the gate removed.
+
+| | device, adjacent, ungated | **gated, octave pairs** | verdict |
+|---|--:|--:|---|
+| read | −18 752 … 17 075 | **244.1 … 272.0 ns/B** | affine |
+| write | 9 568 … 14 312 | **10 860.9 … 12 278.6 ns/B** | affine |
+
+It reproduces on the `6ca2f7d` capture, which has no `l0lin` line at all —
+read 229.9–253.9, write 10 846.9–12 272.9, both affine. Two captures taken a day
+apart, one coarse and one fine, agreeing on the shape is worth more than either.
+
+**A staircase still trips it**, which is the property that matters: secants
+across an octave of a page-quantised cost disagree with each other (29.5 against
+19.7 µs/B for a 256 B page), and `tools/selftest.py` covers exactly that — its
+page-wise synthetic device is still reported non-affine, and its affine device
+still reports affine.
 
 ### What the `6ca2f7d` capture could not show
 

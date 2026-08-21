@@ -249,6 +249,55 @@ def wls(points, weight="rel"):
     return a, b, note
 
 
+def gated_marginals(points, a, b):
+    """Marginal cost (ns/B) over pairs that can actually support the estimate.
+
+    A first difference between *adjacent* sweep points is a poor estimator of
+    the slope, and it gets worse as the sweep gets finer. The error in dt/dn
+    is about 2*eps*t/dn for a per-point noise eps, so it grows as dn shrinks:
+    on the DK matrix capture the 1.5x midpoints (dn/n = 0.33..0.5) turned ~5 %
+    batch-to-batch variance into an 18 % swing, and one outlying batch — a 6 B
+    read measuring 112.8 us where its neighbours measured 63..79 — produced a
+    marginal of -18752 ns/B. A cost that cannot be negative was reported as
+    negative, and the verdict built on that range called an affine part "NOT
+    affine". So the sweep that was made finer to *see* structure made this
+    particular test blinder.
+
+    Two gates, both structural rather than tuned:
+
+    - **Only above the fixed-cost crossover, n >= a/b.** Below it the byte
+      term is a minority of the measurement, so a difference there is mostly
+      noise. This is the same crossover the throughput lines already print
+      (266 B read, 13 B write on the DK), not a new constant.
+    - **Pair across an octave, not with the neighbour.** Each surviving point
+      is paired with the first later point at >= 2x its size, so dn >= n and
+      noise passes through at ~2*eps instead of being amplified by n/dn.
+
+    `b` comes from the fit, which is weighted least squares over every point,
+    so it does not inherit this problem.
+
+    A staircase still trips the test: secants across an octave of a
+    page-quantised cost disagree with each other (29.5 vs 19.7 us/B for a
+    256 B page), which is what the spread is read for.
+
+    Returns (slopes, n_used, n_excluded) with slopes as
+    (lo_size, hi_size, ns_per_b).
+    """
+    if b <= 0:
+        return [], 0, len(points)
+    crossover = a / b
+    pts = sorted(points)
+    usable = [(x, y) for x, y in pts if x >= crossover]
+    excluded = len(pts) - len(usable)
+    slopes = []
+    for i, (x0, y0) in enumerate(usable):
+        for x1, y1 in usable[i + 1:]:
+            if x1 >= 2 * x0:
+                slopes.append((x0, x1, (y1 - y0) / (x1 - x0)))
+                break
+    return slopes, len(slopes), excluded
+
+
 def residuals(points, a, b):
     """Per-point relative error of the fitted line, worst-first summary."""
     out = []
@@ -285,6 +334,7 @@ def build_model(geom, rows, lin=None, name=None, weight="rel",
 
     model = {}
     curve = {}
+    gated = {}
     for op, pts, unit in (
         ("read", pts_rw("read"), "per_byte_ns"),
         ("write", pts_rw("write"), "per_byte_ns"),
@@ -301,6 +351,24 @@ def build_model(geom, rows, lin=None, name=None, weight="rel",
             "residuals": res,
         }
         curve[op] = [[x, y] for x, y in pts]
+
+        # Gated marginal range: the honest version of the device's l0lin
+        # summary. Only for the transfer classes — erase is swept over block
+        # counts, where every adjacent pair already spans an octave or more.
+        if op in ("read", "write") and b > 0 and len(pts) >= 3:
+            slopes, used, rej = gated_marginals(pts, a, b)
+            if used:
+                vals = [m for _, _, m in slopes]
+                gated[op] = {
+                    "min": min(vals),
+                    "max": max(vals),
+                    "used": used,
+                    "rejected": rej,
+                    "pairs": [[lo, hi, m] for lo, hi, m in slopes],
+                }
+
+    if gated:
+        model["gated_marginal"] = gated
 
     # The page-straddle probe is reported, never folded into the fit: it is a
     # different operation (one transfer, two program pages) and averaging it
@@ -937,29 +1005,50 @@ def show_model(model, verbose=False):
     # together: a slope with a 10x marginal spread behind it is an average,
     # not a description.
     lin = model.get("linearity") or {}
-    if lin:
+    gm = (model.get("model") or {}).get("gated_marginal") or {}
+    if lin or gm:
         print("\n  marginal cost across the sweep (d ns / d B) — constant "
               "iff the cost is affine:")
         for op in ("read", "write"):
-            if op not in lin:
+            e = lin.get(op)
+            g = gm.get(op)
+            if not e and not g:
                 continue
-            e = lin[op]
-            sp = e.get("spread")
-            if e["marginal_max_ns_per_b"] <= 0:
+            if e is None:
+                # Capture predates the device's l0lin line. The gated range is
+                # computed from the swept points, so it needs nothing from it.
+                print(f"    {op:<6} device summary absent in this capture")
+                e = None
+
+            # The device differences ADJACENT points, which cannot support a
+            # verdict — see gated_marginals(). Its range is still printed,
+            # because it is what the board measured and a reader should be
+            # able to see what the gate removed, but the verdict comes from
+            # the gated pairs.
+            if e is not None:
+                print(f"    {op:<6} device, adjacent pairs, ungated: "
+                      f"{e['marginal_min_ns_per_b']:9.2f} .. "
+                      f"{e['marginal_max_ns_per_b']:9.2f} ns/B")
+
+            if not g or g["used"] < 2:
+                print(f"    {'':<6} gated: fewer than two octave pairs "
+                      f"above the crossover -> no verdict")
+                continue
+
+            lo, hi = g["min"], g["max"]
+            sp = (hi / lo) if lo > 0 else None
+            if hi <= 0:
                 verdict = "flat: cost does not depend on size"
             elif sp is None:
-                # The marginal touches zero or goes negative somewhere while
-                # being positive elsewhere. That is the signature of a cost
-                # that is flat across a range and then steps — a page program
-                # — not of a missing measurement.
                 verdict = ("NOT affine: flat over part of the sweep, "
                            "stepped elsewhere")
             elif sp <= 1.25:
                 verdict = "affine"
             else:
                 verdict = f"NOT affine, {sp:.2f}x spread"
-            print(f"    {op:<6} {e['marginal_min_ns_per_b']:9.2f} .. "
-                  f"{e['marginal_max_ns_per_b']:9.2f} ns/B   -> {verdict}")
+            print(f"    {'':<6} gated, octave pairs ({g['used']} used, "
+                  f"{g['rejected']} points below the crossover excluded): "
+                  f"{lo:9.2f} .. {hi:9.2f} ns/B   -> {verdict}")
 
     stair = model.get("page_program") or []
     if stair:
