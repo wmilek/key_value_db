@@ -1,0 +1,192 @@
+*** Booting Zephyr OS build 4a405846193f ***
+l0 perf 1.0.0 — raw flash_area timing
+l0geom part_bytes=8388608 block_bytes=65536 blocks=128 write_align=4 erased_val=0xff region_blocks=32 max_xfer=65536 program_page=256 cycles_per_s=32768 source=hardware timing=real board=nrf5340dk/nrf5340/cpuapp
+partition 8388608 B, 128 blocks of 65536 B, write align 4, erased 0xff
+working region: first 32 block(s) = 2097152 B  (THIS ERASES THEM)
+
+-- erase: cost vs erase size --
+l0raw op=erase blocks=1 ops=3 total_ns=3273162840 ns_per_op=1091054280 ns_per_block=1091054280 min_ns=1091033935 max_ns=1091094970
+  erase                 1 blk x3           1091.054 ms/call      1091.054 ms/block
+l0raw op=erase blocks=2 ops=3 total_ns=6545928954 ns_per_op=2181976318 ns_per_block=1090988159 min_ns=2181976318 max_ns=2181976318
+  erase                 2 blk x3           2181.976 ms/call      1090.988 ms/block
+l0raw op=erase blocks=4 ops=3 total_ns=12879455565 ns_per_op=4293151855 ns_per_block=1073287963 min_ns=4283050537 max_ns=4303253173
+  erase                 4 blk x3           4293.151 ms/call      1073.287 ms/block
+l0raw op=erase blocks=8 ops=3 total_ns=25788940428 ns_per_op=8596313476 ns_per_block=1074539184 min_ns=8576110839 max_ns=8616516113
+  erase                 8 blk x3           8596.313 ms/call      1074.539 ms/block
+l0raw op=erase blocks=16 ops=3 total_ns=52759460447 ns_per_op=17586486815 ns_per_block=1099155425 min_ns=17515777587 max_ns=17647094726
+  erase                16 blk x3          17586.486 ms/call      1099.155 ms/block
+l0raw op=erase blocks=32 ops=3 total_ns=105993408202 ns_per_op=35331136067 ns_per_block=1104098002 min_ns=35243591308 max_ns=35374908447
+  erase                32 blk x3          35331.136 ms/call      1104.098 ms/block
+l0raw op=erase1 blocks=1 ops=32 total_ns=35387847882 ns_per_op=1105870246 ns_per_block=1105870246 min_ns=1040527343 max_ns=1161743164
+  erase1                1 blk x32          1105.870 ms/call  (spread 1040.527..1161.743 ms)
+
+-- read: cost vs transfer size --
+     size      ops         us/op        KiB/s       ns/B   marginal ns/B
+l0raw op=read size=1 ops=819 total_ns=50231933 ns_per_op=61333
+        1      819        61.333           15   61333.00         -
+l0raw op=read size=2 ops=546 total_ns=33599853 ns_per_op=61538
+        2      546        61.538           31   30769.00       205.00
+l0raw op=read size=3 ops=819 total_ns=50537109 ns_per_op=61705
+        3      819        61.705           46   20568.33       167.00
+l0raw op=read size=4 ops=819 total_ns=64453125 ns_per_op=78697
+        4      819        78.697           48   19674.25     16992.00
+l0raw op=read size=6 ops=546 total_ns=61614990 ns_per_op=112847
+        6      546       112.847           51   18807.83     17075.00
+l0raw op=read size=8 ops=546 total_ns=41137695 ns_per_op=75343
+        8      546        75.343          103    9417.87    -18752.00
+l0raw op=read size=12 ops=819 total_ns=51727294 ns_per_op=63159
+       12      819        63.159          184    5263.25     -3046.00
+l0raw op=read size=16 ops=819 total_ns=57037353 ns_per_op=69642
+       16      819        69.642          223    4352.62      1620.75
+l0raw op=read size=24 ops=819 total_ns=59661865 ns_per_op=72847
+       24      819        72.847          321    3035.29       400.62
+l0raw op=read size=32 ops=546 total_ns=47760009 ns_per_op=87472
+       32      546        87.472          356    2733.50      1828.12
+l0raw op=read size=48 ops=546 total_ns=44982910 ns_per_op=82386
+       48      546        82.386          568    1716.37      -317.87
+l0raw op=read size=64 ops=819 total_ns=67962646 ns_per_op=82982
+       64      819        82.982          752    1296.59        37.25
+l0raw op=read size=96 ops=409 total_ns=37231445 ns_per_op=91030
+       96      409        91.030         1029     948.22       251.50
+l0raw op=read size=128 ops=409 total_ns=41809082 ns_per_op=102222
+      128      409       102.222         1222     798.60       349.75
+l0raw op=read size=192 ops=409 total_ns=52246093 ns_per_op=127741
+      192      409       127.741         1467     665.31       398.73
+l0raw op=read size=256 ops=327 total_ns=46539306 ns_per_op=142322
+      256      327       142.322         1755     555.94       227.82
+l0raw op=read size=384 ops=273 total_ns=45623779 ns_per_op=167120
+      384      273       167.120         2243     435.20       193.73
+l0raw op=read size=512 ops=273 total_ns=54473876 ns_per_op=199538
+      512      273       199.538         2504     389.72       253.26
+l0raw op=read size=768 ops=182 total_ns=48126220 ns_per_op=264429
+      768      182       264.429         2835     344.30       253.48
+l0raw op=read size=1024 ops=148 total_ns=50140380 ns_per_op=338786
+     1024      148       338.786         2951     330.84       290.45
+l0raw op=read size=1536 ops=109 total_ns=50415039 ns_per_op=462523
+     1536      109       462.523         3242     301.12       241.67
+l0raw op=read size=2048 ops=86 total_ns=50628662 ns_per_op=588705
+     2048       86       588.705         3396     287.45       246.44
+l0raw op=read size=3072 ops=58 total_ns=49194335 ns_per_op=848178
+     3072       58       848.178         3536     276.09       253.39
+l0raw op=read size=4096 ops=45 total_ns=49835205 ns_per_op=1107449
+     4096       45      1107.449         3611     270.37       253.19
+l0raw op=read size=6144 ops=30 total_ns=49072265 ns_per_op=1635742
+     6144       30      1635.742         3667     266.23       257.95
+l0raw op=read size=8192 ops=23 total_ns=49346923 ns_per_op=2145518
+     8192       23      2145.518         3728     261.90       248.91
+l0raw op=read size=12288 ops=15 total_ns=47729492 ns_per_op=3181966
+    12288       15      3181.966         3770     258.94       253.03
+l0raw op=read size=16384 ops=11 total_ns=46417236 ns_per_op=4219748
+    16384       11      4219.748         3791     257.55       253.36
+l0raw op=read size=24576 ops=7 total_ns=44128417 ns_per_op=6304059
+    24576        7      6304.059         3806     256.51       254.43
+l0raw op=read size=32768 ops=5 total_ns=41870117 ns_per_op=8374023
+    32768        5      8374.023         3821     255.55       252.68
+l0raw op=read size=49152 ops=3 total_ns=37567138 ns_per_op=12522379
+    49152        3     12522.379         3833     254.76       253.19
+l0raw op=read size=65536 ops=3 total_ns=49987792 ns_per_op=16662597
+    65536        3     16662.597         3840     254.25       252.69
+l0lin op=read cmarg_min=-1875200 cmarg_max=1707500
+  marginal cost -18752.00 .. 17075.00 ns/B
+  -> NOT affine: the marginal cost is zero or negative over part of the sweep
+     and clearly positive elsewhere. A cost that is flat across a range and
+     then steps looks exactly like this; the page-program table below says
+     whether that is what this is.
+
+-- write: cost vs transfer size --
+     size      ops         us/op        KiB/s       ns/B   marginal ns/B
+l0raw op=write size=4 ops=234 total_ns=48675537 ns_per_op=208015
+        4      234       208.015           18   52003.75         -
+l0raw op=write size=8 ops=182 total_ns=46661376 ns_per_op=256381
+        8      182       256.381           30   32047.62     12091.50
+l0raw op=write size=12 ops=148 total_ns=46417236 ns_per_op=313629
+       12      148       313.629           37   26135.75     14312.00
+l0raw op=write size=16 ops=136 total_ns=48004150 ns_per_op=352971
+       16      136       352.971           43   22060.68      9835.50
+l0raw op=write size=24 ops=117 total_ns=52673339 ns_per_op=450199
+       24      117       450.199           51   18758.29     12153.50
+l0raw op=write size=32 ops=96 total_ns=50567626 ns_per_op=526746
+       32       96       526.746           58   16460.81      9568.37
+l0raw op=write size=48 ops=68 total_ns=50506591 ns_per_op=742743
+       48       68       742.743           62   15473.81     13499.81
+l0raw op=write size=64 ops=54 total_ns=49346923 ns_per_op=913831
+       64       54       913.831           68   14278.60     10693.00
+l0raw op=write size=96 ops=38 total_ns=49743652 ns_per_op=1309043
+       96       38      1309.043           71   13635.86     12350.37
+l0raw op=write size=128 ops=29 total_ns=49102783 ns_per_op=1693199
+      128       29      1693.199           73   13228.11     12004.87
+l0raw op=write size=192 ops=20 total_ns=49621582 ns_per_op=2481079
+      192       20      2481.079           75   12922.28     12310.62
+l0raw op=write size=256 ops=15 total_ns=48797607 ns_per_op=3253173
+      256       15      3253.173           76   12707.70     12063.96
+l0raw op=write size=384 ops=10 total_ns=48339843 ns_per_op=4833984
+      384       10      4833.984           77   12588.50     12350.08
+l0raw op=write size=512 ops=7 total_ns=44738769 ns_per_op=6391252
+      512        7      6391.252           78   12482.91     12166.15
+l0raw op=write size=768 ops=5 total_ns=47668457 ns_per_op=9533691
+      768        5      9533.691           78   12413.66     12275.15
+l0raw op=write size=1024 ops=3 total_ns=38024902 ns_per_op=12674967
+     1024        3     12674.967           78   12377.89     12270.60
+l0raw op=write size=1536 ops=2 total_ns=37902832 ns_per_op=18951416
+     1536        2     18951.416           79   12338.16     12258.68
+l0raw op=write size=2048 ops=1 total_ns=25238037 ns_per_op=25238037
+     2048        1     25238.037           79   12323.26     12278.55
+l0raw op=write size=3072 ops=1 total_ns=37811279 ns_per_op=37811279
+     3072        1     37811.279           79   12308.35     12278.55
+l0raw op=write size=4096 ops=1 total_ns=50354003 ns_per_op=50354003
+     4096        1     50354.003           79   12293.45     12248.75
+l0raw op=write size=6144 ops=1 total_ns=75469970 ns_per_op=75469970
+     6144        1     75469.970           79   12283.52     12263.65
+l0raw op=write size=8192 ops=1 total_ns=100585937 ns_per_op=100585937
+     8192        1    100585.937           79   12278.55     12263.65
+l0raw op=write size=12288 ops=1 total_ns=150787353 ns_per_op=150787353
+    12288        1    150787.353           79   12271.10     12256.20
+l0raw op=write size=16384 ops=1 total_ns=201049804 ns_per_op=201049804
+    16384        1    201049.804           79   12271.10     12271.10
+l0raw op=write size=24576 ops=1 total_ns=301574707 ns_per_op=301574707
+    24576        1    301574.707           79   12271.10     12271.10
+l0raw op=write size=32768 ops=1 total_ns=402069091 ns_per_op=402069091
+    32768        1    402069.091           79   12270.17     12267.38
+l0raw op=write size=49152 ops=1 total_ns=603027343 ns_per_op=603027343
+    49152        1    603027.343           79   12268.62     12265.51
+l0raw op=write size=65536 ops=1 total_ns=803985595 ns_per_op=803985595
+    65536        1    803985.595           79   12267.84     12265.51
+l0lin op=write cmarg_min=956837 cmarg_max=1431200
+  marginal cost 9568.37 .. 14312.00 ns/B  (1.49x spread)
+  -> NOT affine: the per-byte cost varies 1.49x across the sweep, so a
+     single slope misprices some sizes. The fit's residuals say by how much.
+
+-- write: page-program staircase (each transfer page-aligned) --
+     size      ops         us/op        KiB/s       ns/B   marginal ns/B
+l0raw op=write_pg size=64 ops=32 total_ns=29479980 ns_per_op=921249
+       64       32       921.249           67   14394.51         -
+l0raw op=write_pg size=128 ops=32 total_ns=54412841 ns_per_op=1700401
+      128       32      1700.401           73   13284.38     12174.25
+l0raw op=write_pg size=252 ops=32 total_ns=102416992 ns_per_op=3200531
+      252       32      3200.531           76   12700.51     12097.82
+l0raw op=write_pg size=256 ops=32 total_ns=104034423 ns_per_op=3251075
+      256       32      3251.075           76   12699.51     12636.00
+l0raw op=write_pg size=260 ops=32 total_ns=107086181 ns_per_op=3346443
+      260       32      3346.443           75   12870.93     23842.00
+l0raw op=write_pg size=384 ops=32 total_ns=154907226 ns_per_op=4840850
+      384       32      4840.850           77   12606.38     12051.66
+l0raw op=write_pg size=512 ops=32 total_ns=204559326 ns_per_op=6392478
+      512       32      6392.478           78   12485.30     12122.09
+l0raw op=write_pg size=516 ops=32 total_ns=207336425 ns_per_op=6479263
+      516       32      6479.263           77   12556.71     21696.25
+l0raw op=write_pg size=768 ops=32 total_ns=304992675 ns_per_op=9531021
+      768       32      9531.021           78   12410.18     12110.15
+l0raw op=write_pg size=1024 ops=32 total_ns=405487060 ns_per_op=12671470
+     1024       32     12671.470           78   12374.48     12267.37
+
+-- write: page-straddle penalty (same size, offset by one align unit) --
+     size      ops         us/op        KiB/s       ns/B   marginal ns/B
+l0raw op=write_unaligned size=256 ops=64 total_ns=209960937 ns_per_op=3280639
+      256       64      3280.639           76   12814.99         -
+l0raw op=write_unaligned size=512 ops=64 total_ns=410949707 ns_per_op=6421089
+      512       64      6421.089           77   12541.18     12267.38
+l0raw op=write_unaligned size=4096 ops=64 total_ns=3223480224 ns_per_op=50366878
+     4096       64     50366.878           79   12296.60     12261.65
+l0end status=0
+
+done. Feed this capture to tools/l0_timing.py fit.

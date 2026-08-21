@@ -936,7 +936,70 @@ def show_model(model):
     # fitted slope replaces. Printed next to the fit so the two are read
     # together: a slope with a 10x marginal spread behind it is an average,
     # not a description.
-    lin = model.get("linearity") or {}
+    # Recomputed from the curve rather than taken from the capture's own
+    # l0lin summary. The device can only gate its adjacent-step statistic when
+    # the capture carries per-point noise, and older captures do not — but the
+    # full curve is right here, so the robust statistics can be derived
+    # regardless of what the device was able to say at the time.
+    lin = dict(model.get("linearity") or {})
+    for op in ("read", "write"):
+        pts = sorted(model.get("curve", {}).get(op) or [])
+        if len(pts) < 3:
+            continue
+        steps = [(pts[i][1] - pts[i - 1][1]) / (pts[i][0] - pts[i - 1][0])
+                 for i in range(1, len(pts)) if pts[i][0] > pts[i - 1][0]]
+        if not steps:
+            continue
+        ordered = sorted(steps)
+        # Overall slope: denominator is the whole size range, so one bad batch
+        # moves it by a rounding error.
+        overall = ((pts[-1][1] - pts[0][1]) / (pts[-1][0] - pts[0][0]))
+
+        # Which steps can say anything about the slope? Only those where the
+        # change being measured is a real fraction of the cost being measured.
+        # At small sizes the size step is a few bytes while the cost is
+        # dominated by the intercept, so the numerator of the first difference
+        # is almost entirely whatever noise the two batches carried — which is
+        # how a clean read curve produced marginals of -18 752 ns/B.
+        #
+        # A percentile band does not fix this: on a geometric ladder most of
+        # the steps ARE at small sizes, so the noisy ones are the majority and
+        # the band tracks them. The device gates on each point's measured
+        # pass-to-pass spread, which is better; this is the fallback for
+        # captures taken before it recorded that.
+        MIN_SIGNAL = 0.05
+        useful = []
+        for i in range(1, len(pts)):
+            dn = pts[i][0] - pts[i - 1][0]
+            if dn <= 0 or pts[i - 1][1] <= 0:
+                continue
+            if overall * dn >= MIN_SIGNAL * pts[i - 1][1]:
+                useful.append((pts[i][1] - pts[i - 1][1]) / dn)
+        band = sorted(useful) if useful else ordered
+        med = band[len(band) // 2]
+        lin[op] = {
+            "marginal_min_ns_per_b": ordered[0],
+            "marginal_max_ns_per_b": ordered[-1],
+            "overall_ns_per_b": overall,
+            "median_ns_per_b": med,
+            "q1_ns_per_b": band[len(band) // 4],
+            "q3_ns_per_b": band[min(len(band) - 1, 3 * len(band) // 4)],
+            "used": len(useful),
+            "total_steps": len(steps),
+            # The test is for systematic DRIFT, not for scatter. If the median
+            # step and the whole-sweep slope agree, the curve has no sustained
+            # curvature, whatever individual steps did — and scatter around a
+            # stable median is measurement noise, not a property of the flash.
+            # A staircase fails this: its flat treads pull the median away
+            # from the overall slope.
+            #
+            # Rejecting on scatter is what made this check report "NOT affine"
+            # for a part whose own fit residual was 3.7 %. The residual table
+            # is the real test of "does one line describe this"; the marginal
+            # column is here to expose structure, and structure means drift.
+            "drift": abs(med - overall) / overall if overall > 0 else None,
+        }
+
     if lin:
         print("\n  marginal cost across the sweep (d ns / d B) — constant "
               "iff the cost is affine:")
@@ -944,22 +1007,48 @@ def show_model(model):
             if op not in lin:
                 continue
             e = lin[op]
-            sp = e.get("spread")
-            if e["marginal_max_ns_per_b"] <= 0:
-                verdict = "flat: cost does not depend on size"
-            elif sp is None:
-                # The marginal touches zero or goes negative somewhere while
-                # being positive elsewhere. That is the signature of a cost
-                # that is flat across a range and then steps — a page program
-                # — not of a missing measurement.
-                verdict = ("NOT affine: flat over part of the sweep, "
-                           "stepped elsewhere")
-            elif sp <= 1.25:
-                verdict = "affine"
+            ov = e.get("overall_ns_per_b")
+            drift = e.get("drift")
+            if ov is None:
+                print(f"    {op:<6} {e['marginal_min_ns_per_b']:9.2f} .. "
+                      f"{e['marginal_max_ns_per_b']:9.2f} ns/B")
+                continue
+            if ov <= 0:
+                verdict = "flat: cost does not grow with size"
+            elif drift is None:
+                verdict = "cannot judge"
+            elif drift <= 0.10:
+                verdict = (f"no drift ({drift * 100:.1f} %): consistent with "
+                           "affine")
             else:
-                verdict = f"NOT affine, {sp:.2f}x spread"
-            print(f"    {op:<6} {e['marginal_min_ns_per_b']:9.2f} .. "
-                  f"{e['marginal_max_ns_per_b']:9.2f} ns/B   -> {verdict}")
+                verdict = (f"DRIFTS {drift * 100:.0f} %: one slope does not "
+                           "describe this")
+            print(f"    {op:<6} overall {ov:9.2f} ns/B   median step "
+                  f"{e['median_ns_per_b']:9.2f}   -> {verdict}")
+            print(f"           step scatter (IQR) {e['q1_ns_per_b']:.0f}.."
+                  f"{e['q3_ns_per_b']:.0f} ns/B over {e.get('used', 0)} of "
+                  f"{e.get('total_steps', 0)} informative steps.")
+
+            # The three checks answer different questions and can disagree,
+            # so say so rather than letting a reader take the friendliest one.
+            # Drift sees sustained curvature. It cannot see a symmetric
+            # zigzag — which is exactly what a page-quantised cost produces on
+            # a geometric ladder, because power-of-two sizes divide the page
+            # and land on one program while the midpoints straddle onto two.
+            # The residual sees any departure from the line; write_pg says
+            # what caused it.
+            worst = m[op]["max_rel_error"]
+            if drift is not None and drift <= 0.10 and worst > 0.10:
+                print(f"           BUT the fit's worst residual is "
+                      f"{worst * 100:.0f} %: the curve departs from the line "
+                      f"without\n           drifting — a zigzag, not a bend. "
+                      f"Read the residual table, and the page-program\n"
+                      f"           staircase for the cause.")
+            else:
+                print(f"           Scatter around a stable median is "
+                      f"measurement noise; the fit residuals below\n"
+                      f"           are the test of whether one line describes "
+                      f"the curve.")
 
     stair = model.get("page_program") or []
     if stair:

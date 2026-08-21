@@ -200,12 +200,26 @@ struct sweep {
 	const char *op;
 	size_t   prev_size;
 	uint64_t prev_ns;
+	uint64_t prev_noise;   /* pass-to-pass spread of the previous point */
 	bool     have_prev;
 	/* Marginal cost range across the sweep, in centi-ns per byte, so the
 	 * spread can be reported without floating point. */
 	int64_t  marg_min;
 	int64_t  marg_max;
+	uint32_t n_used;       /* steps that cleared the significance gate */
+	uint32_t n_skipped;    /* steps too noisy to say anything */
 	bool     have_marg;
+	/* Endpoints, for the slope across the whole sweep. Its denominator is
+	 * the full size range rather than one step, so it survives an outlier
+	 * that would wreck any single first difference — which is what makes
+	 * it the headline rather than the min/max of the step column. */
+	size_t   first_size;
+	uint64_t first_ns;
+	uint64_t first_noise;
+	size_t   last_size;
+	uint64_t last_ns;
+	uint64_t last_noise;
+	bool     have_first;
 };
 
 static void sweep_begin(struct sweep *s, const char *op, const char *title)
@@ -263,18 +277,45 @@ static void sweep_row(struct sweep *s, size_t size, uint32_t ops,
 		const int64_t d_b = (int64_t)size - (int64_t)s->prev_size;
 		const int64_t cmarg = d_ns * 100 / d_b;
 
-		printk("  %8lld.%02llu", (long long)(cmarg / 100),
-		       (unsigned long long)(llabs(cmarg) % 100));
+		/*
+		 * A first difference between two adjacent points has no
+		 * defence against one bad batch: at small transfer sizes the
+		 * whole signal is smaller than a single outlier, so one
+		 * disturbed measurement produces a marginal of thousands of
+		 * ns/B, or a negative one, and a verdict built on the extremes
+		 * of this column then calls an affine part non-affine. That is
+		 * a false negative this check actually produced on a DK
+		 * capture, on a part whose fit is clean to +-1.4 %.
+		 *
+		 * The gate: a step only informs the verdict when the change it
+		 * measures is bigger than the noise of the two points that
+		 * formed it. `noise` is the pass-to-pass spread each point
+		 * reports for itself, so this is a significance test against
+		 * measured uncertainty rather than a magic threshold. Steps
+		 * that fail it are still printed -- they are data -- but
+		 * marked `?` and left out of the range.
+		 */
+		const uint64_t noise = s->prev_noise + (pmax - pmin);
+		const bool significant = d_ns > (int64_t)noise;
 
-		if (!s->have_marg) {
-			s->marg_min = s->marg_max = cmarg;
-			s->have_marg = true;
+		printk("  %8lld.%02llu%s", (long long)(cmarg / 100),
+		       (unsigned long long)(llabs(cmarg) % 100),
+		       significant ? " " : "?");
+
+		if (!significant) {
+			s->n_skipped++;
 		} else {
-			s->marg_min = MIN(s->marg_min, cmarg);
-			s->marg_max = MAX(s->marg_max, cmarg);
+			s->n_used++;
+			if (!s->have_marg) {
+				s->marg_min = s->marg_max = cmarg;
+				s->have_marg = true;
+			} else {
+				s->marg_min = MIN(s->marg_min, cmarg);
+				s->marg_max = MAX(s->marg_max, cmarg);
+			}
 		}
 	} else {
-		printk("         -");
+		printk("          -");
 	}
 
 	/* Pass-to-pass spread as a percentage of the mean. */
@@ -286,59 +327,106 @@ static void sweep_row(struct sweep *s, size_t size, uint32_t ops,
 		printk("     -\n");
 	}
 
+	if (!s->have_first) {
+		s->first_size = size;
+		s->first_ns = ns_op;
+		s->first_noise = pmax - pmin;
+		s->have_first = true;
+	}
+	s->last_size = size;
+	s->last_ns = ns_op;
+	s->last_noise = pmax - pmin;
+
 	s->prev_size = size;
 	s->prev_ns = ns_op;
+	s->prev_noise = pmax - pmin;
 	s->have_prev = true;
 }
 
-/* The verdict the matrix supports, stated rather than left to the reader. */
+/*
+ * The verdict the matrix supports, stated rather than left to the reader.
+ *
+ * Two statistics, deliberately not one:
+ *
+ *   overall — the slope across the whole sweep, (t_last - t_first) /
+ *             (n_last - n_first). Its denominator is the entire size range, so
+ *             a single disturbed batch moves it by a rounding error. This is
+ *             the robust answer to "does cost grow with size at all".
+ *   step range — the min and max of the adjacent-step column, over the steps
+ *             that rose above their own noise. This is the fine structure, and
+ *             the only thing that can catch a staircase, but it is fragile by
+ *             construction.
+ *
+ * Reporting the fragile one alone is what produced a false "NOT affine" on a
+ * DK capture whose fit was clean to +-1.4 %.
+ */
 static void sweep_end(struct sweep *s)
 {
-	if (!s->have_marg) {
+	if (!s->have_first || s->last_size <= s->first_size) {
 		return;
 	}
 
-	printk("l0lin op=%s cmarg_min=%lld cmarg_max=%lld\n", s->op,
-	       (long long)s->marg_min, (long long)s->marg_max);
+	const int64_t d_ns = (int64_t)s->last_ns - (int64_t)s->first_ns;
+	const int64_t d_b = (int64_t)s->last_size - (int64_t)s->first_size;
+	const int64_t overall = d_ns * 100 / d_b;
+	const uint64_t end_noise = s->first_noise + s->last_noise;
 
-	printk("  marginal cost %lld.%02llu .. %lld.%02llu ns/B",
+	printk("l0lin op=%s overall_cmarg=%lld cmarg_min=%lld cmarg_max=%lld "
+	       "used=%u skipped=%u\n", s->op, (long long)overall,
+	       (long long)(s->have_marg ? s->marg_min : 0),
+	       (long long)(s->have_marg ? s->marg_max : 0),
+	       s->n_used, s->n_skipped);
+
+	printk("  cost per byte across the whole sweep: %lld.%02llu ns/B\n",
+	       (long long)(overall / 100),
+	       (unsigned long long)(llabs(overall) % 100));
+
+	if (d_ns <= (int64_t)end_noise) {
+		printk("  -> cost does not grow with size: over a %zu -> %zu B "
+		       "range the total change\n     is within the "
+		       "measurement's own noise. This substrate charges per "
+		       "call.\n", s->first_size, s->last_size);
+		return;
+	}
+
+	if (s->n_used < 3) {
+		printk("  -> cost does grow with size, but only %u step(s) "
+		       "rose above their own noise,\n     so the sweep cannot "
+		       "say whether the growth is even. Read the fit's "
+		       "residuals.\n", s->n_used);
+		return;
+	}
+
+	printk("  step-to-step marginal %lld.%02llu .. %lld.%02llu ns/B",
 	       (long long)(s->marg_min / 100),
 	       (unsigned long long)(llabs(s->marg_min) % 100),
 	       (long long)(s->marg_max / 100),
 	       (unsigned long long)(llabs(s->marg_max) % 100));
 
-	if (s->marg_max <= 0) {
-		printk("\n  -> cost does not grow with size at all: this "
-		       "substrate charges per call.\n");
-		return;
-	}
 	if (s->marg_min <= 0) {
-		/* Zero here is a signal, not a gap in the measurement: a cost
-		 * that is flat across a range of sizes and then jumps — one
-		 * page program covering every transfer up to a page — has
-		 * exactly this shape. Calling it noise would report the most
-		 * interesting thing the sweep found as an absence. */
-		printk("\n  -> NOT affine: the marginal cost is zero or "
-		       "negative over part of the sweep\n     and clearly "
-		       "positive elsewhere. A cost that is flat across a range "
-		       "and\n     then steps looks exactly like this; the "
-		       "page-program table below says\n     whether that is "
-		       "what this is.\n");
+		printk("\n  -> flat over part of the sweep and clearly rising "
+		       "elsewhere, on steps that\n     cleared the noise "
+		       "gate. A cost that is constant across a range and then "
+		       "steps\n     looks exactly like this; the page-program "
+		       "table says whether that is it.\n");
 		return;
 	}
 
-	/* Spread as a ratio, in hundredths, so "1.08x" prints without a FPU. */
-	const uint64_t spread = (uint64_t)s->marg_max * 100 / (uint64_t)s->marg_min;
+	const uint64_t spread =
+		(uint64_t)s->marg_max * 100 / (uint64_t)s->marg_min;
 
-	printk("  (%llu.%02llux spread)\n", (unsigned long long)(spread / 100),
-	       (unsigned long long)(spread % 100));
+	printk("  (%llu.%02llux spread over %u of %u steps; %u too noisy to "
+	       "count)\n", (unsigned long long)(spread / 100),
+	       (unsigned long long)(spread % 100), s->n_used,
+	       s->n_used + s->n_skipped, s->n_skipped);
 	if (spread <= 125) {
 		printk("  -> affine: one fixed cost plus one cost per byte "
 		       "describes this sweep.\n");
 	} else {
 		printk("  -> NOT affine: the per-byte cost varies %llu.%02llux "
-		       "across the sweep, so a\n     single slope misprices "
-		       "some sizes. The fit's residuals say by how much.\n",
+		       "across the steps that\n     cleared the gate, so a "
+		       "single slope misprices some sizes. The fit's "
+		       "residuals\n     say by how much.\n",
 		       (unsigned long long)(spread / 100),
 		       (unsigned long long)(spread % 100));
 	}

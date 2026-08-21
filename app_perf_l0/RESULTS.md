@@ -590,7 +590,142 @@ read-dominated phases land at 0.57× because of CPU above L0, not because of
 this — but a 10 % modelling error sits underneath that number and should not be
 mistaken for signal.
 
-### What this capture cannot show
+### 5d. The matrix re-run — both gaps closed
+
+Re-run on the current app at `90f75d4`, same board and geometry. The sweep is
+now a matrix: **32 read points, 28 write, 10 `write_pg`, 7 erase**, with the
+1.5× midpoints and the page-aligned staircase probe that the `6ca2f7d` capture
+could not carry.
+
+Coefficients reproduce, which is the first thing to check — a finer grid over
+the same part should not move them:
+
+| class | `6ca2f7d` (15 pts) | **matrix (28–32 pts)** | Δ |
+|---|--:|--:|--:|
+| read per byte | 258.3 ns/B | **256.0 ns/B** | −0.9 % |
+| write per byte | 12 156.5 ns/B | **12 182.9 ns/B** | +0.2 % |
+| erase per block | 1 061.4 ms | **1 087.6 ms** | +2.5 % |
+| read fixed | 65.7 µs | 68.1 µs | +3.7 % |
+| write fixed | 157.1 µs | 158.2 µs | +0.7 % |
+
+**The erase intercept is not identified by either run** — 51.6 ms against
+8.2 ms — because every erase point is dominated by its per-block term. What both
+agree on is the sum: a 1-block erase is 1 113 ms one way and 1 096 ms the other,
+against 1 107–1 111 ms measured directly. Quote the 1-block figure, not the
+split.
+
+#### `write_pg`: no staircase, measured
+
+The test §5b had no data for. A page-quantised cost would make 252 B and 256 B
+identical and jump at 260 B:
+
+| size | µs/op | implied programs | a staircase needs |
+|--:|--:|--:|--:|
+| 252 B | 3 200.5 | 3.47 | 1 |
+| 256 B | 3 251.1 | 3.53 | 1 |
+| 260 B | 3 346.4 | 3.63 | **2** |
+| 512 B | 6 392.5 | 6.94 | 2 |
+| 516 B | 6 479.3 | 7.03 | **3** |
+| 1 024 B | 12 671.5 | 13.75 | 4 |
+
+252 → 256 costs +1.6 % for +1.6 % more bytes; 512 → 516 costs +1.4 % for
++0.8 %. The tool prints *"cost does NOT track ceil(size / page); the part or
+driver is not programming a page at a time."*
+
+**H1 is now measured, not inferred.** §5b reached the same conclusion from the
+flatness between doublings and said plainly that "implausible is not measured".
+It is measured.
+
+Stated in the terms `a170069` insists on: each extra byte costs the same
+whatever offset it lands at, which is what the staircase question asked. It does
+*not* mean a write of 260 B costs 260/256 of a 256 B write — it costs
+158.2 µs + 12.183 µs/B either way, and the fixed term is 4.9 % of a 256 B write.
+
+#### The marginal-cost verdict is a false negative
+
+The tool reports `write` **"NOT affine, 1.50x spread"** and `read` **"NOT
+affine: flat over part of the sweep, stepped elsewhere"**. Both are artefacts of
+the smallest points, and the curves are clean wherever the measurement is:
+
+| | flat above | marginal | spread |
+|---|--:|--:|--:|
+| write | 96 B | 12 004 – 12 350 ns/B | **±1.4 %** |
+| read | 512 B | 241 – 258 ns/B | ±3 % |
+
+Below those sizes the `write` marginals *alternate* high and low — 14 312,
+9 835, 12 153, 9 568, 13 500, 10 693 — which is the signature of rounding rather
+than structure, and `read` produces **negative** marginals (−18 752 ns/B at 8 B)
+that no physical cost can explain.
+
+It is not timer resolution: each point averages 546–819 repetitions, so per-op
+resolution is ~7 ns against a 30.5 µs tick. They are outliers — a 6 B read
+measured 112.8 µs where its neighbours at 4 B and 8 B measured 78.7 and 75.3,
+and 12 B measured 63.2. A first-difference test over adjacent points has no
+defence against one bad batch, and at these sizes the whole signal is smaller
+than the outlier.
+
+**So the verdict line should be gated on the points that can support it** —
+either a minimum per-op duration, or a median over repeated batches, or by
+fitting the marginal over a window rather than adjacent pairs. As printed it
+will call a perfectly affine part non-affine on any board whose small-transfer
+timings carry occasional interference, which is every board.
+
+That is a defect in the check, not in the model: the fitted coefficients are
+unaffected, because the fit is weighted least squares over all points rather
+than a first difference between neighbours.
+
+#### Fixed — and the fix needed all three suggestions
+
+Re-running the tool on this same capture now reports:
+
+```
+    read   overall    253.32 ns/B   median step    253.20   -> no drift (0.0 %): consistent with affine
+           step scatter (IQR) 251..254 ns/B over 20 of 31 informative steps.
+    write  overall  12265.42 ns/B   median step  12265.52   -> no drift (0.0 %): consistent with affine
+           step scatter (IQR) 12153..12279 ns/B over 27 of 27 informative steps.
+```
+
+Four changes, because each of the suggested gates turned out to be necessary
+and none of them sufficient alone:
+
+1. **The headline is now the slope across the whole sweep**, not the extremes
+   of the step column. Its denominator is the entire size range, so one bad
+   batch moves it by a rounding error. `read` overall 253.32 against a median
+   step of 253.20 is the evidence; the ±18 752 ns/B extremes never had any.
+2. **Steps must carry signal to be counted.** A step informs the slope only
+   where the change it measures is at least 5 % of the cost being measured.
+   On a geometric ladder most steps are at small sizes where the size moves a
+   few bytes and the cost is nearly all intercept — 11 of read's 31 steps
+   measure essentially nothing, and those were the ones deciding the verdict.
+   The device now gates on each point's **measured pass-to-pass spread**
+   instead, which is stronger; this percentile-free rule is the fallback for
+   captures taken before it recorded one.
+3. **The test is for drift, not scatter.** Comparing the median step against
+   the whole-sweep slope detects sustained curvature. Scatter around a stable
+   median is measurement noise, and rejecting on it is precisely what produced
+   the false negative — a part whose own fit residual was 3.7 %.
+4. **Each point is now measured three times** (`CONFIG_APP_PERF_L0_PASSES`),
+   with the mean reported and the extremes printed as a spread. That is what
+   gives the device the noise estimate gate 2 needs, and it turns every row
+   from a number into a number with an error bar.
+
+**One thing the drift test cannot see, and says so.** A page-quantised cost
+sampled on a geometric ladder *zigzags symmetrically*: powers of two divide
+the page and land on one program, the 1.5× midpoints straddle onto two. The
+median step still matches the overall slope, so drift correctly reports none —
+while the fit residual is large. The tool now cross-checks the two and prints
+
+> `BUT the fit's worst residual is 38 %: the curve departs from the line
+> without drifting — a zigzag, not a bend.`
+
+so a reader cannot take "consistent with affine" from one check while another
+contradicts it. The three signals answer different questions: **drift** sees a
+bend, the **residual table** sees any departure from the line, and
+**`write_pg`** identifies the cause. `tools/selftest.py` asserts all three
+behaviours against a synthetic page-quantised device, including that the
+cross-check fires.
+
+### What the `6ca2f7d` capture could not show
 
 It was taken at `6ca2f7d`, before the sweep became a matrix, so it has powers
 of two only — no 1.5× midpoints and no `write_pg` phase. The tables above are
@@ -606,9 +741,11 @@ therefore computed *from* it rather than printed *by* it, and two gaps remain:
   `ceil(n/page)`, and the tool should print *"cost does NOT track
   ceil(size / page)"*.
 
-A re-run on the current app closes both. Nothing in the fitted model changes
-with it — the coefficients come from the same 15 points either way — so this is
-a completeness item, not a correction.
+**Both are closed by §5d**, which is the re-run. Nothing in the fitted model
+changed with it — the coefficients come from the same part either way, and
+reproduced to within 0.9 % on read and 0.2 % on write — so this was a
+completeness item, not a correction. It is kept because the reasoning it
+records ("implausible is not measured") is the reason the re-run happened.
 
 ## 6. Measured against the datasheet
 
