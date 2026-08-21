@@ -15,8 +15,10 @@
  * flash_area_erase() as functions of the one parameter each of them has:
  *
  *   read  / write   — TRANSFER SIZE, from one byte (one write alignment unit
- *                     for writes) up to one erase block, in powers of two
- *                     with the 1.5x midpoints in between. Each sweep prints a
+ *                     for writes) up to one erase block, sampled
+ *                     CONFIG_APP_PERF_L0_STEPS_PER_OCTAVE times per doubling
+ *                     and each point timed CONFIG_APP_PERF_L0_PASSES times.
+ *                     Each sweep prints a
  *                     matrix — size, ops, us/op, KiB/s, ns/B, and the
  *                     MARGINAL ns/B against the row above — because that last
  *                     column is what answers "can one slope describe this":
@@ -26,6 +28,12 @@
  *                     call whatever it carries, so throughput still depends
  *                     on transfer size, which is what the KiB/s column is
  *                     there to show.
+ *   read_odd        — consecutive integer sizes either side of several
+ *                     anchors, plus the same read from shifted start offsets.
+ *                     A geometric ladder only ever samples multiples of the
+ *                     alignment above a few hundred bytes, which would hide a
+ *                     driver that splits a transfer whose length or address
+ *                     is not a whole number of controller words.
  *   write_pg        — the same write, each transfer pinned to a program-page
  *                     boundary, so a part that programs by page shows a clean
  *                     ceil(n/page) staircase instead of the average of two
@@ -93,6 +101,7 @@ LOG_MODULE_REGISTER(app_perf_l0, CONFIG_APP_PERF_L0_LOG_LEVEL);
 #define TARGET_MS     CONFIG_APP_PERF_L0_TARGET_MS
 #define MAX_REPS      CONFIG_APP_PERF_L0_MAX_REPS
 #define ERASE_REPS    CONFIG_APP_PERF_L0_ERASE_REPS
+#define PASSES        CONFIG_APP_PERF_L0_PASSES
 
 /* One buffer serves every phase; MAX_XFER is clamped to the erase block at
  * runtime, so on a part with small blocks most of it goes unused. */
@@ -205,17 +214,32 @@ static void sweep_begin(struct sweep *s, const char *op, const char *title)
 	s->op = op;
 	printk("\n-- %s --\n", title);
 	printk("     size      ops         us/op        KiB/s       ns/B   "
-	       "marginal ns/B\n");
+	       "marginal ns/B   spread\n");
+}
+
+/* Start a new group inside the same table: the next row prints no marginal.
+ * Used where consecutive rows are not consecutive sizes, so a difference
+ * across the jump would be arithmetic without meaning. */
+static void sweep_gap(struct sweep *s)
+{
+	s->have_prev = false;
 }
 
 static void sweep_row(struct sweep *s, size_t size, uint32_t ops,
-		      uint64_t total_ns)
+		      uint64_t total_ns, uint64_t pmin, uint64_t pmax)
 {
 	const uint64_t ns_op = ops ? total_ns / ops : 0;
 
-	printk("l0raw op=%s size=%zu ops=%u total_ns=%llu ns_per_op=%llu\n",
+	/* ns_per_op is the mean over every pass, which is what a cost model
+	 * wants. min/max are the per-pass extremes: a point whose passes
+	 * disagree is a point the model should not be trusted at, and without
+	 * them a single number gives no way to tell a stable measurement from
+	 * a lucky one. */
+	printk("l0raw op=%s size=%zu ops=%u total_ns=%llu ns_per_op=%llu "
+	       "min_ns=%llu max_ns=%llu\n",
 	       s->op, size, ops, (unsigned long long)total_ns,
-	       (unsigned long long)ns_op);
+	       (unsigned long long)ns_op, (unsigned long long)pmin,
+	       (unsigned long long)pmax);
 
 	/* KiB/s = size / (ns_op / 1e9) / 1024, staged to keep the intermediate
 	 * inside 64 bits for a 64 KiB transfer. */
@@ -239,7 +263,7 @@ static void sweep_row(struct sweep *s, size_t size, uint32_t ops,
 		const int64_t d_b = (int64_t)size - (int64_t)s->prev_size;
 		const int64_t cmarg = d_ns * 100 / d_b;
 
-		printk("  %8lld.%02llu\n", (long long)(cmarg / 100),
+		printk("  %8lld.%02llu", (long long)(cmarg / 100),
 		       (unsigned long long)(llabs(cmarg) % 100));
 
 		if (!s->have_marg) {
@@ -250,7 +274,16 @@ static void sweep_row(struct sweep *s, size_t size, uint32_t ops,
 			s->marg_max = MAX(s->marg_max, cmarg);
 		}
 	} else {
-		printk("         -\n");
+		printk("         -");
+	}
+
+	/* Pass-to-pass spread as a percentage of the mean. */
+	if (pmax > pmin && ns_op) {
+		printk("  %llu.%01llu%%\n",
+		       (unsigned long long)((pmax - pmin) * 100 / ns_op),
+		       (unsigned long long)((pmax - pmin) * 1000 / ns_op % 10));
+	} else {
+		printk("     -\n");
 	}
 
 	s->prev_size = size;
@@ -312,36 +345,67 @@ static void sweep_end(struct sweep *s)
 }
 
 /*
- * Sizes to sweep: powers of two, each followed by its 1.5x midpoint.
+ * The size ladder: a geometric sweep with STEPS_PER_OCTAVE linear
+ * subdivisions inside each doubling.
  *
  * Powers of two alone are exactly the wrong sample points for a cost that
  * steps at a power-of-two boundary — every sample lands on a step, the
- * staircase looks like a line through its corners, and the sweep concludes
- * "linear" about a function that is not. The midpoints break that.
+ * staircase reads as a line through its corners, and the sweep concludes
+ * "affine" about a function that is not. Subdividing each octave breaks that,
+ * and how finely is the knob: 1 gives bare powers of two, 2 adds the 1.5x
+ * midpoints, 4 gives 1x 1.25x 1.5x 1.75x, 8 halves the gaps again.
  *
- * Returns 0 when the sweep is done.
+ * Resolution is the whole reason to spend time here. A step located between
+ * two samples is only known to lie somewhere in that interval, so at 1 step
+ * per octave a feature is placed within a factor of 2 and at 8 within 9 %.
+ * The DK's read path turned out to have exactly such a feature — the measured
+ * cost across 64->128 B rose at 432 ns/B against ~253 ns/B either side — and
+ * two samples an octave apart cannot say whether that is a step, a knee, or a
+ * slope change.
+ *
+ * The ladder is built once into a static table rather than generated by a
+ * next() function, because the increments differ per octave: below
+ * `align * STEPS` the linear subdivision would ask for a sub-alignment stride,
+ * so those octaves simply carry fewer points.
  */
-static size_t sweep_first(size_t base)
-{
-	return base;
-}
+#define STEPS_PER_OCTAVE CONFIG_APP_PERF_L0_STEPS_PER_OCTAVE
 
-static size_t sweep_next(size_t size, size_t base, size_t align, size_t max)
-{
-	/* A midpoint is only reachable when it is still a whole number of
-	 * write-alignment units. */
-	if (size >= base && (size & (size - 1)) == 0) {
-		const size_t mid = size + size / 2;
+/* 17 octaves (1 B .. 64 KiB) at 8 subdivisions, plus slack for the exact
+ * endpoint. */
+static uint32_t g_sizes[17 * 8 + 4];
+static uint32_t g_nsizes;
 
-		if (mid <= max && size / 2 >= align && (size / 2) % align == 0) {
-			return mid;
+static void sizes_build(size_t base, size_t align, size_t max)
+{
+	g_nsizes = 0;
+
+	for (size_t oct = base; oct <= max; oct *= 2) {
+		size_t inc = oct / STEPS_PER_OCTAVE;
+
+		if (inc < align) {
+			inc = align;
+		}
+		for (size_t v = oct; v < oct * 2 && v <= max; v += inc) {
+			if (v % align != 0) {
+				continue;
+			}
+			if (g_nsizes > 0 && g_sizes[g_nsizes - 1] >= v) {
+				continue;
+			}
+			if (g_nsizes >= ARRAY_SIZE(g_sizes)) {
+				return;
+			}
+			g_sizes[g_nsizes++] = (uint32_t)v;
 		}
 	}
-	/* Back to the next power of two: from a midpoint 1.5s, that is 2s. */
-	const size_t pow2 = ((size & (size - 1)) == 0) ? size : (size / 3) * 2;
-	const size_t next = pow2 * 2;
 
-	return (next <= max) ? next : 0;
+	/* The largest transfer is the one the model extrapolates from, so it
+	 * is worth having exactly rather than whatever the ladder last
+	 * landed on. */
+	if (max % align == 0 && g_nsizes > 0 && g_sizes[g_nsizes - 1] != max &&
+	    g_nsizes < ARRAY_SIZE(g_sizes)) {
+		g_sizes[g_nsizes++] = (uint32_t)max;
+	}
 }
 
 /* --- sweep helpers ------------------------------------------------------ */
@@ -439,12 +503,19 @@ static int phase_erase(void)
 		       (unsigned long long)(total / calls / span / 1000 % 1000));
 	}
 
-	/* The same blocks again, one call each: the batching comparison. */
+	/* The same blocks again, one call each: the batching comparison, and
+	 * the only place the run sees a POPULATION of identical operations.
+	 * Erase time on NOR is not a constant — it varies with the block, with
+	 * its contents and with wear — so every sample is emitted individually
+	 * as well as summarised. A model carries one number for erase; this is
+	 * the spread that number is standing in for. */
 	if (span_max > 1) {
 		struct span s;
 		uint64_t total = 0, min_ns = UINT64_MAX, max_ns = 0;
+		static uint32_t samples[64];
+		uint32_t n = MIN(span_max, (uint32_t)ARRAY_SIZE(samples));
 
-		for (uint32_t b = 0; b < span_max; b++) {
+		for (uint32_t b = 0; b < n; b++) {
 			span_start(&s);
 			int rc = flash_area_erase(g_fa, (off_t)b * g.block,
 						  g.block);
@@ -455,11 +526,68 @@ static int phase_erase(void)
 			}
 			uint64_t ns = span_end(&s);
 
+			samples[b] = (uint32_t)MIN(ns, (uint64_t)UINT32_MAX);
+			printk("l0raw op=erase1_sample block=%u ns=%llu\n", b,
+			       (unsigned long long)ns);
 			total += ns;
 			min_ns = MIN(min_ns, ns);
 			max_ns = MAX(max_ns, ns);
 		}
+
+		/* Median by insertion sort of a copy: n is at most 64 and this
+		 * runs once, after several minutes of erasing. */
+		for (uint32_t i = 1; i < n; i++) {
+			uint32_t v = samples[i];
+			uint32_t j = i;
+
+			while (j > 0 && samples[j - 1] > v) {
+				samples[j] = samples[j - 1];
+				j--;
+			}
+			samples[j] = v;
+		}
+		const uint32_t med = n ? samples[n / 2] : 0;
+
+		printk("l0raw op=erase1_dist n=%u min_ns=%llu med_ns=%u "
+		       "max_ns=%llu\n", n, (unsigned long long)min_ns, med,
+		       (unsigned long long)max_ns);
+		printk("  %-16s %6u blk x%-6u  median %llu.%03llu ms  "
+		       "spread %llu.%03llu..%llu.%03llu ms (%llu.%02llux)\n",
+		       "erase1 dist", 1, n,
+		       (unsigned long long)(med / 1000000),
+		       (unsigned long long)(med / 1000 % 1000),
+		       (unsigned long long)(min_ns / 1000000),
+		       (unsigned long long)(min_ns / 1000 % 1000),
+		       (unsigned long long)(max_ns / 1000000),
+		       (unsigned long long)(max_ns / 1000 % 1000),
+		       (unsigned long long)(min_ns ? max_ns * 100 / min_ns / 100 : 0),
+		       (unsigned long long)(min_ns ? max_ns * 100 / min_ns % 100 : 0));
+
+		span_max = n;
 		raw_erase("erase1", 1, span_max, total, min_ns, max_ns);
+
+		/* Erasing a block that is already erased. A part that checks
+		 * before erasing would short-circuit; NOR generally does not,
+		 * and blob_db_prepare() re-erases blocks often enough that the
+		 * answer is worth having rather than assuming. */
+		span_start(&s);
+		int rc = flash_area_erase(g_fa, 0, g.block);
+
+		if (rc < 0) {
+			LOG_ERR("erase-already-erased: %d", rc);
+			return rc;
+		}
+		uint64_t again = span_end(&s);
+
+		printk("l0raw op=erase_erased blocks=1 ops=1 total_ns=%llu "
+		       "ns_per_op=%llu\n", (unsigned long long)again,
+		       (unsigned long long)again);
+		printk("  %-16s %6u blk x%-6u  %8llu.%03llu ms  "
+		       "(%llu%% of a median first erase)\n",
+		       "erase (erased)", 1, 1,
+		       (unsigned long long)(again / 1000000),
+		       (unsigned long long)(again / 1000 % 1000),
+		       (unsigned long long)(med ? again * 100 / med : 0));
 		printk("  %-16s %6u blk x%-6u  %8llu.%03llu ms/call  "
 		       "(spread %llu.%03llu..%llu.%03llu ms)\n",
 		       "erase1", 1, span_max,
@@ -519,8 +647,10 @@ static int phase_read(void)
 	/* Reads start at one byte. Unlike a write, a read has no alignment
 	 * floor to respect, and the single-byte row is the one that shows the
 	 * per-call overhead almost undiluted. */
-	for (size_t size = sweep_first(1); size;
-	     size = sweep_next(size, 1, 1, g.max_xfer)) {
+	sizes_build(1, 1, g.max_xfer);
+
+	for (uint32_t si = 0; si < g_nsizes; si++) {
+		const size_t size = g_sizes[si];
 		struct span s;
 
 		/* Probe one operation to size the batch. */
@@ -534,26 +664,157 @@ static int phase_read(void)
 		uint64_t est = span_end(&s);
 
 		const uint32_t reps = reps_for(est, 0);
+		uint64_t total = 0, pmin = UINT64_MAX, pmax = 0;
+		uint32_t ops = 0;
+
+		for (uint32_t pass = 0; pass < PASSES; pass++) {
+			span_start(&s);
+			for (uint32_t i = 0; i < reps; i++) {
+				/* Walk the region so no single address can be
+				 * served from a driver-side cache for the
+				 * whole batch. */
+				off_t off = (off_t)(((uint64_t)i * size) %
+						    (region_bytes - size + 1));
+
+				off -= off % (off_t)g.align;
+				rc = flash_area_read(g_fa, off, g_buf, size);
+				if (rc < 0) {
+					LOG_ERR("read size=%zu: %d", size, rc);
+					return rc;
+				}
+			}
+			uint64_t t = span_end(&s);
+
+			total += t;
+			ops += reps;
+			pmin = MIN(pmin, t / reps);
+			pmax = MAX(pmax, t / reps);
+		}
+
+		sweep_row(&sw, size, ops, total, pmin, pmax);
+	}
+	sweep_end(&sw);
+
+	return 0;
+}
+
+/*
+ * Read cost either side of a word boundary — the driver-splitting probe.
+ *
+ * The size ladder is geometric, so above a few hundred bytes every sample it
+ * takes is a multiple of the write alignment. That hides a cost this stack can
+ * actually pay: a transfer whose LENGTH is not a whole number of the
+ * controller's words, or whose OFFSET is not word-aligned, may be split into
+ * two commands, or routed through a bounce buffer, or issued as a DMA plus a
+ * tail — none of which the geometric sweep would ever sample.
+ *
+ * So this phase samples consecutive integers around a few anchors. Because the
+ * sizes differ by one byte, the marginal column stops being a slope estimate
+ * and becomes a direct readout: the cost of the 257th byte. If that byte costs
+ * microseconds, the driver did something structural at 256, and the model's
+ * single slope is averaging over a discontinuity rather than measuring one.
+ *
+ * Reads only. A write must be a multiple of flash_area_align(), so on a part
+ * with align > 1 the odd lengths are not merely slow but rejected; the
+ * page-program phase covers the equivalent question for writes at the
+ * granularity writes are allowed to use.
+ */
+static int phase_read_odd(void)
+{
+	const size_t anchors[] = { 16, 64, 256, 512, 1024, 4096, 16384 };
+	const uint32_t rd_blocks = MIN(g.region, 2u);
+	const size_t region_bytes = (size_t)rd_blocks * g.block;
+	struct sweep sw;
+
+	sweep_begin(&sw, "read_odd",
+		    "read: cost either side of a word boundary (does the "
+		    "driver split?)");
+
+	for (size_t ai = 0; ai < ARRAY_SIZE(anchors); ai++) {
+		const size_t a = anchors[ai];
+
+		if (a + 4 > g.max_xfer || a + 8 > region_bytes) {
+			continue;
+		}
+		sweep_gap(&sw);
+
+		for (int d = -2; d <= 4; d++) {
+			const size_t size = a + (size_t)d;
+			struct span s;
+
+			span_start(&s);
+			int rc = flash_area_read(g_fa, 0, g_buf, size);
+
+			if (rc < 0) {
+				LOG_ERR("read_odd probe %zu: %d", size, rc);
+				return rc;
+			}
+			const uint32_t reps = reps_for(span_end(&s), 0);
+
+			span_start(&s);
+			for (uint32_t i = 0; i < reps; i++) {
+				off_t off = (off_t)(((uint64_t)i * size) %
+						    (region_bytes - size + 1));
+
+				off -= off % (off_t)g.align;
+				rc = flash_area_read(g_fa, off, g_buf, size);
+				if (rc < 0) {
+					LOG_ERR("read_odd %zu: %d", size, rc);
+					return rc;
+				}
+			}
+			uint64_t t = span_end(&s);
+
+			sweep_row(&sw, size, reps, t, t / reps, t / reps);
+		}
+	}
+
+	/*
+	 * The same question asked of the OFFSET rather than the length: one
+	 * fixed size, read from offset 0 and then from offsets 1..3. A
+	 * controller that requires word-aligned source addresses pays for
+	 * these, and nothing else in the sweep would notice.
+	 */
+	printk("\n-- read: cost vs offset alignment (same size, shifted "
+	       "start) --\n");
+	printk("   offset      ops         us/op\n");
+
+	const size_t size = MIN((size_t)256, g.max_xfer);
+
+	for (off_t base_off = 0; base_off <= 3; base_off++) {
+		struct span s;
+
+		span_start(&s);
+		int rc = flash_area_read(g_fa, base_off, g_buf, size);
+
+		if (rc < 0) {
+			/* An unaligned offset may simply be refused; that is
+			 * an answer, not a failure of the run. */
+			printk("   %6lld  %18s (rc=%d)\n",
+			       (long long)base_off, "refused", rc);
+			continue;
+		}
+		const uint32_t reps = reps_for(span_end(&s), 0);
 
 		span_start(&s);
 		for (uint32_t i = 0; i < reps; i++) {
-			/* Walk the region so no single address can be served
-			 * from a driver-side cache for the whole batch. */
-			off_t off = (off_t)(((uint64_t)i * size) %
-					    (region_bytes - size + 1));
-
-			off -= off % (off_t)g.align;
-			rc = flash_area_read(g_fa, off, g_buf, size);
+			rc = flash_area_read(g_fa, base_off, g_buf, size);
 			if (rc < 0) {
-				LOG_ERR("read size=%zu: %d", size, rc);
-				return rc;
+				break;
 			}
 		}
 		uint64_t total = span_end(&s);
+		uint64_t ns_op = reps ? total / reps : 0;
 
-		sweep_row(&sw, size, reps, total);
+		printk("l0raw op=read_offset size=%zu offset=%lld ops=%u "
+		       "total_ns=%llu ns_per_op=%llu\n",
+		       size, (long long)base_off, reps,
+		       (unsigned long long)total, (unsigned long long)ns_op);
+		printk("   %6lld  %7u  %8llu.%03llu us\n",
+		       (long long)base_off, reps,
+		       (unsigned long long)(ns_op / 1000),
+		       (unsigned long long)(ns_op % 1000));
 	}
-	sweep_end(&sw);
 
 	return 0;
 }
@@ -571,59 +832,130 @@ static int phase_read(void)
  * the part's program page can straddle two pages, which is exactly what the
  * `write_unaligned` points below isolate.
  */
+/*
+ * A write cursor over a pre-erased region, rather than an erase per sweep
+ * point.
+ *
+ * Erased space is the expensive thing here — a 64 KB block erase is ~1.1 s
+ * against a ~200 ms measurement — so erasing per point made the sweep's cost
+ * scale with the NUMBER OF POINTS, and every extra sample size cost 2.2 s of
+ * erase to buy 0.2 s of measurement. That is backwards for a benchmark whose
+ * job is resolution.
+ *
+ * With a cursor the cost scales with BYTES CONSUMED instead: points are laid
+ * end to end through the region and the whole region is erased only when it
+ * fills. Sampling eight sizes per octave instead of one now costs almost
+ * nothing, which is what makes the density affordable. The erases stay outside
+ * every timed span either way.
+ */
+static off_t g_wr_cursor;
+
+/* Reserve `need` erased bytes, erasing the whole region if they do not fit.
+ * Returns the offset to write at, or -1 if the region cannot hold `need` at
+ * all. */
+static off_t wr_reserve(size_t need)
+{
+	const size_t region_bytes = (size_t)g.region * g.block;
+
+	if (need > region_bytes) {
+		return -1;
+	}
+	if ((size_t)g_wr_cursor + need > region_bytes) {
+		int rc = flash_area_erase(g_fa, 0, region_bytes);
+
+		if (rc < 0) {
+			LOG_ERR("write region erase: %d", rc);
+			return -1;
+		}
+		g_wr_cursor = 0;
+	}
+
+	const off_t off = g_wr_cursor;
+
+	g_wr_cursor += (off_t)need;
+	/* Keep the cursor on a write-alignment boundary; a transfer that is
+	 * not a multiple of the alignment would otherwise leave it stranded
+	 * and the next write would be rejected. */
+	if (g_wr_cursor % (off_t)g.align) {
+		g_wr_cursor += (off_t)g.align - g_wr_cursor % (off_t)g.align;
+	}
+	return off;
+}
+
 static int phase_write(void)
 {
 	struct sweep sw;
 
 	sweep_begin(&sw, "write", "write: cost vs transfer size");
 
-	for (size_t size = sweep_first(g.align); size;
-	     size = sweep_next(size, g.align, g.align, g.max_xfer)) {
+	sizes_build(g.align, g.align, g.max_xfer);
+	g_wr_cursor = 0;
+	if (wr_reserve(0) < 0) {
+		return -EINVAL;
+	}
+	/* Start from a known-erased region. */
+	int rc = flash_area_erase(g_fa, 0, (size_t)g.region * g.block);
+
+	if (rc < 0) {
+		LOG_ERR("write region erase: %d", rc);
+		return rc;
+	}
+	g_wr_cursor = 0;
+
+	for (uint32_t si = 0; si < g_nsizes; si++) {
+		const size_t size = g_sizes[si];
 		struct span s;
-		int rc;
+		off_t off;
 
-		rc = flash_area_erase(g_fa, 0, g.block);
-		if (rc < 0) {
-			LOG_ERR("write probe erase: %d", rc);
-			return rc;
+		/* Probe one operation to size the batch. */
+		off = wr_reserve(size);
+		if (off < 0) {
+			continue;
 		}
-
 		fill_pattern(size, (uint8_t)size);
 
 		span_start(&s);
-		rc = flash_area_write(g_fa, 0, g_buf, size);
+		rc = flash_area_write(g_fa, off, g_buf, size);
 		if (rc < 0) {
 			LOG_ERR("write probe size=%zu: %d", size, rc);
 			return rc;
 		}
 		uint64_t est = span_end(&s);
 
-		/* Cap by what the region can hold: one operation must never
-		 * land on already-programmed bytes. */
 		const uint32_t cap =
 			(uint32_t)(((uint64_t)g.region * g.block) / size);
 		const uint32_t reps = reps_for(est, cap);
-		const uint32_t need_blocks =
-			(uint32_t)DIV_ROUND_UP((uint64_t)reps * size, g.block);
+		uint64_t total = 0, pmin = UINT64_MAX, pmax = 0;
+		uint32_t ops = 0;
 
-		rc = flash_area_erase(g_fa, 0, (size_t)need_blocks * g.block);
-		if (rc < 0) {
-			LOG_ERR("write erase %u blocks: %d", need_blocks, rc);
-			return rc;
-		}
-
-		span_start(&s);
-		for (uint32_t i = 0; i < reps; i++) {
-			rc = flash_area_write(g_fa, (off_t)i * size, g_buf,
-					      size);
-			if (rc < 0) {
-				LOG_ERR("write size=%zu i=%u: %d", size, i, rc);
-				return rc;
+		for (uint32_t pass = 0; pass < PASSES; pass++) {
+			off = wr_reserve((size_t)reps * size);
+			if (off < 0) {
+				break;
 			}
-		}
-		uint64_t total = span_end(&s);
 
-		sweep_row(&sw, size, reps, total);
+			span_start(&s);
+			for (uint32_t i = 0; i < reps; i++) {
+				rc = flash_area_write(g_fa,
+						      off + (off_t)i * size,
+						      g_buf, size);
+				if (rc < 0) {
+					LOG_ERR("write size=%zu i=%u: %d",
+						size, i, rc);
+					return rc;
+				}
+			}
+			uint64_t t = span_end(&s);
+
+			total += t;
+			ops += reps;
+			pmin = MIN(pmin, t / reps);
+			pmax = MAX(pmax, t / reps);
+		}
+
+		if (ops) {
+			sweep_row(&sw, size, ops, total, pmin, pmax);
+		}
 	}
 	sweep_end(&sw);
 
@@ -707,7 +1039,7 @@ static int phase_write_pages(void)
 		}
 		uint64_t total = span_end(&s);
 
-		sweep_row(&sw, size, reps, total);
+		sweep_row(&sw, size, reps, total, total / reps, total / reps);
 	}
 	/* Deliberately no linearity verdict: a staircase is not supposed to
 	 * have a constant marginal cost, and calling it "NOT affine" would
@@ -779,7 +1111,7 @@ static int phase_write_unaligned(void)
 		}
 		uint64_t total = span_end(&s);
 
-		sweep_row(&sw, size, reps, total);
+		sweep_row(&sw, size, reps, total, total / reps, total / reps);
 	}
 	/* No verdict here either: three points offset from the grid are a
 	 * comparison against the aligned rows, not a curve. */
@@ -885,6 +1217,9 @@ int main(void)
 	rc = phase_erase();
 	if (rc == 0) {
 		rc = phase_read();
+	}
+	if (rc == 0) {
+		rc = phase_read_odd();
 	}
 	if (rc == 0) {
 		rc = phase_write();

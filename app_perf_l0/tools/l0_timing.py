@@ -877,13 +877,13 @@ def cmd_fit(args):
     if out:
         out.write_text(json.dumps(model, indent=2, sort_keys=False) + "\n")
         print(f"wrote {out}")
-    show_model(model, verbose=args.verbose)
+    show_model(model)
     if not out:
         print("\n(no -o given; model not saved)")
     return 0
 
 
-def show_model(model, verbose=False):
+def show_model(model):
     g = model["geometry"]
     print(f"\nmodel: {model['name']}   source={model['source']} "
           f"timing={model['timing']} board={model['board']}")
@@ -994,16 +994,31 @@ def show_model(model, verbose=False):
     for n in model.get("notes", []):
         print(f"  note: {n}")
 
-    if verbose:
-        print("\n  residuals (measured vs fitted):")
-        for op in ("read", "write", "erase"):
-            unit = "blk" if op == "erase" else "B"
-            print(f"   {op}")
-            for r_ in m[op]["residuals"]:
-                print(f"     {r_['x']:9.0f} {unit}  "
-                      f"measured {r_['measured_ns'] / 1000:12.3f} us  "
-                      f"fitted {r_['predicted_ns'] / 1000:12.3f} us  "
-                      f"{r_['rel'] * 100:+8.1f} %")
+    # Always printed, never behind a flag. A fitted slope is a claim about
+    # data, and this table is the data the claim was made from: every swept
+    # point, what the straight line says it should have cost, and by how much
+    # the two differ. Without it a model is an assertion; with it the reader
+    # can see where the interpolation holds and where it does not — which is
+    # not uniform, and matters most exactly where a workload's transfers sit.
+    for op in ("read", "write", "erase"):
+        res = m[op]["residuals"]
+        if not res:
+            continue
+        unit = "blk" if op == "erase" else "B"
+        sc, us = (1e6, "ms") if op == "erase" else (1e3, "us")
+        a = m[op]["fixed_ns"]
+        b = m[op].get("per_byte_ns", m[op].get("per_block_ns", 0.0))
+        print(f"\n  {op}: t(n) = {a / sc:.3f} {us} + "
+              f"{b / (sc if op == 'erase' else 1):.4f} "
+              f"{us + '/' + unit if op == 'erase' else 'ns/B'} * n")
+        print(f"    {'n':>9}     measured      fitted     error")
+        for r_ in res:
+            print(f"    {r_['x']:9.0f} {unit} {r_['measured_ns'] / sc:11.3f}{us}"
+                  f" {r_['predicted_ns'] / sc:10.3f}{us} "
+                  f"{r_['rel'] * 100:+8.1f} %")
+        worst = max(res, key=lambda r_: abs(r_["rel"]))
+        print(f"    worst {worst['rel'] * 100:+.1f} % at {worst['x']:.0f} "
+              f"{unit}")
 
 
 def _breakeven(cls, unit_key):
@@ -1218,7 +1233,7 @@ def cmd_simconf(args):
 
 
 def cmd_show(args):
-    show_model(load_model(args.model), verbose=True)
+    show_model(load_model(args.model))
     return 0
 
 
@@ -1240,7 +1255,9 @@ def main():
                    help="fit only transfer sizes in this range, e.g. 4:4096 "
                         "— use it when the workload lives in one size regime")
     p.add_argument("-v", "--verbose", action="store_true",
-                   help="print the per-point residual table")
+                   help="accepted and ignored: the per-point measured-vs-"
+                        "fitted table is always printed, because it is the "
+                        "evidence for the fit")
     p.set_defaults(func=cmd_fit)
 
     p = sub.add_parser(

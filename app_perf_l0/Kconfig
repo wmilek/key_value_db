@@ -35,7 +35,7 @@ config APP_PERF_L0_REGION_BLOCKS
 
 config APP_PERF_L0_TARGET_MS
 	int "Target duration of one sweep point, in milliseconds"
-	default 50
+	default 200
 	range 1 10000
 	help
 	  Each read/write sweep point repeats its operation until roughly this
@@ -54,7 +54,7 @@ config APP_PERF_L0_MAX_REPS
 
 config APP_PERF_L0_ERASE_REPS
 	int "How many times each erase span is repeated"
-	default 3
+	default 5
 	range 1 100
 	help
 	  Erase time on NOR varies with wear and with the block's contents, so
@@ -78,3 +78,40 @@ config APP_PERF_L0_PROGRAM_PAGE
 	  is visible directly rather than averaged away. Set it to 0 to skip
 	  that phase; setting it wrong costs nothing but a badly chosen set of
 	  sample points.
+
+config APP_PERF_L0_STEPS_PER_OCTAVE
+	int "Size samples per doubling"
+	default 8
+	range 1 8
+	help
+	  How finely the read/write size sweep subdivides each octave: 1 gives
+	  bare powers of two, 2 adds the 1.5x midpoints, 4 gives 1x 1.25x 1.5x
+	  1.75x, 8 halves the gaps again.
+
+	  This is the resolution knob, and resolution is the point. A cost step
+	  between two samples is only known to lie somewhere in that interval,
+	  so bare powers of two place a feature within a factor of two — enough
+	  to know something happened, never enough to say where. Octaves below
+	  `write_align * this` carry fewer points, since the subdivision would
+	  otherwise ask for a sub-alignment stride.
+
+	  Cost is roughly linear in this for reads (milliseconds) and steeply
+	  so for writes, which erase the space each point consumes.
+
+config APP_PERF_L0_PASSES
+	int "Timed passes per sweep point"
+	default 3
+	range 1 10
+	help
+	  How many times each read/write sweep point repeats its whole timed
+	  batch. The reported cost is the mean over all passes; the extremes
+	  are reported beside it as a spread, and emitted as min_ns/max_ns on
+	  the machine-readable row.
+
+	  One pass gives a number with nothing to say about its own
+	  reliability. Three make a point whose passes disagree visible as
+	  such, which matters because the fit weights every point equally and
+	  a single disturbed batch would otherwise tilt the model silently.
+
+	  Reads cost TARGET_MS per extra pass. Writes also consume erased
+	  space, which the region cursor pays for in whole-region erases.

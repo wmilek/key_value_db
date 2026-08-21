@@ -513,6 +513,83 @@ worth reading the residual table rather than the headline slope.
 win in the L0 read path on this board; a faster `sck-frequency` is the only
 lever.
 
+### 5c. Does the straight line actually fit? Every point, measured vs fitted
+
+A fitted slope is a claim about data. This is the data it was made from — the
+table `l0_timing.py show` now prints unconditionally, because a model without
+it is an assertion.
+
+**Write — `t(n) = 157.129 µs + 12 156.49 ns/B · n`**
+
+|     n | measured | fitted | error |
+|------:|---------:|-------:|------:|
+|     4 B |    208.146 µs |    205.755 µs |  −1.1 % |
+|     8 B |    256.717 µs |    254.381 µs |  −0.9 % |
+|    16 B |    353.196 µs |    351.632 µs |  −0.4 % |
+|    32 B |    526.746 µs |    546.136 µs |  **+3.7 %** |
+|    64 B |    913.832 µs |    935.144 µs |  +2.3 % |
+|   128 B |   1692.147 µs |   1713.159 µs |  +1.2 % |
+|   256 B |   3251.139 µs |   3269.190 µs |  +0.6 % |
+|   512 B |   6391.253 µs |   6381.251 µs |  −0.2 % |
+|  1024 B |  12674.967 µs |  12605.373 µs |  −0.5 % |
+|  4096 B |  50354.003 µs |  49950.105 µs |  −0.8 % |
+| 16384 B | 200988.769 µs | 199329.034 µs |  −0.8 % |
+| 65536 B | 803588.867 µs | 796844.749 µs |  −0.8 % |
+
+**Erase — `t(m) = 51.643 ms + 1061.434 ms/block · m`**
+
+| blocks | measured | fitted | error |
+|------:|---------:|-------:|------:|
+|  1 | 1107.133 ms | 1113.077 ms | +0.5 % |
+|  1 | 1111.237 ms | 1113.077 ms | +0.2 % |
+|  2 | 2202.179 ms | 2174.510 ms | −1.3 % |
+|  4 | 4316.722 ms | 4297.378 ms | −0.4 % |
+|  8 | 8552.541 ms | 8543.112 ms | −0.1 % |
+| 16 | 16913.066 ms | 17034.581 ms | +0.7 % |
+| 32 | 33893.382 ms | 34017.519 ms | +0.4 % |
+
+Write and erase are straight lines to within **3.7 %** and **1.3 %** worst
+case, and write is within **0.8 % everywhere above 512 B**. For these two the
+interpolation is not an approximation worth worrying about.
+
+**Read — `t(n) = 65.682 µs + 258.27 ns/B · n` — is not, in the middle:**
+
+|     n | measured | fitted | error |
+|------:|---------:|-------:|------:|
+|     4 B |     61.594 µs |     66.715 µs |  **+8.3 %** |
+|     8 B |     62.973 µs |     67.749 µs |  **+7.6 %** |
+|    16 B |     71.152 µs |     69.815 µs |  −1.9 % |
+|    32 B |     75.903 µs |     73.947 µs |  −2.6 % |
+|    64 B |     83.951 µs |     82.212 µs |  −2.1 % |
+|   128 B |    111.624 µs |     98.741 µs | **−11.5 %** |
+|   256 B |    144.082 µs |    131.800 µs |  **−8.5 %** |
+|   512 B |    202.929 µs |    197.917 µs |  −2.5 % |
+|  1024 B |    330.077 µs |    330.152 µs |  +0.0 % |
+|  4096 B |   1108.127 µs |   1123.560 µs |  +1.4 % |
+| 65536 B |  16677.856 µs |  16991.725 µs |  +1.9 % |
+
+Above 512 B the read fit is within 2 %. Between 64 B and 256 B it is not: the
+line under-predicts by up to 11.5 %, because the measured cost **steps** there.
+The marginal cost across 64→128 B is 432 ns/B against ~253 ns/B everywhere
+else, and 8→16 B reads 1 022 ns/B. Something in the read path costs extra at
+those sizes that a single slope has to average away, and averaging it away is
+what produces the +8 % at 4–8 B on the other side of the same fit.
+
+This is a **single run and one point per size**, so the two anomalies are worth
+confirming before theorising about the driver. They are not timer resolution:
+the 128 B point averages 409 operations over 45.7 ms against a 30.5 µs tick,
+so the quantisation is 0.07 %. The 1.5× midpoints added since this capture
+would localise the step to within 1.5× instead of 2×, which is the first thing
+a re-run buys.
+
+**What it means for predictions.** The model's error on a workload is the error
+at the sizes that workload uses, not the headline residual. `blob_db`'s mean
+read is 14.3 B, where the fit is good (−1.9 % at 16 B). A caller doing 128 B
+reads gets predictions ~11 % low. §5's phase table is consistent with that:
+read-dominated phases land at 0.57× because of CPU above L0, not because of
+this — but a 10 % modelling error sits underneath that number and should not be
+mistaken for signal.
+
 ### What this capture cannot show
 
 It was taken at `6ca2f7d`, before the sweep became a matrix, so it has powers

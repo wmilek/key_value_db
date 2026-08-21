@@ -18,12 +18,22 @@ is the one parameter each L0 call has.
 
 | phase | swept parameter | question |
 |---|---|---|
-| `read` | transfer size, **1 B → one erase block** | what does a small transfer cost against a large one, and how much of it is per-call overhead a caller pays again on every extra transaction? |
+| `read` | transfer size, **1 B → one erase block**, 8 samples per doubling | what does a small transfer cost against a large one, and how much of it is per-call overhead a caller pays again on every extra transaction? |
+| `read_odd` | **consecutive integer sizes** either side of 16, 64, 256, 512, 1024, 4096, 16384 B | does the driver split a transfer whose length is not a whole number of controller words? At one-byte steps the marginal column stops being a slope estimate and becomes a direct readout: the cost of the 257th byte |
+| `read_offset` | fixed size, start offset shifted by 1, 2, 3 B | the same question asked of the address rather than the length |
 | `write` | transfer size, `write_align` → one erase block, transfers packed back to back as `blob_db` writes them | the same question on the program path — and whether the cost is a line at all |
 | `write_pg` | transfer size, each transfer **pinned to a program-page boundary** | the page-program staircase, isolated: is one byte past a page boundary a whole extra program? |
 | `write_unaligned` | fixed size, offset by one alignment unit | the page-straddle penalty: one transfer, two program pages |
 | `erase` | **erase size** — blocks covered by one call | is a 16-block erase cheaper than sixteen 1-block erases? `blob_db_prepare()` does the latter, `blob_db_erase_all()` the former |
-| `erase1` | one block, repeated | the per-block anchor, and the spread — NOR erase time is not a constant |
+| `erase1` | one block, repeated over every block in the region | the per-block anchor, and the **distribution** — each sample is emitted individually, because a model carries one number for erase and this is the spread that number stands in for |
+| `erase_erased` | one block that is already erased | does erasing blank flash cost anything less? `blob_db_prepare()` re-erases often enough that it is worth measuring rather than assuming |
+
+Every read and write point is measured **three times** (`CONFIG_APP_PERF_L0_PASSES`).
+The reported cost is the mean; the extremes appear beside it as a `spread`
+column and as `min_ns`/`max_ns` on the machine-readable row. A single pass
+gives a number with nothing to say about its own reliability, and the fit
+weights every point equally — so a point whose passes disagree needs to be
+visible as such.
 
 ### The matrix, and the column that answers the question
 
@@ -67,11 +77,21 @@ the flash's achievable bandwidth.
 
 Two details exist because of writes specifically:
 
-- **The sizes are not only powers of two.** Each is followed by its 1.5×
-  midpoint (1, 2, 3, 4, 6, 8, 12, 16, 24 …). Powers of two are exactly the
+- **The sizes are not only powers of two.** The ladder subdivides each octave
+  into `CONFIG_APP_PERF_L0_STEPS_PER_OCTAVE` samples (8 by default: 1, 2, 3, 4,
+  5, 6, 7, 8, 9, 10, 12, 14, 16, 20, 24, 28 …). Powers of two are exactly the
   wrong sample points for a cost that steps at a power-of-two boundary: every
   sample lands on a step, the staircase looks like a line through its corners,
-  and the sweep concludes "linear" about a function that is not.
+  and the sweep concludes "affine" about a function that is not. Resolution is
+  the point — a step between two samples is only located to within the gap, so
+  bare powers of two place a feature within a factor of two, and eight steps
+  place it within 9 %.
+
+  This is affordable because the write sweep runs a **cursor** through a
+  pre-erased region rather than erasing per point. Erased space is the
+  expensive thing (a 1.1 s block erase against a 200 ms measurement), so
+  erasing per point made cost scale with the number of samples; with a cursor
+  it scales with bytes consumed, and extra sample sizes are nearly free.
 - **`write_pg` pins each transfer to a page boundary.** The packed `write`
   sweep answers *what `blob_db` pays*, because `blob_db` writes back to back —
   but a packed transfer touches `ceil(n/page)` or one more depending on where
@@ -149,7 +169,10 @@ west flash
 # capture the console; see RUN_ON_DK.md
 ```
 
-Roughly seven minutes on the nRF5340-DK, most of it erase. The capture carries
+Roughly **thirteen minutes** on the nRF5340-DK — 112 read sizes and 96 write
+sizes, three passes each, plus the probes — and over half of it is the erase
+sweep. The knobs that trade run time for resolution are in the table at the
+bottom. The capture carries
 machine-readable `l0geom` / `l0raw` / `l0end` records alongside the
 human-readable tables.
 
@@ -303,6 +326,8 @@ separates them. `RESULTS.md` §5 has the scorecard.
 | `CONFIG_APP_PERF_L0_TARGET_MS` | how long one sweep point should last; precision against run time |
 | `CONFIG_APP_PERF_L0_MAX_REPS` | repetition ceiling, so a cheap operation cannot ask for millions |
 | `CONFIG_APP_PERF_L0_ERASE_REPS` | repeats per erase span — the dominant term in total run time |
+| `CONFIG_APP_PERF_L0_STEPS_PER_OCTAVE` | size samples per doubling (8): the resolution knob, and what places a cost step to within 9 % instead of a factor of 2 |
+| `CONFIG_APP_PERF_L0_PASSES` | timed passes per point (3): turns each row from a number into a number with a spread |
 | `CONFIG_APP_PERF_L0_PROGRAM_PAGE` | the part's program page (256 B on most SPI NOR); chooses the sizes for the page-program sweep. `flash_area` does not report it, so it has to be told; `0` skips that phase |
 
 On `native_sim` the app builds and runs in seconds, and

@@ -46,28 +46,33 @@ a silent console is usually the wrong node, not a dead board.
 
 ## What to expect while it runs
 
-**About seven minutes, most of it silence.** A 64 KB block erase on this part
-is ~1.07 s and the sweep performs roughly 220 of them; the erase phase alone is
-around four minutes of apparent quiet between lines. That silence *is* the
+**About thirteen minutes, most of it silence.** A 64 KB block erase on this
+part is ~1.07 s and the run performs roughly 400 of them; the erase phase alone
+is around seven minutes of apparent quiet between lines. That silence *is* the
 measurement.
 
 The phases arrive in this order, and each prints an `l0raw` record followed by
 a human-readable line:
 
-1. `-- erase: cost vs erase size --` — the long one. Spans of 1, 2, 4, 8, 16
-   and 32 blocks, three repetitions each, then 32 single-block calls.
-2. `-- read: cost vs transfer size --` — seconds. Programs two blocks first
-   (untimed), then sweeps 1 B … 64 KB in 32 rows.
-3. `-- write: cost vs transfer size --` — a minute or two; each sweep point
-   erases the space it is about to consume.
-4. `-- write: page-program staircase --` — page-aligned transfers around the
+1. `-- erase: cost vs erase size --` — the long one, ~7 min. Spans of 1, 2, 4,
+   8, 16 and 32 blocks, five repetitions each; then every block in the region
+   erased singly, each sample printed, with the distribution summarised; then
+   one already-erased block.
+2. `-- read: cost vs transfer size --` — ~1 min. Programs two blocks first
+   (untimed), then 112 sizes from 1 B to 64 KB, three passes each.
+3. `-- read: cost either side of a word boundary --` — seconds. Consecutive
+   integer sizes around seven anchors, then the offset-alignment probe.
+4. `-- write: cost vs transfer size --` — ~3 min. 96 sizes, three passes, laid
+   end to end through a pre-erased region.
+5. `-- write: page-program staircase --` — page-aligned transfers around the
    256 B boundary; twenty seconds or so.
-5. `-- write: page-straddle penalty --` — seconds to tens of seconds.
-6. A final erase of the working region, then `l0end status=0`.
+6. `-- write: page-straddle penalty --` — seconds to tens of seconds.
+7. A final erase of the working region, then `l0end status=0`.
 
-Each of 2–5 prints a matrix: size, ops, µs/op, KiB/s, ns/B and the marginal
-cost. The last column is the one to read — see `README.md`. Sweeps 2 and 3
-also print a one-line verdict on whether their curve is affine.
+Each sweep prints a matrix: size, ops, µs/op, KiB/s, ns/B, the marginal cost
+and the pass-to-pass spread. The marginal column is the one to read — see
+`README.md`. Sweeps 2 and 4 also print a one-line verdict on whether their
+curve is affine.
 
 The app never exits — Zephyr's idle loop runs forever once `main()` returns —
 so stop capturing after `l0end status=0`. A non-zero status means a phase
@@ -95,7 +100,9 @@ l0geom part_bytes=8388608 block_bytes=65536 blocks=128 write_align=4 erased_val=
 partition 8388608 B, 128 blocks of 65536 B, write align 4, erased 0xff
 ```
 
-`block_bytes=65536` is correct for this board and comes from
+`program_page=256` is not discovered — it is
+`CONFIG_APP_PERF_L0_PROGRAM_PAGE`, and it only chooses sample points for the
+page-program sweep. `block_bytes=65536` is correct for this board and comes from
 `CONFIG_NORDIC_QSPI_NOR_FLASH_LAYOUT_PAGE_SIZE` (default 65536), not from the
 part's 4 KB sector. `write_align=4` is what `nrf_qspi_nor` reports. If either
 differs, stop and say so — every number below depends on them, and the model
