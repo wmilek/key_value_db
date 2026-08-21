@@ -152,7 +152,15 @@ def wls(points, weight="rel"):
             sxx += w * x * x
             sxy += w * x * y
         det = s * sxx - sx * sx
-        if abs(det) < 1e-12:
+        # Relative, not absolute. det carries the units of the weights, and
+        # `weight="rel"` makes those 1/y^2 — so with y in nanoseconds, as the
+        # capture emits, det lands around 1e-13 for a perfectly conditioned
+        # sweep and an absolute 1e-12 test rejects it. The same data in
+        # microseconds gives det=0.12 and passes: a pure change of time unit
+        # flipped the model from affine to flat, silently, because this branch
+        # sets no note. Compare against the scale of the terms that formed it.
+        scale = s * sxx + sx * sx
+        if scale <= 0.0 or abs(det) <= 1e-12 * scale:
             return (sy / s if s else 0.0), 0.0
         b = (s * sxy - sx * sy) / det
         a = (sy - b * sx) / s

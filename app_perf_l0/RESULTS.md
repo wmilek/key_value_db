@@ -225,3 +225,93 @@ l0raw op=write_unaligned size=512 ops=64 total_ns=6400000 ns_per_op=100000
 l0raw op=write_unaligned size=4096 ops=31 total_ns=3100000 ns_per_op=100000
 l0end status=0
 ```
+
+## 6. Measured on the DK — the falsification of §4
+
+Run on board 960115021 at `6ca2f7d`, `flash_area`, geometry as reported by the
+app itself: 8 388 608 B partition, 128 blocks of 65 536 B, write align 4,
+`source=hardware timing=real`. Capture and fitted model alongside this file.
+
+The direct fit, from a sweep of L0 calls with no storage stack in the image:
+
+| class | fixed per call | per unit | points | max rel err |
+|---|--:|--:|--:|--:|
+| read | **65.682 µs** | **258.3 ns/B** | 15 | 11.5 % |
+| write | **157.129 µs** | **12 156.5 ns/B** | 15 | 3.7 % |
+| erase | **51 643 µs** | **1 061.434 ms/blk** | 7 | 1.3 % |
+
+Ceilings that follow: **read 3 781 kB/s, write 80 kB/s**, and a transfer pays
+only its fixed cost below 254 B (read) or 13 B (write).
+
+### Scorecard against §4
+
+| coefficient | derived (§3) | **direct** | §4 predicted | verdict |
+|---|--:|--:|---|---|
+| erase per block | 1 106 ms | **1 061.4 ms** | within a few % | **held** (−4.0 %) |
+| read fixed | 67.7 µs | **65.7 µs** | lower | held, but only −3 % |
+| write fixed | 314 µs | **157.1 µs** | lower | **held** (−50 %) |
+| read per byte | 631 ns/B | **258.3 ns/B** | within a few % | **failed** (−59 %) |
+| write per byte | 29.6 µs/B | **12.16 µs/B** | the one to watch | **failed** (−59 %) |
+
+**§4 predicted the CPU above L0 would show up in the fixed terms. It is mostly
+in the per-byte terms.** `read fixed` barely moved, which rules out the reading
+§4 offered — that the difference is `blob_db`'s per-read CPU — as the main
+effect. The per-call overhead really is ~66 µs of QSPI.
+
+The two failures are the same failure. Both per-byte coefficients are
+overstated by almost exactly the same factor:
+
+    read   258.3 / 631    = 0.409
+    write 12 156 / 29 600 = 0.411
+
+Two independent classes landing within 0.3 % of each other is not the part
+behaving oddly; it is the *derived* fit unable to separate them. The 36
+observations it was solved from come from stack phases where reads and writes
+co-occur, so read-per-byte and write-per-byte are collinear there and the
+excess CPU was distributed across both in proportion. Only a sweep that varies
+one call at a time can break that, which is the case for this app stated as a
+measurement rather than an argument.
+
+The direct fit also finds a term the derived model does not have: **an erase
+call costs 51.6 ms before it erases anything.** A 1-block erase is therefore
+1.113 s against 1.061 s of block time, and the derived model folded that
+overhead into its per-block figure — which is most of the 4 % it sits high by.
+
+### What the model predicts about phases it never saw
+
+Feeding `app_perf`'s `flash_area` I/O counters through the **direct** model.
+This is not circular: the model comes from raw L0 calls, the counters from a
+`blob_db` stack.
+
+| phase | measured | L0 predicts | ratio | dominant term |
+|---|--:|--:|--:|---|
+| `lg pwrite` | 72.700 s | 72.343 s | **1.00×** | erase 98 % |
+| `lg write` | 154.400 s | 151.370 s | **0.98×** | erase 98 % |
+| `read` | 0.046 s | 0.042 s | 0.91× | read 100 % |
+| `lg rewrite` | 17.900 s | 13.413 s | 0.75× | erase 75 % |
+| `update` | 0.251 s | 0.144 s | **0.57×** | write 52 % |
+| `lg read` | 7.500 s | 4.278 s | **0.57×** | read 100 % |
+
+The split is exactly along the dominant term. **Where a phase is erase-bound,
+L0 accounts for all of it. Where it is transfer-bound, L0 accounts for 57 %,
+and the missing 43 % is CPU above L0** — slot walking, header parsing, CRC and
+memcpy over the payload, none of which is flash.
+
+That is the number this app was built to produce, and no stopwatch on the board
+could have separated it.
+
+### Two conclusions elsewhere in this repo are wrong because of it
+
+**`app_perf/RESULTS.md` attributes ~7.6 ms to a 256 B page program** and calls
+it ~4× the part's typical, "the limit is the part". The direct sweep says a page
+program is **12.16 µs/B × 256 = 3.11 ms**, which is unremarkable for an
+MX25R6435F. The part is behaving normally; the excess was software above L0.
+
+**Write throughput to pre-erased blocks is ~80 kB/s at L0, not ~32 kiB/s.** The
+32 kiB/s figure is what the *stack* achieves through `blob_db`; the flash will
+take bytes 2.5× faster than that. Likewise reads: 3 781 kB/s at L0 against the
+~1.55 MB/s the stack-level per-byte constant implies.
+
+Both errors point the same way — cost measured at the top of a stack was
+attributed to the bottom of it — and both were only visible once the bottom was
+measured on its own.
