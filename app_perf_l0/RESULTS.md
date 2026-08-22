@@ -895,6 +895,54 @@ to contribute. `west twister -T key_value_db -p native_sim` run twice gives
 18/18 configurations and 209/209 test cases both times, with per-suite statuses
 identical. And `tools/selftest.py` passes both of its synthetic devices.
 
+### 5f. Stability: the same image, run twice
+
+`ddaf35f` compares three captures taken at different sweep densities, where the
+harness changed underneath. This is the complementary check — the **bit-identical
+image**, same board, run again — so any difference is the part and the run, not
+the code.
+
+| class | points | median \|Δ\| | p90 | max |
+|---|--:|--:|--:|--:|
+| read | 112 | **0.04 %** | 0.63 % | 3.48 % (12 B) |
+| write | 96 | **0.03 %** | 0.05 % | 1.04 % (32 B) |
+| erase | 6 spans | — | — | 0.65 % |
+
+Coefficients reproduce to within a fifth of a percent: read 253.8 → 253.8 ns/B
+with the intercept 69.232 → 69.081 µs, write 12 222.4 → 12 219.2 ns/B with
+159.438 → 159.165 µs. The gated read range is 252.76–253.50 against
+252.71–253.41. `erase1_dist` returns the **same median to the nanosecond**
+(1 111 267 089 ns both runs) with min/max moving ~1 %.
+
+The worst disagreements are at 12 B and 32 B — the small-transfer region §5b,
+§5c and `ddaf35f` all independently identify as the noisy one. Nothing new is
+noisy.
+
+#### The offset-2 anomaly is real
+
+`FINDINGS.md` flags offset 2 costing ~31 µs more than offsets 1 and 3, where
+`read_non_aligned()` decomposes all three identically, and marks it as within one
+bad batch because `read_offset` is single-pass. A second run settles that without
+needing the multi-pass change:
+
+| offset | run 1 | run 2 | agreement |
+|--:|--:|--:|--:|
+| 0 | 132 261 ns | 132 205 ns | 0.04 % |
+| 1 | 187 409 | 187 311 | 0.05 % |
+| **2** | **218 504** | **218 392** | 0.05 % |
+| 3 | 187 409 | 187 344 | 0.03 % |
+
+The excess of offset 2 over offsets 1 and 3 is **+31 095 ns** and **+31 081 ns**
+— two independent draws agreeing to 14 ns. It is not a bad batch, and the open
+question is no longer whether it is real but why: the decomposition into prefix,
+252 B aligned body and suffix is the same at all three offsets, so the extra cost
+is somewhere the transaction count does not distinguish. The `memmove` shift
+distance is the obvious suspect and the obvious next probe.
+
+So the item needs a theory rather than more runs. Making `read_offset` honour
+`PASSES` is still worth doing — it would have answered this from one capture
+instead of two — but it is no longer what blocks the finding.
+
 ## 6. Measured against the datasheet
 
 `tools/l0_timing.py spec` compares a model against a part's specified
