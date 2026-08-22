@@ -1,0 +1,42 @@
+/*
+ * native_sim, with the geometry of the nRF5340-DK's on-board MX25R6435F.
+ *
+ * A predicted hardware time is only as good as the operation counts fed into
+ * it, and those counts are a function of geometry: blob_db derives its bucket
+ * count, its slot alignment and its segment size from the erase block size and
+ * the write alignment it finds at mount. A native_sim run on the simulator's
+ * native 4 KB / 1 B geometry therefore issues a *different* number of
+ * operations than the DK would — the prediction would be arithmetically
+ * correct about a workload nobody is going to run.
+ *
+ * This overlay removes that mismatch:
+ *
+ *   erase-block-size  65536  MX25R64 block erase, which is what the
+ *                            nordic,qspi-nor driver reports as its page
+ *                            layout (CONFIG_NORDIC_QSPI_NOR_FLASH_LAYOUT_PAGE_SIZE)
+ *   write-block-size      4  what nrf_qspi_nor reports from flash_area_align()
+ *   storage_partition   8 MB at the same offset the DK overlay uses
+ *
+ * Use it for any run whose numbers will be fed to tools/l0_timing.py predict:
+ *
+ *   west build -b native_sim key_value_db/app_perf \
+ *       -DEXTRA_DTC_OVERLAY_FILE=$PWD/key_value_db/app_perf_l0/geometry/mx25r64.overlay
+ *
+ * It does NOT model the part's timing — nothing in the flash simulator does.
+ * It models the part's SHAPE, so that the operation counts are the ones the
+ * hardware would produce, and the timing model supplies the rest.
+ */
+
+&flashcontroller0 {
+	reg = <0x00000000 DT_SIZE_M(16)>;
+};
+
+&flash0 {
+	reg = <0x00000000 DT_SIZE_M(16)>;
+	erase-block-size = <65536>;
+	write-block-size = <4>;
+};
+
+&storage_partition {
+	reg = <0x00800000 DT_SIZE_M(8)>;
+};

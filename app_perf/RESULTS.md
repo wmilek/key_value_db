@@ -9,6 +9,19 @@ Every wall-clock figure here comes from the board. On `native_sim` they
 are all `0 ms`, because the flash simulator models no latency; only the
 `io …` counters are meaningful there.
 
+That is no longer the end of the story: `app_perf_l0` measures what an
+L0 operation costs, and `app_perf_l0/tools/l0_timing.py predict` turns
+these counters into predicted wall-clock, so a `native_sim` run at this
+board's geometry produces the timings below without the board. The
+captures here are what that model was first checked against — see
+`app_perf_l0/RESULTS.md` §2–§4.
+
+**The `io …` line gained a field after these captures were taken.** It
+now reports erase *bytes* as well as erase calls (`er 9 ops/ 589824 B`),
+because one call may cover one block or the whole partition and a cost
+model fed only the count cannot tell those apart. The captures below
+predate it and show `er 9` alone; nothing else about them changed.
+
 Everything below is the **`flash_area` backend** unless a section says
 otherwise. Note that this is no longer the default: `blob_db` defaults to
 `CONFIG_BLOB_DB_BACKEND_UBI`, and "The UBI backend" measures it. The tables
