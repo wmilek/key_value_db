@@ -11,6 +11,9 @@ answers the linearity question the matrix was built for, §6 checks the result
 against the part's datasheet, and §1–§3 remain reproducible on a host with no
 board attached.
 
+Why the numbers are what they are — the driver code and datasheet clauses
+behind them — is in [`FINDINGS.md`](FINDINGS.md).
+
 ## Setup
 
 - **Host runs**: `native_sim`, Zephyr build `5058917ea61b`, host toolchain

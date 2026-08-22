@@ -104,6 +104,17 @@ Two details exist because of writes specifically:
 > first `CONFIG_APP_PERF_L0_REGION_BLOCKS` blocks of it, repeatedly. Do not run
 > it on a device whose store you want to keep.
 
+## Why the numbers look the way they do
+
+[`FINDINGS.md`](FINDINGS.md) is the companion to `RESULTS.md`: where that one
+measures, this one explains, from the `nordic,qspi-nor` driver source and the
+part's datasheet. It answers three questions the sweep raised but cannot settle
+on its own — why an unaligned read costs 42–65 % more (the driver splits it
+into three QSPI transactions plus a `memmove`), which power mode the part is
+running in (Ultra Low Power, and nothing on this board can change it), and what
+the part offers that the stack does not use (erase suspend/resume, and 4 KB
+sector erase the driver already supports).
+
 ## The model, and why it is a line
 
 Each class is fitted to an affine cost:
