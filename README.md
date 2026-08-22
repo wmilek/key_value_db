@@ -180,22 +180,43 @@ Two things to know before switching a real device:
 The ztest suites all run on `native_sim`:
 
 ```shell
-west twister -T key_value_db -p native_sim -v --inline-logs   # tests + app builds
+west twister -T key_value_db -p native_sim -v --inline-logs   # tests + samples + app builds
 west twister -T key_value_db/tests -p native_sim              # tests only
+west twister -T key_value_db/samples -p native_sim            # samples only
 ```
+
+The samples are not only built but *run*: each one's console narration is
+checked against the output it documents, so a sample cannot drift from the API
+it demonstrates.
 
 This is what CI runs ([`build.yml`](.github/workflows/build.yml)), plus an
 app build on the non-default `flash_area` backend. At the merge gate it also
 cross-builds for ARM: the demo on both storage backends and with `kvdb`
-enabled, `app_perf`, and `app_cbor_persondb` in both of its frontends — so the
-binaries that produce the hardware numbers cannot rot between runs on real
-hardware.
+enabled, `samples/kvhash`, `app_perf`, and `app_cbor_persondb` in both of its
+frontends — so the binaries that produce the hardware numbers cannot rot
+between runs on real hardware.
+
+## Samples
+
+Start here if you are learning the API. Each sample in [`samples/`](samples) is
+the smallest complete program that uses **one** API, narrating every call and
+its return code on the console — no timing loops, no parameter sweeps, nothing
+between you and the calls.
+
+| Sample | Demonstrates |
+|---|---|
+| [`samples/kvhash/`](samples/kvhash) | the L2 Map shape (`kvhash_map_ops`): create / get / set / del over a persistent hash map, where its root id comes from, and the errors worth handling (`-ENOMEM` sizing, `-ENOENT`, the one-payload-per-bucket `-ENOSPC`) |
+
+```shell
+west build -p always -b native_sim samples/kvhash && ./build/zephyr/zephyr.exe
+```
 
 ## Applications
 
-Each application is a standalone Zephyr app. The measuring ones print their
-timings over the console and keep hardware-measured reference numbers in a
-`RESULTS.md` next to the source.
+Each application is a standalone Zephyr app. Unlike the samples, these exist to
+*measure* and to *probe*: the measuring ones print their timings over the
+console and keep hardware-measured reference numbers in a `RESULTS.md` next to
+the source.
 
 | Application | What it does | Reference results |
 |---|---|---|
@@ -328,6 +349,7 @@ lib/
   kvdb/  blobfs/      L3  access interfaces
 include/app/lib/      public headers — blob_db.h · rootreg.h · kvdb.h · blobfs.h
                       · containers/{shape_map,shape_seq,kvhash}.h
+samples/              API samples — smallest complete program per API (kvhash)
 app/                  blob_db demo application
 app_perf*/            benchmarks (+ hardware reference RESULTS.md)
                       app_perf_l0/ also carries the L0 timing model:
