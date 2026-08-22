@@ -326,6 +326,71 @@ period near the expected end would cut it, at the cost of more RDSR traffic.
 
 ---
 
+## 4. Which erase does the *shipped* configuration use? UBI on the DK
+
+Everything above traces the `flash_area` path. `blob_db` defaults to the UBI
+backend, so this is the one that actually ships, and the chain is worth
+following to the end because it lands on the same erase command by a longer
+route.
+
+```
+blob_db_store_ubi.c:70   flash_get_page_info_by_offs(flash_dev, 0, &page_info)
+                         -> page_info.size = CONFIG_NORDIC_QSPI_NOR_FLASH_LAYOUT_PAGE_SIZE
+                                           = 65536
+blob_db_store_ubi.c:79   ubi_flash_desc.erase_block_size = 65536
+ubi_plain_core_runtime.c flash_area_erase(fa, pnum * erase_block_size,
+                                              erase_block_size)     <- one PEB
+nrf_qspi_nor.c:611       size >= 65536 && block-aligned
+                         -> nrfx_qspi_erase(NRF_QSPI_ERASE_LEN_64KB, addr)
+```
+
+**So: 64 KiB block erase, opcode `D8h`, one PEB per call — the same command
+`flash_area` issues, and ~1086 ms measured.** The 4 KiB sector erase the
+peripheral supports is never reached, because nothing ever asks for a 4 KiB
+range.
+
+Confirmed by running the UBI backend at the DK's geometry (`native_sim` +
+`geometry/mx25r64.*`, which reproduces the board's operation counts exactly —
+`RESULTS.md` §2):
+
+```
+<inf> blob_db_store: attached UBI volume 'blobdb' id=0
+<inf> blob_db: partition 7989536 B, 122 sectors of 65488 B, 119 buckets
+```
+
+Three things fall out of those numbers:
+
+- **The PEB is 64 KiB but the LEB is 65 488 B.** Plain UBI takes
+  `UBI_EC_HDR_SIZE (16) + UBI_VID_HDR_SIZE (32)` = 48 B off the front of every
+  block (`ubi_plain_core_init.c:854`), and that is what `blob_db` sees as its
+  sector. The *erase* is still the full 65 536 B block: UBI's header lives
+  inside the block it erases.
+- **UBI costs 4.75 % of the partition before any data is stored.** 122 LEBs ×
+  65 488 B = 7 989 536 B against 8 388 608 raw, and 119 buckets against
+  `flash_area`'s 125. Of the 128 PEBs, 2 go to the UBI device header
+  (`CONFIG_UBI_DEV_HDR_NR_OF_RES_PEBS`) and 4 to `BLOB_DB_UBI_SPARE_PEBS`
+  (`blob_db_store_ubi.c:39`) for the reclaim pool.
+- **Chip erase is unreachable under UBI**, which retracts the concern in §3c
+  for the shipped default. The driver takes that branch only when one call
+  covers the whole device; `blob_db_store_erase()` under UBI unmaps LEB by LEB
+  (`blob_db_store_ubi.c:197`) and the erases happen one PEB at a time in
+  reclaim, so `blob_db_erase_all()` pays 122 × ~1086 ms ≈ 133 s rather than a
+  single ~163 s chip erase. §3c applies to the `flash_area` backend only.
+
+### A measurement caveat this exposes
+
+Under UBI the erase counter is not counting erases. `blob_db_store_erase()`
+notes `BLOB_DB_IO_NOTE(BLOB_DB_IO_ERASE, len)` and then calls
+`ubi_leb_unmap()`, which only *marks* the LEB dirty — the flash erase happens
+later, inside UBI's reclaim, below the seam where the counter sits. So a UBI
+run's erase count is a count of unmap requests, and the real erases are both
+deferred and invisible to it.
+
+That compounds the known undercount recorded in `doc/impl/l0_backends.md` §7,
+and it is why `RESULTS.md` says a prediction for a UBI build is a lower bound.
+Timing a UBI workload from its counters will be wrong in the term that
+dominates every erase-bound phase.
+
 ## Summary — what is on the table
 
 | | measured today | available | needs |
@@ -334,7 +399,8 @@ period near the expected end would cut it, at the cost of more RDSR traffic.
 | power mode | Ultra Low Power | erase −40 %, program −73 % | 24-bit WRSR in `nrf_qspi_nor`, or a `mxicy,mx25r-power-mode` property on the `nordic,qspi-nor` binding |
 | erase latency | blocks ~1086 ms | ~200 µs read latency during erase, for ~70 % longer erase | suspend/resume in the driver + a flash-API or ex-op path |
 | erase granularity | 64 KB blocks | 58 ms per erase instead of 800 ms typ | **nothing in the driver** — it already picks 4 KB when asked. `blob_db` sized for a 4 KB bucket, via the reported layout |
-| whole-partition erase | untested | avoid the chip-erase branch | `blob_db_erase_all()` on an 8 MB partition = the whole device, which the driver maps to chip erase (~163 s predicted) instead of 128 block erases (~139 s) |
+| whole-partition erase (`flash_area`) | untested | avoid the chip-erase branch | `blob_db_erase_all()` on an 8 MB partition = the whole device, which the driver maps to chip erase (~163 s predicted) instead of 128 block erases (~139 s). Does **not** apply under UBI — see §4 |
+| erase accounting under UBI | counts unmaps, not erases | a usable erase term for the model | accounting pushed into the provider, or a UBI-side counter — `doc/impl/l0_backends.md` §7 |
 
 None of these is a defect. They are choices that were made by default, and the
 measurements are what makes them visible as choices.
