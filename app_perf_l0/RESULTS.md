@@ -387,9 +387,11 @@ This is not circular: the model comes from raw L0 calls, the counters from a
 | `lg read` | 7.500 s | 4.278 s | **0.57×** | read 100 % |
 
 The split is exactly along the dominant term. **Where a phase is erase-bound,
-L0 accounts for all of it. Where it is transfer-bound, L0 accounts for 57 %,
-and the missing 43 % is CPU above L0** — slot walking, header parsing, CRC and
+L0 accounts for all of it. Where it is transfer-bound, L0 accounts for 57 %**,
+and the remainder was originally read here as CPU above L0 — slot walking, header parsing, CRC and
 memcpy over the payload, none of which is flash.
+
+> **§5e qualifies this.** The read sweep is aligned and `blob_db` is not, and a misaligned start costs 42–65 % more. Much of this 43 % may be misalignment *at* L0 rather than CPU above it.
 
 That is the number this app was built to produce, and no stopwatch on the board
 could have separated it.
@@ -746,6 +748,93 @@ changed with it — the coefficients come from the same part either way, and
 reproduced to within 0.9 % on read and 0.2 % on write — so this was a
 completeness item, not a correction. It is kept because the reasoning it
 records ("implausible is not measured") is the reason the re-run happened.
+
+### 5e. The full-resolution run — 112 read sizes, 96 write
+
+Run at `04ae252` with `STEPS_PER_OCTAVE=8` and `PASSES=3`: **112 read points,
+96 write, 49 word-boundary, 4 offset-alignment**, against the 15 per class the
+first capture carried. Capture and model under `models/`.
+
+#### The coefficients survive a 7× denser ladder and a changed procedure
+
+This is the check that matters, because `0e0b48b` did not only add points — it
+stopped erasing per write point, laying the sweep end to end through a
+pre-erased region instead. A procedure change and a density change at once
+could easily have moved the fit.
+
+| | 15 pts | 32 pts | **112 pts** | total drift |
+|---|--:|--:|--:|--:|
+| read per byte | 258.3 | 256.0 | **253.8 ns/B** | −1.7 % |
+| read fixed | 65.7 | 68.1 | **69.2 µs** | +5.3 % |
+| write per byte | 12 156.5 | 12 182.9 | **12 222.4 ns/B** | +0.5 % |
+| write fixed | 157.1 | 158.2 | **159.4 µs** | +1.5 % |
+| erase per block | 1 061.4 | 1 087.6 | **1 086.3 ms** | +2.3 % |
+
+The per-byte terms move by under 2 % across all three. The fixed terms drift
+slightly upward as the ladder fills in below the crossover, which is what an
+intercept does when it is asked to carry more points that mostly measure it.
+
+#### The gated verdict tightens by two orders of magnitude
+
+| capture | octave pairs | read range | spread |
+|---|--:|--:|--:|
+| `6ca2f7d` (15 pts) | 8 | 229.9 – 253.9 ns/B | 1.104× |
+| matrix (32 pts) | 14 | 244.1 – 272.0 ns/B | 1.114× |
+| **full (112 pts)** | **56** | **252.76 – 253.50 ns/B** | **1.003×** |
+
+Write is 11 004.5 – 12 315.3 ns/B over 85 pairs, also affine. Meanwhile the
+device's own noise-gated adjacent-pair range still spans **210 – 17 216 ns/B**
+on reads, so the octave pairing is what makes a verdict possible at all; the
+extra density does not rescue a first difference, it only makes the gated
+estimator sharper. `write_pg` is unchanged: still no staircase.
+
+#### What the resolution was for: alignment is not free
+
+The read sweep is aligned, and the fitted 253.8 ns/B is therefore the *aligned*
+cost. The offset probe holds the size at 256 B and shifts only the start:
+
+| start offset | µs/op | vs aligned |
+|--:|--:|--:|
+| 0 | 132.3 | — |
+| 1 | 187.4 | **+42 %** |
+| 2 | 218.5 | **+65 %** |
+| 3 | 187.4 | +42 % |
+
+Length matters independently, and multiples of four are cheapest:
+
+| n (B) | 14 | 15 | **16** | 17 | 18 | 19 | **20** |
+|---|--:|--:|--:|--:|--:|--:|--:|
+| µs/op | 97.9 | 78.1 | **70.3** | 94.7 | 82.7 | 82.9 | **76.3** |
+
+The same shape repeats at 64 (86.0 against 95–107 either side) and at 256
+(134.8 against 147–161). The driver works in words, and a transfer pays for
+both a misaligned start and a non-word length.
+
+#### This softens §5's claim about where the missing time goes
+
+§5 reports that transfer-bound phases predict at 0.57× and concludes **"the
+missing 43 % is CPU above L0"**. That is now too confident.
+
+`blob_db` reads at arbitrary offsets inside slots; the model it is being scored
+against was fitted on aligned transfers. If those reads pay the ~1.5× the offset
+probe measures, `lg read` predicts 4.278 × 1.5 = **6.4 s against 7.5 s measured,
+a ratio of 0.86× rather than 0.57×** — and misalignment at L0 accounts for
+roughly three quarters of what was attributed to CPU above it.
+
+That is arithmetic on a hypothesis, not a result: this app does not know
+`blob_db`'s offset distribution, and nothing here has measured it. But the
+claim as written is no longer supported, and the way to settle it is an
+alignment histogram at the store seam rather than another sweep down here.
+
+#### Two smaller results
+
+**Erasing an already-erased block costs the same as a dirty one** — 1 091.1 ms
+against a 1 111.3 ms median. There is no shortcut to skip, so a layer that
+tracks which blocks are already clean saves the whole erase or nothing.
+
+**Block-to-block erase time spans 1 050.7 – 1 151.7 ms across 32 blocks**, a
+1.10× spread. Worth knowing before reading a 4 % difference in an erase-bound
+phase as a change in behaviour.
 
 ## 6. Measured against the datasheet
 
