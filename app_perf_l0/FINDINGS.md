@@ -226,16 +226,34 @@ is why it might be worth it.
 
 ### 3b. Erase granularity — the driver already does 4 KB; the 64 KB choice is ours
 
-The part supports three erase sizes (opcodes per `drivers/flash/spi_nor.h:49`,
-`:51`, `:53`; times from datasheet §15, ULP):
+The part supports three erase sizes. **The nRF QSPI peripheral can issue only
+two of them**, plus chip erase — this is a hardware limit, not a driver choice.
+`modules/hal/nordic/nrfx/hal/nrf_qspi.h:179` enumerates the `ERASE.LEN`
+register field:
 
-| | opcode | ULP typ | per byte | latency per call |
-|---|---|---:|---:|---:|
-| Sector erase 4 KB | `20h` | 58 ms | 14.2 µs/B | **58 ms** |
-| Block erase 32 KB | `52h` | 1.0 s | 30.5 µs/B | 1.0 s |
-| Block erase 64 KB | `D8h` | 0.8 s | 12.2 µs/B | 800 ms |
+```c
+typedef enum {
+    NRF_QSPI_ERASE_LEN_4KB  = QSPI_ERASE_LEN_LEN_4KB,  /**< Erase 4 kB block (flash command 0x20). */
+    NRF_QSPI_ERASE_LEN_64KB = QSPI_ERASE_LEN_LEN_64KB, /**< Erase 64 kB block (flash command 0xD8). */
+    NRF_QSPI_ERASE_LEN_ALL  = QSPI_ERASE_LEN_LEN_All   /**< Erase all (flash command 0xC7). */
+} nrf_qspi_erase_len_t;
+```
 
-**And the driver already issues whichever fits.** `nrf_qspi_nor.c:604`:
+| | opcode | reachable here | ULP typ | per byte | latency per call |
+|---|---|---|---:|---:|---:|
+| Sector erase 4 KB | `20h` | **yes** | 58 ms | 14.2 µs/B | **58 ms** |
+| Block erase 32 KB | `52h` | **no — no `ERASE.LEN` encoding** | 1.0 s | 30.5 µs/B | 1.0 s |
+| Block erase 64 KB | `D8h` | **yes** | 0.8 s | 12.2 µs/B | 800 ms |
+| Chip erase | `C7h` | yes | 120 s | 14.3 µs/B | 120 s |
+
+Reaching `52h` at all would mean going around the erase path entirely, through
+the QSPI custom-instruction (CINSTR) interface. **It is not worth it**: in
+Ultra Low Power a 32 KB erase is specified at 1.0 s against the 64 KB erase's
+0.8 s, so the one granularity the peripheral cannot reach is also the one with
+no reason to be used. The hardware limit costs nothing on this part.
+
+**Of the two it can issue, the driver already picks whichever fits.**
+`nrf_qspi_nor.c:604`:
 
 ```c
 if (size == params->size) {                 /* chip erase           */
@@ -263,10 +281,10 @@ time — which is what `blob_db_prepare()` does — latency is what is felt. The
 costs are real too: 16× more buckets, 16× the bucket-header overhead, and a
 payload cap that falls with the sector size.
 
-**The 32 KB anomaly**: in Ultra Low Power a 32 KB block erase (1.0 s typ) is
-*slower than a 64 KB one* (0.8 s typ). There is never a reason to use `52h` on
-this part in this mode — and the driver never does, which the code above shows
-is by construction rather than by luck.
+So the practical answer to "which erase sizes does the driver have" is
+**two: 4 KiB and 64 KiB** (plus chip erase). 32 KiB is absent, and absent from
+the silicon rather than the software — which on this part is no loss, since
+32 KiB is the slower of the two block erases in Ultra Low Power.
 
 ### 3c. Chip erase is a trap, and `blob_db_erase_all()` may already be taking it
 
