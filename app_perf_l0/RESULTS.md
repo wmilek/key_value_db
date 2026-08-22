@@ -839,6 +839,62 @@ tracks which blocks are already clean saves the whole erase or nothing.
 1.10× spread. Worth knowing before reading a 4 % difference in an erase-bound
 phase as a change in behaviour.
 
+### 5e. Are the numbers stable? Three DK runs, and the suite twice
+
+Reproducibility, checked rather than assumed. The three board captures on the
+branch are independent runs of the same board at different sweep densities —
+and, between the first and the last, a **changed write procedure** (per-point
+erase became a cursor through a pre-erased region). A coefficient that survives
+both is measuring the part rather than the harness.
+
+| coefficient | `direct` 15 pts | `matrix` 32/28 | `full` 112/96 | spread |
+|---|---:|---:|---:|---:|
+| read per byte | 258.27 ns/B | 256.02 | 253.78 | **1.018×** |
+| write per byte | 12 156.5 ns/B | 12 182.9 | 12 222.4 | **1.005×** |
+| erase per block | 1 061.43 ms | 1 087.56 | 1 086.31 | **1.025×** |
+| write fixed | 157.13 µs | 158.16 | 159.44 | **1.015×** |
+| read fixed | 65.68 µs | 68.12 | 69.23 | 1.054× |
+
+Four of five inside 2.5 % across a 7× density change and a procedure change.
+
+**The read intercept's 5.4 % is not drift in the part, it is the fit doing what
+it should.** It moves monotonically with point count, because the ladder fills
+in below the read crossover (254 B) and those added points measure almost
+nothing *but* the intercept — so the weighted fit lets them speak. The right
+question is whether it changes an answer, and the models are compared where
+that is decided, at the predictions:
+
+| read of | `direct` | `matrix` | `full` | spread |
+|---:|---:|---:|---:|---:|
+| 4 B | 66.72 µs | 69.14 | 70.25 | 1.053× |
+| 256 B | 131.80 µs | 133.65 | 134.20 | 1.018× |
+| 1 KB | 330.15 µs | 330.23 | 329.10 | **1.003×** |
+| 64 KB | 16 991.7 µs | 16 843.3 | 16 700.9 | 1.017× |
+
+| write of | `direct` | `matrix` | `full` | spread |
+|---:|---:|---:|---:|---:|
+| 4 B | 205.76 µs | 206.90 | 208.33 | 1.013× |
+| 256 B | 3 269.2 µs | 3 277.0 | 3 288.4 | 1.006× |
+| 64 KB | 796 845 µs | 798 579 | 801 165 | **1.005×** |
+
+The three models disagree by **at most 5 % anywhere, and under 2 % over most of
+the range** — including on `blob_db`'s own mean operation sizes (14.3 B read:
+1.050×; 48 B write: 1.007×). For a cost model whose stated purpose is turning
+operation counts into seconds, that is well inside what the prediction is used
+for; §5's phase ratios move in the third digit whichever of the three is used.
+
+Where the disagreement concentrates is exactly where §5b said the fixed term
+dominates and §5c said the fit is worst — small reads. Three independent
+statements about the same region, which is the sort of agreement that makes a
+model believable.
+
+**Host side**, for completeness: `native_sim` produces **byte-identical**
+captures across three consecutive runs (253 `l0raw` rows each, `diff`-clean),
+so the harness contributes no variance of its own; the flash simulator has none
+to contribute. `west twister -T key_value_db -p native_sim` run twice gives
+18/18 configurations and 209/209 test cases both times, with per-suite statuses
+identical. And `tools/selftest.py` passes both of its synthetic devices.
+
 ## 6. Measured against the datasheet
 
 `tools/l0_timing.py spec` compares a model against a part's specified
