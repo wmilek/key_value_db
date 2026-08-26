@@ -1,0 +1,20 @@
+/*
+ * Move blob_db's storage_partition off the app-core internal NVMC (32 KB at
+ * 0xf8000) and onto the on-board MX25R64 QSPI NOR (8 MB), matching the
+ * native_sim geometry above.
+ */
+
+/delete-node/ &storage_partition;
+
+&mx25r64 {
+	partitions {
+		compatible = "fixed-partitions";
+		#address-cells = <1>;
+		#size-cells = <1>;
+
+		storage_partition: partition@0 {
+			label = "storage";
+			reg = <0x00000000 0x00800000>;
+		};
+	};
+};

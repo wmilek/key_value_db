@@ -112,6 +112,14 @@ jobs:
           west build -p always -b nrf5340dk/nrf5340/cpuapp -d build/nrf_kvdb key_value_db/app -- \
             -DCONFIG_BLOBDB_KVDB=y
 
+      # The samples are the documentation people copy from, so they must keep
+      # building for the target too — not just on native_sim, where twister
+      # already builds and runs them.
+      - name: Build samples/kvhash (ARM)
+        run: |
+          west build -p always -b nrf5340dk/nrf5340/cpuapp -d build/nrf_sample_kvhash \
+            key_value_db/samples/kvhash
+
       # app_perf is the binary that gets flashed to produce the numbers in
       # app_perf/RESULTS.md, and it exercises paths `app` does not: segmented
       # large objects, blob_db_write(), and the I/O counters. Until this step

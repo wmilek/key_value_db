@@ -1,0 +1,21 @@
+# Lets Twister build (and, on native_sim, run) the sample:
+#   west twister -T key_value_db/samples -p native_sim -v --inline-logs
+sample:
+  description: kvhash (L2 Map shape) operations, step by step
+  name: kvhash-basics
+tests:
+  sample.kvhash:
+    platform_allow: native_sim
+    harness: console
+    harness_config:
+      type: multi_line
+      ordered: true
+      regex:
+        - "\\[2\\] find the map's root id, and create the map the first time"
+        - "\\[4\\] get — read the values back"
+        - "\\[7\\] del — remove a key, and what a missing key returns"
+        - "sample complete"
+  # Anywhere the sample cannot be run by Twister, still keep it compiling.
+  sample.kvhash.build:
+    platform_exclude: native_sim
+    build_only: true
