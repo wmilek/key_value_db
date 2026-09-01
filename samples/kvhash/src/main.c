@@ -62,14 +62,21 @@ LOG_MODULE_REGISTER(sample_kvhash, CONFIG_SAMPLE_KVHASH_LOG_LEVEL);
 #define SAMPLE_MAP_KEY ROOTREG_KEY(0x534d504cu /* 'SMPL' */, 0)
 
 /*
- * Bucket count, frozen into the map when it is created. kvhash reads
- * map_config.initial_capacity as the size of its bucket directory, clamped so
- * the directory fits one blob payload — with the default
- * CONFIG_BLOB_DB_MAX_PAYLOAD_LEN of 256 the ceiling is 31 buckets. There is no
- * online resize in v1, so pick it for the store you expect: a key lands in
- * bucket fnv1a(key) % n_buckets and each bucket is a short linear scan.
+ * What this sample stores — four settings-style entries of a few dozen bytes.
+ *
+ * Note what is NOT here: a bucket count. An application describes its data and
+ * the container derives its own geometry from it (bucket count, depth, bucket
+ * size), because those depend on the payload size and the medium, which are
+ * not the application's to know. Leave a field zero and it means "I do not
+ * know" — a NULL config is legal and lets kvhash choose everything.
+ *
+ * There is no online resize in v1, so the declaration is frozen into the map
+ * at create: describe the store you expect, not the one you have on the first
+ * boot.
  */
-#define N_BUCKETS 16
+#define N_ENTRIES        4
+#define TYPICAL_ENTRY_B  32
+#define MAX_ENTRY_B      64
 
 /* The container's whole API surface. */
 static const struct map_ops *const map = &kvhash_map_ops;
@@ -166,14 +173,29 @@ static int run(void)
 	 * exactly the create-once condition. */
 	if (!blob_db_exists(root)) {
 		const struct map_config cfg = {
-			.initial_capacity = N_BUCKETS,
+			.expected_entries = N_ENTRIES,
+			.typical_entry_bytes = TYPICAL_ENTRY_B,
+			.max_entry_bytes = MAX_ENTRY_B,
 		};
 
 		rc = map->create(root, &cfg);
-		printk("    create(root, .initial_capacity=%u) -> %d   [first run]\n",
-		       (unsigned)N_BUCKETS, rc);
+		printk("    create(root, .expected_entries=%u) -> %d   [first run]\n",
+		       (unsigned)N_ENTRIES, rc);
 		if (rc != 0) {
 			return rc;
+		}
+
+		/* What the container decided. stat() reads only values the map
+		 * already keeps in order to work, so it costs a blob read and
+		 * never a write — and it is the only way to see the geometry,
+		 * which create() deliberately does not also report. */
+		struct map_info info;
+
+		if (map->stat && map->stat(root, &info) == 0) {
+			printk("    stat(root) -> depth %u, %u buckets, "
+			       "entries up to %u B\n",
+			       info.depth, (unsigned)info.buckets,
+			       (unsigned)info.entry_bytes_limit);
 		}
 	} else {
 		/* A later boot lands here: the map was built by an earlier run and
