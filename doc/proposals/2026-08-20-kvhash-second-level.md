@@ -251,6 +251,57 @@ reports **blob count beside bytes**, because bytes alone cannot see this knee.
 And the lesson generalises past this constant: a container's cost is not only
 what it moves, it is what it makes the layer beneath it hold.
 
+### 5.2b The floor priced on both ends — DK model, 10 000 persons
+
+§5.2a corrected the floor from 256 to 4 096 using `native_sim` **read** timings.
+That platform models no erase latency, so the write half of the trade was
+invisible when the value was chosen. `app_perf_l0` (main, #31) closes that: it
+fits an affine per-class cost model from hardware, and `blob_db`'s counters give
+exactly the totals it needs, so a `native_sim` run becomes a hardware estimate
+of a board it never touched.
+
+Swept at 10 000 persons, per operation, priced on the measured DK model:
+
+| floor | buckets | `check` flash ops | **`check`** | erases / 200 `put` | **`put`** |
+|--:|--:|--:|--:|--:|--:|
+| 1 024 | 3 721 | 58 969 | **22.3 ms** | 150 | **1 069 ms** |
+| 2 048 | 1 936 | 38 346 | 15.2 ms | 255 | 1 764 ms |
+| **4 096** | 961 | 23 535 | **10.3 ms** | 355 | **2 419 ms** |
+
+**1 024 → 4 096 makes reads 2.15× cheaper and writes 2.26× dearer**, monotonic
+in both directions. The write cost is almost entirely erase: 389 s of the 484 s
+predicted for 200 `put`s at floor 4 096.
+
+**The confidence is uneven, and it favours this question.** Against the real
+10 000-person DK run: predicted `put` 2 419 ms against 2 564 ms measured —
+**0.94**. Predicted `check` 10.3 ms against 26.8 ms — 0.39. The write path is
+erase-dominated and erase is the best-fitted class in the model (1.7 % max
+error); the read path is dominated by per-operation cost above L0, which the
+model explicitly excludes. So the side the floor most affects is the side
+predicted accurately.
+
+**Where it crosses.** Correcting reads by the measured 2.5× shortfall and taking
+writes as predicted, for a workload of R reads per write:
+
+```
+floor 1 024:  55.8R + 1 069 ms
+floor 4 096:  25.8R + 2 419 ms      cross at R ~ 45
+```
+
+**So 4 096 is right for the product and wrong for the benchmark.** An
+access-control database performs thousands of checks per enrolment, far above
+45, so the shipped value suits what `app_cbor_persondb` models. Its own
+benchmark is dominated by a 10 000-person fill — nearly pure write — where a
+lower floor finishes materially faster. The constant is serving the simulated
+product, not the measurement harness, which is the right way round but worth
+knowing when reading a fill time.
+
+*Method: `native_sim` counters priced by `models/mx25r64_nrf5340dk_full.json`,
+not a DK run. The ~1.25× counter discrepancy between `native_sim` and the board
+(§13.1) applies equally to all three rows, so it cancels in the comparison and
+not in the absolute values. The read column carries a hand-applied 2.5×
+correction, so the crossover is order-of-magnitude.*
+
 **The reason to prefer this over A is not the bytes. It is that a two-level map
 can split.** Bucket overflow stops being `-ENOSPC` and becomes "split this
 sub-map and rehash it". That retires **K2**, and with it the reason
@@ -1021,6 +1072,17 @@ For the record, so these are not re-opened as blockers:
   So the two-level target is `max(typical_entry_bytes, MIN_BUCKET_BYTES)`, not
   one entry per bucket. §5.2's rule was right about the direction and wrong at
   both ends — which is what a check, and then a build, are for.
+
+  **Now priced on both ends (§5.2b).** 4 096 was fitted to `native_sim` read
+  timings, on a platform that models no erase latency, so the write half was
+  invisible. With `app_perf_l0`'s hardware cost model the dial reads: 1 024 →
+  4 096 buys 2.15× on reads and costs 2.26× on writes, crossing at about **45
+  reads per write**. 4 096 is therefore correct for the workload this
+  application models and conservative for its own fill-dominated benchmark. The
+  value stands; what changes is that it is now a measured trade rather than a
+  read-side optimum, and **the right long-term shape is a declared read/write
+  mix rather than one global constant** — the same argument that moved geometry
+  into `map_config`.
 
   Both are constants, not format fields: each map records its own geometry, so
   moving either later changes only maps created afterwards and never invalidates
