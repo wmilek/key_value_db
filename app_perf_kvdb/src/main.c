@@ -429,7 +429,7 @@ int main(void)
 
 	if (rc != 0) {
 		LOG_ERR("mount: %d", rc);
-		return 0;
+		goto out;
 	}
 
 	if (IS_ENABLED(CONFIG_APP_PERF_KVDB_FRESH_START)) {
@@ -573,8 +573,6 @@ int main(void)
 out:
 	blob_db_unmount();
 #ifdef CONFIG_ARCH_POSIX
-	/* On native_sim, terminate the process so shell reruns are one-liners;
-	 * exit code reflects the verify outcome. */
 	posix_exit(rc == 0 ? 0 : 1);
 #endif
 	return 0;

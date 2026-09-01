@@ -25,7 +25,7 @@ needed to follow along:
 
 ```shell
 west build -p always -b native_sim samples/kvhash
-./build/zephyr/zephyr.exe
+./build/zephyr/zephyr.exe --flash=kvhash.bin --flash_erase
 ```
 
 They are ordinary Zephyr applications, so any supported board works too — the
