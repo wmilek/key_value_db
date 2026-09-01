@@ -452,6 +452,12 @@ int scenario_bench(struct scenario *s, enum scenario_bench_kind which,
 	out->store_ops = st1.map_gets + st1.map_sets + st1.map_dels;
 	out->flash_ops = st1.flash_reads + st1.flash_writes + st1.flash_erases;
 	out->flash_bytes = st1.bytes_read + st1.bytes_written + st1.bytes_erased;
+	out->reads = st1.flash_reads;
+	out->writes = st1.flash_writes;
+	out->erases = st1.flash_erases;
+	out->bytes_read = st1.bytes_read;
+	out->bytes_written = st1.bytes_written;
+	out->bytes_erased = st1.bytes_erased;
 	out->measured = st1.io_measured;
 	/* Microseconds, not milliseconds/ops: `cbor` runs in a few hundred
 	 * microseconds in total, and rounding that to whole milliseconds is

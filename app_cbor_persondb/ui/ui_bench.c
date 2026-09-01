@@ -65,6 +65,19 @@ static void print_bench(const struct bench_result *b)
 	       b->name, b->ops, b->us, ops_x100 / 100ULL, ops_x100 % 100ULL,
 	       b->us_per_op, b->store_ops, b->flash_ops, b->flash_bytes,
 	       b->measured ? "" : "?", b->amplification);
+
+	/* The same phase split by operation class, in the form
+	 * app_perf_l0/tools/l0_timing.py parses. A native_sim run measures no
+	 * time but counts every operation, and the L0 cost model is affine per
+	 * class, so these six numbers are enough to predict what this phase
+	 * would cost on hardware. */
+	if (b->measured) {
+		printk("io %-6s      : rd %6" PRIu64 " ops/%9" PRIu64 " B  "
+		       "wr %6" PRIu64 " ops/%9" PRIu64 " B  "
+		       "er %5" PRIu64 " ops/%9" PRIu64 " B\n",
+		       b->name, b->reads, b->bytes_read, b->writes,
+		       b->bytes_written, b->erases, b->bytes_erased);
+	}
 }
 
 static void print_report(const struct scenario_report *r)
