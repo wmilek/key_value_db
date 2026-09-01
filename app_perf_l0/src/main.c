@@ -90,8 +90,8 @@
 
 #include <zephyr/app_version.h>
 
-#if defined(CONFIG_ARCH_POSIX)
-#include <posix_board_if.h>
+#ifdef CONFIG_ARCH_POSIX
+#include "posix_board_if.h"   /* posix_exit() — end the sim run cleanly */
 #endif
 
 LOG_MODULE_REGISTER(app_perf_l0, CONFIG_APP_PERF_L0_LOG_LEVEL);
@@ -1299,6 +1299,9 @@ int main(void)
 
 	if (rc < 0) {
 		printk("l0end status=%d\n", rc);
+#ifdef CONFIG_ARCH_POSIX
+	posix_exit(rc == 0 ? 0 : 1);
+#endif
 		return 0;
 	}
 
@@ -1328,11 +1331,8 @@ int main(void)
 
 	flash_area_close(g_fa);
 
-#if defined(CONFIG_ARCH_POSIX)
-	/* On a board, main() returning leaves the idle loop spinning and the
-	 * operator stops the capture by hand. On native_sim the capture is a
-	 * shell pipeline, so exit and let it end on its own. */
-	posix_exit(rc < 0 ? 1 : 0);
+#ifdef CONFIG_ARCH_POSIX
+	posix_exit(rc == 0 ? 0 : 1);
 #endif
 	return 0;
 }

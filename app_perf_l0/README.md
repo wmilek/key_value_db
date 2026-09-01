@@ -213,7 +213,7 @@ west build -b native_sim key_value_db/app_perf \
   -DCONFIG_BLOB_DB_LOG_LEVEL_INF=y \
   -DEXTRA_DTC_OVERLAY_FILE=$PWD/key_value_db/app_perf_l0/geometry/mx25r64.overlay \
   -DEXTRA_CONF_FILE=$PWD/key_value_db/app_perf_l0/geometry/mx25r64.conf
-./build/zephyr/zephyr.exe > run.log
+./build/zephyr/zephyr.exe --flash=perf_mx25r64.bin --flash_erase > run.log
 ```
 
 `CONFIG_BLOB_DB_LOG_LEVEL_INF=y` is what makes `blob_db` print its geometry

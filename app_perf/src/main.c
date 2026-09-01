@@ -64,6 +64,10 @@
 
 #include <zephyr/app_version.h>
 
+#ifdef CONFIG_ARCH_POSIX
+#include "posix_board_if.h"   /* posix_exit() — end the sim run cleanly */
+#endif
+
 LOG_MODULE_REGISTER(app_perf, CONFIG_APP_PERF_LOG_LEVEL);
 
 #define N_OPS   CONFIG_APP_PERF_N_OPS
@@ -539,7 +543,7 @@ int main(void)
 
 	if (rc < 0) {
 		LOG_ERR("mount: %d", rc);
-		return 0;
+		goto out;
 	}
 
 	uint8_t val[VAL_LEN];
@@ -641,5 +645,8 @@ int main(void)
 
 out:
 	blob_db_unmount();
+#ifdef CONFIG_ARCH_POSIX
+	posix_exit(rc == 0 ? 0 : 1);
+#endif
 	return 0;
 }

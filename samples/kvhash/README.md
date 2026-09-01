@@ -56,7 +56,7 @@ these ops.
 
 ```shell
 west build -p always -b native_sim samples/kvhash
-./build/zephyr/zephyr.exe
+./build/zephyr/zephyr.exe --flash=kvhash.bin --flash_erase
 ```
 
 Expected output (abridged):

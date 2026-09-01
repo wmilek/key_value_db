@@ -145,6 +145,11 @@ survives a restart the same way it does on a device:
 ./build/zephyr/zephyr.exe --flash=/tmp/blob.bin   # run again: the counter advances
 ```
 
+Always pass `--flash=`, and give each app its own file. Every `native_sim`
+binary here defaults to the same `./flash.bin`, and `app_cbor_persondb` writes
+it in the DK's 64 KB-sector geometry that the other builds cannot read — a
+store written by one app and then opened by another fails to mount.
+
 The storage stack is exercised on two targets: `native_sim` (simulated flash,
 where the test suites run) and `nrf5340dk/nrf5340/cpuapp`, whose
 `storage_partition` sits on the on-board MX25R64 QSPI NOR — both are built by
@@ -208,7 +213,8 @@ between you and the calls.
 | [`samples/kvhash/`](samples/kvhash) | the L2 Map shape (`kvhash_map_ops`): create / get / set / del over a persistent hash map, where its root id comes from, and the errors worth handling (`-ENOMEM` sizing, `-ENOENT`, the one-payload-per-bucket `-ENOSPC`) |
 
 ```shell
-west build -p always -b native_sim samples/kvhash && ./build/zephyr/zephyr.exe
+west build -p always -b native_sim samples/kvhash
+./build/zephyr/zephyr.exe --flash=kvhash.bin --flash_erase
 ```
 
 ## Applications
