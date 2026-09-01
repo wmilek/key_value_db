@@ -31,7 +31,7 @@
 #include "scenario.h"
 
 #ifdef CONFIG_ARCH_POSIX
-#include "posix_board_if.h"
+#include "posix_board_if.h"   /* posix_exit() — end the sim run cleanly */
 #endif
 
 #define VERIFY_SAMPLES CONFIG_APP_CBOR_PERSONDB_VERIFY_SAMPLES

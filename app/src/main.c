@@ -11,7 +11,7 @@
  * next allocation restarts at 2, and the boot counter resets to 1.
  *
  * Run natively with a backing flash file to see the count persist:
- *   ./zephyr.exe --flash=/tmp/blob.bin --stop_at=1
+ *   ./zephyr.exe --flash=/tmp/blob.bin
  */
 
 #include <zephyr/kernel.h>
@@ -20,6 +20,10 @@
 #include <app/lib/blob_db.h>
 
 #include <zephyr/app_version.h>
+
+#ifdef CONFIG_ARCH_POSIX
+#include "posix_board_if.h"   /* posix_exit() — end the sim run cleanly */
+#endif
 
 LOG_MODULE_REGISTER(main, CONFIG_APP_LOG_LEVEL);
 
@@ -32,7 +36,7 @@ int main(void)
 	int rc = blob_db_mount();
 	if (rc < 0) {
 		LOG_ERR("blob_db_mount failed: %d", rc);
-		return 0;
+		goto out;
 	}
 
 	uint32_t boot_count;
@@ -79,5 +83,8 @@ int main(void)
 
 out:
 	blob_db_unmount();
+#ifdef CONFIG_ARCH_POSIX
+	posix_exit(rc == 0 ? 0 : 1);
+#endif
 	return 0;
 }

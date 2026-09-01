@@ -145,6 +145,11 @@ survives a restart the same way it does on a device:
 ./build/zephyr/zephyr.exe --flash=/tmp/blob.bin   # run again: the counter advances
 ```
 
+Always pass `--flash=`, and give each app its own file. Every `native_sim`
+binary here defaults to the same `./flash.bin`, and `app_cbor_persondb` writes
+it in the DK's 64 KB-sector geometry that the other builds cannot read — a
+store written by one app and then opened by another fails to mount.
+
 The storage stack is exercised on two targets: `native_sim` (simulated flash,
 where the test suites run) and `nrf5340dk/nrf5340/cpuapp`, whose
 `storage_partition` sits on the on-board MX25R64 QSPI NOR — both are built by
@@ -180,30 +185,61 @@ Two things to know before switching a real device:
 The ztest suites all run on `native_sim`:
 
 ```shell
-west twister -T key_value_db -p native_sim -v --inline-logs   # tests + app builds
+west twister -T key_value_db -p native_sim -v --inline-logs   # tests + samples + app builds
 west twister -T key_value_db/tests -p native_sim              # tests only
+west twister -T key_value_db/samples -p native_sim            # samples only
 ```
+
+The samples are not only built but *run*: each one's console narration is
+checked against the output it documents, so a sample cannot drift from the API
+it demonstrates.
 
 This is what CI runs ([`build.yml`](.github/workflows/build.yml)), plus an
 app build on the non-default `flash_area` backend. At the merge gate it also
 cross-builds for ARM: the demo on both storage backends and with `kvdb`
-enabled, `app_perf`, and `app_cbor_persondb` in both of its frontends — so the
-binaries that produce the hardware numbers cannot rot between runs on real
-hardware.
+enabled, `samples/kvhash`, `app_perf`, and `app_cbor_persondb` in both of its
+frontends — so the binaries that produce the hardware numbers cannot rot
+between runs on real hardware.
+
+## Samples
+
+Start here if you are learning the API. Each sample in [`samples/`](samples) is
+the smallest complete program that uses **one** API, narrating every call and
+its return code on the console — no timing loops, no parameter sweeps, nothing
+between you and the calls.
+
+| Sample | Demonstrates |
+|---|---|
+| [`samples/kvhash/`](samples/kvhash) | the L2 Map shape (`kvhash_map_ops`): create / get / set / del over a persistent hash map, where its root id comes from, and the errors worth handling (`-ENOMEM` sizing, `-ENOENT`, the one-payload-per-bucket `-ENOSPC`) |
+
+```shell
+west build -p always -b native_sim samples/kvhash
+./build/zephyr/zephyr.exe --flash=kvhash.bin --flash_erase
+```
 
 ## Applications
 
-Each application is a standalone Zephyr app. The measuring ones print their
-timings over the console and keep hardware-measured reference numbers in a
-`RESULTS.md` next to the source.
+Each application is a standalone Zephyr app. Unlike the samples, these exist to
+*measure* and to *probe*: the measuring ones print their timings over the
+console and keep hardware-measured reference numbers in a `RESULTS.md` next to
+the source.
 
 | Application | What it does | Reference results |
 |---|---|---|
 | [`app/`](app) | `blob_db` demo: a boot counter persisted at the root id, wiped with `blob_db_erase_all()` every 5th boot | — |
 | [`app_perf/`](app_perf) | raw `blob_db` benchmark: prepend / append / read / update over a linked list of blobs | [`RESULTS.md`](app_perf/RESULTS.md) |
+| [`app_perf_l0/`](app_perf_l0) | **L0 cost model**: raw `flash_area` timing, swept over transfer size and erase size as a matrix of µs/op, KiB/s and marginal cost — so whether the relationship is linear is read off, not assumed. Its output feeds a timing model that turns any `native_sim` run's I/O counters into predicted hardware wall-clock, and can be checked against the part's datasheet | [`RESULTS.md`](app_perf_l0/RESULTS.md) |
 | [`app_perf_mc/`](app_perf_mc) | model-container benchmark — the price of the full crash-safe mutation discipline | [`RESULTS.md`](app_perf_mc/RESULTS.md) |
 | [`app_perf_kvdb/`](app_perf_kvdb) | `kvdb` demo + benchmark with **cross-reboot verification**: every value is predicted from a stored generation counter, so a rerun proves the previous run survived — and an interrupted run is detected and proven atomic | [`RESULTS.md`](app_perf_kvdb/RESULTS.md) |
 | [`app_cbor_persondb/`](app_cbor_persondb) | a CBOR person/credential database — 10 000 people over the L2 Map shape, with the access decision, crash safety and capacity planning a real product needs. Both a **worked example** of building on this stack and a **probe** of it | [`RESULTS.md`](app_cbor_persondb/RESULTS.md) |
+
+`app_perf_l0` is the one to reach for when a change moves flash traffic and
+there is no board on the desk. It is the only app here that links none of the
+stack — it measures `flash_area` itself — and the model fitted from one board
+run turns the operation counters every other benchmark already prints into
+predicted seconds on that board. A `native_sim` run carrying the target's
+geometry reproduces the hardware's counters exactly (`app_perf_l0/RESULTS.md`
+§2), which is what makes the prediction meaningful rather than arithmetic.
 
 `app_perf_kvdb` is the one to reach for when validating power-loss behavior on
 real hardware: cut power during its modify phase and the next boot classifies
@@ -319,8 +355,11 @@ lib/
   kvdb/  blobfs/      L3  access interfaces
 include/app/lib/      public headers — blob_db.h · rootreg.h · kvdb.h · blobfs.h
                       · containers/{shape_map,shape_seq,kvhash}.h
+samples/              API samples — smallest complete program per API (kvhash)
 app/                  blob_db demo application
 app_perf*/            benchmarks (+ hardware reference RESULTS.md)
+                      app_perf_l0/ also carries the L0 timing model:
+                      tools/l0_timing.py, models/, geometry/
 app_cbor_persondb/    worked example & probe (README · DESIGN · FINDINGS · RESULTS)
 tests/lib/            ztest suites: blob_db · blob_db_contract · rootreg · kvdb
 tests/support/        shared test shims (crash injection)

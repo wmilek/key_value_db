@@ -1,0 +1,52 @@
+{
+  "schema": "l0-part-spec/1",
+  "part": "MX25R6435F",
+  "source": "Macronix MX25R6435F datasheet Rev. 1.6, August 08 2022 — section 15, ERASE AND PROGRAMMING PERFORMANCE, page 75",
+  "page_bytes": 256,
+  "notes": [
+    "Section 15 has two tables. Each mode caption sits ABOVE its table: the first table (64 KB block erase typ 0.8 s, page program typ 3.2 ms) is Ultra Low Power Mode, and the second (0.48 s / 0.85 ms) is High Performance Mode. Reading the captions as if they were below swaps the two, and they differ by 2-4x, so the swap changes every verdict.",
+    "The mode is Configuration Register-2 bit 1, the L/H switch. It is a VOLATILE bit whose power-on value comes from the part's ordering code, and Rev 1.6 no longer states a generic default (revision history, page 85: 'Removed L/H Switch bit descriptions (default value) P31'). Zephyr's nordic,qspi-nor driver does not write CR2, so a board runs whatever the part powers up as -- which makes the mode something to determine by measurement rather than to assume.",
+    "The '(Applied Vhv at WP# pin)' rows are a different operating condition, high voltage on WP#, and are recorded here only for completeness. They are not the basis of any comparison: nothing on the nRF5340-DK drives Vhv.",
+    "Typical figures are 25 C, typical VCC, checkerboard pattern for program and all-zero for erase. Maximum figures are 85 C at minimum operating voltage. A measurement at room temperature that sits well above typ is not out of spec, but it is worth explaining.",
+    "These are the part's internal erase and program times. They do not include the SPI bus time to shift the data in, nor the driver's per-call overhead -- both of which land in the model's fixed term, not its per-unit term. Compare per-unit against these; do not compare the fixed term against them."
+  ],
+  "modes": {
+    "ultra_low_power": {
+      "config": "Configuration Register-2 bit 1 = 0",
+      "write_status_register": { "typ_ns": 10000000, "max_ns": 30000000 },
+      "erase_block_ns": {
+        "4096":  { "typ_ns": 58000000,    "max_ns": 240000000,
+                   "vhv_typ_ns": 36000000, "vhv_max_ns": 210000000 },
+        "32768": { "typ_ns": 1000000000,  "max_ns": 3000000000,
+                   "vhv_typ_ns": 220000000, "vhv_max_ns": 1050000000 },
+        "65536": { "typ_ns": 800000000,   "max_ns": 3500000000,
+                   "vhv_typ_ns": 430000000, "vhv_max_ns": 2100000000 }
+      },
+      "chip_erase": { "typ_ns": 120000000000, "max_ns": 240000000000,
+                      "vhv_typ_ns": 45000000000, "vhv_max_ns": 135000000000 },
+      "byte_program": { "typ_ns": 40000, "max_ns": 100000,
+                        "vhv_typ_ns": 32000, "vhv_max_ns": 100000 },
+      "page_program": { "typ_ns": 3200000, "max_ns": 10000000,
+                        "vhv_typ_ns": 600000, "vhv_max_ns": 3600000 }
+    },
+    "high_performance": {
+      "config": "Configuration Register-2 bit 1 = 1",
+      "write_status_register": { "typ_ns": 9500000, "max_ns": 20000000 },
+      "erase_block_ns": {
+        "4096":  { "typ_ns": 40000000,   "max_ns": 240000000,
+                   "vhv_typ_ns": 36000000, "vhv_max_ns": 210000000 },
+        "32768": { "typ_ns": 240000000,  "max_ns": 1500000000,
+                   "vhv_typ_ns": 220000000, "vhv_max_ns": 1050000000 },
+        "65536": { "typ_ns": 480000000,  "max_ns": 3000000000,
+                   "vhv_typ_ns": 430000000, "vhv_max_ns": 2100000000 }
+      },
+      "chip_erase": { "typ_ns": 50000000000, "max_ns": 150000000000,
+                      "vhv_typ_ns": 45000000000, "vhv_max_ns": 135000000000 },
+      "byte_program": { "typ_ns": 32000, "max_ns": 100000,
+                        "vhv_typ_ns": 32000, "vhv_max_ns": 100000 },
+      "page_program": { "typ_ns": 850000, "max_ns": 4000000,
+                        "vhv_typ_ns": 600000, "vhv_max_ns": 3600000 }
+    }
+  },
+  "endurance_cycles": 100000
+}

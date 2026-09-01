@@ -1,0 +1,22 @@
+/*
+ * Same 16 MB sim-flash / 8 MB storage_partition layout as the other benchmark
+ * apps, so the working region has room for the erase-size sweep. The
+ * simulator's own geometry (4 KB erase blocks, 1 B write alignment) is left
+ * alone here — that is the point of the default build: it measures the host
+ * as the host is.
+ *
+ * To make a native_sim run correspond to a real part, add the matching
+ * overlay from geometry/ instead of editing this file.
+ */
+
+&flashcontroller0 {
+	reg = <0x00000000 DT_SIZE_M(16)>;
+};
+
+&flash0 {
+	reg = <0x00000000 DT_SIZE_M(16)>;
+};
+
+&storage_partition {
+	reg = <0x00800000 DT_SIZE_M(8)>;
+};
