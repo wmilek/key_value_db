@@ -3,6 +3,7 @@
 Status: draft (pre-implementation)
 · Part of the stack in `doc/architecture.md` · Governed by `doc/principles.md`
 · Builds on L1: `doc/layers/l1_blob_db.md`
+· Provider implementations (non-normative): `doc/impl/l2_kvhash.md`
 
 ---
 
@@ -73,6 +74,33 @@ magic/type. Handles (`seq_t`, `map_t`) hold the root id plus O(1) cursor state
 Each container type tags its root node with a 4-byte magic, so `open` fails fast
 with `-EINVAL` when pointed at a root of the wrong type.
 
+### 2.4 Destroying a container
+
+A container is destroyed by whoever holds its root id — a root-registry entry
+(`l1_root_registry.md`), or a field in another container's node.
+
+> A holder keeps its record of the root id until `destroy` returns 0, and
+> removes it only afterwards.
+
+That record is the only thing that can name the structure after a crash: remove
+it first and crash mid-destroy, and the container's i-nodes are stranded on
+flash with nothing left to name them.
+
+Returning 0 is the only completion — an error, or a reboot with no answer, means
+call it again. Repeating is always safe: a part-way destroyed container resumes
+and returns 0; one never built, or already gone, returns `-ENOENT`. Once destroy
+has begun, reads answer `-ENOENT` for every key, so a caller never observes a
+half-destroyed container.
+
+The full sequence:
+
+    1. holder records its decision to drop the entry   (its own single-update commit)
+    2. ops->destroy(root)                              repeat until it returns 0
+    3. holder removes the entry
+
+Step 1 is what makes step 2 happen again after a crash: without it the holder
+rediscovers an ordinary entry naming an ordinary root, and never retries.
+
 ## 3. The two abstract shapes
 
 L3 binds against a *shape*, never a concrete container (P6). Two shapes cover
@@ -82,13 +110,28 @@ the planned interfaces:
 `create · open · append · get(index) · set(index) · remove(index) · len · iterate`
 
 **Map** — key-addressed (`map_ops`):
-`create · open · get(key) · set(key) · del(key) · has(key) · iterate`
+`create · destroy · open · get(key) · set(key) · del(key) · has(key) · iterate`
 
 > Implemented so far (`include/app/lib/containers/shape_map.h`): the point
-> subset `create(root, map_config) · get · set · del`, plus `map_config` for
-> create-time hints (e.g. hash bucket count). `open` collapses into "resolve
-> root, then call these"; `has` is an L3 convenience over `get`; `iterate`
-> is deferred until an ordered backend (kvtree) needs it.
+> subset `create(root, map_config) · get · set · del · destroy`, plus
+> `map_config` for create-time hints (e.g. hash bucket count). `open`
+> collapses into "resolve root, then call these"; `has` is an L3 convenience
+> over `get`; `iterate` is deferred until an ordered backend (kvtree) needs
+> it.
+>
+> `destroy` is the one op an L3 caller cannot assemble for itself: only the
+> provider knows which i-nodes its root reaches, so releasing them has to be
+> a container operation or the "L3 binds to a shape, never a container"
+> rule (P6) breaks the first time an interface wants to drop an instance.
+> Destroying a container is not a §2.2 mutation of it but its removal, so its
+> contract is §2.4: the holder keeps its record of the root until `destroy`
+> returns 0, and repeats the call after a crash.
+>
+> Note the asymmetry with `create`: `get`/`set`/`del`/`destroy` all read the
+> root before touching it, so they answer `-ENOENT` on a destroyed root,
+> while `create` writes directly and inherits D3's "update on a deleted id is
+> undefined". A replacement map therefore goes at a fresh `alloc_id`, never
+> back on the old root.
 
 Keys and values are opaque byte strings (`ptr + len`); key semantics (strings,
 paths, hashes) belong to L3. Concrete containers export a `const struct
@@ -175,8 +218,9 @@ blob; with n/nbuckets small this is O(1) average, ~2 flash reads. Set/del
 rewrite one bucket blob and, only when a bucket is first created, the root — one
 or two atomic updates, root last as the commit point.
 
-> **v1 implementation note.** The shipped bucket is a *self-contained packed
-> pair-list blob*, not a `kvlist` chain — so kvhash does **not** select kvlist,
+> **v1 implementation note** (full design: `doc/impl/l2_kvhash.md`). The
+> shipped bucket is a *self-contained packed pair-list blob*, not a `kvlist`
+> chain — so kvhash does **not** select kvlist,
 > and a bucket that outgrows one payload returns `-ENOSPC` (rather than
 > overflow-chaining). Promoting buckets to full kvlist chains (§4.2), and
 > online resize, are future revisions; the on-flash `version` byte reserves
@@ -209,6 +253,9 @@ Every implementation must uphold (checklist for reviews and tests):
 4. **O(1) steady-state RAM** — no per-element RAM, no caches (P3).
 5. **Bounded stack** — ≤ 4 KB transient, plus O(depth) ids for `kvtree`;
    stack buffers preferred over heap (P2).
+6. **Resumable destruction** — the root outlives every node it owns, so an
+   interrupted `destroy` re-derives its work from the root; the operation is
+   idempotent and may be repeated after a crash (§2.4).
 
 ## 6. Kconfig
 

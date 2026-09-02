@@ -1,0 +1,5 @@
+common:
+  tags: storage containers map_ops kvhash
+  platform_allow: native_sim
+tests:
+  lib.containers: {}

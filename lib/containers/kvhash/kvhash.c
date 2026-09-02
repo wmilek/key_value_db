@@ -11,6 +11,8 @@
  *
  *   root blob (the directory):
  *     [u32 magic 'KVHA'] [u16 n_buckets] [u16 version] [u64 bucket_id]*n
+ *     (magic 'KVHD' instead means a destroy has committed and the buckets are
+ *      still being released -- see kvhash_destroy)
  *   bucket blob (packed pair list):
  *     ( [u16 klen] [u16 vlen] [key bytes] [val bytes] )*
  *
@@ -40,6 +42,7 @@
 LOG_MODULE_REGISTER(kvhash, CONFIG_BLOB_CONTAINER_KVHASH_LOG_LEVEL);
 
 #define KVHASH_DIR_MAGIC   0x4b564841u /* 'KVHA' */
+#define KVHASH_DIR_DYING   0x4b564844u /* 'KVHD' — destroy committed, release pending */
 #define KVHASH_VERSION     1
 
 #define MAX_PAYLOAD        CONFIG_BLOB_DB_MAX_PAYLOAD_LEN
@@ -113,8 +116,11 @@ static inline size_t dir_len(uint16_t n_buckets)
 	return DIR_HDR_LEN + (size_t)n_buckets * 8u;
 }
 
-/* Load and validate the directory into dir_buf; report the bucket count. */
-static int dir_load(uint64_t root, uint16_t *n_buckets)
+/*
+ * Load and validate the directory into dir_buf; report the bucket count and
+ * whether a destroy has already committed on this root.
+ */
+static int dir_load_raw(uint64_t root, uint16_t *n_buckets, bool *dying)
 {
 	size_t got = 0;
 	int rc = blob_db_get(root, dir_buf, sizeof(dir_buf), &got);
@@ -129,7 +135,11 @@ static int dir_load(uint64_t root, uint16_t *n_buckets)
 	uint32_t magic;
 
 	memcpy(&magic, &dir_buf[0], sizeof(magic));
-	if (magic != KVHASH_DIR_MAGIC) {
+	if (magic == KVHASH_DIR_MAGIC) {
+		*dying = false;
+	} else if (magic == KVHASH_DIR_DYING) {
+		*dying = true;
+	} else {
 		return -EIO;
 	}
 
@@ -140,6 +150,22 @@ static int dir_load(uint64_t root, uint16_t *n_buckets)
 	}
 	*n_buckets = n;
 	return 0;
+}
+
+/*
+ * The data-path load. A root whose destroy has committed is gone as far as
+ * every reader is concerned (l2_containers.md 2.4), so the whole container
+ * answers -ENOENT and no caller sees the part of it still on flash.
+ */
+static int dir_load(uint64_t root, uint16_t *n_buckets)
+{
+	bool dying = false;
+	int rc = dir_load_raw(root, n_buckets, &dying);
+
+	if (rc != 0) {
+		return rc;
+	}
+	return dying ? -ENOENT : 0;
 }
 
 static inline uint64_t dir_bucket(uint16_t idx)
@@ -368,9 +394,80 @@ static int kvhash_del(uint64_t root, const void *key, size_t klen)
 	return blob_db_update(bid, bkt_buf, used);
 }
 
+/*
+ * Destroy, per l2_containers.md 2.4.
+ *
+ * Stamping the directory's magic is the commit: one atomic update that takes
+ * the whole container out of view while leaving every bucket id in place. That
+ * is what lets an interrupted release resume -- the work list is re-read from
+ * the root rather than journalled -- and it is why the root has to be released
+ * last. Deleting the root first would take the bucket ids with it and strand
+ * the buckets with nothing left anywhere to name them.
+ *
+ * Returning 0 is the only completion; on anything else the caller repeats the
+ * call and the release picks up where it stopped.
+ */
+static int kvhash_destroy(uint64_t root)
+{
+	uint16_t n;
+	bool dying = false;
+	int rc = dir_load_raw(root, &n, &dying);
+
+	if (rc != 0) {
+		return rc;
+	}
+
+	if (!dying) {
+		uint32_t magic = KVHASH_DIR_DYING;
+
+		memcpy(&dir_buf[0], &magic, sizeof(magic));
+
+		rc = blob_db_update(root, dir_buf, dir_len(n));
+		if (rc != 0) {
+			return rc; /* nothing released; the container is intact */
+		}
+	}
+
+	/* Release the buckets. A bucket already gone is the resumed case, not an
+	 * error. A real failure is remembered but does not stop the others --
+	 * every one released is progress the repeat need not redo. */
+	int first_err = 0;
+
+	for (uint16_t i = 0; i < n; i++) {
+		uint64_t bid = dir_bucket(i);
+
+		if (bid == 0) {
+			continue;
+		}
+
+		int drc = blob_db_delete(bid);
+
+		if (drc != 0 && drc != -ENOENT) {
+			LOG_WRN("root=%llu: bucket %u (id %llu) not released: %d",
+				(unsigned long long)root, i,
+				(unsigned long long)bid, drc);
+			if (first_err == 0) {
+				first_err = drc;
+			}
+		}
+	}
+
+	if (first_err != 0) {
+		return first_err; /* still dying; the caller repeats */
+	}
+
+	rc = blob_db_delete(root);
+	if (rc == 0) {
+		LOG_DBG("destroyed map root=%llu n_buckets=%u",
+			(unsigned long long)root, n);
+	}
+	return rc;
+}
+
 const struct map_ops kvhash_map_ops = {
 	.create = kvhash_create,
 	.get = kvhash_get,
 	.set = kvhash_set,
 	.del = kvhash_del,
+	.destroy = kvhash_destroy,
 };
