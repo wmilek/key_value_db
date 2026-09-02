@@ -39,6 +39,7 @@ instructions live in the repository ``README.md``.
 
    impl/l1_bucketlog
    impl/l0_backends
+   impl/l2_kvhash
 
 .. toctree::
    :maxdepth: 1

@@ -3,6 +3,7 @@
 Status: draft (pre-implementation)
 · Part of the stack in `doc/architecture.md` · Governed by `doc/principles.md`
 · Builds on L1: `doc/layers/l1_blob_db.md`
+· Provider implementations (non-normative): `doc/impl/l2_kvhash.md`
 
 ---
 
@@ -217,12 +218,9 @@ blob; with n/nbuckets small this is O(1) average, ~2 flash reads. Set/del
 rewrite one bucket blob and, only when a bucket is first created, the root — one
 or two atomic updates, root last as the commit point.
 
-`destroy` stamps the root's magic `'KVHD'` as its commit — the bucket ids stay
-in place, so an interrupted release re-derives its work by re-reading the root —
-then releases the buckets and the root itself, last (§2.4).
-
-> **v1 implementation note.** The shipped bucket is a *self-contained packed
-> pair-list blob*, not a `kvlist` chain — so kvhash does **not** select kvlist,
+> **v1 implementation note** (full design: `doc/impl/l2_kvhash.md`). The
+> shipped bucket is a *self-contained packed pair-list blob*, not a `kvlist`
+> chain — so kvhash does **not** select kvlist,
 > and a bucket that outgrows one payload returns `-ENOSPC` (rather than
 > overflow-chaining). Promoting buckets to full kvlist chains (§4.2), and
 > online resize, are future revisions; the on-flash `version` byte reserves
