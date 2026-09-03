@@ -202,6 +202,22 @@ int kvdb_get(kvdb_t *db, const char *key, void *out, size_t out_sz, size_t *out_
 	return db->ops->get(db->root, key, strlen(key), out, out_sz, out_len);
 }
 
+int kvdb_set_id(kvdb_t *db, const char *key, uint64_t id)
+{
+	if (db == NULL || key == NULL) {
+		return -EINVAL;
+	}
+	return map_idref_set(db->ops, db->root, key, strlen(key), id);
+}
+
+int kvdb_get_id(kvdb_t *db, const char *key, uint64_t *out_id)
+{
+	if (db == NULL || key == NULL) {
+		return -EINVAL;
+	}
+	return map_idref_get(db->ops, db->root, key, strlen(key), out_id);
+}
+
 int kvdb_delete(kvdb_t *db, const char *key)
 {
 	if (db == NULL || key == NULL) {

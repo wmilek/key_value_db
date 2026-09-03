@@ -10,6 +10,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include <app/lib/containers/map_idref.h>
 #include <app/lib/containers/shape_map.h>
 
 #ifdef __cplusplus
@@ -131,7 +132,44 @@ int kvdb_set(kvdb_t *db, const char *key, const void *val, size_t len);
 int kvdb_get(kvdb_t *db, const char *key, void *out, size_t out_sz, size_t *out_len);
 
 /**
+ * @brief Store the blob_db id @p id as the value of @p key.
+ *
+ * The typed spelling of @ref kvdb_set for the recurring case where a value is
+ * a reference to another blob rather than data. Equivalent on flash to setting
+ * the eight bytes of @p id by hand — see @ref lib_map_idref for what is and is
+ * not implied, in particular that **no ownership is implied**: deleting this
+ * key removes the entry only, never the blob it names.
+ *
+ * @retval 0        stored
+ * @retval -EINVAL  bad arguments, or @p id is zero
+ * @retval -ENOSPC  the entry does not fit the backend's per-key budget
+ * @retval -EIO     flash error
+ */
+int kvdb_set_id(kvdb_t *db, const char *key, uint64_t id);
+
+/**
+ * @brief Fetch the blob_db id stored under @p key by @ref kvdb_set_id.
+ *
+ * Rejects a value that cannot be a reference — one that is not exactly eight
+ * bytes, or is zero — so reading a data-valued key as an id fails loudly
+ * instead of yielding a plausible-looking number.
+ *
+ * @param db      open handle
+ * @param key     NUL-terminated key
+ * @param out_id  (out) the recorded id, untouched on failure
+ *
+ * @retval 0        found; @p out_id set
+ * @retval -ENOENT  key not present
+ * @retval -EINVAL  bad arguments, or the stored value is not a reference
+ * @retval -EIO     flash error
+ */
+int kvdb_get_id(kvdb_t *db, const char *key, uint64_t *out_id);
+
+/**
  * @brief Remove @p key.
+ *
+ * Removes the entry only. If the value was a reference (@ref kvdb_set_id), the
+ * blob it named is left alone and stays the caller's to delete.
  *
  * @retval 0        removed
  * @retval -ENOENT  key not present

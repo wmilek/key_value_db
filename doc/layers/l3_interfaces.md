@@ -75,7 +75,19 @@ int  kvdb_set   (kvdb_t *db, const char *key, const void *val, size_t len);
 int  kvdb_get   (kvdb_t *db, const char *key, void *out, size_t out_sz, size_t *len);
 int  kvdb_delete(kvdb_t *db, const char *key);
 bool kvdb_has   (kvdb_t *db, const char *key);
+
+/* Typed accessors for values that are blob_db ids (map_idref, L2 §3). */
+int  kvdb_set_id(kvdb_t *db, const char *key, uint64_t id);
+int  kvdb_get_id(kvdb_t *db, const char *key, uint64_t *out_id);
 ```
+
+**Id-valued entries.** `kvdb_set_id`/`kvdb_get_id` are the typed spelling of
+`set`/`get` for the case where a value references another blob. They store the
+eight bytes of the id — nothing new on flash, and interchangeable with the
+untyped calls — and reject a non-reference value on read (`-EINVAL`) rather
+than returning a plausible-looking number. Ownership is **not** implied:
+`kvdb_delete` on such a key removes the entry only, leaving the referenced
+blob to its creator (L2 §3).
 
 **Instances.** Distinct `name`s are fully independent stores (§2); the same
 name always attaches to the same store. Names are 1..`KVDB_NAME_MAX` bytes.
