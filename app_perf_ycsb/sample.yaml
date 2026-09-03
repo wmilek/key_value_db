@@ -1,0 +1,32 @@
+sample:
+  description: YCSB core workloads (A, B, C, D, F) over kvdb (L3)
+  name: ycsb-perf
+tests:
+  # The headline configuration: YCSB's own defaults (recordcount 1000,
+  # 10 x 100 B records, zipfianconstant 0.99). Build only — the load phase
+  # alone formats the partition, which is minutes on the DK's QSPI NOR.
+  perf.ycsb:
+    build_only: true
+
+  # Small enough to run in CI, so the workload drivers, the generator and the
+  # read verification stay regression-tested. The record shrinks to 10 x 10 B;
+  # everything else is the spec's.
+  perf.ycsb.smoke:
+    platform_allow: native_sim
+    extra_configs:
+      - CONFIG_APP_PERF_YCSB_RECORD_COUNT=256
+      - CONFIG_APP_PERF_YCSB_OPERATION_COUNT=256
+      - CONFIG_APP_PERF_YCSB_FIELD_LEN=10
+      - CONFIG_APP_PERF_YCSB_SELFTEST_DRAWS=20000
+      - CONFIG_BLOB_DB_MAX_PAYLOAD_LEN=2016
+    harness: console
+    harness_config:
+      type: multi_line
+      ordered: true
+      regex:
+        # The distribution is right. Without this a broken generator still
+        # prints every other line and CI calls it a pass.
+        - "generator  : PASS"
+        # Every read returned exactly the bytes its key and version predict.
+        - "VERIFY PASS"
+        - "ycsb: done"

@@ -231,6 +231,7 @@ the source.
 | [`app_perf_l0/`](app_perf_l0) | **L0 cost model**: raw `flash_area` timing, swept over transfer size and erase size as a matrix of µs/op, KiB/s and marginal cost — so whether the relationship is linear is read off, not assumed. Its output feeds a timing model that turns any `native_sim` run's I/O counters into predicted hardware wall-clock, and can be checked against the part's datasheet | [`RESULTS.md`](app_perf_l0/RESULTS.md) |
 | [`app_perf_mc/`](app_perf_mc) | model-container benchmark — the price of the full crash-safe mutation discipline | [`RESULTS.md`](app_perf_mc/RESULTS.md) |
 | [`app_perf_kvdb/`](app_perf_kvdb) | `kvdb` demo + benchmark with **cross-reboot verification**: every value is predicted from a stored generation counter, so a rerun proves the previous run survived — and an interrupted run is detected and proven atomic | [`RESULTS.md`](app_perf_kvdb/RESULTS.md) |
+| [`app_perf_ycsb/`](app_perf_ycsb) | **the YCSB core workloads** (A, B, C, D, F) over `kvdb` — the standard key-value benchmark, so a number here can be put next to one from LevelDB, RocksDB or LMDB. Workload E needs range scans and is blocked on `kvtree` | [`RESULTS.md`](app_perf_ycsb/RESULTS.md) |
 | [`app_cbor_persondb/`](app_cbor_persondb) | a CBOR person/credential database — 10 000 people over the L2 Map shape, with the access decision, crash safety and capacity planning a real product needs. Both a **worked example** of building on this stack and a **probe** of it | [`RESULTS.md`](app_cbor_persondb/RESULTS.md) |
 
 `app_perf_l0` is the one to reach for when a change moves flash traffic and
@@ -240,6 +241,15 @@ run turns the operation counters every other benchmark already prints into
 predicted seconds on that board. A `native_sim` run carrying the target's
 geometry reproduces the hardware's counters exactly (`app_perf_l0/RESULTS.md`
 §2), which is what makes the prediction meaningful rather than arithmetic.
+
+`app_perf_ycsb` is the one to reach for when the question is comparative rather
+than "did this change help?". Every other benchmark here runs a workload of its
+own devising, which cannot be set against anything outside this tree; that one
+runs YCSB. It is also where the container's cost model is measured rather than
+assumed: `kvhash` reads its whole bucket directory on every operation, so read
+amplification grows as the square root of the record count, and the app derives
+the bucket count that minimises it, prints the prediction, and then reports what
+the flash actually did.
 
 `app_perf_kvdb` is the one to reach for when validating power-loss behavior on
 real hardware: cut power during its modify phase and the next boot classifies

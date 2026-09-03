@@ -1,0 +1,26 @@
+/*
+ * Model the DK's storage exactly: 8 MiB of partition in 64 KB sectors.
+ *
+ * The erase-block-size override is what makes a native_sim run worth
+ * reporting. blob_db can only rebind a payload that fits *twice* between the
+ * bucket header and the sector end, so the simulator's default 4 KB sectors
+ * cap the sustainable payload at 2026 B — below the 16384 this app configures,
+ * which would leave a kvhash bucket writable once and never updatable
+ * (app_cbor_persondb/FINDINGS.md B10). Carrying the target's geometry is also
+ * what makes the I/O counters reproduce the hardware's exactly
+ * (app_perf_l0/RESULTS.md §2), which is the whole claim behind reporting
+ * amplification from a simulator run.
+ */
+
+&flashcontroller0 {
+	reg = <0x00000000 DT_SIZE_M(16)>;
+};
+
+&flash0 {
+	reg = <0x00000000 DT_SIZE_M(16)>;
+	erase-block-size = <65536>;
+};
+
+&storage_partition {
+	reg = <0x00800000 DT_SIZE_M(8)>;
+};

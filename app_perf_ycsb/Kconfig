@@ -1,0 +1,156 @@
+# YCSB core-workload benchmark — Kconfig entry point.
+
+menu "Zephyr"
+source "Kconfig.zephyr"
+endmenu
+
+module = APP_PERF_YCSB
+module-str = APP_PERF_YCSB
+source "subsys/logging/Kconfig.template.log_config"
+
+menu "YCSB workload parameters"
+
+config APP_PERF_YCSB_RECORD_COUNT
+	int "recordcount — records inserted by the load phase"
+	default 1000
+	range 16 8192
+	help
+	  YCSB's `recordcount`. The spec's own default is 1000; the Java
+	  client is usually driven far past it, which an MCU is not.
+
+	  This is the parameter the store's capacity is checked against at
+	  boot: kvhash holds one packed bucket per blob payload, so a record
+	  count that cannot fit is a startup failure with the arithmetic
+	  printed, not a mid-run -ENOSPC. See README.md §Sizing.
+
+config APP_PERF_YCSB_OPERATION_COUNT
+	int "operationcount — operations per workload"
+	default 1000
+	range 16 65536
+	help
+	  YCSB's `operationcount`, applied to each enabled workload
+	  separately. Total run length is this times the number of enabled
+	  workloads, plus the load phase.
+
+config APP_PERF_YCSB_FIELD_COUNT
+	int "fieldcount — fields per record"
+	default 10
+	range 1 32
+	help
+	  YCSB's `fieldcount`. Together with fieldlength this sets the record
+	  size; the spec's 10 x 100 B = 1000 B is the default here too.
+
+config APP_PERF_YCSB_FIELD_LEN
+	int "fieldlength — bytes per field"
+	default 100
+	range 8 1024
+	help
+	  YCSB's `fieldlength`. The floor of 8 is this harness's, not the
+	  spec's: every field carries an 8-byte {keynum, field, version}
+	  stamp so a read can be verified byte for byte (see README.md
+	  §Data integrity).
+
+config APP_PERF_YCSB_ZIPFIAN_PERMILLE
+	int "zipfianconstant, in permille"
+	default 990
+	range 100 999
+	help
+	  YCSB's `zipfianconstant` (theta), scaled by 1000 because Kconfig has
+	  no floats. The spec's default is 0.99, so 990. Must stay below 1000:
+	  Gray's method divides by (1 - theta).
+
+config APP_PERF_YCSB_BUCKETS
+	int "kvhash bucket count (0 = derive)"
+	default 0
+	range 0 8190
+	help
+	  Bucket count handed to kvdb_open() as map_config.initial_capacity.
+
+	  0 derives it, and the derivation is the point: kvhash reads the
+	  whole bucket directory AND one whole packed bucket on every
+	  operation, so bytes-read per op is 8*B + recordcount*entry/B, which
+	  is smallest at B = sqrt(recordcount * entry / 8). The app computes
+	  that, rounds it up to a power of two for headroom against bucket
+	  skew, and prints both the choice and the predicted fullest bucket.
+
+config APP_PERF_YCSB_SEED
+	int "PRNG seed"
+	default 1
+	help
+	  Seeds every generator. Fixed by default: two runs of the same build
+	  must issue the same key sequence, or the flash-I/O counters in
+	  RESULTS.md are a sample rather than a regression guard.
+
+config APP_PERF_YCSB_VERIFY
+	bool "Verify every read against its expected bytes"
+	default y
+	help
+	  Recompute what each read should have returned and compare all of it.
+	  This is YCSB's `dataintegrity` option, and it is on by default here
+	  because the property under test is a crash-safe store: a benchmark
+	  that reports throughput without checking the bytes came back intact
+	  is measuring the wrong thing. Costs one memcmp per read against a
+	  flash access, so it does not move the numbers.
+
+endmenu
+
+menu "Workloads to run"
+
+config APP_PERF_YCSB_WORKLOAD_A
+	bool "A — update heavy (50 % read / 50 % update, Zipfian)"
+	default y
+
+config APP_PERF_YCSB_WORKLOAD_B
+	bool "B — read mostly (95 % read / 5 % update, Zipfian)"
+	default y
+
+config APP_PERF_YCSB_WORKLOAD_C
+	bool "C — read only (100 % read, Zipfian)"
+	default y
+
+config APP_PERF_YCSB_WORKLOAD_D
+	bool "D — read latest (95 % read / 5 % insert, latest distribution)"
+	default y
+
+config APP_PERF_YCSB_WORKLOAD_F
+	bool "F — read-modify-write (50 % read / 50 % RMW, Zipfian)"
+	default y
+
+comment "Workload E (95 % scan) needs range queries; kvhash is unordered"
+
+endmenu
+
+menu "Measurement"
+
+config APP_PERF_YCSB_HIST_BUCKETS
+	int "Latency histogram buckets"
+	default 2048
+	range 64 8192
+
+config APP_PERF_YCSB_HIST_BUCKET_US
+	int "Latency histogram bucket width, microseconds"
+	default 50
+	range 1 100000
+	help
+	  Default span is 2048 x 50 us = 102 ms, comfortably past the ~1.1 s
+	  worst case of a cold 64 KB QSPI erase only because that lands in the
+	  load phase; anything over the top bucket is counted separately and
+	  reported, so a percentile is never quietly computed over clipped
+	  data.
+
+config APP_PERF_YCSB_SELFTEST
+	bool "Check the generator before touching flash"
+	default y
+	help
+	  Draw from the scrambled Zipfian and compare the head's observed
+	  share of the draws against the share zeta() predicts. A benchmark
+	  whose distribution is wrong reports numbers that look fine, so this
+	  runs first and fails the run rather than the reviewer.
+
+config APP_PERF_YCSB_SELFTEST_DRAWS
+	int "Self-test sample count"
+	default 100000
+	range 1000 10000000
+	depends on APP_PERF_YCSB_SELFTEST
+
+endmenu

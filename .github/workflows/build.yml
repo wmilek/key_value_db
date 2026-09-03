@@ -140,6 +140,16 @@ jobs:
           west build -p always -b nrf5340dk/nrf5340/cpuapp -d build/nrf_perf_l0 \
             key_value_db/app_perf_l0
 
+      # app_perf_ycsb is flashed to produce app_perf_ycsb/RESULTS.md, so it
+      # needs the same protection app_perf gets. It is also the only app here
+      # that links libm (the Zipfian generator is Gray's method, which needs
+      # pow()), so it is the only one whose ARM build can break on a libc
+      # change that native_sim never sees.
+      - name: Build app_perf_ycsb (ARM)
+        run: |
+          west build -p always -b nrf5340dk/nrf5340/cpuapp -d build/nrf_perf_ycsb \
+            key_value_db/app_perf_ycsb
+
       # Same reasoning for app_cbor_persondb: both frontends, because the shell
       # one pulls in a subsystem the benchmark build never links.
       - name: Build app_cbor_persondb — benchmark frontend (ARM)

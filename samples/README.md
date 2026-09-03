@@ -12,6 +12,7 @@ benchmark applications one level up:
 |---|---|
 | how an API is called, in the smallest complete program | `samples/` (here) |
 | how fast it is on real hardware | [`app_perf/`](../app_perf), [`app_perf_mc/`](../app_perf_mc), [`app_perf_kvdb/`](../app_perf_kvdb) |
+| how it compares to other key-value stores | [`app_perf_ycsb/`](../app_perf_ycsb) — the YCSB core workloads |
 | how to build a real product on the stack | [`app_cbor_persondb/`](../app_cbor_persondb) |
 
 | Sample | Demonstrates |
