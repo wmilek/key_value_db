@@ -71,7 +71,16 @@ enum kvdb_backend {
  */
 struct kvdb_config {
 	enum kvdb_backend backend;      /**< preferred backend to build */
-	size_t            initial_capacity; /**< entry-count hint (0 = default) */
+	/**
+	 * What will be stored here, passed through to the backend's
+	 * @ref map_config. Describe the data, not the container's geometry —
+	 * all-zero means "I do not know" and the backend chooses. A field that
+	 * is set is honoured or the create fails; it is never quietly
+	 * reinterpreted.
+	 */
+	size_t expected_entries;      /**< how many entries (0 = unknown) */
+	size_t typical_entry_bytes;   /**< mean key+value bytes (0 = unknown) */
+	size_t max_entry_bytes;       /**< largest key+value bytes (0 = unknown) */
 };
 
 /**

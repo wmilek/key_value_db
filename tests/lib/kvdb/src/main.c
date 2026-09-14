@@ -183,7 +183,7 @@ ZTEST(kvdb, test_many_keys_span_buckets)
 {
 	struct kvdb_config cfg = {
 		.backend = KVDB_BACKEND_HASH,
-		.initial_capacity = 16,
+		.expected_entries = 16,
 	};
 	kvdb_t db;
 

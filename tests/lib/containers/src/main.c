@@ -83,15 +83,17 @@ ZTEST_SUITE(map_contract, NULL, NULL, map_before, map_after, NULL);
 ZTEST_SUITE(kvhash_layout, NULL, NULL, map_before, map_after, NULL);
 
 /*
- * Build a fresh map and return its root.
+ * Build a fresh map and return its root. @p expected is the population the
+ * caller declares -- a sizing hint, not a limit; the geometry it buys is the
+ * container's business (see the kvhash_layout suite).
  *
  * Note what this helper has to do: `create` binds a root, it does not mint
  * one. The caller allocates the id first. That precondition is not stated in
  * shape_map.h today (see UNSPECIFIED-2) — this helper is where it lives.
  */
-static uint64_t fresh_map(const struct provider *p, size_t capacity)
+static uint64_t fresh_map(const struct provider *p, size_t expected)
 {
-	struct map_config cfg = { .initial_capacity = capacity };
+	struct map_config cfg = { .expected_entries = expected };
 	uint64_t root = blob_db_alloc_id();
 
 	zassert_not_equal(root, 0, "%s: alloc_id failed", p->name);
@@ -599,12 +601,14 @@ ZTEST(map_contract, test_unbound_root_is_indistinguishable_from_a_miss)
 static const struct provider kvhash = { "kvhash", &kvhash_map_ops };
 
 /*
- * shape_map.h calls initial_capacity an "expected entry count", but kvhash
- * uses the number as its bucket count. The two readings only differ in
- * observable behaviour at the edges — here, that asking for 2 does not cap
- * the map at 2 entries.
+ * expected_entries sizes the map; it does not bound it. Understating it costs
+ * depth and packing, never correctness -- a map declared for 2 still holds 16.
+ *
+ * Worth pinning because the field's ancestor (initial_capacity) was read as a
+ * bucket count by this provider and as an entry count by the shape header,
+ * and the two only diverge observably at exactly this edge (FINDINGS.md K9).
  */
-ZTEST(kvhash_layout, test_capacity_is_not_an_entry_limit)
+ZTEST(kvhash_layout, test_declared_population_is_not_an_entry_limit)
 {
 	uint64_t root = fresh_map(&kvhash, 2);
 	char key[8], out[8];
@@ -624,43 +628,135 @@ ZTEST(kvhash_layout, test_capacity_is_not_an_entry_limit)
 }
 
 /*
- * An oversized capacity is silently clamped to what one directory payload
- * holds, not rejected. Worth pinning: -ENOSPC is a documented create() return,
- * so "too big" plausibly *could* have been an error, and a caller who assumes
- * it gets what it asked for is wrong today with no diagnostic.
+ * A population the geometry cannot honour is refused at create, not quietly
+ * built smaller. 100 000 entries want ~317 buckets per level; one directory
+ * payload holds far fewer, and there is no third level.
+ *
+ * This inverts what this provider used to do -- clamp to what fits and say
+ * nothing -- which is the mechanism behind FINDINGS.md K9: a caller that
+ * declared a large population got a small map and no diagnostic, and only
+ * met the consequence later as -ENOSPC on some unlucky key. Failing the
+ * declaration outright is the cure, so pin it.
  */
-ZTEST(kvhash_layout, test_oversized_capacity_is_clamped_not_rejected)
+ZTEST(kvhash_layout, test_unhonourable_population_is_refused)
 {
-	struct map_config cfg = { .initial_capacity = 100000 };
+	struct map_config cfg = { .expected_entries = 100000 };
 	uint64_t root = blob_db_alloc_id();
-	char out[8];
+
+	zassert_not_equal(root, 0);
+	zassert_equal(kvhash_map_ops.create(root, &cfg), -EINVAL,
+		      "a population past the payload's reach must be refused");
+	zassert_false(blob_db_exists(root),
+		      "a refused create must not leave a map behind");
+}
+
+/*
+ * A contradictory declaration is arithmetic, so it is caught before anything
+ * is written: an entry larger than a record can ever hold, and a typical
+ * entry larger than the maximum.
+ */
+ZTEST(kvhash_layout, test_contradictory_config_is_refused)
+{
+	struct map_info info = { 0 };
+	uint64_t root = blob_db_alloc_id();
+	struct map_config too_big = {
+		.expected_entries = 8,
+		.max_entry_bytes = CONFIG_BLOB_DB_MAX_PAYLOAD_LEN + 1u,
+	};
+	struct map_config inverted = {
+		.expected_entries = 8,
+		.typical_entry_bytes = 64,
+		.max_entry_bytes = 32,
+	};
+
+	zassert_not_equal(root, 0);
+	zassert_equal(kvhash_map_ops.create(root, &too_big), -EINVAL,
+		      "max_entry_bytes past the payload must be refused");
+	zassert_equal(kvhash_map_ops.create(root, &inverted), -EINVAL,
+		      "typical > max must be refused");
+	zassert_false(blob_db_exists(root), "a refused create wrote anyway");
+
+	/* And the limit the caller was measured against is discoverable. */
+	zassert_ok(kvhash_map_ops.create(root, NULL));
+	zassert_ok(kvhash_map_ops.stat(root, &info));
+	zassert_true(info.entry_bytes_limit < CONFIG_BLOB_DB_MAX_PAYLOAD_LEN,
+		     "entry_bytes_limit must leave room for the entry header");
+}
+
+/*
+ * A population that one directory cannot address is built two levels deep
+ * instead -- a directory of sub-directories -- and stat() is how a caller
+ * learns that. The map must behave exactly like a flat one while it does,
+ * and destroy must reclaim the whole tree, sub-directories included.
+ */
+ZTEST(kvhash_layout, test_large_population_builds_a_second_level)
+{
+	size_t baseline = blob_db_count();
+	struct map_config cfg = { .expected_entries = 128 };
+	struct map_info info = { 0 };
+	uint64_t root = blob_db_alloc_id();
+	char key[8], out[8];
 	size_t len = 0;
 
 	zassert_not_equal(root, 0);
-	zassert_ok(kvhash_map_ops.create(root, &cfg),
-		   "an unreachable capacity should clamp, not fail");
+	zassert_ok(kvhash_map_ops.create(root, &cfg));
+	zassert_ok(kvhash_map_ops.stat(root, &info));
 
-	zassert_ok(kvhash_map_ops.set(root, "k", 1, "v", 1));
-	zassert_ok(kvhash_map_ops.get(root, "k", 1, out, sizeof(out), &len));
-	zassert_equal(len, 1);
+	zassert_equal(info.depth, 2,
+		      "128 entries need more buckets than one directory addresses");
+	zassert_true(info.fanout >= 2, "a second level with no fan-out");
+	zassert_equal(info.buckets, (uint32_t)info.fanout * info.fanout,
+		      "levels should be uniform: %u != %u^2",
+		      info.buckets, info.fanout);
+
+	for (int i = 0; i < 64; i++) {
+		snprintf(key, sizeof(key), "k%03d", i);
+		zassert_ok(kvhash_map_ops.set(root, key, strlen(key), "vvvv", 4),
+			   "set %s", key);
+	}
+	for (int i = 0; i < 64; i++) {
+		snprintf(key, sizeof(key), "k%03d", i);
+		zassert_ok(kvhash_map_ops.get(root, key, strlen(key), out,
+					      sizeof(out), &len), "get %s", key);
+		zassert_equal(len, 4, "%s truncated", key);
+	}
+
+	zassert_ok(kvhash_map_ops.del(root, "k007", 4));
+	zassert_equal(kvhash_map_ops.get(root, "k007", 4, out, sizeof(out), &len),
+		      -ENOENT, "deleted key still readable two levels down");
+	zassert_ok(kvhash_map_ops.get(root, "k008", 4, out, sizeof(out), &len),
+		   "a neighbour went with it");
+
+	zassert_ok(kvhash_map_ops.destroy(root), "destroy of a two-level map");
+	zassert_equal(blob_db_count(), baseline,
+		      "destroy left %zu blob(s) of the second level behind",
+		      blob_db_count() - baseline);
 }
 
 /*
  * A bucket is one blob payload. Overflowing it is -ENOSPC, and — the part
  * that matters — the failed insert must leave the bucket exactly as it was.
  *
- * Two buckets and ten 100-byte values guarantee the overflow by pigeonhole
- * without hard-coding fnv1a: some bucket takes at least five entries, and
- * three already exceed the 256-byte default payload.
+ * Ten 100-byte values into a map declared for 2 guarantee the overflow by
+ * pigeonhole without hard-coding the hash: three such entries already exceed
+ * the 256-byte default payload, so any bucket count up to 4 forces one. The
+ * count is read back rather than assumed -- geometry is the container's to
+ * choose, and the pigeonhole is only sound while it stays small.
  */
 ZTEST(kvhash_layout, test_bucket_overflow_is_enospc_without_damage)
 {
 	uint64_t root = fresh_map(&kvhash, 2);
+	struct map_info info = { 0 };
 	char big[100];
 	bool stored[10] = { false };
 	int enospc = 0;
 
 	memset(big, 'x', sizeof(big));
+
+	zassert_ok(kvhash_map_ops.stat(root, &info));
+	zassert_true(info.buckets <= 4,
+		     "%u buckets breaks the pigeonhole this test rests on",
+		     info.buckets);
 
 	for (int i = 0; i < 10; i++) {
 		char key[8];
@@ -700,7 +796,7 @@ ZTEST(kvhash_layout, test_bucket_overflow_is_enospc_without_damage)
 
 /*
  * kvhash's on-flash directory, as far as these tests need it:
- *   [u32 magic][u16 n_buckets][u16 version][u64 bucket_id]*n
+ *   [u32 magic][u16 n_buckets][u8 version][u8 depth][u64 child_id]*n
  * 'KVHD' in place of 'KVHA' is the dying stamp destroy writes as its commit.
  */
 #define KVHA_DYING_MAGIC 0x4b564844u

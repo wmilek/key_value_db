@@ -203,20 +203,30 @@ keys, and as `kvhash`'s per-bucket representation.
 
 ### 4.3 `kvhash` — k→v hash  *(implemented)*
 
-Root holds a fixed array of bucket ids; each bucket is a single blob holding a
-packed pair list.
+Root holds a fixed array of child ids; each bucket is a single blob holding a
+packed pair list. A map is one or two levels deep, and the root says which.
 
 ```
-root   { magic 'KVHA', nbuckets, version, bucket_id[nbuckets] }   nbuckets fixed at create
-bucket = ( u16 klen, u16 vlen, key bytes, val bytes )*            0 = empty, created lazily
+root   { magic 'KVHA', n, version, depth, child_id[n] }   geometry fixed at create
+  depth 1: child_id[i] is a bucket
+  depth 2: child_id[i] is a sub-directory, itself a depth-1 root
+bucket = ( u16 klen, u16 vlen, key bytes, val bytes )*   0 = empty, created lazily
 ```
 
-`nbuckets` comes from `map_config.initial_capacity` at `create` (default 8,
-capped so the directory fits one i-node payload) and is frozen into the root —
-no online resize in v1. Lookup: hash key (FNV-1a) → read root → scan one bucket
-blob; with n/nbuckets small this is O(1) average, ~2 flash reads. Set/del
-rewrite one bucket blob and, only when a bucket is first created, the root — one
-or two atomic updates, root last as the commit point.
+A directory must fit one i-node payload, so one level addresses at most
+`(payload - 8) / 8` buckets — 31 at the 256 B default. A population past that
+is built as a directory of sub-directories instead: two independent indices cut
+from one hash, `n` × `n` buckets, still a fixed geometry with no online resize.
+The caller does not choose depth; it declares a population in `map_config` and
+`create` derives the geometry, returning `-EINVAL` if it cannot honour the
+declaration (`doc/impl/l2_kvhash.md` §1.2).
+
+Lookup: hash key (CRC-32) → read root → (depth 2: read one sub-directory) →
+scan one bucket blob; with n/nbuckets small this is O(1) average, 2 flash reads
+one level deep and 3 at two. Set/del rewrite one bucket blob and, only when a
+bucket is first created, its immediate parent directory — one or two atomic
+updates, parent last as the commit point. A second level therefore costs one
+extra read per operation and buys metadata that scales as √N rather than N.
 
 > **v1 implementation note** (full design: `doc/impl/l2_kvhash.md`). The
 > shipped bucket is a *self-contained packed pair-list blob*, not a `kvlist`

@@ -71,7 +71,8 @@ kvhash sample 1.0.0 — the L2 Map shape, one operation at a time
 
 [2] find the map's root id, and create the map the first time
     rootreg_get_or_create('SMPL':0) -> 0, root id 2
-    create(root, .initial_capacity=16) -> 0   [first run]
+    create(root, .expected_entries=4) -> 0   [first run]
+    stat(root) -> depth 1, 2 buckets, entries up to 252 B
 
 [3] set — insert pairs
     set("device/name", "kv-demo-01") -> 0
@@ -123,13 +124,16 @@ the board.
 ## Things to try
 
 - Raise `CONFIG_BLOB_DB_MAX_PAYLOAD_LEN` (256 by default): more and larger
-  pairs fit in a bucket, and the bucket-directory ceiling rises with it (31
-  buckets at 256 bytes). Step 9 sizes its oversized value from the same symbol,
-  so it stays refused — the bound is a whole *bucket*, not one value.
-- Change `N_BUCKETS` in [`src/main.c`](src/main.c) and rerun with
-  `CONFIG_SAMPLE_KVHASH_FRESH_START=n`: the new value is ignored, because the
-  bucket count is frozen into the map when it is created and there is no online
-  resize in v1.
+  pairs fit in a bucket, and the geometry kvhash derives changes with it —
+  `stat()` in step 2 reports what it chose. Step 9 sizes its oversized value
+  from the same symbol, so it stays refused — the bound is a whole *bucket*,
+  not one value.
+- Raise `N_ENTRIES` in [`src/main.c`](src/main.c) and rerun with
+  `CONFIG_SAMPLE_KVHASH_FRESH_START=y`: declaring a larger population makes
+  kvhash build a wider map, and past a few hundred entries a second level —
+  watch `stat()` report `depth 2`. Rerun with `FRESH_START=n` instead and the
+  new declaration is ignored, because the geometry is frozen into the map when
+  it is created and there is no online resize in v1.
 - Set `CONFIG_BLOB_CONTAINER_KVHASH_LOG_LEVEL_DBG=y` to see the container's own
   view of each operation next to the sample's narration.
 

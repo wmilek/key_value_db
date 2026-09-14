@@ -1,5 +1,5 @@
 common:
-  tags: storage blob_db
+  tags: [storage, blob_db]
   platform_allow: native_sim
 # blob_db defaults to the UBI backend, but most of this suite injects faults by
 # writing the raw partition at offsets that are only blob_db's on flash_area

@@ -14,6 +14,20 @@ they appear. A full-scale DK run remains
 outstanding for `A4`, but §5d now measures **5 000 persons on hardware** — half
 scale — and puts the `A4` range at 2.0–2.4 h.
 
+**The two-level `kvhash` is measured on the DK in §5e (1 000 persons) and
+§5f (5 000 and 10 000).** At full scale **10 000 persons completes** — the
+scale the one-level container could not reach — at 51.6 % live with 0 overflows,
+and an access decision costs **114.9 flash operations / 26.79 ms**, less than
+the same container spends at 1 000 persons. Writes move the other way: a `put`
+costs **2.23 sector erases and 2.56 s**. Operation count predicts reads to
+within 0.3 % and mispredicts writes by 93 %.
+
+**The 1 000-person view alone is misleading.** Whole run 2.31×
+faster than the sixteen-shard build it replaces and 19.2× faster than the
+one-level container, with `fill` 4.52× faster than shards; reads and `put` cost
+1.3–1.7× more, all of it transaction count. The proposal's §13 `native_sim`
+timings do not transfer in either direction — see §5e.
+
 **`blob_db` now defaults to the UBI backend; §4a, §5 and §5b are
 `flash_area`.** §5c measures the default's *timings* on the same board: reads
 cost ~1.9× more, `fill` is 1.10× *cheaper*, and the `A4` floor improves
@@ -445,6 +459,56 @@ UBI reserves. That is the whole reason PR #20 sized the pool per geometry
 instead of picking one generous default: `native_sim`'s 4 KB blocks need 2 046
 PEBs, and the same symbol would then cost ~32 KB of RAM on a board that has
 128 blocks.
+
+### The shell frontend, and the stack that was never sized for it
+
+§4a's shell row predates the payload bump. Rebuilt at the branch head with
+`CONFIG_APP_CBOR_PERSONDB_FRONTEND_SHELL=y`: **FLASH 121 576 B, RAM 233 432 B
+(50.9 % of the part)** against 85 724 / 202 064 for the benchmark frontend.
+
+Most of the RAM difference is a fix rather than the shell. `blob_db` builds
+every slot in a `MAX_PAYLOAD + 46` byte **stack** frame (B5 job 3), and
+`prj.conf` sizes `CONFIG_MAIN_STACK_SIZE` for the resulting 19 870 B chain — but
+the shell frontend runs that chain on the **shell thread**, which Zephyr defaults
+to 2 048 B. Every `persondb` command overflowed it and halted the system on the
+first keystroke:
+
+```
+uart:~$ persondb stat
+<err> os: ***** USAGE FAULT *****
+<err> os:   Stack overflow (context area not valid)
+<err> os: Current thread: 0x200008f0 (shell_uart)
+```
+
+`CONFIG_SHELL_STACK_SIZE` now defaults to 28 672 when that frontend is selected,
+costing ~26 KB of RAM and only in that build. The frontend was previously
+buildable but not runnable, which is how a footprint row existed for something
+that had never executed a command on hardware.
+
+Verified against the 10 000-person store: `stat`, `show`, `cardof`, `card` and
+`check` all work.
+
+The shell also exposed that `scenario_now_us()` was reading `k_uptime_get()` —
+whole milliseconds, multiplied by 1 000 to look like microseconds. Invisible in
+the benchmark, where every phase averages over 200 samples, and ±3.7 % on the
+shell's single-shot `check`. It now reads `k_uptime_ticks()`, which on this SoC
+is 32 768 Hz, so ~30.5 µs. The difference:
+
+```
+before:  GRANTED in 27000 us   DENIED in 28000 us   (1 ms quantisation)
+after:   GRANTED in 27314 us   DENIED in 27314 us
+```
+
+Five consecutive decisions measured 27 313–27 314 µs, so **an access decision is
+deterministic to ~1 µs** and the apparent 27/28 ms jitter was entirely the clock.
+Against §5f's 26.785 ms (run 1) and 27.350 ms (run 2) for the same operation
+under the benchmark frontend, the interactive path lands inside the run-to-run
+spread — the two frontends agree, as `DESIGN.md` §9 says they should.
+
+It also sharpens §6's point about denials: **GRANTED and DENIED cost the same to
+the microsecond** when the card is real, because both resolve card → person →
+record and only the permission match differs. Only an *unknown card* is cheap
+(§5f's `miss`, 12.5 ms), because it stops after one lookup.
 
 ### It does not move the needle on this app, and here is why
 
@@ -969,6 +1033,266 @@ that holds on hardware, decisions at 10 000 persons will be *faster* than the
 range rather than a midpoint. `put`, being erase-bound, will not get that
 reprieve.
 
+## 5e. The two-level `kvhash` on hardware — at 1 000 persons
+
+> **Read §5f before quoting this section's read results.** Everything here is
+> measured at 1 000 persons, which is *below the crossover*: at 5 000 and 10 000
+> the read regression reported here reverses into a 2× improvement, and the
+> `fill` win reported here erodes. The counters and the mechanism stand; the
+> ranking is scale-bound.
+
+The proposal's §13.2 says plainly that nothing had run on the DK. This is that
+run, at **1 000 persons** — the scale §5/§5c hold sixteen-shard DK numbers at,
+so all three builds compare like for like. Default UBI backend, `FRESH_START`,
+partition raw-erased first. Raw capture in §8c.
+
+It builds for ARM, boots, and passes both verifies with `VERIFY PASS`, 2 479
+credentials, mean entry 432 B, **0 bucket overflows and 0 buckets past
+near-full**. `stat()` reports **people map depth 1, 250 buckets; credential map
+depth 2, 256 buckets.**
+
+The middle column is the one-level build this proposal replaces
+(`0904b8f`, `DESIGN.md` §12.2), measured on the same board at the same scale.
+
+| phase | sixteen shards | one level | **two level** | vs shards | vs one level |
+|---|--:|--:|--:|--:|--:|
+| `open` + `prepare` | 136.0 s | 147.4 s | 146.0 s | ×1.07 | ×1.01 faster |
+| **`fill`** | 732.6 s | 7 430.4 s | **162.1 s** | **×4.52 faster** | **×45.8 faster** |
+| `verify` (256) | 11.4 s | 19.3 s | 16.4 s | ×1.44 slower | ×1.18 faster |
+| `mutate` (64) | 5.3 s | 54.5 s | 9.2 s | ×1.72 slower | ×5.95 faster |
+| `re-verify` (256) | 12.0 s | 20.1 s | 17.4 s | ×1.44 slower | ×1.16 faster |
+| `check` | 27.66 ms | 46.50 ms | 36.04 ms | ×1.30 slower | ×1.29 faster |
+| `byid` | 14.06 ms | 23.99 ms | **14.11 ms** | **×1.00** | ×1.70 faster |
+| `miss` | 13.72 ms | 21.47 ms | 22.35 ms | ×1.63 slower | ×1.04 slower |
+| `put` | 107.41 ms | 145.14 ms | 179.69 ms | ×1.67 slower | ×1.24 slower |
+| `cbor` | 0.945 ms | 0.950 ms | 0.985 ms | control — no flash |
+| **whole run** | **15.5 min** | **2.14 h** | **6.69 min** | **×2.31 faster** | **×19.2 faster** |
+
+**The container beats the workaround it replaces, on the whole run and by a
+wide margin on `fill`.** That is a stronger claim than `native_sim` could make,
+where `fill` was still slower than sharded. It is not uniformly better: reads
+and `put` cost more than the sixteen-shard build did, and the reason is
+specific.
+
+### The trade is bytes for transactions, and UBI prices those apart
+
+| per op | flash ops | | | bytes | | |
+|---|--:|--:|--:|--:|--:|--:|
+| | shards | one level | **two level** | shards | one level | **two level** |
+| `check` | 115.6 | 120.9 | **176.2** | 10 073 | 34 736 | **6 330** |
+| `byid` | 53.8 | 60.6 | **57.5** | 5 135 | 17 614 | **4 432** |
+| `miss` | 56.8 | 51.5 | **118.5** | 4 846 | 16 998 | **1 860** |
+| `put` | 318.4 | 402.2 | **555.8** | 20 870 | 77 326 | **17 636** |
+
+Every byte column improves — `miss` moves **2.6× fewer bytes than the sharded
+build and 9.1× fewer than one level**, and amplification falls from 210× and
+739× to **80×**. Every transaction column rises. On UBI a transaction costs
+178 µs and a byte 0.616 µs, so the axis that got better is the cheap one.
+
+§5c's constants, with no refitting, price the result exactly:
+
+| | predicted | measured | error |
+|---|--:|--:|--:|
+| `check` | 36.25 ms | 36.04 ms | **+0.6 %** |
+| `miss` | 22.24 ms | 22.35 ms | **−0.5 %** |
+| `byid` | 12.97 ms | 14.11 ms | −8.1 % |
+| `put` | 109.80 ms | 179.69 ms | −38.9 % |
+
+Reads land within a percent. `put`'s residual is 69.9 ms, or **0.065 sector
+erases per operation** — against 0.035 for the sharded build and 0.024 for one
+level, so writes still carry a little more erase than either.
+
+### `byid` is the control that identifies the cost as *depth*
+
+`byid` is a dead heat with the sixteen-shard build — 14.11 ms against 14.06 —
+and it is the one lookup that goes to the people map, which `stat()` reports at
+**depth 1**. `check` is two lookups, one into the **depth-2** credential map,
+and it costs ×1.30. `miss` is a single depth-2 lookup and costs ×1.63.
+
+So the read regression is not the second level *existing*; it is the second
+level being *traversed*. A depth-1 map performs exactly as the sharded build
+did. That also predicts the regression shrinks as maps get wider relative to
+their contents, and grows wherever depth 2 is reached.
+
+### What `native_sim` got wrong, in both directions again
+
+| claim (§13, `native_sim`) | on the DK |
+|---|---|
+| `fill` 3.3× faster than one level | **45.8× faster** — understated ~14× |
+| `check` 2.6× faster than one level | **1.29× faster** — overstated ~2× |
+| 4.5× fewer bytes per `check` | **5.49× fewer** — beaten |
+
+The byte counters transfer and are if anything conservative. The *timings*
+transfer in neither direction, and both errors have one root, as in §5d and in
+the one-level measurement: `native_sim` counts bytes and models no erase
+latency. It therefore cannot see the compaction this change removes — which is
+where nearly all of the `fill` win lives — and it cannot see that the
+transactions this change adds are the expensive axis on real flash.
+
+**This is §1 earning its place for the third time in this file.** Structure
+transferred; the ranking did not.
+
+### What this means for the proposal
+
+On hardware the change is a clear net win at this scale: the whole run is 2.31×
+faster than the build it replaces, capacity is restored, amplification falls
+everywhere, and nothing regressed by more than ×1.7. The costs are real and
+worth stating without softening — `put` is the slowest of the three builds, and
+`miss` is marginally slower than one level despite moving a ninth of the bytes.
+
+Both are transaction-count costs, which `FINDINGS.md` N1 identifies as the
+dominant term on this stack. **The lever that would pay best here is reducing
+transactions per traversal, not bytes** — the bytes are already good.
+
+## 5f. Two-level `kvhash` at 5 000 and 10 000 persons
+
+§5e measured this container at 1 000 persons and concluded reads had regressed.
+**That conclusion is scale-bound and does not survive here.** Four runs, two
+scales, two runs each — the first fills, the second is steady state. Default UBI
+backend, partition raw-erased before each scale. Raw captures in §8d and §8e.
+
+### 10 000 persons completes on hardware
+
+The scale that returned `-ENOSPC` at person 9 670 on the one-level container
+finishes on the board: **10 000 of 10 000 written, 40 commits, `VERIFY PASS`
+twice**, live content **4 336 158 B = 51.6 %**, 24 932 credentials, mean entry
+433 B, **0 bucket overflows and 0 buckets past near-full.**
+
+Those are byte-for-byte the `native_sim` figures and the sixteen-shard build's
+figures at this scale, so the structural claim transfers exactly. Even the two
+`expired` results in `check` reproduce §8's note about validity windows at
+10 000. `fill` took **2.80 h**; whole run 3.02 h.
+
+The `kvhash: bucket … full` warning stayed silent throughout, on hardware as in
+simulation.
+
+### Reads get *faster* as the dataset grows
+
+| `check` | flash ops | bytes | wall clock |
+|---|--:|--:|--:|
+| two level @1 000 | 176.2 | 6 330 B | 36.04 ms |
+| two level @5 000 | 144.5 | 7 763 B | 31.15 ms |
+| **two level @10 000** | **114.9** | 8 591 B | **26.79 ms** |
+| sixteen shards @1 000 | 115.6 | 10 073 B | 27.66 ms |
+| sixteen shards @5 000 | 344.0 | 13 494 B | 67.69 ms |
+
+**114.9 operations per access decision at full scale**, against the 135 the
+proposal predicted — beaten, and in the right direction. Declared capacity buys
+buckets (250 → 484 → 961), buckets are therefore shallower, and the slot walk
+per lookup shortens faster than the extra level costs.
+
+The consequence is worth stating plainly: **an access decision at 10 000 persons
+costs less than the same container answers at 1 000** (26.79 against 36.04 ms),
+and it matches the sixteen-shard build's best DK figure ever recorded — which
+that build only reached at a tenth of this scale. `verify` shows the same shape
+end to end: 16.4 s → 13.2 s → **11.6 s** across the three scales, where the
+sixteen-shard build went 11.4 s → 30.9 s over the first two.
+
+`byid` 14.77 ms / 58.2 ops and `miss` 12.55 ms / 56.9 ops at 10 000 follow.
+
+**This is the result the branch is for, and the DK states it more strongly than
+`native_sim` could.** §5e's read regression was real at 1 000 persons and is an
+artefact of measuring below the crossover.
+
+### Writes: operations fall, wall clock explodes
+
+| `put` | flash ops | bytes | wall clock | **erases/op** |
+|---|--:|--:|--:|--:|
+| @1 000 | 555.8 | 17 636 B | 179.7 ms | 0.065 |
+| @5 000 | 400.0 | 89 164 B | 1 091.5 ms | 0.90 |
+| **@10 000** | **326.8** | **194 721 B** | **2 564.4 ms** | **2.23** |
+
+**Operation count falls 41 % while wall clock rises 14×.** A single `put` at
+full scale is 2.56 seconds and pays over two whole sector erases. Amplification
+goes 40× → 207× → **453×**.
+
+The erase column is derived, not measured: it is what remains after charging
+§5c's UBI constants (178 µs per transaction, 0.616 µs/B) against the measured
+counters. Nothing in the stack reports erases directly (`FINDINGS.md` B3), which
+is exactly why this cost stayed invisible until wall clock exposed it.
+
+`mutate` says the same: 143 ms per card at 1 000, 821 ms at 5 000, **1 533 ms**
+at 10 000, and 1 813 ms per card in the steady-state run where cards are revoked
+as well as granted.
+
+### The operation-count model predicts reads and cannot predict writes
+
+Applying §5c's constants to each measured counter set, with no refitting:
+
+| | predicted | measured | error |
+|---|--:|--:|--:|
+| `check` @10 000 | 26.71 ms | 26.79 ms | **+0.3 %** |
+| `check` @5 000 | 31.49 ms | 31.15 ms | **+1.1 %** |
+| `byid` @5 000 | 16.33 ms | 17.28 ms | −5.5 % |
+| `put` @10 000 | 178.12 ms | 2 564.40 ms | **−93 %** |
+
+Reads land within about a percent at both scales. `put` is out by more than an
+order of magnitude, and the gap is erase.
+
+**So the brief's thesis — that operation count is what hardware charges for and
+therefore the result to check — is confirmed for reads and refuted for writes.**
+A contradiction, recorded as a finding: the two-level container concentrates
+data into fewer, larger buckets, which shortens every read walk and lengthens
+every write's erase debt. `MIN_BUCKET_BYTES = 4096` sets the floor on how large,
+so it is also the knob that sets this cost.
+
+### `fill` crosses over in the opposite direction
+
+| `fill`, ms per person | @1 000 | @5 000 | @10 000 |
+|---|--:|--:|--:|
+| sixteen shards | 732.6 | 675.4 | not run |
+| **two level** | **162.1** | **546.8** | **1 007.3** |
+| ratio | ×4.52 faster | ×1.24 faster | — |
+
+The fill advantage erodes with scale as the read advantage grows. At 10 000 the
+sixteen-shard build was never run on this board; §5d's linear extrapolation from
+its 5 000 point gives ~6 754 s against 10 073 s measured here, which suggests
+two-level is now the slower filler — but that is a measurement against an
+extrapolation, and §5d itself found linear extrapolation unreliable in both
+directions. **Recorded as an open comparison, not a conclusion.** Settling it
+needs the sixteen-shard build run at 10 000, which §5d put beyond `A4`'s reach
+at ~2.0–2.4 h.
+
+### Declared capacity eats the volume
+
+| | `prepare` formats |
+|---|--:|
+| sixteen shards @1 000 | 100 buckets |
+| two level @1 000 | 99 |
+| two level @5 000 | 77 |
+| **two level @10 000** | **68** |
+
+Structure consumes 32 of the volume's ~100 PEBs at full scale — roughly 2 MB of
+the 8 MB part gone before a person is written. The 51.6 % live figure is against
+the whole partition and does not show this; measured against what remains for
+data it is far tighter. That is the term B13's medium wall actually moves on,
+and it is the one to watch if the declared capacity is raised again.
+
+### Steady state, and run-to-run agreement
+
+Second runs agree closely with first runs on every read — at 10 000, `check`
+26.79 → 27.35 ms (+2.1 %), `byid` 14.77 → 14.34, `miss` 12.55 → 13.65, `put`
+2 564.4 → 2 558.4 ms (−0.2 %). A rerun's `open` is 789 ms at 10 000 and 935 ms
+at 5 000, against ~144 s when the run also creates the store.
+
+`mutate` is the one phase that is materially more expensive in steady state,
+because a first run has nothing to revoke: 232.1 s against 98.1 s at 10 000, for
+twice the card operations.
+
+### What to take from this
+
+At the scale the app is designed for, the two-level container is a clear win on
+every read and a clear loss on every write, and both are larger than
+`native_sim` suggested. The capacity claim holds exactly. Whether the trade is
+worth taking depends on the read/write mix — `app_perf_kvdb/RESULTS.md` records
+the same change making that app's read-dominated loop *slower*, which is the
+same trade seen from the other end.
+
+The write cost is the open problem, and it is not a `kvhash` bug: it is
+`blob_db` compaction being driven by bucket size, on a medium whose erase
+granularity the map cannot see. **A `put` costing 2.23 sector erases is the
+finding this run contributes.**
+
 ## 6. What the numbers say
 
 *Rewritten after the large-payload merge. The previous version of this section
@@ -1206,6 +1530,222 @@ while the app is mid-QSPI-erase can leave the MX25R6435F answering JEDEC id
 `00 00 00` on the next boot, needing `nrfutil device recover`. The console is
 VCOM 2; resolve its `/dev/ttyACM*` node with `nrfutil device list` rather than
 assuming, since it shifts with USB enumeration order.
+
+## 8c. Raw capture — nRF5340-DK, two-level `kvhash`, 1 000 persons, UBI
+
+Board 960115021, `ade6a3e`, `N_PERSONS=1000`, `FRESH_START=y`, default UBI
+backend, partition raw-erased beforehand. UBI's volume-probe lines are elided.
+
+The `ops/s` column below is the **pre-fix, truncated** form — `ui_bench.c`
+computed it by integer division, so `put`'s 5.57 printed as `5` and, at 5 000
+persons in §8b, 1.23 printed as `1` (a 19 % under-report). Every figure in §5e
+is derived from `us/op`, which was always exact. A rerun now prints two
+rounded decimals.
+
+```
+*** Booting Zephyr OS build 4a405846193f ***
+
+persondb 1.0.0 — CBOR person/credential database
+[00:02:26.082,214] <inf> persondb: created store for 1000 persons: people map depth 1, 250 buckets; credential map depth 2, 256 buckets
+open         : 145837 ms
+prepare      :    130 ms (99 buckets formatted)
+fill         : 162071 ms  1000 written, 1000/1000 total, 4 commits
+verify       :  16385 ms  256 persons, 602 cards
+VERIFY PASS
+mutate       :   9157 ms  rev 0 -> 1  (0 revoked, 64 assigned)
+re-verify    :  17354 ms  256 persons, 618 cards
+VERIFY PASS
+
+bench check :   200 ops in  7208000 us ->      27 ops/s    36040 us/op   400 store ops  35245 flash ops   1266097 B  amp 15x
+             : 200 granted, 0 denied, 0 unknown, 0 expired
+bench byid  :   200 ops in  2821000 us ->      70 ops/s    14105 us/op   200 store ops  11503 flash ops    886418 B  amp 11x
+bench miss  :   200 ops in  4469000 us ->      44 ops/s    22345 us/op   200 store ops  23705 flash ops    372059 B  amp 80x
+bench put   :   200 ops in 35937000 us ->       5 ops/s   179685 us/op   864 store ops 111164 flash ops   3527182 B  amp 40x
+bench cbor  :   200 ops in   197000 us ->    1015 ops/s      985 us/op     0 store ops      0 flash ops         0 B  amp 0x
+
+store
+  partition   : 8388608 B (8192 KiB)
+  maps        : 1 person (depth 1, 250 buckets) + 1 credential (depth 2, 256 buckets)
+  persons     : 1000 of 1000   credentials: 2479
+  mean entry  : 432 B
+  live content: 432759 B = 5.1 % of the partition
+  bucket overflows: 0
+  buckets past near-full: 0
+
+persondb: done — store at rev 1; rerun to prove persistence
+```
+
+Wall clock 6.69 min, of which `open` is 36 % and `fill` 40 %. Footprint on this
+build is FLASH 86 032 B and RAM 202 064 B — within 1.6 % and 16 B of the
+one-level build, so the second level costs essentially nothing in either.
+
+## 8d. Raw capture — nRF5340-DK, two-level `kvhash`, 5 000 persons, UBI
+
+Board 960115021, branch head, `N_PERSONS=5000`, default UBI backend, partition
+raw-erased before run 1. UBI's volume-probe lines elided. Run 1 creates and
+fills; run 2 is the steady-state run.
+
+### Run 1 — create and fill
+
+```
+*** Booting Zephyr OS build 4a405846193f ***
+
+persondb 1.0.0 — CBOR person/credential database
+[00:02:24.144,470] <inf> persondb: created store for 5000 persons: people map depth 2, 484 buckets; credential map depth 2, 256 buckets
+open         : 143899 ms
+prepare      :    107 ms (77 buckets formatted)
+fill         : 2733867 ms  5000 written, 5000/5000 total, 20 commits
+verify       :  13166 ms  256 persons, 654 cards
+VERIFY PASS
+mutate       :  52543 ms  rev 0 -> 1  (0 revoked, 64 assigned)
+re-verify    :  13529 ms  256 persons, 662 cards
+VERIFY PASS
+
+bench check :   200 ops in  6230000 us ->    32.10 ops/s    31150 us/op   400 store ops  28890 flash ops   1552566 B  amp 19x
+             : 200 granted, 0 denied, 0 unknown, 0 expired
+bench byid  :   200 ops in  3455000 us ->    57.89 ops/s    17275 us/op   200 store ops  14529 flash ops   1106933 B  amp 14x
+bench miss  :   200 ops in  2820000 us ->    70.92 ops/s    14100 us/op   200 store ops  14066 flash ops    436251 B  amp 94x
+bench put   :   200 ops in 218302000 us ->     0.92 ops/s  1091510 us/op   874 store ops  80009 flash ops  17832777 B  amp 207x
+bench cbor  :   200 ops in   194000 us ->  1030.93 ops/s      970 us/op     0 store ops      0 flash ops         0 B  amp 0x
+
+store
+  partition   : 8388608 B (8192 KiB)
+  maps        : 1 person (depth 2, 484 buckets) + 1 credential (depth 2, 256 buckets)
+  persons     : 5000 of 5000   credentials: 12550
+  mean entry  : 433 B
+  live content: 2169730 B = 25.8 % of the partition
+  bucket overflows: 0
+  buckets past near-full: 0
+  NOTE: physical occupancy (live + uncompacted garbage) is not
+        observable through the API — see FINDINGS.md B3.
+
+persondb: done — store at rev 1; rerun to prove persistence
+```
+
+### Run 2 — steady state (rev 1 -> 2)
+
+```
+*** Booting Zephyr OS build 4a405846193f ***
+
+persondb 1.0.0 — CBOR person/credential database
+open         :    935 ms
+prepare      :     23 ms (0 buckets formatted)
+fill         : already complete (5000 persons)
+verify       :  13729 ms  256 persons, 662 cards
+VERIFY PASS
+mutate       : 103869 ms  rev 1 -> 2  (64 revoked, 64 assigned)
+re-verify    :  13955 ms  256 persons, 662 cards
+VERIFY PASS
+
+bench check :   200 ops in  6588000 us ->    30.36 ops/s    32940 us/op   400 store ops  30846 flash ops   1575269 B  amp 19x
+             : 200 granted, 0 denied, 0 unknown, 0 expired
+bench byid  :   200 ops in  3813000 us ->    52.45 ops/s    19065 us/op   200 store ops  16526 flash ops   1130657 B  amp 15x
+bench miss  :   200 ops in  2869000 us ->    69.71 ops/s    14345 us/op   200 store ops  14353 flash ops    439833 B  amp 95x
+bench put   :   200 ops in 258847000 us ->     0.77 ops/s  1294235 us/op   873 store ops  67933 flash ops  21157991 B  amp 246x
+bench cbor  :   200 ops in   194000 us ->  1030.93 ops/s      970 us/op     0 store ops      0 flash ops         0 B  amp 0x
+
+store
+  partition   : 8388608 B (8192 KiB)
+  maps        : 1 person (depth 2, 484 buckets) + 1 credential (depth 2, 256 buckets)
+  persons     : 5000 of 5000   credentials: 12550
+  mean entry  : 433 B
+  live content: 2169730 B = 25.8 % of the partition
+  bucket overflows: 0
+  buckets past near-full: 0
+  NOTE: physical occupancy (live + uncompacted garbage) is not
+        observable through the API — see FINDINGS.md B3.
+
+persondb: done — store at rev 2; rerun to prove persistence
+```
+
+## 8e. Raw capture — nRF5340-DK, two-level `kvhash`, 10 000 persons, UBI
+
+Same board and build settings at `N_PERSONS=10000`. **This is the scale the
+one-level container could not reach** — it stopped at person 9 670 with
+`-ENOSPC` (`FINDINGS.md` B13).
+
+### Run 1 — create and fill
+
+```
+*** Booting Zephyr OS build 4a405846193f ***
+
+persondb 1.0.0 — CBOR person/credential database
+[00:02:24.691,131] <inf> persondb: created store for 10000 persons: people map depth 2, 961 buckets; credential map depth 2, 256 buckets
+open         : 144445 ms
+prepare      :     97 ms (68 buckets formatted)
+fill         : 10073208 ms  10000 written, 10000/10000 total, 40 commits
+verify       :  11588 ms  256 persons, 660 cards
+VERIFY PASS
+mutate       :  98134 ms  rev 0 -> 1  (0 revoked, 64 assigned)
+re-verify    :  11818 ms  256 persons, 664 cards
+VERIFY PASS
+
+bench check :   200 ops in  5357000 us ->    37.33 ops/s    26785 us/op   400 store ops  22973 flash ops   1718124 B  amp 21x
+             : 198 granted, 0 denied, 0 unknown, 2 expired
+bench byid  :   200 ops in  2954000 us ->    67.70 ops/s    14770 us/op   200 store ops  11644 flash ops   1082992 B  amp 14x
+bench miss  :   200 ops in  2509000 us ->    79.71 ops/s    12545 us/op   200 store ops  11379 flash ops    626210 B  amp 136x
+bench put   :   200 ops in 512880000 us ->     0.39 ops/s  2564400 us/op   862 store ops  65353 flash ops  38944186 B  amp 453x
+bench cbor  :   200 ops in   194000 us ->  1030.93 ops/s      970 us/op     0 store ops      0 flash ops         0 B  amp 0x
+
+store
+  partition   : 8388608 B (8192 KiB)
+  maps        : 1 person (depth 2, 961 buckets) + 1 credential (depth 2, 256 buckets)
+  persons     : 10000 of 10000   credentials: 24932
+  mean entry  : 433 B
+  live content: 4336158 B = 51.6 % of the partition
+  bucket overflows: 0
+  buckets past near-full: 0
+  NOTE: physical occupancy (live + uncompacted garbage) is not
+        observable through the API — see FINDINGS.md B3.
+
+persondb: done — store at rev 1; rerun to prove persistence
+```
+
+### Run 2 — steady state (rev 1 -> 2)
+
+```
+*** Booting Zephyr OS build 4a405846193f ***
+
+persondb 1.0.0 — CBOR person/credential database
+open         :    789 ms
+prepare      :     23 ms (0 buckets formatted)
+fill         : already complete (10000 persons)
+verify       :  12482 ms  256 persons, 664 cards
+VERIFY PASS
+mutate       : 232101 ms  rev 1 -> 2  (64 revoked, 64 assigned)
+re-verify    :  12485 ms  256 persons, 664 cards
+VERIFY PASS
+
+bench check :   200 ops in  5470000 us ->    36.56 ops/s    27350 us/op   400 store ops  23580 flash ops   1725200 B  amp 21x
+             : 198 granted, 0 denied, 0 unknown, 2 expired
+bench byid  :   200 ops in  2867000 us ->    69.76 ops/s    14335 us/op   200 store ops  11137 flash ops   1076953 B  amp 14x
+bench miss  :   200 ops in  2729000 us ->    73.29 ops/s    13645 us/op   200 store ops  12654 flash ops    641602 B  amp 139x
+bench put   :   200 ops in 511685000 us ->     0.39 ops/s  2558425 us/op   865 store ops  67037 flash ops  38920838 B  amp 452x
+bench cbor  :   200 ops in   195000 us ->  1025.64 ops/s      975 us/op     0 store ops      0 flash ops         0 B  amp 0x
+
+store
+  partition   : 8388608 B (8192 KiB)
+  maps        : 1 person (depth 2, 961 buckets) + 1 credential (depth 2, 256 buckets)
+  persons     : 10000 of 10000   credentials: 24932
+  mean entry  : 433 B
+  live content: 4336158 B = 51.6 % of the partition
+  bucket overflows: 0
+  buckets past near-full: 0
+  NOTE: physical occupancy (live + uncompacted garbage) is not
+        observable through the API — see FINDINGS.md B3.
+
+persondb: done — store at rev 2; rerun to prove persistence
+```
+
+Build for either scale with:
+
+```
+west build -p always -b nrf5340dk/nrf5340/cpuapp app_cbor_persondb \
+      -- -DCONFIG_APP_CBOR_PERSONDB_N_PERSONS=10000
+```
+
+Erase the partition raw before run 1; run 2 is the same image reflashed with the
+store left in place.
 
 ## 9. Sizing history
 

@@ -2,7 +2,7 @@ sample:
   description: CBOR person/credential database over the L2 Map shape
   name: cbor-persondb
 common:
-  tags: storage cbor
+  tags: [storage, cbor]
 tests:
   # The headline configuration. Build only: a 10 000-person fill is roughly
   # 2.5 h on the DK's QSPI NOR (DESIGN.md §6.2).

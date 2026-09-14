@@ -224,16 +224,47 @@ ONE_LEVEL_MAX_BUCKETS = 255    # D3e — 2 048 B directory, one blob at create
 SAFE_BUCKET_FRACTION  = 0.6    # D3d/§9.7 — the warning threshold, used here
                                # as the sizing target so a fresh map starts
                                # below the line it would warn at.
-MIN_BUCKET_BYTES      = 256    # Floor on the two-level target. §5.2 said the
-                               # limit on "more buckets" is per-blob overhead
-                               # and left it unquantified; this model quantified
-                               # it. At ~1 entry per bucket the credential map
-                               # wanted 20 164 buckets for 23 B entries — a blob
-                               # per entry, 14 B of slot header on 23 B of data,
-                               # 62 % overhead, and 2 311 B per get. At a 256 B
-                               # floor: 1 849 buckets, 6 % overhead, 952 B per
-                               # get. The floor never binds for entries larger
-                               # than itself, so the people map is unaffected.
+MIN_BUCKET_BYTES      = 4096   # Floor on the two-level target, and the one
+                               # number in this model that was got wrong twice.
+                               #
+                               # §5.2 said the limit on "more buckets" is
+                               # per-blob overhead and left it unquantified.
+                               # This model first quantified it as slot-header
+                               # waste *inside* a bucket and set the floor at
+                               # 256 B. Building the container showed both were
+                               # the wrong quantity: the cost of more buckets is
+                               # not what a bucket carries, it is how many blobs
+                               # the store ends up holding, because blob_db
+                               # finds a blob by walking slot headers in its
+                               # erase block and that walk grows with the
+                               # population of the block.
+                               #
+                               # Measured on the app (RESULTS.md), floor vs
+                               # `check`, which is two map gets:
+                               #
+                               #    floor  buckets  blobs   us   flash ops
+                               #      256     8100  10082  228         787
+                               #     1024     3025   3586  108         325
+                               #     4096      784   1084   70         135
+                               #     8192      400    ---  bucket past 60% warn
+                               #
+                               # 16 B per flash operation at the 256 floor is
+                               # header-sized: those operations are the walk.
+                               # 4096 is the knee; 8192 pushes buckets past the
+                               # warning line, which is the container refusing a
+                               # geometry it cannot recover from.
+
+# Empirical: flash operations per `check` against the store's blob count,
+# fitted to the three measured points above (native_sim, steady state, this
+# dataset). Not a law of the stack — a calibration, kept so the model predicts
+# the same knee the device does instead of the one arithmetic alone suggested.
+OPS_PER_BLOB          = 0.0725
+OPS_FIXED             = 56
+
+
+def blobs_for(depth, m, n, buckets):
+    """Blobs a map costs the store: one per bucket, plus its directories."""
+    return buckets + (m + 1 if depth == 2 else 1)
 
 
 def derive_geometry(expected_entries, typical_entry_bytes, max_entry_bytes,
@@ -253,9 +284,16 @@ def derive_geometry(expected_entries, typical_entry_bytes, max_entry_bytes,
         return 1, 0, small, small
 
     # ~1 entry per bucket (§5.2) but never buckets smaller than the floor:
-    # below it, blob_db's per-slot header dominates the entry it carries.
+    # below it the store holds so many blobs that blob_db's slot walk costs
+    # more than the bytes saved (see MIN_BUCKET_BYTES).
     target = max(typical_entry_bytes, MIN_BUCKET_BYTES)
     buckets = max(1, -(-(expected_entries * typical_entry_bytes) // target))
+    # Never fewer buckets than one level would have given: below that the
+    # second level is buying nothing. Mirrors kvhash.c:362 — this line was
+    # missing here, and the model put the credential map at 121 buckets where
+    # the device built 256. The check has to be the code's twin or it is
+    # checking something else.
+    buckets = max(buckets, ONE_LEVEL_MAX_BUCKETS)
     m = int(buckets ** 0.5)
     while m * m < buckets:
         m += 1
@@ -301,10 +339,11 @@ def two_level_report(payload=16384):
     print(f"\n=== proposed two-level kvhash, payload {payload} B ===")
     warn = int(payload * SAFE_BUCKET_FRACTION)
 
+    # The numbers the application declares in persondb.c, not the dataset's
+    # own averages: this models the config the firmware actually passes.
     for name, keys, entries, typ, mx_entry in (
-            ("people",      person_keys,     N_PERSONS, 433, 700),
-            ("credentials", credential_keys, sum(1 + (mix(i, 3) % 4)
-                                                 for i in range(N_PERSONS)), 23, 23)):
+            ("people",      person_keys,     N_PERSONS, 380, 700),
+            ("credentials", credential_keys, N_PERSONS * 5 // 2, 23, 23)):
         depth, m, n, buckets = derive_geometry(entries, typ, mx_entry, payload)
         meta = (8 + 8 * n) if depth == 1 else (8 + 8 * m) + (8 + 8 * n)
         mxb, mean, used, total = spread(keys(), m if depth == 2 else 0, n, idx_crc)
@@ -313,8 +352,11 @@ def two_level_report(payload=16384):
         print(f"  derived      : depth {depth}, "
               f"{'%d x %d' % (m, n) if depth == 2 else '%d' % n} "
               f"= {buckets} buckets  (D3e/D3f)")
+        blobs = blobs_for(depth, m, n, buckets)
         print(f"  metadata/op  : {meta} B      bucket mean {mean:.0f} B")
         print(f"  bytes/get    : {meta + mean:.0f} B")
+        print(f"  blobs        : {blobs}  -- the cost that bounds bucket count,")
+        print(f"                 not the bytes (see MIN_BUCKET_BYTES)")
         print(f"  fullest      : {mxb} B = {100*mxb/payload:.0f}% of payload"
               f"   {'OVER 60% WARN LINE' if mxb > warn else 'below the warn line'}")
         print(f"  buckets used : {used}/{buckets}")
@@ -325,4 +367,44 @@ def two_level_report(payload=16384):
                   f"  <- must be far worse, or the check is not checking")
 
 
+def floor_sweep(payload=16384):
+    """Why MIN_BUCKET_BYTES is 4096 and not 256, reproduced from the model.
+
+    Bytes per get keep improving as buckets shrink; total blobs -- and with
+    them the slot walk that dominates a lookup -- get steadily worse. The
+    optimum is where their sum turns, and arithmetic on bytes alone cannot see
+    it. That is the whole correction.
+    """
+    print(f"\n=== the bucket floor, bytes against blobs (payload {payload} B) ===")
+    print(f"{'floor':>6} {'buckets':>8} {'blobs':>7} {'bytes/get':>10} "
+          f"{'est ops':>8} {'fullest':>8}")
+    ncards = sum(1 + (mix(i, 3) % 4) for i in range(N_PERSONS))
+    global MIN_BUCKET_BYTES
+    keep = MIN_BUCKET_BYTES
+
+    for floor in (256, 1024, 4096, 8192):
+        MIN_BUCKET_BYTES = floor
+        tot_blobs, line = 0, {}
+        for name, keys, entries, typ, mx_entry in (
+                ("people", person_keys, N_PERSONS, 380, 700),
+                ("cred", credential_keys, N_PERSONS * 5 // 2, 23, 23)):
+            depth, m, n, buckets = derive_geometry(entries, typ, mx_entry, payload)
+            meta = (8 + 8 * n) if depth == 1 else (8 + 8 * m) + (8 + 8 * n)
+            mxb, mean, _, _ = spread(keys(), m if depth == 2 else 0, n, idx_crc)
+            tot_blobs += blobs_for(depth, m, n, buckets)
+            line[name] = (buckets, meta + mean, mxb)
+        ops = OPS_PER_BLOB * tot_blobs + OPS_FIXED
+        warn = "  PAST 60% WARN" if line["people"][2] > payload * SAFE_BUCKET_FRACTION else ""
+        print(f"{floor:>6} {line['people'][0]:>8} {tot_blobs:>7} "
+              f"{line['people'][1]:>9.0f}B {ops:>8.0f} "
+              f"{line['people'][2]:>7}B{warn}")
+
+    MIN_BUCKET_BYTES = keep
+    print("\nShipped: 4096. Bytes per get are not the minimum there and that is")
+    print("the point -- 256 moves fewer bytes and measured 3.3x slower, because")
+    print("it puts 10 082 blobs in the store and blob_db walks slot headers to")
+    print("find each one. RESULTS.md has the device numbers.")
+
+
 two_level_report()
+floor_sweep()
