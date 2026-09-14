@@ -90,9 +90,6 @@ struct persondb_stat {
 				      * Wrong on the UBI backend, undetectably. */
 
 	uint32_t enospc_hits;        /* F11: bucket overflows, never expected */
-	uint32_t near_full_hits;     /* sets whose bucket passed the container's
-				      * near-full threshold — the early warning
-				      * that a geometry is tighter than declared */
 
 	/* Map-level work this module performed. */
 	uint64_t map_gets;

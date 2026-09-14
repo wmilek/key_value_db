@@ -214,17 +214,34 @@ guarantees create-once.
 ### 4.3 A bucket that fills has no recovery
 
 A bucket that outgrows one payload returns `-ENOSPC`, and the map cannot grow
-to escape it — the geometry is fixed at create. `set` mitigates rather than
-solves: it already knows how full the record it just rewrote is, so it returns
-a positive value once a bucket passes `NEAR_FULL_PCT` (60 %) of the payload.
-That is a warning, not a failure — the value *was* stored — so callers must
-test `rc < 0` for failure, which is stated in `shape_map.h` and is the one
-place this shape departs from "non-zero means trouble".
+to escape it — the geometry is fixed at create, and K6 (no iteration) means the
+contents cannot be copied into a larger map either. The only point at which
+this is preventable is the declaration passed to `create`.
 
-It moves the news earlier, from the key that could not be stored to the key
-that nearly could, but a caller that has already sized its map has no action
-left beyond rebuilding at a larger declaration. The real cure is online resize,
-which v1 does not have.
+An earlier revision tried to soften that with a near-full warning: `set`
+already knows how full the record it just rewrote is, so it returned a positive
+value once a bucket passed 60 % of the payload. It was removed, and the reason
+is worth keeping.
+
+The warning was free to *produce* but not free to *have*. A positive success
+return is an exception to "non-zero means trouble" that every caller must know
+about: the one application that handled it (`app_cbor_persondb`) had already
+aborted a fill by reading `rc != 0` as failure, the L3 wrapper `kvdb_set()`
+forwarded the value while its own header documented only `0`, and 26 assertions
+in this suite plus 19 in `tests/lib/kvdb` read it as a failure. Against that,
+the single consumer did nothing with the value beyond incrementing a counter
+for a printed line — discarding the one thing an in-band return offers over a
+log line, which is *which key* tripped it — and that counter read `0` in every
+recorded run, because the derived geometry of §1.1 sizes buckets so it does
+not fire.
+
+So the mitigation was carried by 45 call sites that could misread it, for one
+that aggregated it away. The real cure is online resize, which v1 does not
+have; `set` is `0`-or-negative like every other op in the shape.
+
+The 60 % figure survives in `BUCKET_FILL_PCT`, where it does a different and
+load-bearing job: it is the margin §1.1 sizes one-level buckets against, so a
+population whose entries run larger than declared still fits.
 
 *(The former item here — `initial_capacity` read as a bucket count, the source
 of FINDINGS.md K9 — is resolved: the field is gone, replaced by the declared

@@ -68,7 +68,7 @@ LOG_MODULE_REGISTER(kvhash, CONFIG_BLOB_CONTAINER_KVHASH_LOG_LEVEL);
 #define SMALL_MAP_LOAD          4u   /* entries per bucket while one level fits */
 #define ONE_LEVEL_MAX_BUCKETS   255u /* past this, spend a second level */
 #define MIN_BUCKET_BYTES        4096u /* below this, per-blob overhead dominates */
-#define NEAR_FULL_PCT           60u  /* warn when a bucket passes this */
+#define BUCKET_FILL_PCT         60u  /* of a payload a full bucket should reach */
 
 BUILD_ASSERT(MAX_BUCKETS >= 2, "MAX_PAYLOAD too small to hold a bucket directory");
 
@@ -347,12 +347,13 @@ static int derive_geometry(const struct map_config *cfg,
 		return 0;
 	}
 
-	/* One level, packed: cap the load so a full bucket stays under the
-	 * near-full threshold rather than against the ceiling. */
+	/* One level, packed: cap the load so a full bucket sits comfortably
+	 * inside a payload rather than against the ceiling. The margin is what
+	 * absorbs a population whose entries run larger than declared. */
 	size_t load = SMALL_MAP_LOAD;
 
 	if (maxent != 0) {
-		size_t safe = (size_t)MAX_PAYLOAD * NEAR_FULL_PCT / 100u;
+		size_t safe = (size_t)MAX_PAYLOAD * BUCKET_FILL_PCT / 100u;
 		size_t by_size = safe / maxent;
 
 		if (by_size < load) {
@@ -579,14 +580,12 @@ static int kvhash_set(uint64_t root, const void *key, size_t klen,
 
 	uint64_t bid = dir_child(dir_buf, idx);
 	size_t used = 0;
-	size_t was = 0;
 
 	if (bid != 0) {
 		rc = blob_db_get(bid, bkt_buf, sizeof(bkt_buf), &used);
 		if (rc != 0) {
 			return rc;
 		}
-		was = used;
 
 		/* Drop any existing entry for this key (in-place compaction). */
 		size_t off, elen;
@@ -640,25 +639,6 @@ static int kvhash_set(uint64_t root, const void *key, size_t klen,
 		}
 	}
 
-	/*
-	 * Near-full warning. Free: this bucket was just read and rewritten, so
-	 * its size is already known. It matters because a map that cannot grow
-	 * has no recovery from -ENOSPC — the bucket count is fixed at create
-	 * and there is no iteration to copy the data out with — so the useful
-	 * moment to react is while there is still room, not at the failure.
-	 */
-	const size_t near_full = (size_t)MAX_PAYLOAD * NEAR_FULL_PCT / 100u;
-
-	if (used >= near_full) {
-		if (was < near_full) {
-			LOG_WRN("bucket %u of map %llu is %u%% full (%zu of %u B) "
-				"— sized for fewer or larger entries than it holds",
-				idx, (unsigned long long)leaf,
-				(unsigned int)(used * 100u / MAX_PAYLOAD),
-				used, (unsigned int)MAX_PAYLOAD);
-		}
-		return 1;
-	}
 	return 0;
 }
 

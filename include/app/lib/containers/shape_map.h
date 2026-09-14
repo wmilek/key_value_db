@@ -147,18 +147,12 @@ struct map_ops {
 	/**
 	 * @brief Insert @p key or replace its value. Keeps map identity.
 	 *
-	 * A **positive** return still means stored — it is a warning, not a
-	 * failure, so callers testing `rc != 0` for failure must test `rc < 0`.
-	 * The provider pays nothing to produce it: a set has already read the
-	 * record it is about to rewrite, so it knows how full that record is.
-	 *
 	 * @retval 0        stored
-	 * @retval >0       stored, and the record holding this key has passed
-	 *                  the provider's near-full threshold. The next few
-	 *                  inserts here may return -ENOSPC, and a map that
-	 *                  cannot grow has no recovery from that — so this is
-	 *                  the point at which to re-plan, not the -ENOSPC.
-	 * @retval -ENOSPC  the record holding this key would overflow
+	 * @retval -ENOSPC  the record holding this key would overflow. A map
+	 *                  cannot be re-shaped after create, so a caller that
+	 *                  meets this has no recovery beyond rebuilding at a
+	 *                  larger declaration — size the map at @ref create,
+	 *                  which is the only point where this is preventable.
 	 * @retval -EIO     flash error
 	 */
 	int (*set)(uint64_t root, const void *key, size_t klen,

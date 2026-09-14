@@ -850,21 +850,26 @@ mistake is not merely unrecoverable, it is **unmigratable**.
 That is the cleanest argument for v2 that this proposal contains: splitting *is*
 the in-place cure, because it re-shapes the map without needing to enumerate it.
 
-**9.7 One free warning, and it should be in v1.** Every `set` already reads its
-target bucket, so `kvhash` knows that bucket's byte size at **zero** extra cost —
-no counter, no second read, no write. It can therefore say so when a bucket
-crosses **60 %** of the payload ceiling (D3d), reported **both** ways: a log
-line, and a positive return from `set` — 0 = stored, >0 = stored and this
-bucket is now past the threshold. Positive matters: every existing caller reads
-`rc != 0` as failure, so a negative code would turn a warning into an error at
-each of them, while a positive one is safely ignored by callers that do not
-care.
+**9.7 One free warning — proposed for v1, built, and then removed.** Every `set`
+already reads its target bucket, so `kvhash` knows that bucket's byte size at
+**zero** extra cost — no counter, no second read, no write. It can therefore say
+so when a bucket crosses **60 %** of the payload ceiling, and the original
+proposal asked for it **both** ways: a log line, and a positive return from
+`set` — 0 = stored, >0 = stored and this bucket is now past the threshold.
 
-This satisfies D3b's rule exactly: observed in passing, never stored. And it is
-the mitigation for §9.6 — it converts K2 from a surprise that arrives when
-recovery is impossible into a signal that arrives while margin still exists.
-Given that v1 deliberately has no occupancy query and no repair path, a warning
-that costs nothing is the difference between a limitation and a trap.
+The reasoning above is what the mechanism cost to *produce*. It said nothing
+about what it cost to *have*, and that is where it failed. See **D3d** for the
+reversal and the measurements behind it; the summary is that a positive success
+return is an exception to "non-zero means trouble" that propagates to every
+caller in the tree, while the one consumer aggregated the value away and the
+counter never left zero. The 60 % figure survives as the packing margin in
+§7.1's derivation, which is a different job.
+
+The §9.6 hazard it was meant to mitigate is therefore **unmitigated in v1**, and
+that stands as the honest position: a map cannot be re-shaped after `create`
+(K3) and cannot be enumerated out of (K6), so the declaration passed to
+`create` is the only point at which a distribution mistake is preventable. The
+cure is online resize (§13), not a warning.
 
 ## 10. Recommendation
 
@@ -1141,18 +1146,48 @@ For the record, so these are not re-opened as blockers:
   **Freeze point.** The hash decides where every key lives, so it is free to
   change now (nothing is deployed, D0) and becomes a reformat once v1 ships.
 
-  **DECIDED with it: §9.7's warning fires at 60 % of the bucket ceiling,
-  reported as both a log line and a return code.** Folded in here because it is
-  the mitigation for this risk. The log line serves bring-up and the interactive
-  shell; the return code lets a fill loop throttle, re-plan or stop on its own
-  terms instead of meeting `-ENOSPC` hours later with no recovery (§9.6). Cost
-  is nil either way — a `set` has already read the bucket, so the size is in
-  hand.
+  **DECIDED with it, then REVERSED: §9.7's near-full warning is removed
+  entirely — no return code, no log line.** Recorded rather than deleted,
+  because the reversal is the more instructive half.
 
-  One constraint on the return value, since most callers will ignore it: make it
-  **positive** — 0 = stored, >0 = stored and this bucket is now past the
-  threshold. Every existing caller tests `rc != 0` for failure, so a negative
-  code would turn a warning into an error at every one of them.
+  The original decision was that the warning fires at 60 % of the bucket
+  ceiling, reported both as a `LOG_WRN` and as a **positive** return from `set`
+  (0 = stored, >0 = stored and past the threshold), positive specifically so
+  that callers testing `rc != 0` would not turn a warning into an error. Cost
+  was judged nil, because a `set` has already read the bucket.
+
+  **What the implementation showed.** "Positive is safely ignored" was wrong in
+  both directions, and the tree measured it:
+
+  - `app_cbor_persondb` — the application the warning was *for* — read
+    `rc != 0` as failure and aborted its fill on the first warning. It needed a
+    dedicated `rc > 0` branch to survive its own mitigation.
+  - `kvdb_set()` forwards the provider's return verbatim, so L3 leaked a
+    positive value while `kvdb.h` documented `0 / -EINVAL / -ENOSPC / -EIO`. A
+    layer boundary silently broke its own contract.
+  - 26 assertions in `tests/lib/containers` and 19 in `tests/lib/kvdb` used
+    `zassert_ok`, which tests `rc != 0`. Two failed the moment a bucket got
+    dense; the other 43 were latent, passing only because their maps are small.
+  - `app_perf_kvdb` has 7 sites on `if (rc != 0) → abort`, one of them a
+    generation commit point, where a warning would have been read as a failure
+    of a write that had actually landed.
+
+  Against 45 sites that could misread it, the value had **one** consumer, which
+  incremented a counter and returned 0 — discarding the only thing an in-band
+  return offers over a log line, namely *which key* tripped it. That counter
+  read `0` in all five recorded runs, because §7.1's derivation sizes buckets so
+  it does not fire.
+
+  **The principle.** A signal nobody acts on is not free merely because it is
+  cheap to compute. Its price is paid by every caller that has to know about the
+  exception, and here that price was 45 call sites for one aggregation. An
+  advisory channel should not be carved out of a return convention the whole
+  tree already relies on; the `LOG_WRN` went with it because a log line whose
+  counter never left zero was not earning its place either.
+
+  What survives is the number: **60 %** is now `BUCKET_FILL_PCT`, the margin
+  one-level buckets are sized against in §7.1, where it absorbs a population
+  whose entries run larger than declared. That was always the load-bearing use.
 
 - **D3e. DECIDED: `{0}` builds one level, small — today's behaviour
   unchanged.** The default serves the small single-level map; two levels are
@@ -1201,10 +1236,15 @@ For the record, so these are not re-opened as blockers:
   failure whose fullest bucket is at 28 % of its ceiling. It names the cause it
   expected, because the errno cannot distinguish them.
 
-  Two riders: validation is arithmetic on the config, so it happens **before any
+  One rider: validation is arithmetic on the config, so it happens **before any
   flash write** — a rejected `create` must not leave an allocated id or an
-  orphan blob behind (**B8**). And it does not collide with §9.7's warning,
-  which is deliberately a *positive* return.
+  orphan blob behind (**B8**).
+
+  With §9.7's warning removed (D3d), `create` is now the *only* place the stack
+  says anything about sizing before the data arrives — which raises the stakes
+  on this `-EINVAL` rather than lowering them. A declaration that cannot be
+  honoured is the last preventable failure; everything after it is `-ENOSPC` on
+  a map that can no longer be re-shaped.
 
 
 - **D3c.** Per-map bucket sizing (§7.1) — worth it, or does declarative config
@@ -1286,12 +1326,15 @@ requires. `VERIFY PASS` and zero bucket overflows at both scales.
 one: bytes moved are not the objective, because a container's cost includes what
 it makes the layer below it hold. The bucket floor moved 256 → 4 096.
 
-**The positive return from `set()` is a real migration hazard, not a
-theoretical one.** `app_cbor_persondb` read `rc != 0` as failure and aborted its
-fill on the first near-full warning. Every caller of a `set` that gains a
-warning return has to be audited; there is no way to add one compatibly. Worth
-weighing against the alternative of a log line alone — this document chose both
-(§9.7), and the cost of "both" is this audit.
+**The positive return from `set()` was a real migration hazard, not a
+theoretical one — and it is what got the warning removed.**
+`app_cbor_persondb` read `rc != 0` as failure and aborted its fill on the first
+near-full warning: the mitigation broke the application it was written for. The
+audit that followed found 45 call sites across the tree that read a positive
+return as failure, against one consumer that used the value — and that one
+aggregated it into a counter which never left zero. There is no way to add a
+warning return compatibly, and here there was nothing on the other side of the
+ledger to pay for it. Removed; see **D3d** for the full accounting.
 
 **The check and the code diverged immediately, in two places.** Running them
 side by side caught it: `tools/sizing.py` was missing the
@@ -1345,10 +1388,13 @@ different bucket counts.
 a largest blob and it still has to be placed. Two details worth keeping:
 
 - **The near-full warning stayed silent through every one of these runs**, at
-  8 000, 10 000 and 13 000 — correctly, because §9.7 is a *bucket* signal and
-  this is a medium wall. It is not the early warning for this failure and
-  should not be mistaken for one. §9.6's gap stands: for K13 the application
-  still gets `-ENOSPC` with nothing before it.
+  8 000, 10 000 and 13 000 — correctly, because §9.7 was a *bucket* signal and
+  this is a medium wall. It was never the early warning for this failure and
+  should not have been mistaken for one. Those silent runs are also half the
+  case for removing it (D3d): a signal that is correct to stay silent, on the
+  only ceiling the application actually meets, is not buying much. §9.6's gap
+  stands and is now unmitigated: for K13 — and for K2 — the application gets
+  `-ENOSPC` with nothing before it.
 - **The benchmark constant is now conservative.** `DESIGN.md` §6.5 set 8 000
   because the ceiling was 9 670. On this container 10 000 completes with room.
   Restoring it is a benchmark decision under D14/D15 — a deliberate re-size,

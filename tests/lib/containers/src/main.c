@@ -79,17 +79,6 @@ static void map_after(void *fixture)
 	blob_db_unmount();
 }
 
-/*
- * set() reports success as rc >= 0, not rc == 0: a positive return means
- * "stored, and the record holding this key is near full" (shape_map.h). It is
- * advisory, and which keys land in a dense record depends on the hash and on
- * the geometry the provider chose -- so no test can predict where it appears,
- * and every set in this suite goes through here rather than zassert_ok.
- *
- * Tests that are *about* the warning assert on the return value directly.
- */
-#define zassert_stored(rc, ...) zassert_true((rc) >= 0, __VA_ARGS__)
-
 ZTEST_SUITE(map_contract, NULL, NULL, map_before, map_after, NULL);
 ZTEST_SUITE(kvhash_layout, NULL, NULL, map_before, map_after, NULL);
 
@@ -160,7 +149,7 @@ ZTEST(map_contract, test_create_accepts_null_config)
 		zassert_ok(p->ops->create(root, NULL), "%s: create(NULL)", p->name);
 
 		/* A default-shaped map is a working map. */
-		zassert_stored(p->ops->set(root, "a", 1, "v", 1), "%s: set", p->name);
+		zassert_ok(p->ops->set(root, "a", 1, "v", 1), "%s: set", p->name);
 		zassert_ok(p->ops->get(root, "a", 1, out, sizeof(out), &len),
 			   "%s: get", p->name);
 		zassert_equal(len, 1, "%s: len", p->name);
@@ -174,7 +163,7 @@ ZTEST(map_contract, test_set_get_roundtrip)
 		char out[32];
 		size_t len = 0;
 
-		zassert_stored(p->ops->set(root, "color", 5, "green", 5),
+		zassert_ok(p->ops->set(root, "color", 5, "green", 5),
 			   "%s: set", p->name);
 		zassert_ok(p->ops->get(root, "color", 5, out, sizeof(out), &len),
 			   "%s: get", p->name);
@@ -194,16 +183,16 @@ ZTEST(map_contract, test_set_replaces_value)
 		char out[32];
 		size_t len = 0;
 
-		zassert_stored(p->ops->set(root, "k", 1, "aaaaaaaa", 8));
+		zassert_ok(p->ops->set(root, "k", 1, "aaaaaaaa", 8));
 
 		/* Shrink. */
-		zassert_stored(p->ops->set(root, "k", 1, "bb", 2));
+		zassert_ok(p->ops->set(root, "k", 1, "bb", 2));
 		zassert_ok(p->ops->get(root, "k", 1, out, sizeof(out), &len));
 		zassert_equal(len, 2, "%s: replace must not leave stale length", p->name);
 		zassert_mem_equal(out, "bb", 2, "%s", p->name);
 
 		/* Grow again. */
-		zassert_stored(p->ops->set(root, "k", 1, "cccccccccc", 10));
+		zassert_ok(p->ops->set(root, "k", 1, "cccccccccc", 10));
 		zassert_ok(p->ops->get(root, "k", 1, out, sizeof(out), &len));
 		zassert_equal(len, 10, "%s: regrow", p->name);
 		zassert_mem_equal(out, "cccccccccc", 10, "%s", p->name);
@@ -217,8 +206,8 @@ ZTEST(map_contract, test_del_removes_only_its_key)
 		char out[16];
 		size_t len = 0;
 
-		zassert_stored(p->ops->set(root, "keep", 4, "1", 1));
-		zassert_stored(p->ops->set(root, "drop", 4, "2", 1));
+		zassert_ok(p->ops->set(root, "keep", 4, "1", 1));
+		zassert_ok(p->ops->set(root, "drop", 4, "2", 1));
 
 		zassert_ok(p->ops->del(root, "drop", 4), "%s: del", p->name);
 		zassert_equal(p->ops->get(root, "drop", 4, out, sizeof(out), &len),
@@ -246,7 +235,7 @@ ZTEST(map_contract, test_get_too_small_reports_true_length)
 		char small[4];
 		size_t len = 0;
 
-		zassert_stored(p->ops->set(root, "k", 1, "0123456789", 10));
+		zassert_ok(p->ops->set(root, "k", 1, "0123456789", 10));
 
 		zassert_equal(p->ops->get(root, "k", 1, small, sizeof(small), &len),
 			      -ENOMEM, "%s: short buffer must fail", p->name);
@@ -275,7 +264,7 @@ ZTEST(map_contract, test_existence_probe)
 		uint64_t root = fresh_map(p, 8);
 		size_t len = 0;
 
-		zassert_stored(p->ops->set(root, "here", 4, "value", 5));
+		zassert_ok(p->ops->set(root, "here", 4, "value", 5));
 
 		zassert_equal(p->ops->get(root, "here", 4, NULL, 0, &len), -ENOMEM,
 			      "%s: probe of a present key", p->name);
@@ -293,7 +282,7 @@ ZTEST(map_contract, test_get_accepts_null_out_len)
 		uint64_t root = fresh_map(p, 8);
 		char out[8];
 
-		zassert_stored(p->ops->set(root, "k", 1, "vv", 2));
+		zassert_ok(p->ops->set(root, "k", 1, "vv", 2));
 		zassert_ok(p->ops->get(root, "k", 1, out, sizeof(out), NULL),
 			   "%s: NULL out_len rejected", p->name);
 		zassert_mem_equal(out, "vv", 2, "%s", p->name);
@@ -317,7 +306,7 @@ ZTEST(map_contract, test_many_keys_stay_independent)
 		for (int i = 0; i < n; i++) {
 			snprintf(key, sizeof(key), "k%02d", i);
 			snprintf(val, sizeof(val), "v%02d", i);
-			zassert_stored(p->ops->set(root, key, strlen(key), val, 3),
+			zassert_ok(p->ops->set(root, key, strlen(key), val, 3),
 				   "%s: set %s", p->name, key);
 		}
 
@@ -364,7 +353,7 @@ ZTEST(map_contract, test_map_survives_remount)
 		char out[16];
 		size_t len = 0;
 
-		zassert_stored(p->ops->set(root, "persist", 7, "yes", 3));
+		zassert_ok(p->ops->set(root, "persist", 7, "yes", 3));
 
 		zassert_ok(blob_db_unmount());
 		zassert_ok(blob_db_mount());
@@ -375,7 +364,7 @@ ZTEST(map_contract, test_map_survives_remount)
 		zassert_mem_equal(out, "yes", 3, "%s", p->name);
 
 		/* And it is still writable, not just readable. */
-		zassert_stored(p->ops->set(root, "after", 5, "ok", 2), "%s", p->name);
+		zassert_ok(p->ops->set(root, "after", 5, "ok", 2), "%s", p->name);
 	}
 }
 
@@ -390,7 +379,7 @@ ZTEST(map_contract, test_destroy_removes_the_map)
 		char out[8];
 		size_t len = 0;
 
-		zassert_stored(p->ops->set(root, "k", 1, "v", 1));
+		zassert_ok(p->ops->set(root, "k", 1, "v", 1));
 
 		zassert_ok(p->ops->destroy(root), "%s: destroy", p->name);
 
@@ -421,7 +410,7 @@ ZTEST(map_contract, test_destroy_releases_every_blob_it_owned)
 
 		for (int i = 0; i < 16; i++) {
 			snprintf(key, sizeof(key), "k%02d", i);
-			zassert_stored(p->ops->set(root, key, strlen(key), "vvvv", 4));
+			zassert_ok(p->ops->set(root, key, strlen(key), "vvvv", 4));
 		}
 
 		zassert_true(blob_db_count() > baseline,
@@ -444,8 +433,8 @@ ZTEST(map_contract, test_destroy_leaves_other_maps_alone)
 		char out[8];
 		size_t len = 0;
 
-		zassert_stored(p->ops->set(doomed, "k", 1, "d", 1));
-		zassert_stored(p->ops->set(keeper, "k", 1, "k", 1));
+		zassert_ok(p->ops->set(doomed, "k", 1, "d", 1));
+		zassert_ok(p->ops->set(keeper, "k", 1, "k", 1));
 
 		zassert_ok(p->ops->destroy(doomed), "%s: destroy", p->name);
 
@@ -455,7 +444,7 @@ ZTEST(map_contract, test_destroy_leaves_other_maps_alone)
 		zassert_mem_equal(out, "k", 1, "%s", p->name);
 
 		/* And the surviving map is still writable. */
-		zassert_stored(p->ops->set(keeper, "more", 4, "x", 1), "%s", p->name);
+		zassert_ok(p->ops->set(keeper, "more", 4, "x", 1), "%s", p->name);
 	}
 }
 
@@ -487,7 +476,7 @@ ZTEST(map_contract, test_replace_a_map_at_a_fresh_id)
 		char out[8];
 		size_t len = 0;
 
-		zassert_stored(p->ops->set(old_root, "k", 1, "old", 3));
+		zassert_ok(p->ops->set(old_root, "k", 1, "old", 3));
 		zassert_ok(p->ops->destroy(old_root));
 
 		uint64_t new_root = fresh_map(p, 4);
@@ -495,7 +484,7 @@ ZTEST(map_contract, test_replace_a_map_at_a_fresh_id)
 		zassert_not_equal(new_root, old_root,
 				  "%s: alloc_id reissued a destroyed root", p->name);
 
-		zassert_stored(p->ops->set(new_root, "k", 1, "new", 3));
+		zassert_ok(p->ops->set(new_root, "k", 1, "new", 3));
 		zassert_ok(p->ops->get(new_root, "k", 1, out, sizeof(out), &len),
 			   "%s: replacement map", p->name);
 		zassert_mem_equal(out, "new", 3, "%s", p->name);
@@ -566,7 +555,7 @@ ZTEST(map_contract, test_empty_value_is_a_stored_value)
 		char out[8];
 		size_t len = 42;
 
-		zassert_stored(p->ops->set(root, "empty", 5, NULL, 0),
+		zassert_ok(p->ops->set(root, "empty", 5, NULL, 0),
 			   "%s: set(vlen 0)", p->name);
 
 		zassert_ok(p->ops->get(root, "empty", 5, out, sizeof(out), &len),
@@ -627,7 +616,7 @@ ZTEST(kvhash_layout, test_declared_population_is_not_an_entry_limit)
 
 	for (int i = 0; i < 16; i++) {
 		snprintf(key, sizeof(key), "k%02d", i);
-		zassert_stored(kvhash.ops->set(root, key, strlen(key), "vvvv", 4),
+		zassert_ok(kvhash.ops->set(root, key, strlen(key), "vvvv", 4),
 			   "set %s past the requested capacity", key);
 	}
 	for (int i = 0; i < 16; i++) {
@@ -722,7 +711,7 @@ ZTEST(kvhash_layout, test_large_population_builds_a_second_level)
 
 	for (int i = 0; i < 64; i++) {
 		snprintf(key, sizeof(key), "k%03d", i);
-		zassert_stored(kvhash_map_ops.set(root, key, strlen(key), "vvvv", 4),
+		zassert_ok(kvhash_map_ops.set(root, key, strlen(key), "vvvv", 4),
 			   "set %s", key);
 	}
 	for (int i = 0; i < 64; i++) {
@@ -780,7 +769,7 @@ ZTEST(kvhash_layout, test_bucket_overflow_is_enospc_without_damage)
 		if (rc == -ENOSPC) {
 			enospc++;
 		} else {
-			zassert_stored(rc, "set %s: unexpected %d", key, rc);
+			zassert_ok(rc, "set %s: unexpected %d", key, rc);
 			stored[i] = true;
 		}
 	}
@@ -831,7 +820,7 @@ ZTEST(kvhash_layout, test_destroy_resumes_after_an_interrupted_release)
 
 	for (int i = 0; i < 16; i++) {
 		snprintf(key, sizeof(key), "k%02d", i);
-		zassert_stored(kvhash_map_ops.set(root, key, strlen(key), "vvvv", 4));
+		zassert_ok(kvhash_map_ops.set(root, key, strlen(key), "vvvv", 4));
 	}
 
 	zassert_ok(blob_db_get(root, dir, sizeof(dir), &got));
@@ -872,7 +861,7 @@ ZTEST(kvhash_layout, test_destroy_tolerates_already_released_buckets)
 
 	for (int i = 0; i < 16; i++) {
 		snprintf(key, sizeof(key), "k%02d", i);
-		zassert_stored(kvhash_map_ops.set(root, key, strlen(key), "vvvv", 4));
+		zassert_ok(kvhash_map_ops.set(root, key, strlen(key), "vvvv", 4));
 	}
 
 	zassert_ok(blob_db_get(root, dir, sizeof(dir), &got));
@@ -951,7 +940,7 @@ ZTEST(kvhash_layout, test_create_on_populated_root_orphans_its_buckets)
 		char key[8];
 
 		snprintf(key, sizeof(key), "k%d", i);
-		zassert_stored(kvhash_map_ops.set(root, key, strlen(key), "v", 1));
+		zassert_ok(kvhash_map_ops.set(root, key, strlen(key), "v", 1));
 	}
 
 	size_t live_before = blob_db_count();

@@ -95,7 +95,6 @@ static void print_report(const struct scenario_report *r)
 	printk("  live content: %" PRIu64 " B = %u.%u %% of the partition\n",
 	       r->logical_bytes, r->fill_permille / 10, r->fill_permille % 10);
 	printk("  bucket overflows: %u\n", r->st.enospc_hits);
-	printk("  buckets past near-full: %u\n", r->st.near_full_hits);
 	if (r->stack_size) {
 		printk("  main stack  : %zu of %zu B used\n", r->stack_used,
 		       r->stack_size);

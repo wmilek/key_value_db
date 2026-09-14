@@ -903,10 +903,11 @@ signature of this finding rather than K2's.
 
 **It is not retired, and the reason matters.** There is still a largest blob,
 it still has to fit the free space of one erase block, and the store still
-reports `-ENOSPC` with no warning first — the near-full signal of §9.7 is a
-*bucket* signal and stayed silent through every run above, correctly, because
-this is a medium wall. An application still cannot see it coming (B3, V3) and
-still cannot recover from it (K3, K6).
+reports `-ENOSPC` with no warning first. A near-full bucket signal was
+prototyped and removed (proposal D3d); it would not have helped here in any
+case, having stayed silent through every run above — correctly, because it was
+a *bucket* signal and this is a medium wall. An application still cannot see
+this coming (B3, V3) and still cannot recover from it (K3, K6).
 
 **Below is the finding as first measured, on the one-level container.**
 
