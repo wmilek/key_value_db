@@ -655,6 +655,51 @@ ZTEST(blob_db, test_allocated_unbound_id_survives_remount)
 	zassert_mem_equal(buf, "keep", 4);
 }
 
+/* 16a. The same guarantee, with a compaction between the allocation and the
+ *      remount. Case 16 never compacts, so the ceiling alloc_id persisted is
+ *      still the newest master at remount and the invariant holds trivially.
+ *      A compaction stamps its own master, and if that master carries the
+ *      allocation pointer instead of the ceiling it lowers the durable bound
+ *      under a RAM copy that alloc_id keeps allocating against — so the ids
+ *      handed out after the compaction are never re-persisted. Mount's bucket
+ *      scan repairs bound ids, which is why nothing visibly breaks; the
+ *      unbound id below is the one it cannot see. */
+ZTEST(blob_db, test_compaction_does_not_lower_id_ceiling)
+{
+	uint64_t id = put_blob("v0000", 5);
+
+	/* Force a compaction here — 500 rebinds overflow the 4 KB bucket. */
+	char val[8];
+
+	for (int i = 0; i < 500; i++) {
+		(void)snprintk(val, sizeof(val), "v%04d", i);
+		zassert_ok(blob_db_update(id, val, 5), "update #%d failed", i);
+	}
+
+	/* Allocate AFTER the compaction and leave it unbound: nothing on flash
+	 * records it, so only the durable ceiling can protect it. */
+	uint64_t unbound = blob_db_alloc_id();
+
+	zassert_true(unbound > id);
+
+	zassert_ok(blob_db_unmount());
+	zassert_ok(blob_db_mount());
+
+	uint64_t next = blob_db_alloc_id();
+
+	zassert_true(next > unbound,
+		     "ceiling lowered: reissued %llu (unbound=%llu)",
+		     (unsigned long long)next, (unsigned long long)unbound);
+
+	/* And the compacted blob is intact. */
+	uint8_t buf[16];
+	size_t got;
+
+	zassert_ok(blob_db_get(id, buf, sizeof(buf), &got));
+	zassert_equal(got, 5);
+	zassert_mem_equal(buf, "v0499", 5);
+}
+
 /* Root invariant — id=1 is live between mount and unmount (see @blob_db_root
  * in blob_db.h). */
 ZTEST(blob_db, test_root_present_after_mount)

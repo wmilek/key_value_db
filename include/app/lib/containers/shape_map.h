@@ -171,6 +171,34 @@ struct map_ops {
 	 * @retval -ENOENT  key not present
 	 */
 	int (*del)(uint64_t root, const void *key, size_t klen);
+
+	/**
+	 * @brief Destroy the map at @p root, releasing every blob it owns.
+	 *
+	 * The mirror of @ref create. Only the provider knows which i-nodes its
+	 * root reaches, so releasing them has to be a container operation.
+	 *
+	 * Returning 0 is the only completion: on any other result the caller
+	 * repeats the call, and must keep its own record of @p root until one
+	 * returns 0 (l2_containers.md §2.4). Repeating is always safe — a
+	 * part-way destroyed map resumes; one never built, or already gone,
+	 * reports -ENOENT.
+	 *
+	 * Once a destroy has begun, @ref get, @ref set and @ref del answer
+	 * -ENOENT for every key, so a half-destroyed map is never observable.
+	 *
+	 * @ref create is the exception and must not be called on a destroyed
+	 * root: it writes directly, and blob_db makes `update` on a deleted id
+	 * undefined behaviour (decision D3). Build a replacement map at a fresh
+	 * `blob_db_alloc_id()`.
+	 *
+	 * @retval 0        destroyed; every blob released
+	 * @retval -ENOENT  @p root does not identify a map
+	 * @retval -ENOSPC  no room to commit; the map is untouched
+	 * @retval -EIO     flash error; the map is untouched or part-way
+	 *                  released, and the call should be repeated
+	 */
+	int (*destroy)(uint64_t root);
 };
 
 /** @} */
