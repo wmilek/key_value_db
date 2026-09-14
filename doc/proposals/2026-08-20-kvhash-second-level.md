@@ -1345,19 +1345,48 @@ model now reproduces the device exactly. This is the drift D3d chose `crc32_ieee
 to avoid, appearing in the arithmetic instead of the hash — a check has to be the
 code's twin or it is checking something else.
 
-### 13.2 What is still unmeasured
+### 13.2 The nRF5340-DK, measured — and the prediction it refuted
 
-- **The nRF5340-DK.** CI cross-builds it; nothing has run on the board. Every
-  ratio above is `native_sim`, where a flash operation is not a QSPI
-  transaction. The DK is where the operation-count win should matter *more*
-  than it does here, since each operation carries a fixed ~65 µs — but that is
-  a prediction, and predictions in this document have not had a good record.
-- ~~**10 000 persons**, D5's second criterion.~~ **Tried, and it passes** —
-  §13.3.
-- **`tools/sizing.py` as a sizing prerequisite** (D5's first criterion) is met
-  in the sense that matters — the application declares populations and the
-  container derives geometry — but the script survives with a changed job, as
-  §11.1 said it should.
+~~Nothing has run on the board.~~ Three runs have: 1 000, 5 000 and 10 000
+persons on UBI, captured in the application's `RESULTS.md` §8c–§8e and analysed
+in its §5e. The prediction above — that the operation-count win should matter
+*more* on hardware — was **wrong, and backwards**.
+
+At 1 000 persons, against the sixteen-shard build this container replaces:
+
+| | sixteen shards | one level | **two levels** |
+|---|--:|--:|--:|
+| `fill` | 732.6 s | 7 430.4 s | **162.1 s** |
+| `check` | 27.66 ms | 46.50 ms | 36.04 ms |
+| `byid` | 14.06 ms | 23.99 ms | **14.11 ms** |
+| `miss` | 13.72 ms | 21.47 ms | 22.35 ms |
+| whole run | 15.5 min | 2.14 h | **6.69 min** |
+
+**The trade is bytes for transactions, and UBI prices those apart.** Every byte
+column improves — `miss` moves 2.6× fewer bytes than the sharded build and 9.1×
+fewer than one level — and every transaction column rises. A transaction costs
+178 µs on UBI and a byte 0.616 µs, so the axis that improved is the cheap one.
+That is the exact opposite of §5.2's model, which optimised bytes.
+
+`byid` is the control that names the cost as *depth*: it is a dead heat with
+the sharded build (14.11 ms vs 14.06) and it is the one lookup that goes to a
+map `stat()` reports at depth 1. `check` (one depth-2 lookup of two) costs
+×1.30 and `miss` (a single depth-2 lookup) ×1.63. The regression is not the
+second level existing; it is the second level being traversed.
+
+**So the honest summary is a whole-run win, not a uniform one.** 2.31× faster
+than the workaround it retires and 19.2× faster than one level, driven almost
+entirely by `fill`; reads and `put` at this scale cost more than sharding did.
+The picture inverts with scale — at 10 000 the sharded build has no comparison
+because it never reached that far.
+
+Still unmeasured: `put`'s erase residual (0.065 sector erases per op against
+0.035 sharded) is unexplained, and nothing has been run on a non-UBI backend.
+
+**`tools/sizing.py` as a sizing prerequisite** (D5's first criterion) is met in
+the sense that matters — the application declares populations and the container
+derives geometry — but the script survives with a changed job, as §11.1 said it
+should. That is a reinterpretation of the criterion, not a clean pass.
 
 ### 13.3 10 000 persons — D5's second criterion, met
 
