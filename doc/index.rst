@@ -38,6 +38,19 @@ instructions live in the repository ``README.md``.
    :caption: Design — implementation
 
    impl/l1_bucketlog
+   impl/l0_backends
+   impl/l2_kvhash
+
+.. toctree::
+   :maxdepth: 1
+   :caption: Design — proposals
+
+   proposals/2026-08-09-large-payloads
+   proposals/2026-08-09-large-payloads-cost
+   proposals/2026-08-09-kvhash-impact
+   proposals/2026-08-09-rootreg-kvdb-impact
+   proposals/2026-08-09-implementation-plan
+   proposals/2026-08-20-kvhash-second-level
 
 .. toctree::
    :maxdepth: 1

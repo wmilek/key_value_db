@@ -9,10 +9,14 @@
  * within). This header abstracts that access so the same blob_db algorithm
  * can run on two substrates, selected at build time:
  *
- *   - flash_area  (default) — raw partition via Zephyr's flash_area API.
- *   - UBI                    — a dynamic UBI volume; each PEB maps 1:1 to a
- *                              LEB and blob_db's in-place slot appends map
- *                              directly onto ubi_leb_write_at().
+ *   - UBI (default) — a dynamic UBI volume; each PEB maps 1:1 to a LEB and
+ *                     blob_db's in-place slot appends map directly onto
+ *                     ubi_leb_write_at().
+ *   - flash_area    — raw partition via Zephyr's flash_area API. No wear
+ *                     leveling and no bad-block handling; faster.
+ *
+ * The layouts are NOT interchangeable — see doc/impl/l0_backends.md §4 for
+ * what happens when a build meets the other one.
  *
  * A byte offset passed to read/write/erase never crosses a PEB boundary
  * (blob_db operates one bucket/master/scratch sector at a time), so a backend
@@ -53,5 +57,19 @@ int blob_db_store_write(off_t off, const void *buf, size_t len);
  * back as the erased value (0xff).
  */
 int blob_db_store_erase(off_t off, size_t len);
+
+/* I/O accounting, counted here so it covers both backends and every caller
+ * uniformly (CONFIG_BLOB_DB_IOSTATS; compiles to nothing when disabled). */
+#if defined(CONFIG_BLOB_DB_IOSTATS)
+enum blob_db_io_op {
+	BLOB_DB_IO_READ,
+	BLOB_DB_IO_WRITE,
+	BLOB_DB_IO_ERASE,
+};
+void blob_db_io_note(enum blob_db_io_op op, size_t bytes);
+#define BLOB_DB_IO_NOTE(op, bytes) blob_db_io_note((op), (bytes))
+#else
+#define BLOB_DB_IO_NOTE(op, bytes) ((void)0)
+#endif
 
 #endif /* LIB_BLOB_DB_STORE_H_ */

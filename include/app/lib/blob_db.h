@@ -100,9 +100,24 @@ extern "C" {
  * (see @ref blob_db_root); on a virgin store it is bound to an empty
  * payload.
  *
+ * An **unrecognized** store is never destroyed. If a master sector parses but
+ * declares a format this build does not understand — a newer version, or
+ * another allocator's magic — mount returns `-ENOTSUP` and writes nothing;
+ * discarding it is the caller's decision, via `blob_db_format()`, which for
+ * that reason does not itself require a mount. Only a
+ * partition whose master sectors read as erased is treated as virgin and
+ * formatted automatically. (If both masters are unreadable but *not* erased —
+ * bit rot, or a power loss during the first format —
+ * `CONFIG_BLOB_DB_AUTOFORMAT_ON_CORRUPT` chooses between reformatting and
+ * `-EIO`.)
+ *
  * @retval 0       success
  * @retval -EALREADY already mounted
- * @retval -EIO    flash I/O error or partition not found
+ * @retval -EIO    flash I/O error, partition not found, or both masters
+ *                 unreadable with `BLOB_DB_AUTOFORMAT_ON_CORRUPT` disabled
+ * @retval -ENOTSUP foreign on-flash format, a sector larger than
+ *                 `CONFIG_BLOB_DB_SECTOR_BUF_SIZE`, or a payload cap the
+ *                 partition geometry cannot sustain
  * @retval -ENODEV partition_label not present in the device tree
  */
 int blob_db_mount(void);
@@ -161,9 +176,18 @@ int blob_db_get(uint64_t id, void *out, size_t out_sz, size_t *out_len);
  * id of 0 or one not yet allocated with -EINVAL, but release builds owe no
  * such check.
  *
+ * With `CONFIG_BLOB_DB_LARGE_PAYLOADS` enabled, a payload longer than
+ * `CONFIG_BLOB_DB_MAX_PAYLOAD_LEN` is stored transparently as several segments
+ * plus an index record, up to `CONFIG_BLOB_DB_MAX_OBJECT_LEN`. The id, its
+ * stability, and the atomicity of the update are unchanged — only the number of
+ * flash writes grows. Read such a payload back with `blob_db_read()`;
+ * `blob_db_get()` still works but needs a buffer for the whole object.
+ *
  * @param id        id previously returned by `alloc_id`
  * @param payload   payload bytes (may be NULL only if @p len == 0)
- * @param len       payload length, in 0..CONFIG_BLOB_DB_MAX_PAYLOAD_LEN
+ * @param len       payload length, in 0..`CONFIG_BLOB_DB_MAX_PAYLOAD_LEN`, or
+ *                  0..`CONFIG_BLOB_DB_MAX_OBJECT_LEN` when
+ *                  `CONFIG_BLOB_DB_LARGE_PAYLOADS` is enabled
  *
  * @retval 0        success
  * @retval -EINVAL  bad arguments, or id was never allocated
@@ -172,6 +196,96 @@ int blob_db_get(uint64_t id, void *out, size_t out_sz, size_t *out_len);
  * @retval -EIO     flash I/O error
  */
 int blob_db_update(uint64_t id, const void *payload, size_t len);
+
+/**
+ * @brief Report the length of the payload bound to an id.
+ *
+ * The cheap way to size a blob before reading it: one bucket lookup, no
+ * payload copy, and no buffer needed. Works for any live id, whether its
+ * payload fits a single slot or (with `CONFIG_BLOB_DB_LARGE_PAYLOADS`) is
+ * segmented across several.
+ *
+ * @param id        id previously returned by `alloc_id` and bound by `update`
+ * @param out_size  (out) payload length in bytes
+ *
+ * @retval 0        success
+ * @retval -ENOENT  id was never assigned, or has been deleted
+ * @retval -EINVAL  bad arguments
+ * @retval -ENODEV  not mounted
+ * @retval -EIO     flash I/O error
+ */
+int blob_db_size(uint64_t id, size_t *out_size);
+
+/**
+ * @brief Read part of a payload — pread-style, with a caller-chosen window.
+ *
+ * The access path for payloads too large to hold in RAM: the caller's buffer
+ * bounds the transfer rather than the payload's size, so reading a 256 KB
+ * object through a 1 KB window costs 1 KB of RAM. A read that starts at or
+ * past the end of the payload succeeds with @p out_read set to 0; one that
+ * overlaps the end is shortened to what exists (a short read, not an error).
+ *
+ * Cost is independent of where @p offset falls: a segmented payload is
+ * addressed through an index record, not walked, so any offset is two bucket
+ * lookups (contract R2). Prefer this over `blob_db_get()` whenever the payload
+ * may be large; `get` still works but demands a buffer for the whole thing.
+ *
+ * @param id        id previously returned by `alloc_id` and bound by `update`
+ * @param offset    byte offset to start at
+ * @param out       (out) buffer to copy into (may be NULL only if @p len == 0)
+ * @param len       maximum bytes to copy
+ * @param out_read  (out, optional) bytes actually copied
+ *
+ * @retval 0        success; @p out_read bytes copied
+ * @retval -ENOENT  id was never assigned, or has been deleted
+ * @retval -EINVAL  bad arguments
+ * @retval -ENODEV  not mounted
+ * @retval -EIO     flash I/O error, or a segment is missing or mislabelled
+ */
+int blob_db_read(uint64_t id, size_t offset, void *out, size_t len,
+		 size_t *out_read);
+
+/**
+ * @brief Overwrite part of a payload in place — pwrite-style.
+ *
+ * The counterpart to `blob_db_read()`, and the reason a filesystem can sit on
+ * this layer: `blob_db_update()` replaces the whole payload, so changing four
+ * bytes of a large object would rewrite all of it. This touches only the
+ * segments the range covers — on a 256 KB object in 8 KB segments that is 8 KB
+ * of flash instead of 264 KB.
+ *
+ * Writing past the current end **extends** the payload, and any gap between
+ * the old end and @p offset reads back as zeros. The update is atomic in the
+ * same sense as `update`: on crash the payload is either wholly the old one or
+ * wholly the new one.
+ *
+ * Growing an *inline* payload beyond `CONFIG_BLOB_DB_MAX_PAYLOAD_LEN` returns
+ * `-EFBIG` rather than converting it to a segmented object. Such a payload
+ * still fits comfortably in RAM, so the caller can promote it with
+ * `blob_db_get()` + `blob_db_update()`; keeping that out of the library avoids
+ * a second whole-object buffer inside it. Segmented objects grow normally, up
+ * to `CONFIG_BLOB_DB_MAX_OBJECT_LEN`.
+ *
+ * Note the whole-object checksum recorded by a full `update` is **not**
+ * maintained across a partial write — recomputing it would require reading the
+ * entire object, defeating the purpose. Every byte remains covered by its
+ * slot's own CRC.
+ *
+ * @param id        id previously returned by `alloc_id` and bound by `update`
+ * @param offset    byte offset to start writing at
+ * @param buf       bytes to write (may be NULL only if @p len == 0)
+ * @param len       number of bytes to write
+ *
+ * @retval 0        success
+ * @retval -ENOENT  id was never assigned, or has been deleted
+ * @retval -EFBIG   would exceed `CONFIG_BLOB_DB_MAX_OBJECT_LEN`, or would grow
+ *                  an inline payload past a single slot (see above)
+ * @retval -ENOSPC  no room to commit the change
+ * @retval -EINVAL  bad arguments
+ * @retval -ENODEV  not mounted
+ * @retval -EIO     flash I/O error
+ */
+int blob_db_write(uint64_t id, size_t offset, const void *buf, size_t len);
 
 /**
  * @brief Delete the blob with the given id.
@@ -248,8 +362,23 @@ int blob_db_iterate(blob_db_iter_cb_t cb, void *user);
  * re-initialized, and `BLOB_DB_ROOT_ID` is bound to an empty payload
  * (see @ref blob_db_root). The id space is reset.
  *
+ * **Does not require a mount.** This is the deliberate-discard path
+ * `blob_db_mount()`'s `-ENOTSUP` refers to, so it must work on precisely the
+ * store that cannot be mounted — an unrecognized format, or one whose masters
+ * are both unreadable under `CONFIG_BLOB_DB_AUTOFORMAT_ON_CORRUPT=n`. Called
+ * while unmounted it opens the partition itself, applies the same geometry
+ * checks a mount does, and on success leaves the DB **mounted** and usable, in
+ * the state a virgin mount would have produced. Called while mounted it
+ * behaves as it always has, and a failure leaves the DB mounted.
+ *
+ * Note the geometry checks still apply: a partition whose sector exceeds
+ * `CONFIG_BLOB_DB_SECTOR_BUF_SIZE`, or a build whose
+ * `CONFIG_BLOB_DB_MAX_PAYLOAD_LEN` the geometry cannot rebind, is refused with
+ * `-ENOTSUP` here too. Those are properties of the build, not of the store, so
+ * discarding the store would not help.
+ *
  * @retval 0        success
- * @retval -ENODEV  not mounted
+ * @retval -ENOTSUP the geometry or the build configuration is unsupported
  * @retval -EIO     flash I/O error
  */
 int blob_db_format(void);
@@ -287,6 +416,80 @@ int blob_db_format(void);
  * @retval -EIO     flash I/O error
  */
 int blob_db_erase_all(void);
+
+#if defined(CONFIG_BLOB_DB_IOSTATS)
+/**
+ * @brief Flash I/O actually performed, counted at the storage seam.
+ *
+ * Operation counts and byte counts are both kept, because they answer
+ * different questions and can point opposite ways: a change that reads fewer
+ * bytes may issue more transactions, and on a serial part each transaction
+ * carries a fixed command-and-address cost. Judging such a change on bytes
+ * alone flatters it; judging on operations alone condemns it.
+ *
+ * Counted below both backends, so `flash_area` and UBI are directly
+ * comparable for the same workload. Deterministic — the same workload yields
+ * the same numbers — which makes these usable as regression guards where
+ * wall-clock is not.
+ */
+struct blob_db_iostats {
+	uint32_t reads;          /**< read operations issued          */
+	uint32_t writes;         /**< write operations issued         */
+	uint32_t erases;         /**< erase operations issued         */
+	uint64_t bytes_read;     /**< bytes requested from the store  */
+	uint64_t bytes_written;  /**< bytes handed to the store       */
+	uint64_t bytes_erased;   /**< bytes covered by erase requests */
+};
+
+/** @brief Snapshot the counters. */
+void blob_db_iostats_get(struct blob_db_iostats *out);
+
+/** @brief Zero the counters, to measure one operation or phase in isolation. */
+void blob_db_iostats_reset(void);
+#endif /* CONFIG_BLOB_DB_IOSTATS */
+
+#if defined(CONFIG_BLOB_DB_TEST_CRASH_HOOKS)
+/**
+ * @brief Where to cut a segmented write or delete, for crash tests.
+ *
+ * Names the steps of the segmented write sequence (proposal §6.4). Setting
+ * `blob_db_test_cut` makes the *next* segmented `blob_db_update()` or
+ * `blob_db_delete()` stop dead after that step and return `-EINTR`, leaving
+ * flash exactly as a power cut at that instant would. The caller then
+ * unmounts and remounts to run recovery.
+ *
+ * The point of interest is `BLOB_DB_CUT_AFTER_COMMIT`: step 3 writes the
+ * index record and is the single commit point, so a cut before it must leave
+ * the object wholly old, and a cut at or after it wholly new — never torn.
+ * Every cut must also leave no unreferenced segment behind once the sweep has
+ * run.
+ *
+ * Test builds only (`CONFIG_BLOB_DB_TEST_CRASH_HOOKS`).
+ */
+enum blob_db_test_cut {
+	BLOB_DB_CUT_NONE = 0,        /**< no cut — normal operation      */
+	BLOB_DB_CUT_AFTER_OWNER_SET, /**< after step 1: sweep window open */
+	BLOB_DB_CUT_MID_SEGMENTS,    /**< inside step 2: one chunk written */
+	BLOB_DB_CUT_AFTER_SEGMENTS,  /**< after step 2: all chunks, no index */
+	BLOB_DB_CUT_AFTER_COMMIT,    /**< after step 3: the commit point  */
+	BLOB_DB_CUT_AFTER_RELEASE,   /**< after step 4: owner still set   */
+};
+
+/**
+ * @brief Arm a cut. Cleared automatically when it fires, so it cuts once.
+ */
+extern enum blob_db_test_cut blob_db_test_cut;
+
+/**
+ * @brief Put the store into the state a torn compaction leaves.
+ *
+ * Reaching that state for real needs an I/O error inside compaction's atomic
+ * window, which no test can provoke on a working flash simulator. This sets
+ * the same flag so the *consequences* — mutations refused with `-EIO`, reads
+ * still served, a remount clearing it — can be tested directly.
+ */
+void blob_db_test_wedge(void);
+#endif /* CONFIG_BLOB_DB_TEST_CRASH_HOOKS */
 
 /**
  * @brief Pre-format the next @p n buckets the allocator will use.

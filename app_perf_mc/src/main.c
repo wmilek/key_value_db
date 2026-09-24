@@ -40,6 +40,10 @@
 
 #include "model_container.h"
 
+#ifdef CONFIG_ARCH_POSIX
+#include "posix_board_if.h"   /* posix_exit() — end the sim run cleanly */
+#endif
+
 LOG_MODULE_REGISTER(app_perf_mc, CONFIG_APP_PERF_MC_LOG_LEVEL);
 
 /* This app is the container's CLIENT — it owns root-id persistence and
@@ -82,7 +86,7 @@ int main(void)
 
 	if (rc < 0) {
 		LOG_ERR("mount: %d", rc);
-		return 0;
+		goto out;
 	}
 
 	/* Fresh store, then pay all sector erases up front so the timed
@@ -215,5 +219,8 @@ int main(void)
 
 out:
 	blob_db_unmount();
+#ifdef CONFIG_ARCH_POSIX
+	posix_exit(rc == 0 ? 0 : 1);
+#endif
 	return 0;
 }

@@ -1,5 +1,5 @@
 common:
-  tags: storage blobfs filesystem
+  tags: [storage, blobfs, filesystem]
   platform_allow: native_sim
 tests:
   lib.blobfs: {}

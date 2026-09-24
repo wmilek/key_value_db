@@ -24,3 +24,45 @@ config APP_PERF_VAL_LEN
 	  Payload bytes stored in each list node (in addition to the 8-byte
 	  next_id header). Keep the total node size under
 	  CONFIG_BLOB_DB_MAX_PAYLOAD_LEN.
+
+if BLOB_DB_LARGE_PAYLOADS
+
+config APP_PERF_OBJ_LEN
+	int "Large-object size in bytes"
+	default 65536
+	help
+	  Size of each object in the large-object phases. Must be within
+	  CONFIG_BLOB_DB_MAX_OBJECT_LEN. Run the app twice with different
+	  values to see the size sweep that matters: partial-write cost should
+	  stay flat while whole-object rewrite cost grows with this number.
+
+config APP_PERF_N_LARGE
+	int "Number of large objects"
+	default 4
+	range 1 64
+	help
+	  Kept small: each object costs OBJ_LEN of writes per phase, and on
+	  64 KB-sector QSPI NOR a cold pass also pays a sector erase per
+	  segment bucket.
+
+config APP_PERF_N_PART
+	int "Number of partial (pread/pwrite) operations per phase"
+	default 32
+	range 4 4096
+	help
+	  Timing is at millisecond resolution, so this needs to be large
+	  enough that a phase totals tens of milliseconds. On real NOR one
+	  partial write is tens of ms, so 32 is already seconds; on native_sim
+	  without CONFIG_FLASH_SIMULATOR_SIMULATE_TIMING raise it substantially
+	  or the phase rounds to zero.
+
+config APP_PERF_PART_LEN
+	int "Bytes touched by each partial operation"
+	default 64
+	range 1 4096
+	help
+	  Deliberately far smaller than a segment: the point of the partial
+	  phases is the ratio between touching a few bytes and rewriting the
+	  whole object.
+
+endif # BLOB_DB_LARGE_PAYLOADS

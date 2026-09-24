@@ -3,10 +3,17 @@
 
 name: Documentation
 
+# Same split as build.yml: push builds the branch head, pull_request builds the
+# merge result. The docs build is the -W Sphinx check, so it is worth having on
+# branch pushes too — including while a PR is conflicted and its merge-result
+# runs cannot happen.
 on:
   push:
-    branches: [main]
   pull_request:
+
+concurrency:
+  group: docs-${{ github.ref }}
+  cancel-in-progress: true
 
 permissions:
   contents: read
@@ -44,11 +51,11 @@ jobs:
           mv _build_sphinx/html/* deploy
 
       - name: Setup pages
-        if: github.event_name != 'pull_request' && matrix.doxygen-version == '1.14.0'
+        if: github.ref == 'refs/heads/main' && matrix.doxygen-version == '1.14.0'
         uses: actions/configure-pages@v4
 
       - name: Upload pages artifact
-        if: github.event_name != 'pull_request' && matrix.doxygen-version == '1.14.0'
+        if: github.ref == 'refs/heads/main' && matrix.doxygen-version == '1.14.0'
         uses: actions/upload-pages-artifact@v3
         with:
           path: doc/deploy
@@ -64,7 +71,9 @@ jobs:
     name: Deploy
     runs-on: ubuntu-22.04
     needs: build
-    if: github.event_name != 'pull_request'
+    # Publish only from main. This was "not a pull_request", which silently
+    # became "any branch push" once the push trigger stopped being main-only.
+    if: github.ref == 'refs/heads/main'
     permissions:
       pages: write
       id-token: write

@@ -1,5 +1,5 @@
 common:
-  tags: extensibility
+  tags: [extensibility]
   integration_platforms:
     - custom_plank
     - qemu_cortex_m0

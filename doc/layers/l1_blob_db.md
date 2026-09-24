@@ -168,6 +168,23 @@ typedef int (*blob_db_iter_cb_t)(uint64_t id,
                                   void *user);
 int      blob_db_iterate(blob_db_iter_cb_t cb, void *user);
 
+/* Partial access. Reports and reads a payload without a buffer for the whole
+ * of it, so a payload larger than available RAM is still usable. Defined for
+ * every payload, inline or segmented; cost is independent of `offset`. A read
+ * at or past the end succeeds with *out_read = 0, and one overlapping the end
+ * is shortened — a short read, not an error. */
+int      blob_db_size (uint64_t id, size_t *out_size);
+int      blob_db_read (uint64_t id, size_t offset, void *out, size_t len,
+                       size_t *out_read);
+
+/* Overwrite part of a payload, extending it (zero-filling any gap) if the
+ * range runs past the end. Atomic in the same sense as `update`. Touches only
+ * the storage the range covers, so changing a few bytes of a large object does
+ * not rewrite all of it. -EFBIG when growing an INLINE payload past a single
+ * slot: promote it with get + update, which is cheap while it is still that
+ * small. */
+int      blob_db_write(uint64_t id, size_t offset, const void *buf, size_t len);
+
 /* Format the partition (erase all blobs, reset the id counter to 1). For
  * factory reset / tests. */
 int      blob_db_format(void);
@@ -206,6 +223,17 @@ int blob_db_multi_delete(const uint64_t *ids, int  *results,     size_t n);
 
 Errors: `-ENOENT`, `-ENOSPC`, `-ENOMEM`, `-EINVAL`, `-EIO`, `-ENODEV` (not
 mounted), `-EALREADY` (double mount), `-ENOTSUP` (foreign on-flash format).
+
+**Mount never destroys a store it does not understand.** A partition whose
+master sectors read as *erased* is virgin and is formatted. A partition
+carrying a format this build cannot read — a newer version of this allocator,
+or a different one (§5.1) — yields `-ENOTSUP` with nothing written; discarding
+it is the caller's decision, expressed by calling `blob_db_format()`.
+Distinguishing the two is a property of the on-flash format, not a heuristic:
+every version stamps a version-and-identity record that any other version can
+parse and verify. Consequently a caller must treat mount failure as a real
+outcome — the pre-v1 behaviour of silently reformatting anything unparseable
+is gone.
 
 **Concurrency contract (v1):** single-threaded — caller serializes. v2 may
 add a `k_mutex`. Corollary used by client recovery: at most one mutation is
@@ -264,22 +292,41 @@ it (fail-fast) without obligating release builds to pay an existence check.
 Reads of dead ids stay defined (`-ENOENT`) because recovery and self-healing
 legitimately probe stale ids.
 
-### 5.4 D4 — Payload chunking lives at L2 (v1); pread extension reserved
+### 5.4 D4 — Payload chunking lives at L1 (amended); pread is part of the API
 
-v1 keeps L1 payloads single-chunk (bounded by `BLOB_DB_MAX_PAYLOAD_LEN`);
-large data is chained at L2 (`seq` container). If a future allocator spreads
-payloads transparently, whole-blob `get` becomes inadequate; the agreed
-extension is allocator-agnostic partial access:
+**Amended.** D4 originally kept L1 payloads single-chunk and chained large data
+at L2 (`seq` container). That is now reversed: **L1 chunks transparently** when
+`BLOB_DB_LARGE_PAYLOADS` is enabled, and the partial-access pair this decision
+reserved is part of §4 rather than a future extension.
 
-```c
-int blob_db_size(uint64_t id, size_t *out_size);
-int blob_db_read(uint64_t id, size_t offset, void *out, size_t len,
-                 size_t *out_read);
-```
+The reversal was decided on **orphan reclaim**. Chunks written above L1 are
+ordinary blobs carrying no mark of what they belong to, so a crash between
+writing them and committing the index leaks blobs that no generic mechanism can
+identify — only a client that remembers its own intent can, making
+mark-and-sweep (`l1_model_container.md` §4) an obligation for every client that
+stores a large value. Inside L1 each segment records its owner, so one
+idempotent sweep that no client participates in reclaims after any crash, and
+P7's "no permanent leak (must)" is structural. Secondary: chunks stay invisible
+to `count`/`iterate`, and the mechanism is written once instead of per client.
 
-A multi-chunk write must commit by writing the id's index record **last**, so
-"no partial reads" (§2) holds unchanged. Writes stay whole-blob until a
-concrete consumer needs streaming.
+The commit rule this decision already stated is unchanged and is what preserves
+§2: a multi-chunk write commits by writing the id's index record **last**, so
+"atomicity" and "no partial reads" hold with no new primitive — the single slot
+append that makes a small write atomic makes a large one atomic.
+
+L2's `seq` remains the right answer for *streams* (logs, queues, append-mostly
+data), not for large single values.
+
+Writes are no longer whole-blob only: `blob_db_write` touches just the storage
+a range covers, so a small change to a large object costs O(chunk) rather than
+O(object). That is what makes a filesystem viable on this layer — a four-byte
+`blobfs_write` into a 256 KB file writes one segment, not the file.
+
+The whole-object checksum a full `update` records is **not** maintained across a
+partial write: recomputing it would mean reading the entire object, which is the
+cost the operation exists to avoid. Every byte stays covered by its own slot's
+CRC; a flag in the index record marks the whole-object value stale so a future
+fsck can tell "not maintained" from "mismatch".
 
 ### 5.5 D5 — Iteration is read-only: mutation from the callback is UB
 

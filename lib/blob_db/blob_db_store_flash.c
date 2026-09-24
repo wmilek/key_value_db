@@ -90,15 +90,18 @@ void blob_db_store_close(void)
 
 int blob_db_store_read(off_t off, void *buf, size_t len)
 {
+	BLOB_DB_IO_NOTE(BLOB_DB_IO_READ, len);
 	return flash_area_read(g_fa, off, buf, len);
 }
 
 int blob_db_store_write(off_t off, const void *buf, size_t len)
 {
+	BLOB_DB_IO_NOTE(BLOB_DB_IO_WRITE, len);
 	return flash_area_write(g_fa, off, buf, len);
 }
 
 int blob_db_store_erase(off_t off, size_t len)
 {
+	BLOB_DB_IO_NOTE(BLOB_DB_IO_ERASE, len);
 	return flash_area_erase(g_fa, off, len);
 }

@@ -24,6 +24,7 @@ manifest:
           - cmsis_6    # required by the ARM port for Cortex-M
           - hal_nordic # required by the custom_plank board (Nordic based)
           - hal_stm32  # required by the nucleo_f302r8 board (STM32 based)
+          - zcbor      # CBOR codec used by app_cbor_persondb (CONFIG_ZCBOR)
     # UBI flash-virtualization layer — provides the wear-leveled volume
     # substrate that the key-value store builds on. The UBI backend needs the
     # in-place partial-update API (ubi_leb_write_at) and the "compile only when

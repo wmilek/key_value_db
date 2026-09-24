@@ -1,0 +1,20 @@
+/*
+ * Run against the on-board MX25R6435F QSPI NOR (8 MiB, 64 KB sectors) rather
+ * than internal flash: R-E is stated in terms of the DK's *external* flash,
+ * and 64 KB sectors are the geometry every number in RESULTS.md assumes.
+ */
+
+/delete-node/ &storage_partition;
+
+&mx25r64 {
+	partitions {
+		compatible = "fixed-partitions";
+		#address-cells = <1>;
+		#size-cells = <1>;
+
+		storage_partition: partition@0 {
+			label = "storage";
+			reg = <0x00000000 0x00800000>;
+		};
+	};
+};
