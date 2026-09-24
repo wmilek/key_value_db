@@ -148,29 +148,49 @@ The shipped module is the **flat** slice of the above: one directory, holding
 files, with the handle-free calls that need no iteration — `create`, `stat`,
 `read`, `write`, `truncate`, `unlink`, `rename`, plus `mount`/`unmount`.
 `name -> dirent { type, body id }` is the Map value; the **file body is its
-own blob**, so its payload length *is* the file size and a write is one
-`blob_db_update()` — L1 atomicity carries through untouched, and no new
-on-flash format appears at L3.
+own blob**, so its payload length *is* the file size and reads/writes go
+straight to `blob_db_read()`/`blob_db_write()` — pread/pwrite at L1, each
+write one crash-atomic operation, no file data staged in RAM at L3, and no
+new on-flash format.
+
+The **body id is a file's durable identity**: `blobfs_lookup` resolves a name
+to it, and the `_id` calls operate on it directly. Rename re-points names and
+never touches the id; unlink deletes the body, after which `_id` calls report
+`-ENOENT`. A handle layer binds to the id and gets POSIX-shaped lifetimes for
+free — handles follow renames and fail cleanly after unlink.
+
+`rename` is two Map mutations (bind `to`, drop `from`), made atomic against
+power loss by a **rename intent** recorded in the filesystem meta blob before
+the first one: mount finds a half-done rename and rolls it forward (intent +
+new name visible) or back (intent only), so no caller ever observes two names
+bound to one body. An occupied destination is refused rather than silently
+replaced.
 
 Two gaps are structural rather than unfinished work, and both report
 `-ENOTSUP` rather than pretending:
 
-- **`mkdir` / `readdir`** wait on an `iterate` op in the Map shape (§3) —
+- **`mkdir` / `readdir`** wait on an enumeration op in the Map shape (§3) —
   the same op `kvdb_foreach` waits on. Nested directories follow it.
-- **File size** is capped by one blob payload
-  (`CONFIG_BLOB_DB_MAX_PAYLOAD_LEN`); `BLOBFS_FILE_CHUNKED` over `seq` is
-  what lifts it.
+- **File size** is capped by one inline blob payload
+  (`CONFIG_BLOB_DB_MAX_PAYLOAD_LEN`); blob_db's segmented objects are what
+  lift it.
 
-`rename` is `set(to)` then `del(from)`: a crash between them leaves both names
-on one body — visible, never a lost file — and an occupied destination is
-refused rather than silently replaced.
+The directory Map is created with a `map_config` declaring
+`max_entry_bytes = BLOBFS_NAME_MAX + sizeof(dirent)`, so a name limit the
+directory's record geometry cannot hold fails at mount, deterministically,
+instead of at the first unlucky `create`.
 
 The Zephyr interop shim (`CONFIG_BLOBFS_FS_INTEROP`) registers a
-`struct fs_file_system_t` at `FS_TYPE_EXTERNAL_BASE`, synthesizing the file
-handles and access-mode checks the VFS expects on top of the handle-free API.
-Ops v1 cannot honor are left NULL — the VFS core turns a NULL op into
-`-ENOTSUP` by itself, so the shim stubs nothing. `sync` succeeds as a no-op:
-a write is durable before it returns.
+`struct fs_file_system_t` at `FS_TYPE_EXTERNAL_BASE` and owns exactly what
+the VFS expects and blobfs lacks: file handles (bound to the body id, per
+the identity rule above), the access-mode checks that go with them, and a
+mutex serializing every op — `fs_*` callers are legitimately concurrent (the
+shell, MCUmgr's fs_mgmt workqueue) while the stack below is single-threaded
+by contract. Ops v1 cannot honor are left NULL — the VFS core turns a NULL
+op into `-ENOTSUP` by itself, so the shim stubs nothing. `sync` succeeds as
+a no-op: a write is durable before it returns. Unmount orphans any handle
+still open (it keeps its slot and reports `-EBADF` until closed) rather than
+recycling slots under live references.
 
 ## 5. `settings` registry (optional)
 

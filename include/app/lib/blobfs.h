@@ -7,6 +7,7 @@
 #define APP_LIB_BLOBFS_H_
 
 #include <stddef.h>
+#include <stdint.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -21,35 +22,50 @@ extern "C" {
  *
  * blobfs stores a directory as a Map container instance (`name -> dirent`)
  * and each file body as its own blob: the dirent records the body's stable
- * i-node id, and the body's payload length *is* the file size. Nothing else
- * is persisted, so a file's bytes are exactly one atomic `blob_db_update()`
- * away from durable — writes inherit L1's crash atomicity unchanged.
+ * i-node id, and the body's payload length *is* the file size. Reads and
+ * writes go straight to blob_db's pread/pwrite calls, so every mutation is
+ * one crash-atomic L1 operation.
+ *
+ * @section blobfs_identity Names and identity
+ *
+ * The **body id is a file's durable identity**; names are directory entries
+ * pointing at it. @ref blobfs_lookup turns a name into that id, and the
+ * `_id` calls operate on it directly — which is what a handle layer should
+ * bind to, because it gives POSIX-shaped lifetimes for free:
+ *
+ * - @ref blobfs_rename re-points names and never touches the id, so an id
+ *   obtained before a rename still addresses the same file after it.
+ * - @ref blobfs_unlink deletes the body, so `_id` calls on an unlinked
+ *   file's id report -ENOENT from then on (there is no orphan-until-close
+ *   state; blob_db deletes immediately).
+ *
+ * Rename is atomic against power loss: an intent recorded in the filesystem
+ * metadata before the directory is touched lets @ref blobfs_mount roll a
+ * half-done rename forward or back, so no caller ever observes two names
+ * bound to one body.
  *
  * @section blobfs_v1 v1 scope
  *
  * The namespace is **flat**: one directory, holding files. `mkdir` and
- * directory iteration are not provided — iteration needs an `iterate` op on
- * @ref map_ops that the shipped Map shape does not define, and nesting waits
- * on that. Paths are therefore a single name, with or without a leading
+ * directory iteration are not provided — iteration needs an enumeration op
+ * on @ref map_ops that the shipped Map shape does not define, and nesting
+ * waits on it. Paths are therefore a single name, with or without a leading
  * slash (`"cfg"` and `"/cfg"` name the same file); an embedded `/` reports
- * -ENOENT because no such directory can exist.
+ * -ENOENT because no such directory can exist, and `"."`/`".."` are
+ * refused (-EINVAL) so every stored name stays addressable through
+ * path-normalizing clients.
  *
- * A file body is a single blob payload, so `CONFIG_BLOB_DB_MAX_PAYLOAD_LEN`
- * caps file size; a write past that cap reports -ENOSPC. Chunked bodies
- * (`seq`) lift the cap and are deferred with it.
- *
- * @section blobfs_api Handle-free API
- *
- * There is no open/close and no file-position state: reads and writes carry
- * an explicit offset (pread/pwrite style), so there is no cursor ownership
- * and no unlink-while-open question. The Zephyr `fs_file_system_t` shim
- * (`CONFIG_BLOBFS_FS_INTEROP`) synthesizes handles on top of this API — see
- * `include/app/lib/blobfs_fs.h`.
+ * A file body is a single inline blob payload, so
+ * `CONFIG_BLOB_DB_MAX_PAYLOAD_LEN` caps file size; a write past that cap
+ * reports -ENOSPC. blob_db's segmented objects are what will lift the cap.
  *
  * @section blobfs_concurrency Concurrency
  *
- * Single-threaded, inheriting the blob_db v1 contract: the caller serializes
- * all calls.
+ * Single-threaded, inheriting the blob_db v1 contract: the caller
+ * serializes all calls. The Zephyr `fs_file_system_t` shim
+ * (`CONFIG_BLOBFS_FS_INTEROP`, see `include/app/lib/blobfs_fs.h`) carries
+ * its own mutex and is safe to call from multiple threads — but it does not
+ * cover callers using this API directly alongside it.
  *
  * See doc/layers/l3_interfaces.md for the full design.
  */
@@ -68,11 +84,16 @@ struct blobfs_stat {
 /**
  * @brief Attach the filesystem, creating it on first use.
  *
- * Finds (or registers) the root directory through the root registry and
- * binds it. Requires blob_db_mount() and rootreg_init() to have run.
+ * Finds (or registers) the root directory through the root registry, binds
+ * it, and completes any rename a crash left half done (see @ref
+ * blobfs_identity). Requires blob_db_mount() and rootreg_init() to have
+ * run.
  *
  * @retval 0         mounted
  * @retval -EALREADY already mounted
+ * @retval -EINVAL   the directory cannot hold BLOBFS_NAME_MAX-sized entries
+ *                   under the configured blob payload cap (a build
+ *                   configuration mistake — deterministic on every boot)
  * @retval -ENODEV   blob_db not mounted / registry not bootstrapped
  * @retval -ENOSPC   registry full, or the directory could not be created
  * @retval -EIO      flash error or corrupt metadata
@@ -95,6 +116,7 @@ int blobfs_unmount(void);
  * @retval 0             created
  * @retval -EEXIST       the name is already taken
  * @retval -EISDIR       @p path names the root directory
+ * @retval -EINVAL       @p path is "." or ".."
  * @retval -ENAMETOOLONG name longer than @ref BLOBFS_NAME_MAX
  * @retval -ENOENT       @p path contains a directory component (v1 is flat)
  * @retval -ENODEV       not mounted
@@ -104,7 +126,65 @@ int blobfs_unmount(void);
 int blobfs_create(const char *path);
 
 /**
- * @brief Report a file's size.
+ * @brief Resolve a name to the file's body id — its durable identity.
+ *
+ * @retval 0       found; *body_id filled
+ * @retval -ENOENT no such file
+ * @retval -EINVAL bad arguments
+ */
+int blobfs_lookup(const char *path, uint64_t *body_id);
+
+/**
+ * @brief Report a file's size by body id.
+ *
+ * @retval 0       *size filled
+ * @retval -ENOENT the file was unlinked
+ * @retval -EINVAL size is NULL
+ */
+int blobfs_size_id(uint64_t body_id, size_t *size);
+
+/**
+ * @brief Read at most @p len bytes from @p off, by body id.
+ *
+ * A read that starts at or past EOF is a short read of 0 bytes, not an
+ * error.
+ *
+ * @retval 0       read (possibly short); @p out_read set
+ * @retval -ENOENT the file was unlinked
+ * @retval -EINVAL bad arguments
+ */
+int blobfs_read_id(uint64_t body_id, size_t off, void *buf, size_t len,
+		   size_t *out_read);
+
+/**
+ * @brief Write @p len bytes at @p off, by body id, extending as needed.
+ *
+ * A write starting past EOF zero-fills the gap. The whole call is one
+ * crash-atomic L1 write: on the next mount the file holds either its
+ * previous content or the new content, never a mixture. A zero-length
+ * write succeeds only if the file still exists.
+ *
+ * @retval 0       written
+ * @retval -ENOENT the file was unlinked
+ * @retval -ENOSPC the result would exceed @ref BLOBFS_FILE_MAX, or the
+ *                 store is full
+ * @retval -EIO    flash error
+ */
+int blobfs_write_id(uint64_t body_id, size_t off, const void *buf, size_t len);
+
+/**
+ * @brief Resize the file, by body id. Growing zero-fills; shrinking
+ *        discards the tail.
+ *
+ * @retval 0       resized
+ * @retval -ENOENT the file was unlinked
+ * @retval -ENOSPC @p size exceeds @ref BLOBFS_FILE_MAX
+ * @retval -EIO    flash error
+ */
+int blobfs_truncate_id(uint64_t body_id, size_t size);
+
+/**
+ * @brief Report a file's size. Path form of @ref blobfs_size_id.
  *
  * @retval 0       found; @p st filled
  * @retval -ENOENT no such file
@@ -112,49 +192,14 @@ int blobfs_create(const char *path);
  */
 int blobfs_stat(const char *path, struct blobfs_stat *st);
 
-/**
- * @brief Read at most @p len bytes from @p off.
- *
- * A read that starts at or past EOF is a short read of 0 bytes, not an
- * error.
- *
- * @param path     file name
- * @param off      byte offset to read from
- * @param buf      (out) destination buffer
- * @param len      capacity of @p buf, in bytes
- * @param out_read (out) bytes actually copied
- *
- * @retval 0       read (possibly short); @p out_read set
- * @retval -ENOENT no such file
- * @retval -EINVAL bad arguments
- */
+/** @brief Read by path — @ref blobfs_lookup + @ref blobfs_read_id. */
 int blobfs_read(const char *path, size_t off, void *buf, size_t len,
 		size_t *out_read);
 
-/**
- * @brief Write @p len bytes at @p off, extending the file as needed.
- *
- * A write starting past EOF zero-fills the gap. The whole call is one
- * `blob_db_update()`, so it is atomic against power loss: on the next mount
- * the file holds either its previous content or the new content, never a
- * mixture.
- *
- * @retval 0       written
- * @retval -ENOENT no such file
- * @retval -ENOSPC the result would exceed @ref BLOBFS_FILE_MAX, or the store
- *                 is full
- * @retval -EIO    flash error
- */
+/** @brief Write by path — @ref blobfs_lookup + @ref blobfs_write_id. */
 int blobfs_write(const char *path, size_t off, const void *buf, size_t len);
 
-/**
- * @brief Resize the file. Growing zero-fills; shrinking discards the tail.
- *
- * @retval 0       resized
- * @retval -ENOENT no such file
- * @retval -ENOSPC @p size exceeds @ref BLOBFS_FILE_MAX
- * @retval -EIO    flash error
- */
+/** @brief Resize by path — @ref blobfs_lookup + @ref blobfs_truncate_id. */
 int blobfs_truncate(const char *path, size_t size);
 
 /**
@@ -163,7 +208,7 @@ int blobfs_truncate(const char *path, size_t size);
  * The name is dropped from the directory first (one atomic Map mutation),
  * then the body blob is deleted. A crash between the two leaves an
  * unreachable body — garbage a later compaction reclaims — never a dangling
- * name.
+ * name. Outstanding body ids for the file report -ENOENT from then on.
  *
  * @retval 0       removed
  * @retval -ENOENT no such file
@@ -174,9 +219,11 @@ int blobfs_unlink(const char *path);
 /**
  * @brief Rename a file within the (single) directory.
  *
- * Binds the new name to the same body, then drops the old one. A crash
- * between the two leaves both names bound to one body; content is never
- * lost. Refuses to overwrite an existing destination.
+ * Atomic against power loss via the recorded intent (see @ref
+ * blobfs_identity): after a crash at any point, mount resolves the rename
+ * so that exactly one of the two names exists. The file keeps its body id,
+ * so ids resolved before the rename remain valid. Refuses to overwrite an
+ * existing destination.
  *
  * @retval 0       renamed
  * @retval -ENOENT @p from does not exist

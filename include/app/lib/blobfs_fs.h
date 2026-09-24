@@ -47,9 +47,23 @@ extern "C" {
  *
  * Not supported, and left NULL so the VFS reports -ENOTSUP: `fs_mkdir`,
  * `fs_opendir`/`fs_readdir`/`fs_closedir` (v1 is a flat namespace and the
- * Map shape has no iterate op) and `fs_statvfs` (blob_db exposes no
+ * Map shape has no enumeration op) and `fs_statvfs` (blob_db exposes no
  * free-space accounting). `fs_sync` is a no-op that succeeds: every write
  * is already durable when it returns.
+ *
+ * @section blobfs_fs_semantics Handles and threads
+ *
+ * Every op serializes on an internal mutex, so the `fs_*` API may be called
+ * from multiple threads (the shell, MCUmgr's fs_mgmt workqueue, the
+ * application) even though the storage stack below is single-threaded by
+ * contract. The mutex does not cover callers using the blobfs API directly
+ * alongside the shim.
+ *
+ * A handle binds to the file's identity (its body id), not its name:
+ * it follows the file through `fs_rename`, and after `fs_unlink` its
+ * reads and writes report -ENOENT — never touching whatever file takes
+ * the name next. Unmounting with files still open orphans their handles:
+ * each keeps its slot, reports -EBADF, and is released by `fs_close`.
  *
  * @section blobfs_fs_limits Limits
  *

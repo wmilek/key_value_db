@@ -7,8 +7,10 @@ project(blobfs_test)
 
 # blobfs and its interop shim are built from lib/ by the module CMake when
 # their Kconfigs are enabled; we add the test and Zephyr's own file system
-# conformance bodies, compiled straight out of the Zephyr tree.
-set(FS_COMMON $ENV{ZEPHYR_BASE}/tests/subsys/fs/common)
+# conformance bodies, compiled straight out of the Zephyr tree. ZEPHYR_BASE
+# is the CMake variable find_package(Zephyr) exports — present however the
+# Zephyr tree was located, unlike the environment variable of the same name.
+set(FS_COMMON ${ZEPHYR_BASE}/tests/subsys/fs/common)
 
 target_sources(app PRIVATE
   src/main.c
@@ -17,3 +19,8 @@ target_sources(app PRIVATE
   ${FS_COMMON}/test_fs_open_flags.c
 )
 target_include_directories(app PRIVATE ${FS_COMMON})
+
+# The recovery test forges a mid-rename crash state, so it speaks the
+# persisted meta format from the library's internal header.
+target_include_directories(app PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/../../../lib/blobfs)
