@@ -96,7 +96,25 @@ bottom-up. Modules marked *skeleton* are build-wired and Kconfig-gated
 | L2 | `kvlist` · `kvtree` · `seq` | `BLOB_CONTAINER_*` | skeleton | — |
 | L2 | shared intent helper | `BLOB_CONTAINERS_INTENT` | skeleton | — |
 | L3 | `kvdb` | `BLOBDB_KVDB` | implemented (kvhash backend) | `tests/lib/kvdb` |
-| L3 | `blobfs` | `BLOBDB_BLOBFS` | skeleton | — |
+| L3 | `blobfs` | `BLOBDB_BLOBFS` | implemented (flat namespace) | `tests/lib/blobfs` |
+
+`blobfs` registers with Zephyr's virtual file system when
+`CONFIG_BLOBFS_FS_INTEROP=y`, so the stack is reachable through the ordinary
+`fs_*` API — and through everything layered on it, the file system shell and
+MCUmgr's `fs_mgmt` group included:
+
+```c
+static struct fs_mount_t mnt = { .type = BLOBFS_FS_TYPE, .mnt_point = "/blob" };
+
+fs_mount(&mnt);                                            /* brings the stack up */
+fs_open(&file, "/blob/wifi.ssid", FS_O_CREATE | FS_O_RDWR);
+```
+
+Its test suite runs Zephyr's own filesystem conformance bodies
+(`tests/subsys/fs/common`) unmodified against a blobfs mount. v1 is a flat
+namespace with one-blob file bodies: `mkdir`/`readdir` report `-ENOTSUP`
+(directory iteration needs an `iterate` op the Map shape does not define yet)
+and `CONFIG_BLOB_DB_MAX_PAYLOAD_LEN` caps file size until chunked bodies land.
 
 `tests/lib/blob_db_contract` is the acceptance suite for the *model container*
 of `doc/layers/l1_model_container.md`: a reference key/value structure built
@@ -265,6 +283,7 @@ unrepresentable.
 | Use case | Enable | Image contains |
 |---|---|---|
 | String key/value store | `CONFIG_BLOBDB_KVDB=y` | blob_db + rootreg + kvhash + kvdb |
+| Files, through Zephyr's `fs_*` API | `CONFIG_BLOBDB_BLOBFS=y` `CONFIG_BLOBFS_FS_INTEROP=y` | + blobfs and its VFS driver |
 | Ids and blobs only, no containers | `CONFIG_BLOB_DB=y` | blob_db |
 | Raw partition instead of UBI | `+ CONFIG_BLOB_DB_BACKEND_FLASH_AREA=y` | drops the UBI volume backend |
 | Objects larger than one flash sector | `+ CONFIG_BLOB_DB_LARGE_PAYLOADS=y` | + segmented objects and partial access |
@@ -352,8 +371,9 @@ lib/
   blob_db/            L1  stable-id blob store (+ flash_area / UBI backends)
   rootreg/            L1½ root registry (owner of id = 1)
   containers/         L2  kvhash (+ seq / kvlist / kvtree / intent skeletons)
-  kvdb/  blobfs/      L3  access interfaces
+  kvdb/  blobfs/      L3  access interfaces (blobfs + its Zephyr VFS driver)
 include/app/lib/      public headers — blob_db.h · rootreg.h · kvdb.h · blobfs.h
+                      · blobfs_fs.h
                       · containers/{shape_map,shape_seq,kvhash}.h
 samples/              API samples — smallest complete program per API (kvhash)
 app/                  blob_db demo application
@@ -362,6 +382,7 @@ app_perf*/            benchmarks (+ hardware reference RESULTS.md)
                       tools/l0_timing.py, models/, geometry/
 app_cbor_persondb/    worked example & probe (README · DESIGN · FINDINGS · RESULTS)
 tests/lib/            ztest suites: blob_db · blob_db_contract · rootreg · kvdb
+                      · blobfs
 tests/support/        shared test shims (crash injection)
 doc/                  design documents; Sphinx + Doxygen setup
 boards/               out-of-tree boards

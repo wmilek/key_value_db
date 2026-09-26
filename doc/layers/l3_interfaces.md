@@ -1,6 +1,7 @@
 # L3 — Access Interfaces
 
-Status: `kvdb` implemented (kvhash backend); `blobfs`/`settings` draft
+Status: `kvdb` implemented (kvhash backend); `blobfs` implemented in its v1
+scope (§4.1); `settings` draft
 · Part of the stack in `doc/architecture.md` · Governed by `doc/principles.md`
 · Builds on L2: `doc/layers/l2_containers.md`
 
@@ -141,6 +142,56 @@ Cross-directory rename crash-semantics are **deferred to the blobfs
 implementation design** (`doc/impl/`, when written); until specified, v1 may
 restrict `rename` to within one directory (`-ENOTSUP` otherwise).
 
+### 4.1 What v1 ships
+
+The shipped module is the **flat** slice of the above: one directory, holding
+files, with the handle-free calls that need no iteration — `create`, `stat`,
+`read`, `write`, `truncate`, `unlink`, `rename`, plus `mount`/`unmount`.
+`name -> dirent { type, body id }` is the Map value; the **file body is its
+own blob**, so its payload length *is* the file size and reads/writes go
+straight to `blob_db_read()`/`blob_db_write()` — pread/pwrite at L1, each
+write one crash-atomic operation, no file data staged in RAM at L3, and no
+new on-flash format.
+
+The **body id is a file's durable identity**: `blobfs_lookup` resolves a name
+to it, and the `_id` calls operate on it directly. Rename re-points names and
+never touches the id; unlink deletes the body, after which `_id` calls report
+`-ENOENT`. A handle layer binds to the id and gets POSIX-shaped lifetimes for
+free — handles follow renames and fail cleanly after unlink.
+
+`rename` is two Map mutations (bind `to`, drop `from`), made atomic against
+power loss by a **rename intent** recorded in the filesystem meta blob before
+the first one: mount finds a half-done rename and rolls it forward (intent +
+new name visible) or back (intent only), so no caller ever observes two names
+bound to one body. An occupied destination is refused rather than silently
+replaced.
+
+Two gaps are structural rather than unfinished work, and both report
+`-ENOTSUP` rather than pretending:
+
+- **`mkdir` / `readdir`** wait on an enumeration op in the Map shape (§3) —
+  the same op `kvdb_foreach` waits on. Nested directories follow it.
+- **File size** is capped by one inline blob payload
+  (`CONFIG_BLOB_DB_MAX_PAYLOAD_LEN`); blob_db's segmented objects are what
+  lift it.
+
+The directory Map is created with a `map_config` declaring
+`max_entry_bytes = BLOBFS_NAME_MAX + sizeof(dirent)`, so a name limit the
+directory's record geometry cannot hold fails at mount, deterministically,
+instead of at the first unlucky `create`.
+
+The Zephyr interop shim (`CONFIG_BLOBFS_FS_INTEROP`) registers a
+`struct fs_file_system_t` at `FS_TYPE_EXTERNAL_BASE` and owns exactly what
+the VFS expects and blobfs lacks: file handles (bound to the body id, per
+the identity rule above), the access-mode checks that go with them, and a
+mutex serializing every op — `fs_*` callers are legitimately concurrent (the
+shell, MCUmgr's fs_mgmt workqueue) while the stack below is single-threaded
+by contract. Ops v1 cannot honor are left NULL — the VFS core turns a NULL
+op into `-ENOTSUP` by itself, so the shim stubs nothing. `sync` succeeds as
+a no-op: a write is durable before it returns. Unmount orphans any handle
+still open (it keeps its slot and reports `-EBADF` until closed) rather than
+recycling slots under live references.
+
 ## 5. `settings` registry (optional)
 
 A flat, typed configuration store (`"net/ip" → typed value`) over a Map backend
@@ -160,15 +211,21 @@ choice                             prompt "kvdb default backend"   depends on BL
 endchoice
 # (KVDB_DEFAULT_BACKEND_{LIST,TREE} join the choice as those containers land.)
 
-config BLOBFS                      bool "Filesystem-like interface" depends on BLOB_CONTAINERS
+# Shipped (§4.1):
+config BLOBDB_BLOBFS               bool "blobfs (L3)"              depends on BLOB_DB
                                    select BLOB_ROOTREG
-choice BLOBFS_DIR_BACKEND          prompt "directory container"    depends on BLOBFS
+                                   select BLOB_CONTAINER_KVHASH
+config BLOBFS_MAX_NAME_LEN         int "Max file name length"      default 12
+config BLOBFS_FS_INTEROP           bool "Register as Zephyr fs backend"  depends on FILE_SYSTEM
+config BLOBFS_FS_TYPE_OFFSET       int "Offset from FS_TYPE_EXTERNAL_BASE"  default 0
+config BLOBFS_FS_MAX_OPEN_FILES    int "Concurrently open files"   default 4
+# Planned, with the containers they wait on:
+choice BLOBFS_DIR_BACKEND          prompt "directory container"    depends on BLOBDB_BLOBFS
   config BLOBFS_DIR_KVHASH         select CONTAINER_KVHASH
   config BLOBFS_DIR_KVTREE         select CONTAINER_KVTREE         # sorted readdir
 endchoice
 config BLOBFS_FILE_CHUNKED         bool "Chunked file bodies"      select CONTAINER_SEQ
 config BLOBFS_MAX_PATH_LEN         int "Max path length"           default 128
-config BLOBFS_FS_INTEROP           bool "Register as Zephyr fs backend"  depends on FILE_SYSTEM
 
 config SETTINGS_KVDB               bool "Zephyr settings backend over kvdb"  depends on KVDB && SETTINGS
 ```
@@ -192,9 +249,16 @@ tests/lib/blobfs/ ztest
 - **`kvdb`**: one functional suite, executed as a twister scenario **per
   backend** (`extra_configs` swaps the `choice`), asserting identical observable
   behavior — the conformance guarantee that makes backends swappable.
-- **`blobfs`**: path walking, deep nesting, readdir, within-directory rename
-  (id stability), offset read/write at chunk boundaries, truncate grow/shrink,
-  short reads at EOF.
+- **`blobfs`**: Zephyr's own filesystem conformance bodies
+  (`$ZEPHYR_BASE/tests/subsys/fs/common`) compiled unmodified against a blobfs
+  mount — `test_fs_basic` (create/write/stat, seek, truncate, unlink, sync,
+  remount persistence) and `test_fs_open_flags` (the whole `FS_O_*` matrix) —
+  answering the same suite FAT and littlefs do, and needing none of the
+  per-filesystem bypass defines littlefs sets. Local tests cover the v1
+  boundaries: `-ENOTSUP` for directories and `statvfs`, the flat namespace,
+  the body size cap, rename, single-mount. Path walking, deep nesting and
+  readdir join when directories do; chunk-boundary read/write joins with
+  `seq`.
 - **Cross-interface**: enable `kvdb` + `blobfs` together; verify id = 1 root
   directory dispatch (§2) and mutual isolation.
 - **Persistence & crash**: remount and torn-write cases at this level are smoke
