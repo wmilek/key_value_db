@@ -299,7 +299,60 @@ anticipates rather than a surprise regression.
 The second `update` phase shows the same shift (998 → 1198 reads,
 2490 → 2650 µs), so it is systematic and not a one-phase artifact.
 
+## The UBI backend on zephyr-ubi v0.1.0
+
+PR #35 moved the UBI backend from the `wmilek/ubi` fork to the
+[zephyr-ubi](https://github.com/kamil-kielbasa/zephyr-ubi) `v0.1.0` release.
+Measured on `99a2ca6`, same board and harness as the rest of this file
+(Zephyr `4a405846193f`, SDK 1.0.1), defaults, built-in UBI key, two runs
+agreeing within 1 %. The last column adds `CONFIG_BLOB_DB_UBI_ATOMIC_REPLACE=y`
+(`36e9169`).
+
+| phase (µs/op) | `flash_area` (`e80f404`) | old fork (`f1100f1`) | **v0.1.0 (`99a2ca6`)** | + `ATOMIC_REPLACE` |
+|---|--:|--:|--:|--:|
+| `read` | 460 | 1 130 | **500** | 500 |
+| `update` (prepend / append) | 2 510 / 2 650 | 3 620 / 3 970 | **2 550 / 2 690** | 2 460 / 2 610 |
+| `prepend` | 21 230 | 33 690 | **21 170** | 21 120 |
+| `append` | 15 520 | 17 150 | **15 010** | 15 300 |
+| `lg read` | 1 820 | 2 686 | **1 918** | 1 927 |
+| `lg pread` q0–q3 | 3 187–3 625 | 5 750–6 031 | **3 406–3 781** | 3 437–3 812 |
+| `prepare` | 1 096 500 | 1 076 300 | 1 090 620–1 117 590 | 1 022 920–1 117 600 |
+| `lg rewrite` | 4 479 500 | 4 497 500 | 4 367 500 | 4 297 750 |
+| `lg pwrite` | 2 272 125 | 2 287 625 | 2 208 125 | 2 272 687 |
+| `lg write` (cold) | 38 602 000 | 31 919 750 | 36 931 000 | 36 668 250 |
+| FLASH / RAM (B) | 55 400 / 239 448 | 78 424 / 242 856 | 96 080 / 255 772 | 96 600 / 255 772 |
+
+The checksums and the blob_db-level I/O counters are identical to the
+old-fork capture, so the difference is UBI's own cost, not less work.
+
+- **The read penalty is gone.** Every phase is within 2–9 % of `flash_area`.
+  Fitting the reads gives UBI about 7–13 µs per flash access over
+  `flash_area`, against the old fork's ~112 µs. The 1.5–2.5× slowdown in the
+  next section no longer applies.
+- **Cold `lg write` is 16 % slower than on the old fork, and that is the
+  honest figure.** Its 126 erases now happen (`ubi_leb_erase()`, about 1.11 s
+  each on 64 KB blocks); the old fork's `unmap` deferred them, so its 31.9 s
+  only looked faster.
+- **Erase-bound phases** (`prepare`, `lg rewrite`, `lg pwrite`) are unchanged.
+- **Footprint is now the cost:** +40.7 KB of flash and +16.3 KB of RAM over
+  `flash_area`. The RAM is the 6.2 KB UBI heap, about 8.5 KB of Mbed TLS AES
+  tables built in RAM (`FT0..3`, `RT0..3`, S-boxes) and about 1 KB of PSA
+  state; `CONFIG_MBEDTLS_AES_ROM_TABLES=y` should move the tables to flash.
+  Crypto is software (TF-PSA-Crypto's built-in drivers); the CMAC runs only
+  when a block header is written or verified, never on an ordinary read.
+- **`ATOMIC_REPLACE` moves nothing here**, because `app_perf` rarely
+  compacts, and every other replace (master rewrites, bucket formats) still
+  pays one erase inline: blob_db never runs `UBI_MAINTENANCE_RECLAIM` and the
+  volume has about four spare blocks. Its gain shows in
+  `app_cbor_persondb/RESULTS.md` §5g.
+- **Logs:** the old fork's `<err> No volumes present on device` lines at
+  mount are gone, so the `<err>` note below is historical.
+
 ## The UBI backend — the first hardware numbers
+
+> **Historical: the old `wmilek/ubi` fork.** Superseded by the section
+> above. The per-transaction cost, the read slowdown, the footprint and the
+> operational notes below describe that release, not zephyr-ubi v0.1.0.
 
 `CONFIG_BLOB_DB_BACKEND_UBI` stores blobs on a dynamic UBI volume instead
 of the raw partition, for wear-levelling and bad-block handling. Until

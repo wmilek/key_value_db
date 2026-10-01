@@ -188,7 +188,7 @@ west build -b native_sim key_value_db/app -- -DCONFIG_BLOB_DB_BACKEND_FLASH_AREA
 Two things to know before switching a real device:
 
 - UBI takes its bookkeeping from the heap, which
-  `CONFIG_HEAP_MEM_POOL_ADD_SIZE_BLOB_DB_UBI` reserves from the partition size
+  `CONFIG_BLOB_DB_UBI_HEAP_SIZE` reserves from the partition size
   assuming 4 KB blocks. A board with larger blocks may lower it.
 - UBI authenticates its metadata with a key from PSA Crypto. The default is a
   fixed development key that detects damage but not tampering; a product
@@ -301,7 +301,7 @@ Frequently adjusted options (see the module `Kconfig` files for the rest):
 |---|---|
 | `CONFIG_BLOB_DB_PARTITION_LABEL` | fixed-partition label to store blobs in (default `storage`) |
 | `CONFIG_BLOB_DB_UBI_KEY_APP` | UBI's metadata key comes from the application, not the built-in development key (UBI backend) |
-| `CONFIG_HEAP_MEM_POOL_ADD_SIZE_BLOB_DB_UBI` | heap reserved for UBI's bookkeeping; defaults from the partition size (UBI backend) |
+| `CONFIG_BLOB_DB_UBI_HEAP_SIZE` | heap reserved for UBI's bookkeeping; defaults from the partition size (UBI backend) |
 | `CONFIG_BLOB_DB_AUTOFORMAT_ON_CORRUPT` | reformat when both master blocks are unreadable (default `y`; set `n` in production) |
 | `CONFIG_BLOB_DB_MAX_PAYLOAD_LEN` | largest blob payload; also caps the kvhash bucket directory |
 | `CONFIG_BLOB_DB_SECTOR_BUF_SIZE` | upper bound on supported flash sector size (64 KB for mx25r64) |

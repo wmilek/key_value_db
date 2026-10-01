@@ -48,6 +48,9 @@ tests:
   lib.blob_db.ubi:
     extra_configs:
       - CONFIG_BLOB_DB_BACKEND_UBI=y
+      # zephyr-ubi's own bookkeeping checks after every call: meant for
+      # tests, and these are the scenarios that drive UBI hardest.
+      - CONFIG_UBI_SELF_CHECKS=y
   # The same suite with the key supplied by the application, as a product
   # would: src/ubi.c defines blob_db_ubi_ikm_key() and overrides the weak
   # blob_db_ubi_state_check(), which turns on the cases that hand blob_db
@@ -55,10 +58,16 @@ tests:
   lib.blob_db.ubi.app_key:
     extra_configs:
       - CONFIG_BLOB_DB_BACKEND_UBI=y
+      # zephyr-ubi's own bookkeeping checks after every call: meant for
+      # tests, and these are the scenarios that drive UBI hardest.
+      - CONFIG_UBI_SELF_CHECKS=y
       - CONFIG_BLOB_DB_UBI_KEY_APP=y
   # Compaction by ubi_leb_change() instead of the scratch-sector protocol
   # (CONFIG_BLOB_DB_UBI_ATOMIC_REPLACE).
   lib.blob_db.ubi.atomic_replace:
     extra_configs:
       - CONFIG_BLOB_DB_BACKEND_UBI=y
+      # zephyr-ubi's own bookkeeping checks after every call: meant for
+      # tests, and these are the scenarios that drive UBI hardest.
+      - CONFIG_UBI_SELF_CHECKS=y
       - CONFIG_BLOB_DB_UBI_ATOMIC_REPLACE=y

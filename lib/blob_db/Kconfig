@@ -42,15 +42,14 @@ config BLOB_DB_BACKEND_UBI
 
 	  The default, on the grounds that a store which survives a torn write
 	  is worth more than a faster one. Measured cost on the nRF5340-DK
-	  (app_perf/RESULTS.md, measured on the previous UBI release): reads
-	  2.5x slower, updates 1.5x, +23 KB of flash. UBI's LEB->PEB
-	  indirection costs per flash transaction and nothing per byte, so
-	  transaction-heavy paths pay most; the sector-erase cost that
-	  dominates writes is unchanged.
+	  (app_perf/RESULTS.md): reads and updates within 2-9 % of the raw
+	  partition, about 7-13 us per flash access, and +40.7 KB of flash and
+	  +16.3 KB of RAM, most of both for PSA Crypto. The sector-erase cost
+	  that dominates writes is unchanged.
 
 	  UBI seals its headers with AES-CMAC through PSA Crypto (Mbed TLS
 	  unless the build has TF-M), and takes its bookkeeping from the heap
-	  at attach: see HEAP_MEM_POOL_ADD_SIZE_BLOB_DB_UBI.
+	  at attach: see BLOB_DB_UBI_HEAP_SIZE.
 
 endchoice
 
@@ -115,6 +114,15 @@ config BLOB_DB_UBI_ATOMIC_REPLACE
 	  old contents stay readable from raw flash until UBI reuses it.
 
 config HEAP_MEM_POOL_ADD_SIZE_BLOB_DB_UBI
+	int
+	default BLOB_DB_UBI_HEAP_SIZE
+	help
+	  What BLOB_DB_UBI_HEAP_SIZE adds to the system heap. Kept apart from
+	  it so the size can be set in a board file for either backend.
+
+endif # BLOB_DB_BACKEND_UBI
+
+config BLOB_DB_UBI_HEAP_SIZE
 	int "Heap reserved for the UBI device"
 	default $(add,$(div,$(dt_nodelabel_reg_size_int,storage_partition),512),4096)
 	help
@@ -126,7 +134,8 @@ config HEAP_MEM_POOL_ADD_SIZE_BLOB_DB_UBI
 	  blocks may lower it. Too little makes blob_db_mount() fail with
 	  -ENOMEM at run time, not at build time.
 
-endif # BLOB_DB_BACKEND_UBI
+	  Used only by the UBI backend; a flash_area build reserves nothing,
+	  so a board file can set it whichever backend the build picks.
 
 config BLOB_DB_PARTITION_LABEL
 	string "Storage partition label"

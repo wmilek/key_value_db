@@ -80,6 +80,19 @@ happened — compaction erases the scratch block to retire a sealed image — so
 the backend asks for the durable erase, at one flash erase per call, which is
 what the raw partition charges too.
 
+**Atomic replace** (`CONFIG_BLOB_DB_UBI_ATOMIC_REPLACE`, off by default).
+`blob_db_store_replace()` — "this block now holds exactly this image" — maps
+onto `ubi_leb_change()`, which leaves the old contents or the new ones across
+a power loss. blob_db then compacts a bucket in that one call instead of the
+scratch-sector protocol (one erase instead of five), which made
+`app_cbor_persondb`'s 1 000-person `fill` 19 % faster on the DK. The replaced
+block is only queued for reclaim, so its old bytes stay on flash, and UBI
+stands it back up at attach if the newest copy fails the checksum
+`ubi_leb_change()` sealed it with. Nothing may therefore be written in place
+over a replaced block: `blob_db_erase_all()`, which otherwise invalidates a
+bucket by zeroing its magic, replaces the bucket with the zeroed header
+instead.
+
 **Volume.** A volume named `blobdb`, created on first mount from the device's
 free LEBs less four spares (`BLOB_DB_UBI_SPARE_LEBS`), and found again by
 name (`ubi_volume_find()`) afterwards. Its LEB count is read back from UBI
@@ -141,18 +154,21 @@ reported at mount but never discarded by blob_db: they may hold the only copy
 of something, and UBI refuses to attach once they reach a twentieth of the
 device.
 
-**Runtime cost**, nRF5340-DK, `app_perf/RESULTS.md` "The UBI backend": reads
-2.5× slower, updates 1.5×, +23 KB `.text` — measured on the previous UBI
-release and not yet re-measured on this one. The LEB→PEB indirection costs
-per flash transaction and nothing per byte, so transaction-heavy paths pay
-most; the sector erase that dominates writes is unchanged. Linking PSA Crypto
-raises the image further: `app` for the nRF5340-DK grows by 41 KB of flash
-over the `flash_area` build (88 KB against 47 KB, Mbed TLS included; Arm GNU
-toolchain 13.2, so indicative rather than a release figure).
+**Runtime cost**, nRF5340-DK, `app_perf/RESULTS.md` "The UBI backend on
+zephyr-ubi v0.1.0": every `app_perf` phase is within 2–9 % of `flash_area`.
+The LEB→PEB indirection costs about 7–13 µs per flash access and nothing per
+byte, against about 112 µs on the previous UBI release, whose 1.5–2.5× read
+slowdown no longer applies. The sector erase that dominates writes is
+unchanged. The cost is now mostly footprint: `app_perf` grows by 40.7 KB of
+flash and 16.3 KB of RAM over `flash_area`. The RAM is the UBI heap (6.2 KB on
+the DK), about 8.5 KB of Mbed TLS AES tables built in RAM and about 1 KB of
+PSA state; `CONFIG_MBEDTLS_AES_ROM_TABLES=y` would move the tables to flash.
+The CMAC runs only when a block header is written or verified — attach, an
+erase, a block's first write — never on an ordinary read.
 
 **Per-board configuration.** zephyr-ubi takes its handle, a scratch buffer
 and 8 B per erase block from the system heap at attach, and a second handle
-and scratch buffer during a format. `CONFIG_HEAP_MEM_POOL_ADD_SIZE_BLOB_DB_UBI`
+and scratch buffer during a format. `CONFIG_BLOB_DB_UBI_HEAP_SIZE`
 reserves that, defaulting to the storage partition's size in 4 KB blocks
 (`size / 4096 × 8`) plus 4 KB — 20 KB for an 8 MB partition. That covers any
 NOR geometry, so a new board needs no setting to work; one with larger blocks
@@ -214,7 +230,8 @@ choice BLOB_DB_BACKEND                        # in lib/blob_db/Kconfig
             BLOB_DB_UBI_KEY_BUILTIN  (default)   # fixed development key
             BLOB_DB_UBI_KEY_APP                  # blob_db_ubi_ikm_key()
         BLOB_DB_UBI_RELOCATE_BUDGET  (1)          # wear-leveling moves per erase
-        HEAP_MEM_POOL_ADD_SIZE_BLOB_DB_UBI        # heap for UBI, from the partition size
+        BLOB_DB_UBI_ATOMIC_REPLACE   (n)          # replace and compact by ubi_leb_change()
+    BLOB_DB_UBI_HEAP_SIZE                     # heap for UBI, from the partition size
 ```
 
 `BLOB_DB` selects `FLASH` and `FLASH_MAP` for either provider;
@@ -251,9 +268,6 @@ invalidation before erase, …) keep zephyr-ubi's defaults (§3).
    provider. This now costs more than an inaccurate ratio: the L0 timing model
    consumes those counters, so a predicted time for a UBI build is a lower
    bound by exactly the traffic they miss.
-3. **UBI throughput not re-measured.** `app_perf/RESULTS.md` predates the
-   move to zephyr-ubi v0.1.0, whose per-transaction cost, header size and
-   wear-leveling moves differ from the release it measured.
-4. **`-Werror` in zephyr-ubi.** The module compiles its sources with its own
+3. **`-Werror` in zephyr-ubi.** The module compiles its sources with its own
    warning set as errors (`cmake/warnings.cmake`), so a new warning from a
    Zephyr header on `main` fails the build there first.

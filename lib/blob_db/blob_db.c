@@ -3208,7 +3208,15 @@ int blob_db_erase_all(void)
 	 * bytes, rounded up to the device's write-block-size; the extra bytes
 	 * land inside the bucket header and programming them to 0x00 is
 	 * equally legal. Skip buckets that already look unformatted so we do
-	 * not touch fresh sectors. */
+	 * not touch fresh sectors.
+	 *
+	 * Not in place when the backend replaces atomically: there a bucket last
+	 * written by blob_db_store_replace() carries a checksum over its header
+	 * (ubi_leb_change), and the block it replaced is still on flash awaiting
+	 * reclaim. Zeroing the magic under that checksum makes the next attach
+	 * reject the newest copy and stand the older one back up — bringing
+	 * back the blobs this call deleted. Replacing the bucket with the zeroed
+	 * header instead leaves a newest copy that verifies, at no erase. */
 	for (uint16_t bid = 0; bid < st.n_buckets; bid++) {
 		if (bid == root_bid) {
 			continue;
@@ -3224,9 +3232,11 @@ int blob_db_erase_all(void)
 		if (memcmp(peek, BUCKET_MAGIC, 4) != 0) {
 			continue;
 		}
-		rc = blob_db_store_write(
-				      peb_offset(BLOB_DB_FIRST_BUCKET + bid),
-				      zeros, zlen);
+		const off_t off = peb_offset(BLOB_DB_FIRST_BUCKET + bid);
+
+		rc = blob_db_store_replace_is_atomic()
+			     ? blob_db_store_replace(off, zeros, zlen)
+			     : blob_db_store_write(off, zeros, zlen);
 		if (rc < 0) {
 			LOG_ERR("erase_all: invalidate bid %u: %d", bid, rc);
 			return rc;
