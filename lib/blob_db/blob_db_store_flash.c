@@ -20,6 +20,7 @@ LOG_MODULE_REGISTER(blob_db_store, CONFIG_BLOB_DB_LOG_LEVEL);
 #define BLOB_DB_PARTITION_ID  PARTITION_ID(storage_partition)
 
 static const struct flash_area *g_fa;
+static size_t g_peb_size;
 
 int blob_db_store_open(struct blob_db_store_geom *geom, bool discard)
 {
@@ -72,6 +73,7 @@ int blob_db_store_open(struct blob_db_store_geom *geom, bool discard)
 		goto err_close;
 	}
 
+	g_peb_size = peb_size;
 	geom->peb_size = peb_size;
 	geom->write_align = write_align;
 	geom->n_pebs = (uint16_t)(fa_size / peb_size);
@@ -107,4 +109,21 @@ int blob_db_store_erase(off_t off, size_t len)
 {
 	BLOB_DB_IO_NOTE(BLOB_DB_IO_ERASE, len);
 	return flash_area_erase(g_fa, off, len);
+}
+
+int blob_db_store_replace(off_t off, const void *buf, size_t len)
+{
+	int rc = blob_db_store_erase(off, g_peb_size);
+
+	if (rc < 0) {
+		return rc;
+	}
+	return blob_db_store_write(off, buf, len);
+}
+
+/* Raw NOR has no such primitive: a cut between the erase and the write
+ * leaves the sector erased. */
+bool blob_db_store_replace_is_atomic(void)
+{
+	return false;
 }

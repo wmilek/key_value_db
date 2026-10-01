@@ -56,3 +56,9 @@ tests:
     extra_configs:
       - CONFIG_BLOB_DB_BACKEND_UBI=y
       - CONFIG_BLOB_DB_UBI_KEY_APP=y
+  # Compaction by ubi_leb_change() instead of the scratch-sector protocol
+  # (CONFIG_BLOB_DB_UBI_ATOMIC_REPLACE).
+  lib.blob_db.ubi.atomic_replace:
+    extra_configs:
+      - CONFIG_BLOB_DB_BACKEND_UBI=y
+      - CONFIG_BLOB_DB_UBI_ATOMIC_REPLACE=y

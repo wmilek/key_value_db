@@ -417,6 +417,15 @@ int blob_db_store_write(off_t off, const void *buf, size_t len)
 	return ubi_leb_write_at(g_ubi, g_vol_id, lnum, within, buf, len);
 }
 
+/* Static data never moves on its own: UBI levels wear only when asked.
+ * A bucket erase is already a slow call, so it carries the step. */
+static void relocate_step(void)
+{
+	if (CONFIG_BLOB_DB_UBI_RELOCATE_BUDGET > 0) {
+		maintain(UBI_MAINTENANCE_RELOCATE, CONFIG_BLOB_DB_UBI_RELOCATE_BUDGET);
+	}
+}
+
 int blob_db_store_erase(off_t off, size_t len)
 {
 	if (len == 0) {
@@ -437,11 +446,37 @@ int blob_db_store_erase(off_t off, size_t len)
 		}
 	}
 
-	/* Static data never moves on its own: UBI levels wear only when asked.
-	 * A bucket erase is already a slow call, so it carries the step. */
-	if (CONFIG_BLOB_DB_UBI_RELOCATE_BUDGET > 0) {
-		maintain(UBI_MAINTENANCE_RELOCATE, CONFIG_BLOB_DB_UBI_RELOCATE_BUDGET);
+	relocate_step();
+	return 0;
+}
+
+int blob_db_store_replace(off_t off, const void *buf, size_t len)
+{
+	if (!IS_ENABLED(CONFIG_BLOB_DB_UBI_ATOMIC_REPLACE)) {
+		const int rc = blob_db_store_erase(off, g_leb_size);
+
+		return rc < 0 ? rc : blob_db_store_write(off, buf, len);
 	}
 
+	const uint32_t lnum = (uint32_t)((size_t)off / g_leb_size);
+
+	/* Counted as the erase and the write it stands for, so the seam's
+	 * counters compare across backends and options. */
+	BLOB_DB_IO_NOTE(BLOB_DB_IO_ERASE, g_leb_size);
+	BLOB_DB_IO_NOTE(BLOB_DB_IO_WRITE, len);
+
+	const int rc = ubi_leb_change(g_ubi, g_vol_id, lnum, buf, len);
+
+	if (rc != 0) {
+		LOG_ERR("ubi_leb_change(%u, %zu B): %d", lnum, len, rc);
+		return rc;
+	}
+
+	relocate_step();
 	return 0;
+}
+
+bool blob_db_store_replace_is_atomic(void)
+{
+	return IS_ENABLED(CONFIG_BLOB_DB_UBI_ATOMIC_REPLACE);
 }

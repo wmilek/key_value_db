@@ -99,6 +99,21 @@ config BLOB_DB_UBI_RELOCATE_BUDGET
 	  rewrites are spread by allocation — what the previous UBI backend
 	  did.
 
+config BLOB_DB_UBI_ATOMIC_REPLACE
+	bool "Replace blocks with ubi_leb_change()"
+	help
+	  blob_db_store_replace() uses ubi_leb_change(), which leaves the old
+	  contents or the new ones across a power loss. blob_db then rewrites
+	  masters and fresh buckets in one call, and compacts a bucket by
+	  replacing it directly instead of staging the image through the
+	  scratch sector under a COMPACTING master: one block erase per
+	  compaction instead of five. On the nRF5340-DK this made
+	  app_cbor_persondb's 1 000-person fill 19 % faster; workloads that
+	  rarely compact see no change.
+
+	  The replaced block is queued for reclaim rather than erased, so its
+	  old contents stay readable from raw flash until UBI reuses it.
+
 config HEAP_MEM_POOL_ADD_SIZE_BLOB_DB_UBI
 	int "Heap reserved for the UBI device"
 	default $(add,$(div,$(dt_nodelabel_reg_size_int,storage_partition),512),4096)

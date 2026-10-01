@@ -268,12 +268,7 @@ static int write_master(uint8_t slot, uint32_t gen, uint8_t state,
 			uint16_t compacting_bid, uint64_t next_id_hint)
 {
 	const uint64_t seg_owner = st.seg_owner;
-
-	int rc = blob_db_store_erase(peb_offset(slot), st.peb_size);
-	if (rc < 0) {
-		LOG_ERR("master %u erase failed: %d", slot, rc);
-		return rc;
-	}
+	int rc;
 
 	/* Staged 0xff-filled so any write-alignment padding matches erased
 	 * flash rather than introducing zero bits. */
@@ -306,7 +301,7 @@ static int write_master(uint8_t slot, uint32_t gen, uint8_t state,
 		return -ENOTSUP;
 	}
 
-	rc = blob_db_store_write(peb_offset(slot), buf, len);
+	rc = blob_db_store_replace(peb_offset(slot), buf, len);
 	if (rc < 0) {
 		LOG_ERR("master %u write failed: %d", slot, rc);
 		return rc;
@@ -830,13 +825,6 @@ static int read_bucket(uint16_t bid, uint8_t *buf)
 
 static int format_bucket(uint16_t bid)
 {
-	int rc = blob_db_store_erase(bucket_offset(bid), st.peb_size);
-
-	if (rc < 0) {
-		LOG_ERR("bucket %u erase: %d", bid, rc);
-		return rc;
-	}
-
 	struct blob_db_bucket_hdr bhdr = {
 		.bucket_id = bid,
 		.reserved  = 0,
@@ -845,9 +833,10 @@ static int format_bucket(uint16_t bid)
 	memcpy(bhdr.magic, BUCKET_MAGIC, 4);
 	bhdr.hdr_crc32 = hdr_crc32(&bhdr, sizeof(bhdr));
 
-	rc = blob_db_store_write(bucket_offset(bid), &bhdr, sizeof(bhdr));
+	const int rc = blob_db_store_replace(bucket_offset(bid), &bhdr,
+					     sizeof(bhdr));
 	if (rc < 0) {
-		LOG_ERR("bucket %u header write: %d", bid, rc);
+		LOG_ERR("bucket %u format: %d", bid, rc);
 	}
 	return rc;
 }
@@ -1228,6 +1217,15 @@ static int compact_commit(uint16_t bid, const uint8_t *new_buf, size_t new_len)
 			"scratch (limit %zu B)", bid, new_len,
 			(size_t)scratch_seal_off());
 		return -ENOSPC;
+	}
+
+	/* A backend that replaces a block atomically needs none of the window
+	 * below: the bucket holds the old image or the new one whatever the
+	 * power does, so there is nothing for recover_compaction() to settle and
+	 * no reason to stamp COMPACTING. A failed replace leaves the old image,
+	 * so it is reported rather than wedging the store. */
+	if (blob_db_store_replace_is_atomic()) {
+		return blob_db_store_replace(bucket_off, new_buf, new_len);
 	}
 
 	/* Step 1: enter atomic window.
