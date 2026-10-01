@@ -29,10 +29,10 @@
  *
  * That is only meaningful on the flash_area backend, where those offsets are
  * blob_db's. Under CONFIG_BLOB_DB_BACKEND_UBI the store lives inside a UBI
- * volume and the same offsets belong to UBI's reserved PEBs and device header,
- * so "corrupting a master" actually destroys UBI's metadata: the injection
- * proves nothing about blob_db, and every later attach fails with
- * "no active reserved PEBs" (-EIO), taking the rest of the suite with it.
+ * volume and the same offsets belong to UBI's headers and volume table, so
+ * "corrupting a master" actually damages UBI's metadata: the injection proves
+ * nothing about blob_db, and later attaches fail or discard what it hit,
+ * taking the rest of the suite with it.
  *
  * So these cases skip on UBI rather than pretend to pass. The gap is real and
  * deliberate: blob_db's crash-safety is verified on flash_area only, because
@@ -793,6 +793,29 @@ ZTEST(blob_db, test_erase_all_survives_remount)
 	zassert_false(blob_db_exists(stale));
 
 	/* And the id space is still reset. */
+	zassert_equal(blob_db_alloc_id(), 2);
+}
+
+/* erase_all after a compaction: the bucket has been replaced, so on a backend
+ * that keeps the replaced block until reclaim (UBI with
+ * CONFIG_BLOB_DB_UBI_ATOMIC_REPLACE) an older copy is still on flash. A remount
+ * must not stand it back up. */
+ZTEST(blob_db, test_erase_all_after_compaction_survives_remount)
+{
+	uint64_t id = put_blob("v0000", 5);
+	char val[8];
+
+	for (int i = 0; i < 500; i++) {
+		(void)snprintk(val, sizeof(val), "v%04d", i);
+		zassert_ok(blob_db_update(id, val, 5), "update #%d failed", i);
+	}
+
+	zassert_ok(blob_db_erase_all());
+	zassert_ok(blob_db_unmount());
+	zassert_ok(blob_db_mount());
+
+	zassert_false(blob_db_exists(id), "an erased blob came back on remount");
+	zassert_equal(blob_db_count(), 1);
 	zassert_equal(blob_db_alloc_id(), 2);
 }
 

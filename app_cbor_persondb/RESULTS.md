@@ -403,6 +403,8 @@ above were taken with a local SDK 1.0.1 install, which gives identical results.
 
 ## 4b. Footprint on the UBI backend (the default)
 
+> Measured on the old `wmilek/ubi` fork; zephyr-ubi v0.1.0 figures are in §5g.
+
 §4a is `flash_area`. `blob_db` now defaults to `CONFIG_BLOB_DB_BACKEND_UBI`, so
 these are the numbers a default build of this app actually produces. Both
 columns were rebuilt at the same commit with the same method — `text + data`
@@ -824,6 +826,8 @@ rest unknown — worth remembering before quoting this file as the cost of the
 API as a whole.
 
 ## 5c. On the UBI backend (the default)
+
+> Measured on the old `wmilek/ubi` fork; zephyr-ubi v0.1.0 figures are in §5g.
 
 `blob_db` now defaults to `CONFIG_BLOB_DB_BACKEND_UBI`; everything above is
 `flash_area`. Same board, same 1 000-person config, with the backend and its
@@ -1292,6 +1296,46 @@ The write cost is the open problem, and it is not a `kvhash` bug: it is
 `blob_db` compaction being driven by bucket size, on a medium whose erase
 granularity the map cannot see. **A `put` costing 2.23 sector erases is the
 finding this run contributes.**
+
+## 5g. On zephyr-ubi v0.1.0 (PR #35)
+
+§4b, §5c and §5e–§5f measured the UBI backend on the old `wmilek/ubi` fork.
+PR #35 moved it to the [zephyr-ubi](https://github.com/kamil-kielbasa/zephyr-ubi)
+`v0.1.0` release. Same board and build as §5e (Zephyr `4a405846193f`, SDK
+1.0.1): two-level `kvhash`, 1 000 persons, `FRESH_START`, partition
+raw-erased first, built-in UBI key. The last column adds
+`CONFIG_BLOB_DB_UBI_ATOMIC_REPLACE=y` (`36e9169`).
+
+| phase | old fork (§8c, `ade6a3e`) | **v0.1.0 (`99a2ca6`)** | + `ATOMIC_REPLACE` |
+|---|--:|--:|--:|
+| `open` | 145.8 s | 37.0 s | 36.9 s |
+| `prepare` (buckets) | 0.13 s (99) | 109.3 s (98) | 109.9 s (98) |
+| `open` + `prepare` | 146.0 s | 146.3 s | 146.8 s |
+| **`fill`** | 162.1 s | **130.6 s** | **105.4 s** |
+| `verify` / `mutate` / `re-verify` | 16.4 / 9.2 / 17.4 s | 7.4 / 6.4 / 7.7 s | 7.2 / 6.3 / 7.5 s |
+| `check` | 36.04 ms | **17.13 ms** | 16.69 ms |
+| `byid` | 14.11 ms | **7.98 ms** | 7.84 ms |
+| `miss` | 22.35 ms | **9.44 ms** | 9.16 ms |
+| `put` | 179.69 ms | **121.98 ms** | 119.64 ms |
+| `cbor` (control, no flash) | 0.985 ms | 0.950 ms | 0.949 ms |
+| **whole run** | **6.69 min** | **5.50 min** | **5.07 min** |
+| FLASH / RAM (B) | 86 032 / 202 064 | 104 328 / 214 980 | 104 832 / 214 980 |
+
+Every run printed `VERIFY PASS` twice, with 0 bucket overflows and 2 479
+credentials; flash-operation counts are within 2 % of the old-fork run.
+
+- **Reads roughly halve** (`check`, `byid`, `miss`), because UBI's cost per
+  flash access fell from ~112 µs to 7–13 µs (`app_perf/RESULTS.md`).
+- **The format's erases moved, not vanished.** v0.1.0's format does not
+  pre-erase blank blocks, so `open` drops from 146 s to 37 s and the erases
+  happen in `prepare`, inside UBI's allocator on each bucket's first write.
+  `open` + `prepare` is unchanged.
+- **One bucket fewer:** `prepare` formats 98 instead of 99, because v0.1.0
+  keeps one more block for its volume table.
+- **`ATOMIC_REPLACE` cuts `fill` by 19 %.** Compaction becomes one
+  `ubi_leb_change()` instead of five block erases (master, scratch, bucket,
+  scratch, master), about six compactions' worth of erases over this run.
+  The I/O counters are byte-identical with and without it.
 
 ## 6. What the numbers say
 

@@ -33,27 +33,107 @@ config BLOB_DB_BACKEND_FLASH_AREA
 
 config BLOB_DB_BACKEND_UBI
 	bool "UBI volume"
-	select UBI_ENABLE
+	select UBI
+	select PSA_CRYPTO
 	help
-	  Store on a dynamic UBI volume, gaining wear-leveling and bad-block
-	  handling. blob_db's in-place slot append maps onto ubi_leb_write_at().
+	  Store on a UBI volume (zephyr-ubi), gaining wear-leveling, bad-block
+	  handling and authenticated metadata. blob_db's in-place slot append
+	  maps onto ubi_leb_write_at().
 
 	  The default, on the grounds that a store which survives a torn write
-	  is worth more than a faster one. Measured cost on the nRF5340-DK
-	  (app_perf/RESULTS.md): reads 2.5x slower, updates 1.5x, +23 KB of
-	  flash. UBI's LEB->PEB indirection costs ~112 us per flash
-	  transaction and nothing per byte, so transaction-heavy paths pay
-	  most; the sector-erase cost that dominates writes is unchanged.
+	  is worth more than a faster one. The LEB->PEB indirection adds a
+	  small cost per flash access and nothing per byte; the sector erase
+	  that dominates writes is unchanged. The larger cost is footprint:
+	  UBI itself, PSA Crypto and the heap UBI takes. Measured figures are
+	  in app_perf/RESULTS.md.
 
-	  With the static memory backend (the UBI default) this requires
-	  CONFIG_UBI_MAX_NR_OF_DATA_PEBS >= the partition's data PEB count,
-	  which is (partition_size / erase_block_size) -
-	  CONFIG_UBI_DEV_HDR_NR_OF_RES_PEBS. It defaults to 14, which builds
-	  cleanly and then fails to attach at runtime, so every board that
-	  uses this backend must set it. The pool costs 16 bytes per PEB, so
-	  size it to the geometry rather than to the maximum.
+	  UBI seals its headers with AES-CMAC through PSA Crypto (Mbed TLS
+	  unless the build has TF-M), and takes its bookkeeping from the heap
+	  at attach: see BLOB_DB_UBI_HEAP_SIZE.
 
 endchoice
+
+if BLOB_DB_BACKEND_UBI
+
+choice BLOB_DB_UBI_KEY
+	prompt "Keying material for UBI's metadata MAC"
+	default BLOB_DB_UBI_KEY_BUILTIN
+	help
+	  UBI derives the keys that seal its headers and volume table from a
+	  PSA key handle. Other keying material makes the store unreadable,
+	  so whichever is chosen must stay the same for the life of the
+	  device; switching means erasing the partition.
+
+config BLOB_DB_UBI_KEY_BUILTIN
+	bool "Built-in development key (NOT secret)"
+	help
+	  Import a fixed key compiled into blob_db, the same on every device.
+	  The MAC then detects damage but not tampering — anyone can re-seal
+	  a forged header. Fine for development and for products that only
+	  wanted UBI's wear-leveling; not for a threat model with an attacker
+	  who can write the flash.
+
+config BLOB_DB_UBI_KEY_APP
+	bool "Application-provisioned key"
+	help
+	  The application defines blob_db_ubi_ikm_key()
+	  (<app/lib/blob_db_ubi.h>) and returns a per-device key it
+	  provisioned into its PSA key store. The build fails to link until
+	  it does.
+
+endchoice
+
+config BLOB_DB_UBI_RELOCATE_BUDGET
+	int "Wear-leveling relocations per bucket erase"
+	default 1
+	range 0 16
+	help
+	  UBI moves rarely rewritten data off little-worn blocks only when
+	  asked (UBI_MAINTENANCE_RELOCATE). Each bucket erase asks for up to
+	  this many moves. Most erases find nothing worth moving
+	  (CONFIG_UBI_WEAR_LEVELING_THRESHOLD); one that does pays a block
+	  copy and an extra erase.
+
+	  0 leaves static data where it is, so only the blocks blob_db
+	  rewrites are spread, by allocation.
+
+config BLOB_DB_UBI_ATOMIC_REPLACE
+	bool "Replace blocks with ubi_leb_change()"
+	help
+	  blob_db_store_replace() uses ubi_leb_change(), which leaves the old
+	  contents or the new ones across a power loss. blob_db then rewrites
+	  masters and fresh buckets in one call, and compacts a bucket by
+	  replacing it directly instead of staging the image through the
+	  scratch sector under a COMPACTING master: one block erase per
+	  compaction instead of five. Workloads that compact often gain;
+	  those that rarely compact see no change (app_cbor_persondb/RESULTS.md).
+
+	  The replaced block is queued for reclaim rather than erased, so its
+	  old contents stay readable from raw flash until UBI reuses it.
+
+config HEAP_MEM_POOL_ADD_SIZE_BLOB_DB_UBI
+	int
+	default BLOB_DB_UBI_HEAP_SIZE
+	help
+	  What BLOB_DB_UBI_HEAP_SIZE adds to the system heap. Kept apart from
+	  it so the size can be set in a board file for either backend.
+
+endif # BLOB_DB_BACKEND_UBI
+
+config BLOB_DB_UBI_HEAP_SIZE
+	int "Heap reserved for the UBI device"
+	default $(add,$(div,$(dt_nodelabel_reg_size_int,storage_partition),512),4096)
+	help
+	  zephyr-ubi takes its handle, a scratch buffer and per-erase-block
+	  bookkeeping from the system heap at attach, and a second handle and
+	  scratch buffer during a format. The default sizes the per-block part
+	  for the storage partition as if it were made of 4 KB erase blocks,
+	  the smallest NOR geometry, plus a fixed allowance for the rest; a
+	  board with larger blocks may lower it. Too little makes blob_db_mount() fail with
+	  -ENOMEM at run time, not at build time.
+
+	  Used only by the UBI backend; a flash_area build reserves nothing,
+	  so a board file can set it whichever backend the build picks.
 
 config BLOB_DB_PARTITION_LABEL
 	string "Storage partition label"
