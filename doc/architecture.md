@@ -36,9 +36,9 @@ acceptance suite (`tests/lib/blob_db_contract`, the sufficiency proof of
 storage as an array of erase blocks through `lib/blob_db/blob_db_store.h`, and
 the `BLOB_DB_BACKEND` Kconfig choice picks what implements it: a raw partition
 via `flash_area`, or a dynamic **UBI volume — the default since PR #20**,
-which adds wear leveling, bad-block handling and authenticated metadata for
-reads within a few percent of the raw partition and about +41 KB of flash, most
-of it PSA Crypto (zephyr-ubi v0.1.0, measured on the nRF5340-DK). This replaced the virtual-`flash_area` integration this
+which adds wear leveling, bad-block handling and authenticated metadata at a
+small cost per flash access and a larger one in footprint (UBI itself and PSA
+Crypto). This replaced the virtual-`flash_area` integration this
 document previously described; `layers/l0_flash.md` §1.1 records why. Both
 backends are built by CI on both targets, and `tests/lib/blob_db` runs its
 suite on each.

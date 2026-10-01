@@ -41,11 +41,11 @@ config BLOB_DB_BACKEND_UBI
 	  maps onto ubi_leb_write_at().
 
 	  The default, on the grounds that a store which survives a torn write
-	  is worth more than a faster one. Measured cost on the nRF5340-DK
-	  (app_perf/RESULTS.md): reads and updates within 2-9 % of the raw
-	  partition, about 7-13 us per flash access, and +40.7 KB of flash and
-	  +16.3 KB of RAM, most of both for PSA Crypto. The sector-erase cost
-	  that dominates writes is unchanged.
+	  is worth more than a faster one. The LEB->PEB indirection adds a
+	  small cost per flash access and nothing per byte; the sector erase
+	  that dominates writes is unchanged. The larger cost is footprint:
+	  UBI itself, PSA Crypto and the heap UBI takes. Measured figures are
+	  in app_perf/RESULTS.md.
 
 	  UBI seals its headers with AES-CMAC through PSA Crypto (Mbed TLS
 	  unless the build has TF-M), and takes its bookkeeping from the heap
@@ -95,8 +95,7 @@ config BLOB_DB_UBI_RELOCATE_BUDGET
 	  copy and an extra erase.
 
 	  0 leaves static data where it is, so only the blocks blob_db
-	  rewrites are spread by allocation — what the previous UBI backend
-	  did.
+	  rewrites are spread, by allocation.
 
 config BLOB_DB_UBI_ATOMIC_REPLACE
 	bool "Replace blocks with ubi_leb_change()"
@@ -106,9 +105,8 @@ config BLOB_DB_UBI_ATOMIC_REPLACE
 	  masters and fresh buckets in one call, and compacts a bucket by
 	  replacing it directly instead of staging the image through the
 	  scratch sector under a COMPACTING master: one block erase per
-	  compaction instead of five. On the nRF5340-DK this made
-	  app_cbor_persondb's 1 000-person fill 19 % faster; workloads that
-	  rarely compact see no change.
+	  compaction instead of five. Workloads that compact often gain;
+	  those that rarely compact see no change (app_cbor_persondb/RESULTS.md).
 
 	  The replaced block is queued for reclaim rather than erased, so its
 	  old contents stay readable from raw flash until UBI reuses it.
@@ -126,12 +124,12 @@ config BLOB_DB_UBI_HEAP_SIZE
 	int "Heap reserved for the UBI device"
 	default $(add,$(div,$(dt_nodelabel_reg_size_int,storage_partition),512),4096)
 	help
-	  zephyr-ubi takes its handle, a scratch buffer and 8 bytes per
-	  erase block from the system heap at attach, and a second handle and
-	  scratch buffer during a format. The default sizes the per-block
-	  part for the storage partition in 4 KB erase blocks (size / 4096 *
-	  8) plus 4 KB, so it covers any NOR geometry; a board with larger
-	  blocks may lower it. Too little makes blob_db_mount() fail with
+	  zephyr-ubi takes its handle, a scratch buffer and per-erase-block
+	  bookkeeping from the system heap at attach, and a second handle and
+	  scratch buffer during a format. The default sizes the per-block part
+	  for the storage partition as if it were made of 4 KB erase blocks,
+	  the smallest NOR geometry, plus a fixed allowance for the rest; a
+	  board with larger blocks may lower it. Too little makes blob_db_mount() fail with
 	  -ENOMEM at run time, not at build time.
 
 	  Used only by the UBI backend; a flash_area build reserves nothing,

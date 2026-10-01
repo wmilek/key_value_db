@@ -337,9 +337,24 @@ old-fork capture, so the difference is UBI's own cost, not less work.
 - **Footprint is now the cost:** +40.7 KB of flash and +16.3 KB of RAM over
   `flash_area`. The RAM is the 6.2 KB UBI heap, about 8.5 KB of Mbed TLS AES
   tables built in RAM (`FT0..3`, `RT0..3`, S-boxes) and about 1 KB of PSA
-  state; `CONFIG_MBEDTLS_AES_ROM_TABLES=y` should move the tables to flash.
+  state; the flash is split below.
   Crypto is software (TF-PSA-Crypto's built-in drivers); the CMAC runs only
   when a block header is written or verified, never on an ordinary read.
+- **Where the footprint goes.** Attributed with `rom_report`/`ram_report` on
+  `app` for the DK (UBI against `flash_area`, Arm GNU 13.2, so indicative):
+
+  | | flash | RAM |
+  |---|--:|--:|
+  | zephyr-ubi code | 15.2 KB | — |
+  | zephyr-ubi log strings (`CONFIG_UBI_LOG_LEVEL_OFF=y` saves 11.0 KB with the call sites) | ~8 KB | — |
+  | PSA Crypto / Mbed TLS: AES + CMAC ~5.6 KB, HKDF (SHA-256, HMAC) ~2.3 KB, PSA core ~5.0 KB, RNG ~1.7 KB | 14.9 KB | 10.0 KB |
+  | heap allocator and mutexes, and the UBI heap | 2.5 KB | 6.2 KB |
+  | `blob_db_store_ubi.c` | 1.1 KB | — |
+  | **total** | **41.8 KB** | **16.3 KB** |
+
+  Crypto is about a third of the flash and most of the RAM.
+  `CONFIG_MBEDTLS_AES_ROM_TABLES=y` (with its default compact tables) trades
+  8.7 KB of RAM for 2.0 KB of flash.
 - **`ATOMIC_REPLACE` moves nothing here**, because `app_perf` rarely
   compacts, and every other replace (master rewrites, bucket formats) still
   pays one erase inline: blob_db never runs `UBI_MAINTENANCE_RECLAIM` and the

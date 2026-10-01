@@ -53,7 +53,7 @@ mitigation, not management, which is why this is no longer the default.
 
 `CONFIG_BLOB_DB_BACKEND_UBI`, `lib/blob_db/blob_db_store_ubi.c`, over the
 [`zephyr-ubi`](https://github.com/kamil-kielbasa/zephyr-ubi) module, pinned
-to release `v0.1.0` in `west.yml`.
+to a release tag in `west.yml`.
 
 Each `blob_db` block maps 1:1 onto a **UBI LEB**; UBI maps LEBs onto physical
 blocks through per-block headers and moves them for wear leveling and
@@ -84,8 +84,8 @@ what the raw partition charges too.
 `blob_db_store_replace()` — "this block now holds exactly this image" — maps
 onto `ubi_leb_change()`, which leaves the old contents or the new ones across
 a power loss. blob_db then compacts a bucket in that one call instead of the
-scratch-sector protocol (one erase instead of five), which made
-`app_cbor_persondb`'s 1 000-person `fill` 19 % faster on the DK. The replaced
+scratch-sector protocol (one erase instead of five), which pays off in
+workloads that compact often (`app_cbor_persondb/RESULTS.md`). The replaced
 block is only queued for reclaim, so its old bytes stay on flash, and UBI
 stands it back up at attach if the newest copy fails the checksum
 `ubi_leb_change()` sealed it with. Nothing may therefore be written in place
@@ -101,16 +101,10 @@ geometry-stability requirement. The spares give relocation a block to move
 onto and absorb blocks retired after a failed write, so neither turns into
 `-ENOSPC` once every LEB is mapped.
 
-**Geometry overhead.** UBI spends 128 B of each block on its two 64 B headers
-and holds three blocks back for its volume table (two copies and a spare for
-their updates), on top of blob_db's four spares. Measured on `native_sim`'s
-8 MB partition of 4 KB blocks:
-
-| | raw partition | through UBI |
-|---|---|---|
-| blocks | 2048 | 2041 |
-| usable bytes per block | 4096 | 3968 |
-| blob_db buckets | 2045 | 2038 |
+**Geometry overhead.** Every LEB is smaller than its physical block by UBI's
+two block headers, and UBI holds a few blocks back for its volume table, on
+top of blob_db's four spares. Both are properties of the zephyr-ubi release
+and its on-flash format; the exact figures are in its documentation.
 
 The shrunken block is not cosmetic: a payload cap tuned for a 4096 B block can
 become unreachable under UBI, and mount then refuses with `-ENOTSUP`. The
@@ -151,29 +145,25 @@ blob_db's behalf:
 
 Blocks UBI keeps as `CORRUPT` (damage behind a valid erase-counter header) are
 reported at mount but never discarded by blob_db: they may hold the only copy
-of something, and UBI refuses to attach once they reach a twentieth of the
-device.
+of something, and UBI refuses to attach once too many accumulate.
 
-**Runtime cost**, nRF5340-DK, `app_perf/RESULTS.md` "The UBI backend on
-zephyr-ubi v0.1.0": every `app_perf` phase is within 2–9 % of `flash_area`.
-The LEB→PEB indirection costs about 7–13 µs per flash access and nothing per
-byte, against about 112 µs on the previous UBI release, whose 1.5–2.5× read
-slowdown no longer applies. The sector erase that dominates writes is
-unchanged. The cost is now mostly footprint: `app_perf` grows by 40.7 KB of
-flash and 16.3 KB of RAM over `flash_area`. The RAM is the UBI heap (6.2 KB on
-the DK), about 8.5 KB of Mbed TLS AES tables built in RAM and about 1 KB of
-PSA state; `CONFIG_MBEDTLS_AES_ROM_TABLES=y` would move the tables to flash.
-The CMAC runs only when a block header is written or verified — attach, an
-erase, a block's first write — never on an ordinary read.
+**Runtime cost.** The LEB→PEB indirection adds a small, fixed cost per flash
+access and nothing per byte, so transaction-heavy paths pay most; the sector
+erase that dominates writes is unchanged. The larger cost is footprint:
+zephyr-ubi itself, PSA Crypto (whose AES tables Mbed TLS builds in RAM unless
+`CONFIG_MBEDTLS_AES_ROM_TABLES` is set) and the heap UBI takes. The CMAC runs
+only when a block header is written or verified — attach, an erase, a block's
+first write — never on an ordinary read. Measured figures for the nRF5340-DK
+are in `app_perf/RESULTS.md` and `app_cbor_persondb/RESULTS.md`.
 
 **Per-board configuration.** zephyr-ubi takes its handle, a scratch buffer
-and 8 B per erase block from the system heap at attach, and a second handle
-and scratch buffer during a format. `CONFIG_BLOB_DB_UBI_HEAP_SIZE`
-reserves that, defaulting to the storage partition's size in 4 KB blocks
-(`size / 4096 × 8`) plus 4 KB — 20 KB for an 8 MB partition. That covers any
-NOR geometry, so a new board needs no setting to work; one with larger blocks
-may lower it, as the DK board files do (6 KB for 128 blocks of 64 KB). Too
-little shows up as `-ENOMEM` from `blob_db_mount()`, not at build time.
+and per-erase-block bookkeeping from the system heap at attach, and a second
+handle and scratch buffer during a format. `CONFIG_BLOB_DB_UBI_HEAP_SIZE`
+reserves that. Its default sizes the per-block part as if the storage
+partition were made of 4 KB erase blocks, the smallest NOR geometry, so a new
+board needs no setting to work; a board with larger blocks may lower it, as
+the DK board files do. Too little shows up as `-ENOMEM` from
+`blob_db_mount()`, not at build time.
 
 ## 4. Cross-backend mounting
 

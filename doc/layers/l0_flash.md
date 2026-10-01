@@ -92,7 +92,7 @@ they guarantee about the substrate:
 | Metadata integrity | none | AES-CMAC over headers and volume table |
 | Torn write during an internal move | n/a — no moves | contained (§2) |
 | `peb_size` vs physical erase block | equal | smaller (per-block headers) |
-| Cost | faster, smaller | slower reads, more flash |
+| Cost | smallest, fastest | small cost per flash access; more flash and RAM |
 
 `flash_area` maps 1:1 onto a device-tree partition and manages nothing, which
 suits NOR and simulation and keeps blob_db's structures at known partition
