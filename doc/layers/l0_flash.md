@@ -89,6 +89,7 @@ they guarantee about the substrate:
 |---|---|---|
 | Wear leveling | none | yes |
 | Bad-block handling | none | yes |
+| Metadata integrity | none | AES-CMAC over headers and volume table |
 | Torn write during an internal move | n/a — no moves | contained (§2) |
 | `peb_size` vs physical erase block | equal | smaller (per-block headers) |
 | Cost | faster, smaller | slower reads, more flash |

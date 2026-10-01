@@ -87,7 +87,7 @@ bottom-up. Modules marked *skeleton* are build-wired and Kconfig-gated
 
 | Layer | Module | Kconfig | State | Tests |
 |---|---|---|---|---|
-| L0 | UBI volume (wear-leveled) | `BLOB_DB_BACKEND_UBI` | implemented (**default**) | `tests/lib/blob_db` (`.ubi` scenario) + every other L1–L3 suite |
+| L0 | UBI volume (wear-leveled) | `BLOB_DB_BACKEND_UBI` | implemented (**default**) | `tests/lib/blob_db` (`.ubi`, `.ubi.app_key` scenarios) + every other L1–L3 suite |
 | L0 | raw partition (`flash_area`) | `BLOB_DB_BACKEND_FLASH_AREA` | implemented | `tests/lib/blob_db` (3 pinned scenarios) |
 | L1 | `blob_db` | `BLOB_DB` | implemented | `tests/lib/blob_db`, `tests/lib/blob_db_contract` |
 | L1 | large payloads (segmented objects) | `BLOB_DB_LARGE_PAYLOADS` | implemented (opt-in, `default n`) | `tests/lib/blob_db` (`.large_payloads`, with crash injection) |
@@ -138,10 +138,10 @@ west update
 ```
 
 `west update` clones Zephyr (only the modules this repo needs — see the
-`name-allowlist` in [`west.yml`](west.yml)) and the [UBI][ubi] flash
-virtualization layer.
+`name-allowlist` in [`west.yml`](west.yml)), Mbed TLS for PSA Crypto, and the
+[zephyr-ubi][ubi] flash virtualization layer.
 
-[ubi]: https://github.com/kamil-kielbasa/ubi
+[ubi]: https://github.com/kamil-kielbasa/zephyr-ubi
 
 ### Build and run
 
@@ -178,8 +178,7 @@ example-application scaffolding. A debug configuration is available with
 #### Storage backend
 
 `blob_db` stores blobs on a **wear-leveled UBI volume by default**. The builds
-above get it with no extra flags; every in-tree board file already sizes UBI's
-static block pool for its partition. To opt out and store directly on the raw
+above get it with no extra flags. To opt out and store directly on the raw
 partition — faster, but no wear leveling and no bad-block handling:
 
 ```shell
@@ -188,9 +187,17 @@ west build -b native_sim key_value_db/app -- -DCONFIG_BLOB_DB_BACKEND_FLASH_AREA
 
 Two things to know before switching a real device:
 
-- A **new board** using the UBI backend must set
-  `CONFIG_UBI_MAX_NR_OF_DATA_PEBS` to its partition's block count. The default
-  of 14 builds cleanly and then fails to attach at runtime.
+- UBI takes its bookkeeping from the heap, which
+  `CONFIG_HEAP_MEM_POOL_ADD_SIZE_BLOB_DB_UBI` reserves from the partition size
+  assuming 4 KB blocks. A board with larger blocks may lower it.
+- UBI authenticates its metadata with a key from PSA Crypto. The default is a
+  fixed development key that detects damage but not tampering; a product
+  provisions its own (`CONFIG_BLOB_DB_UBI_KEY_APP`, see
+  [`blob_db_ubi.h`](include/app/lib/blob_db_ubi.h)).
+- A UBI build refuses a partition holding anything but a UBI device it can
+  read — a `flash_area` store, or one written by the UBI release used before
+  zephyr-ubi v0.1.0 — with `-ENOTSUP`, and leaves it untouched;
+  `blob_db_format()` discards it.
 - The two layouts are **not interchangeable**, and mount does not reliably
   refuse the wrong one — booting a `flash_area` build on a UBI store currently
   reformats it. Erase the partition deliberately when switching, and set
@@ -293,7 +300,8 @@ Frequently adjusted options (see the module `Kconfig` files for the rest):
 | Option | Meaning |
 |---|---|
 | `CONFIG_BLOB_DB_PARTITION_LABEL` | fixed-partition label to store blobs in (default `storage`) |
-| `CONFIG_UBI_MAX_NR_OF_DATA_PEBS` | UBI's static block pool; must match the partition's block count (UBI backend) |
+| `CONFIG_BLOB_DB_UBI_KEY_APP` | UBI's metadata key comes from the application, not the built-in development key (UBI backend) |
+| `CONFIG_HEAP_MEM_POOL_ADD_SIZE_BLOB_DB_UBI` | heap reserved for UBI's bookkeeping; defaults from the partition size (UBI backend) |
 | `CONFIG_BLOB_DB_AUTOFORMAT_ON_CORRUPT` | reformat when both master blocks are unreadable (default `y`; set `n` in production) |
 | `CONFIG_BLOB_DB_MAX_PAYLOAD_LEN` | largest blob payload; also caps the kvhash bucket directory |
 | `CONFIG_BLOB_DB_SECTOR_BUF_SIZE` | upper bound on supported flash sector size (64 KB for mx25r64) |
@@ -400,11 +408,10 @@ for out-of-tree Zephyr structure.
 
 ## Zephyr version
 
-The manifest tracks Zephyr `main`. The `ubi` module currently points at the
-`feature/leb-partial-update` branch of a fork, because the UBI backend needs the
-in-place partial-update API (`ubi_leb_write_at`) that is still pending upstream;
-[`west.yml`](west.yml) records the condition for flipping it back to a release
-tag.
+The manifest tracks Zephyr `main`. The UBI layer is pinned to the
+[zephyr-ubi][ubi] `v0.1.0` release, which targets Zephyr 4.4; the backend in
+`lib/blob_db/blob_db_store_ubi.c` is written against that release's API and
+on-flash format.
 
 ## License
 

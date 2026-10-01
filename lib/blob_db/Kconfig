@@ -33,27 +33,85 @@ config BLOB_DB_BACKEND_FLASH_AREA
 
 config BLOB_DB_BACKEND_UBI
 	bool "UBI volume"
-	select UBI_ENABLE
+	select UBI
+	select PSA_CRYPTO
 	help
-	  Store on a dynamic UBI volume, gaining wear-leveling and bad-block
-	  handling. blob_db's in-place slot append maps onto ubi_leb_write_at().
+	  Store on a UBI volume (zephyr-ubi), gaining wear-leveling, bad-block
+	  handling and authenticated metadata. blob_db's in-place slot append
+	  maps onto ubi_leb_write_at().
 
 	  The default, on the grounds that a store which survives a torn write
 	  is worth more than a faster one. Measured cost on the nRF5340-DK
-	  (app_perf/RESULTS.md): reads 2.5x slower, updates 1.5x, +23 KB of
-	  flash. UBI's LEB->PEB indirection costs ~112 us per flash
-	  transaction and nothing per byte, so transaction-heavy paths pay
-	  most; the sector-erase cost that dominates writes is unchanged.
+	  (app_perf/RESULTS.md, measured on the previous UBI release): reads
+	  2.5x slower, updates 1.5x, +23 KB of flash. UBI's LEB->PEB
+	  indirection costs per flash transaction and nothing per byte, so
+	  transaction-heavy paths pay most; the sector-erase cost that
+	  dominates writes is unchanged.
 
-	  With the static memory backend (the UBI default) this requires
-	  CONFIG_UBI_MAX_NR_OF_DATA_PEBS >= the partition's data PEB count,
-	  which is (partition_size / erase_block_size) -
-	  CONFIG_UBI_DEV_HDR_NR_OF_RES_PEBS. It defaults to 14, which builds
-	  cleanly and then fails to attach at runtime, so every board that
-	  uses this backend must set it. The pool costs 16 bytes per PEB, so
-	  size it to the geometry rather than to the maximum.
+	  UBI seals its headers with AES-CMAC through PSA Crypto (Mbed TLS
+	  unless the build has TF-M), and takes its bookkeeping from the heap
+	  at attach: see HEAP_MEM_POOL_ADD_SIZE_BLOB_DB_UBI.
 
 endchoice
+
+if BLOB_DB_BACKEND_UBI
+
+choice BLOB_DB_UBI_KEY
+	prompt "Keying material for UBI's metadata MAC"
+	default BLOB_DB_UBI_KEY_BUILTIN
+	help
+	  UBI derives the keys that seal its headers and volume table from a
+	  PSA key handle. Other keying material makes the store unreadable,
+	  so whichever is chosen must stay the same for the life of the
+	  device; switching means erasing the partition.
+
+config BLOB_DB_UBI_KEY_BUILTIN
+	bool "Built-in development key (NOT secret)"
+	help
+	  Import a fixed key compiled into blob_db, the same on every device.
+	  The MAC then detects damage but not tampering — anyone can re-seal
+	  a forged header. Fine for development and for products that only
+	  wanted UBI's wear-leveling; not for a threat model with an attacker
+	  who can write the flash.
+
+config BLOB_DB_UBI_KEY_APP
+	bool "Application-provisioned key"
+	help
+	  The application defines blob_db_ubi_ikm_key()
+	  (<app/lib/blob_db_ubi.h>) and returns a per-device key it
+	  provisioned into its PSA key store. The build fails to link until
+	  it does.
+
+endchoice
+
+config BLOB_DB_UBI_RELOCATE_BUDGET
+	int "Wear-leveling relocations per bucket erase"
+	default 1
+	range 0 16
+	help
+	  UBI moves rarely rewritten data off little-worn blocks only when
+	  asked (UBI_MAINTENANCE_RELOCATE). Each bucket erase asks for up to
+	  this many moves. Most erases find nothing worth moving
+	  (CONFIG_UBI_WEAR_LEVELING_THRESHOLD); one that does pays a block
+	  copy and an extra erase.
+
+	  0 leaves static data where it is, so only the blocks blob_db
+	  rewrites are spread by allocation — what the previous UBI backend
+	  did.
+
+config HEAP_MEM_POOL_ADD_SIZE_BLOB_DB_UBI
+	int "Heap reserved for the UBI device"
+	default $(add,$(div,$(dt_nodelabel_reg_size_int,storage_partition),512),4096)
+	help
+	  zephyr-ubi takes its handle, a scratch buffer and 8 bytes per
+	  erase block from the system heap at attach, and a second handle and
+	  scratch buffer during a format. The default sizes the per-block
+	  part for the storage partition in 4 KB erase blocks (size / 4096 *
+	  8) plus 4 KB, so it covers any NOR geometry; a board with larger
+	  blocks may lower it. Too little makes blob_db_mount() fail with
+	  -ENOMEM at run time, not at build time.
+
+endif # BLOB_DB_BACKEND_UBI
 
 config BLOB_DB_PARTITION_LABEL
 	string "Storage partition label"

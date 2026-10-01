@@ -21,8 +21,11 @@ LOG_MODULE_REGISTER(blob_db_store, CONFIG_BLOB_DB_LOG_LEVEL);
 
 static const struct flash_area *g_fa;
 
-int blob_db_store_open(struct blob_db_store_geom *geom)
+int blob_db_store_open(struct blob_db_store_geom *geom, bool discard)
 {
+	/* No metadata below blob_db's own: nothing to replace. */
+	ARG_UNUSED(discard);
+
 	int rc = flash_area_open(BLOB_DB_PARTITION_ID, &g_fa);
 
 	if (rc < 0) {

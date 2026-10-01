@@ -439,11 +439,13 @@ static int format_masters_fresh(void)
  * the store closed if anything is rejected. Shared by mount and by the
  * format-an-unmountable-store path, which needs exactly the same checks:
  * every buffer and bucket-arithmetic assumption below rests on them, and a
- * format writes through the same primitives a mount does. */
-static int store_open_and_validate(void)
+ * format writes through the same primitives a mount does. discard is passed
+ * to the backend: only the format path may have it replace a substrate it
+ * cannot open (blob_db_store.h). */
+static int store_open_and_validate(bool discard)
 {
 	struct blob_db_store_geom geom;
-	int rc = blob_db_store_open(&geom);
+	int rc = blob_db_store_open(&geom, discard);
 
 	if (rc < 0) {
 		LOG_ERR("store open: %d", rc);
@@ -519,7 +521,7 @@ int blob_db_mount(void)
 	IDX_INVALIDATE();
 	st.wedged = false;   /* recovery below re-establishes a safe state */
 
-	int rc = store_open_and_validate();
+	int rc = store_open_and_validate(false);
 
 	if (rc < 0) {
 		return rc;
@@ -3099,7 +3101,7 @@ int blob_db_format(void)
 	 * Nothing above blob_db can open the substrate on our behalf, so open
 	 * it here, with the same geometry checks a mount applies. */
 	if (!st.mounted) {
-		rc = store_open_and_validate();
+		rc = store_open_and_validate(true);
 		if (rc < 0) {
 			return rc;
 		}

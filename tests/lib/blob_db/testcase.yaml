@@ -37,19 +37,22 @@ tests:
   # than blob_db's masters. Keeping this scenario means the default is
   # exercised by the library's own suite and not only by the apps.
   #
-  # The PEB pool is set here rather than in boards/native_sim.conf so the
-  # flash_area scenarios above do not assign a symbol that does not exist when
-  # UBI_ENABLE is off. 8 MB of 4 KB blocks is 2048 PEBs, less 2 reserved.
-  #
   # LARGE_PAYLOADS is deliberately absent, and cannot simply be added here:
-  # UBI spends 48 B per PEB on its own headers, so the LEB blob_db sees is
-  # 4048 B rather than 4096. The rebind rule caps a payload at
-  # (4048 - 16) / 2 - 14 = 2002 B, while enabling LARGE_PAYLOADS raises
+  # UBI spends 128 B per PEB on its two headers, so the LEB blob_db sees is
+  # 3968 B rather than 4096. The rebind rule caps a payload at
+  # (3968 - 16) / 2 - 14 = 1962 B, while enabling LARGE_PAYLOADS raises
   # MAX_PAYLOAD_LEN to 2016 — mount then refuses with -ENOTSUP, correctly.
   # The pair is only reachable on this geometry by also lowering
-  # MAX_PAYLOAD_LEN to <= 2002. The DK's 64 KB blocks have room to spare and
+  # MAX_PAYLOAD_LEN to <= 1962. The DK's 64 KB blocks have room to spare and
   # are unaffected, which is why app_perf runs both options there.
   lib.blob_db.ubi:
     extra_configs:
       - CONFIG_BLOB_DB_BACKEND_UBI=y
-      - CONFIG_UBI_MAX_NR_OF_DATA_PEBS=2046
+  # The same suite with the key supplied by the application, as a product
+  # would: src/ubi.c defines blob_db_ubi_ikm_key() and overrides the weak
+  # blob_db_ubi_state_check(), which turns on the cases that hand blob_db
+  # a wrong key and a refused rollback check.
+  lib.blob_db.ubi.app_key:
+    extra_configs:
+      - CONFIG_BLOB_DB_BACKEND_UBI=y
+      - CONFIG_BLOB_DB_UBI_KEY_APP=y

@@ -29,10 +29,10 @@
  *
  * That is only meaningful on the flash_area backend, where those offsets are
  * blob_db's. Under CONFIG_BLOB_DB_BACKEND_UBI the store lives inside a UBI
- * volume and the same offsets belong to UBI's reserved PEBs and device header,
- * so "corrupting a master" actually destroys UBI's metadata: the injection
- * proves nothing about blob_db, and every later attach fails with
- * "no active reserved PEBs" (-EIO), taking the rest of the suite with it.
+ * volume and the same offsets belong to UBI's headers and volume table, so
+ * "corrupting a master" actually damages UBI's metadata: the injection proves
+ * nothing about blob_db, and later attaches fail or discard what it hit,
+ * taking the rest of the suite with it.
  *
  * So these cases skip on UBI rather than pretend to pass. The gap is real and
  * deliberate: blob_db's crash-safety is verified on flash_area only, because
