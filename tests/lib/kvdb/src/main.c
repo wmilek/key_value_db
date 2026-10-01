@@ -218,6 +218,139 @@ ZTEST(kvdb, test_unavailable_backend_rejected)
 	zassert_equal(kvdb_open(&db, "tree", &cfg), -ENOTSUP);
 }
 
+/* ---- id-valued entries (kvdb_set_id / kvdb_get_id) ---- */
+
+/* A reference round-trips, and a missing key is still -ENOENT. */
+ZTEST(kvdb, test_id_roundtrip)
+{
+	kvdb_t db = open_hash("refs");
+	uint64_t target = blob_db_alloc_id();
+	uint64_t got = 0;
+
+	zassert_not_equal(target, 0, "alloc_id must not yield 0");
+	zassert_equal(kvdb_get_id(&db, "missing", &got), -ENOENT);
+
+	zassert_ok(kvdb_set_id(&db, "child", target));
+	zassert_ok(kvdb_get_id(&db, "child", &got));
+	zassert_equal(got, target);
+}
+
+/* Nothing new on flash: a reference is exactly the 8 bytes of the id, so the
+ * untyped and typed accessors read each other's writes. */
+ZTEST(kvdb, test_id_is_plain_eight_bytes)
+{
+	kvdb_t db = open_hash("refs");
+	uint64_t target = blob_db_alloc_id();
+	uint64_t raw = 0;
+	size_t len = 0;
+
+	zassert_ok(kvdb_set_id(&db, "child", target));
+	zassert_ok(kvdb_get(&db, "child", &raw, sizeof(raw), &len));
+	zassert_equal(len, MAP_IDREF_VALUE_LEN, "a reference must be 8 bytes");
+	zassert_equal(raw, target);
+
+	/* ...and the same value written untyped reads back as a reference. */
+	uint64_t other = blob_db_alloc_id();
+	uint64_t got = 0;
+
+	zassert_ok(kvdb_set(&db, "hand", &other, sizeof(other)));
+	zassert_ok(kvdb_get_id(&db, "hand", &got));
+	zassert_equal(got, other);
+}
+
+/* Reading a data-valued key as a reference fails instead of inventing an id. */
+ZTEST(kvdb, test_id_rejects_non_reference_value)
+{
+	kvdb_t db = open_hash("refs");
+	uint64_t got = 0xdeadbeef;
+	uint64_t zero = 0;
+
+	/* Too short. */
+	zassert_ok(kvdb_set(&db, "short", "green", 5));
+	zassert_equal(kvdb_get_id(&db, "short", &got), -EINVAL);
+
+	/* Too long — must not leak through as -ENOMEM. */
+	zassert_ok(kvdb_set(&db, "long", "0123456789ab", 12));
+	zassert_equal(kvdb_get_id(&db, "long", &got), -EINVAL);
+
+	/* Empty. */
+	zassert_ok(kvdb_set(&db, "empty", NULL, 0));
+	zassert_equal(kvdb_get_id(&db, "empty", &got), -EINVAL);
+
+	/* Right length, but zero is not a valid id. */
+	zassert_ok(kvdb_set(&db, "zero", &zero, sizeof(zero)));
+	zassert_equal(kvdb_get_id(&db, "zero", &got), -EINVAL);
+
+	zassert_equal(got, 0xdeadbeef, "out_id must be untouched on failure");
+}
+
+/* Bad arguments are rejected, including a zero id on the write side. */
+ZTEST(kvdb, test_id_argument_validation)
+{
+	kvdb_t db = open_hash("refs");
+	uint64_t got = 0;
+
+	zassert_equal(kvdb_set_id(&db, "k", 0), -EINVAL, "0 is never a valid id");
+	zassert_equal(kvdb_set_id(NULL, "k", 42), -EINVAL);
+	zassert_equal(kvdb_set_id(&db, NULL, 42), -EINVAL);
+	zassert_equal(kvdb_get_id(NULL, "k", &got), -EINVAL);
+	zassert_equal(kvdb_get_id(&db, NULL, &got), -EINVAL);
+	zassert_equal(kvdb_get_id(&db, "k", NULL), -EINVAL);
+}
+
+/* Deleting a reference entry removes the entry only — the blob it named is
+ * untouched. This is the deliberate no-ownership rule, not an oversight. */
+ZTEST(kvdb, test_id_delete_does_not_touch_target)
+{
+	kvdb_t db = open_hash("refs");
+	uint64_t target = blob_db_alloc_id();
+
+	zassert_ok(blob_db_update(target, "payload", 7));
+	zassert_ok(kvdb_set_id(&db, "child", target));
+
+	zassert_ok(kvdb_delete(&db, "child"));
+
+	uint64_t got = 0;
+
+	zassert_equal(kvdb_get_id(&db, "child", &got), -ENOENT);
+	zassert_true(blob_db_exists(target), "target blob must survive its entry");
+
+	char out[8];
+	size_t len = 0;
+
+	zassert_ok(blob_db_get(target, out, sizeof(out), &len));
+	zassert_equal(len, 7);
+	zassert_mem_equal(out, "payload", 7);
+}
+
+/* References survive a remount, and still resolve to a live blob. */
+ZTEST(kvdb, test_id_persistence_across_remount)
+{
+	uint64_t target;
+
+	{
+		kvdb_t db = open_hash("refdur");
+
+		target = blob_db_alloc_id();
+		zassert_ok(blob_db_update(target, "v", 1));
+		zassert_ok(kvdb_set_id(&db, "child", target));
+	}
+
+	blob_db_unmount();
+	zassert_ok(blob_db_mount());
+	zassert_ok(rootreg_init());
+
+	kvdb_t db;
+
+	zassert_ok(kvdb_open(&db, "refdur", NULL));
+
+	uint64_t got = 0;
+
+	zassert_ok(kvdb_get_id(&db, "child", &got));
+	zassert_equal(got, target);
+	zassert_true(blob_db_exists(got));
+}
+
 /* Name bounds are enforced. */
 ZTEST(kvdb, test_name_validation)
 {
