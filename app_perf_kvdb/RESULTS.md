@@ -9,6 +9,19 @@ in this file predated PR 2's lookup change and are superseded — the
 reference to app_perf's "16.9 ms per blob_db read" no longer describes
 this library at all; a small-blob read is now 460 µs.
 
+**The two-level `kvhash` is measured on the DK in "On the two-level
+`kvhash`".** `populate` is 2.08× faster and a rerun's `mount+open` 2.89×
+faster, but steady-state reads cost ~1.65× more, so this app's rerun goes
+12.8 s → 19.7 s. It lands the opposite way from `app_cbor_persondb`, and the
+reason is read/write mix.
+
+**`blob_db` now defaults to the UBI backend, and the tables below are
+`flash_area`.** Both are measured — see "On the UBI backend", which is also
+where this app's most interesting result lives: **UBI halves the cost of
+creating the store**, because `flash_area` erases the partition and then
+erases every bucket again, while UBI reuses the blocks its own format just
+erased.
+
 ## Setup
 
 - **Target**: nRF5340-DK (S/N 960115021, PCA10095), cpuapp core
@@ -70,7 +83,144 @@ measured; the gap is the bucket repack plus the second directory read.
 64 KB sector erase at ~1.09 s each, a property of the MX25R64 and not of
 any code in this tree.
 
-## Raw UART capture (first run after FRESH_START, gen 1 -> 2)
+## On the UBI backend (the default)
+
+Same commit, same board, same defaults; only `CONFIG_BLOB_DB_BACKEND_UBI`
+differs, taken from the board conf rather than a command-line override.
+
+### Store creation is halved — the one place UBI wins outright
+
+| phase | `flash_area` | UBI | |
+|---|--:|--:|--:|
+| `mount+open` (incl. format) | 140.0 s | 145.4 s | +4% |
+| `prepare` (116–122 buckets) | **134.5 s** | **0.148 s** | **×909** |
+| **format + prepare total** | **274.5 s** | **145.5 s** | **×1.89 faster** |
+| `populate` | 27.1 ms/op | 29.8 ms/op | ×1.10 slower |
+
+`prepare` costs 1 275 µs/op against 1 102 467. The reason is not that UBI
+made erasing cheap — it is that **`flash_area` erases the same blocks
+twice.** `FRESH_START` erases the whole partition, and then `prepare()`
+erases each of the 122 buckets again, because on the raw partition a bucket
+format means erasing that sector whether or not it was just erased. On UBI
+a bucket format is an LEB operation, and UBI still has the PEBs its own
+format erased moments earlier, so it hands one over without touching flash.
+
+**This is a genuine saving of ~129 s on first population, not an accounting
+artifact** — but it is available only while UBI has pre-erased blocks in
+hand. `app_perf_mc/RESULTS.md` now shows both sides of that from a single
+binary run twice: 1 279 µs/op on a volume UBI has just formatted, and
+1 102 000 µs/op on the very next run, when the pool is spent. UBI moves erase
+cost in time; it does not remove it.
+
+### Steady state is slower, in proportion to read count
+
+| phase | `flash_area` | UBI | Δ |
+|---|--:|--:|--:|
+| `mount+open` (rerun) | 1.26 s | 1.52 s | ×1.21 |
+| `verify` | 2.71 ms | 6.08 ms | ×2.24 |
+| `modify` | 11.1 ms | 16.1 ms | ×1.46 |
+| `reverify` | 2.82 ms | 6.40 ms | ×2.27 |
+| **rerun total** | **≈6.4 s** | **≈12.8 s** | **×2.0** |
+
+Both `VERIFY PASS` results hold on both backends, at the same generations.
+
+The pattern matches `app_perf/RESULTS.md`: UBI's LEB→PEB indirection costs
+~112 µs per flash transaction and nothing per byte, so read-dominated
+phases take the full ~2.25× while `modify`, which is half write, takes
+~1.46×. A `kvdb_get` is two blob_db reads, and both now pay the penalty.
+
+So on the default backend the "one-minute steady-state test" is a
+~13-second test rather than a ~6-second one — still far from the minute the
+`N_KEYS` help text assumes.
+
+## On the two-level `kvhash`
+
+`kvhash` gained a second bucket level (`doc/proposals/2026-08-20-kvhash-second-level.md`).
+This app goes through `kvdb` to reach it, so it is measured here as well.
+Same board, same defaults, same UBI backend; only the container differs. The
+proposal's §13.2 notes nothing had run on the DK — this is that run.
+
+`VERIFY PASS` at every generation, so the change is behaviour-preserving through
+`kvdb`.
+
+| phase | one level (UBI) | **two level** | |
+|---|--:|--:|--:|
+| `mount+open` (first, incl. format) | 145 366 ms | 143 781 ms | ×1.01 faster |
+| `prepare` | 1 275 µs/op (116 buckets) | 1 310 µs/op (100 buckets) | ×1.03 slower |
+| **`populate`** | **29 770 µs/op** | **14 340 µs/op** | **×2.08 faster** |
+| `verify` (first) | 5 531 µs/op | 9 088 µs/op | ×1.64 slower |
+| `modify` (first) | 15 352 µs/op | 15 331 µs/op | ×1.00 |
+| `reverify` (first) | 6 045 µs/op | 9 846 µs/op | ×1.63 slower |
+| **`mount+open`** (rerun) | **1 518 ms** | **526 ms** | **×2.89 faster** |
+| `verify` (rerun) | 6 083 µs/op | 9 923 µs/op | ×1.63 slower |
+| `modify` (rerun) | 16 122 µs/op | 16 423 µs/op | ×1.02 slower |
+| `reverify` (rerun) | 6 401 µs/op | 10 793 µs/op | ×1.69 slower |
+| **rerun total** | **≈12.8 s** | **≈19.7 s** | **×1.54 slower** |
+
+The shape matches `app_cbor_persondb/RESULTS.md` §5e exactly, which is the
+useful part: two applications, different access patterns, same verdict.
+
+**Writes and boot get faster; steady-state reads get slower.** `populate` halves
+and `mount+open` on a rerun is nearly three times quicker, because both are
+dominated by writing or reading map structure whose largest blob just got much
+smaller. `verify` and `reverify` are pure `kvdb_get` and cost ~1.65× more,
+because a two-level lookup is an extra flash transaction and UBI charges 178 µs
+for one against 0.616 µs per byte (`app_perf/RESULTS.md`).
+
+`modify` is unchanged to within 2 % in both runs, which is the tell: it is a get
+plus an update, so the read regression and the write improvement land on top of
+each other and cancel.
+
+**So the trade is not free here, and unlike persondb this app does not come out
+ahead on the whole run** — its steady-state loop is read-dominated, and 12.8 s
+becomes 19.7 s. persondb's whole run improves 2.31× because it is fill-dominated.
+Which way the change lands depends entirely on the read/write mix, and these two
+apps bracket it.
+
+Note `prepare` formats **100** buckets against 116: the two-level container's
+structure occupies more of the volume up front.
+
+## Raw UART capture — UBI, first run (`FRESH_START`, gen 1 -> 2)
+
+UBI's volume-probe lines are elided; it logs them at `<err>` level.
+
+```
+*** Booting Zephyr OS build 4a405846193f ***
+kvdb perf 1.0.0  (N_KEYS=768  VAL_LEN=16  STRIDE=4  val=24 B)
+FRESH_START: formatting store
+[00:02:25.567,413] <inf> rootreg: virgin store — registry bootstrapped at id 1
+mount+open   :         145366 ms
+state: empty store -> initial population
+bench prepare  :  116 ops in    148 ms  ->   783.783 ops/s  (   1275 us/op)
+bench populate :  770 ops in  22923 ms  ->    33.590 ops/s  (  29770 us/op)
+bench verify   :  769 ops in   4254 ms  ->   180.771 ops/s  (   5531 us/op)
+VERIFY PASS (gen 1)
+bench modify   :  196 ops in   3009 ms  ->    65.137 ops/s  (  15352 us/op)
+bench reverify :  769 ops in   4649 ms  ->   165.411 ops/s  (   6045 us/op)
+VERIFY PASS (gen 2)
+done — store at gen 2; rerun to verify persistence
+```
+
+Note `prepare` formats **116** buckets against 122 on `flash_area`: UBI
+reserves 2 PEBs for its headers, so the volume is smaller and fewer buckets
+fit.
+
+## Raw UART capture — UBI, rerun (gen 2 -> 3)
+
+```
+*** Booting Zephyr OS build 4a405846193f ***
+kvdb perf 1.0.0  (N_KEYS=768  VAL_LEN=16  STRIDE=4  val=24 B)
+mount+open   :           1518 ms
+state: rerun, store at gen 2
+bench verify   :  769 ops in   4678 ms  ->   164.386 ops/s  (   6083 us/op)
+VERIFY PASS (gen 2)
+bench modify   :  196 ops in   3160 ms  ->    62.025 ops/s  (  16122 us/op)
+bench reverify :  769 ops in   4923 ms  ->   156.205 ops/s  (   6401 us/op)
+VERIFY PASS (gen 3)
+done — store at gen 3; rerun to verify persistence
+```
+
+## Raw UART capture — `flash_area`, first run (gen 1 -> 2)
 
 ```
 *** Booting Zephyr OS build 4a405846193f ***
@@ -89,7 +239,7 @@ VERIFY PASS (gen 2)
 done — store at gen 2; rerun to verify persistence
 ```
 
-## Raw UART capture (rerun, gen 2 -> 3)
+## Raw UART capture — `flash_area`, rerun (gen 2 -> 3)
 
 ```
 *** Booting Zephyr OS build 4a405846193f ***
@@ -109,6 +259,39 @@ slightly faster than the rerun's (2.71 / 11.1 / 2.82 ms) because that
 store was populated moments earlier in bucket order; the rerun reads it
 back cold from a fresh mount.
 
+## Raw UART capture — two-level `kvhash`, first run (gen 1 -> 2)
+
+```
+*** Booting Zephyr OS build 4a405846193f ***
+kvdb perf 1.0.0  (N_KEYS=768  VAL_LEN=16  STRIDE=4  val=24 B)
+[00:02:23.903,320] <inf> rootreg: virgin store — registry bootstrapped at id 1
+mount+open   :         143781 ms
+state: empty store -> initial population
+bench prepare  :  100 ops in    131 ms  ->   763.358 ops/s  (   1310 us/op)
+bench populate :  770 ops in  11042 ms  ->    69.733 ops/s  (  14340 us/op)
+bench verify   :  769 ops in   6989 ms  ->   110.030 ops/s  (   9088 us/op)
+VERIFY PASS (gen 1)
+bench modify   :  196 ops in   3005 ms  ->    65.224 ops/s  (  15331 us/op)
+bench reverify :  769 ops in   7572 ms  ->   101.558 ops/s  (   9846 us/op)
+VERIFY PASS (gen 2)
+done — store at gen 2; rerun to verify persistence
+```
+
+## Raw UART capture — two-level `kvhash`, rerun (gen 2 -> 3)
+
+```
+*** Booting Zephyr OS build 4a405846193f ***
+kvdb perf 1.0.0  (N_KEYS=768  VAL_LEN=16  STRIDE=4  val=24 B)
+mount+open   :            526 ms
+state: rerun, store at gen 2
+bench verify   :  769 ops in   7631 ms  ->   100.773 ops/s  (   9923 us/op)
+VERIFY PASS (gen 2)
+bench modify   :  196 ops in   3219 ms  ->    60.888 ops/s  (  16423 us/op)
+bench reverify :  769 ops in   8300 ms  ->    92.650 ops/s  (  10793 us/op)
+VERIFY PASS (gen 3)
+done — store at gen 3; rerun to verify persistence
+```
+
 ## Reproducing
 
 ```bash
@@ -116,7 +299,13 @@ west build -p always -b nrf5340dk/nrf5340/cpuapp -d build/kvdb app_perf_kvdb
 # add -- -DCONFIG_APP_PERF_KVDB_FRESH_START=y for the store-creation run
 ```
 
-The store must be one this build can mount. `app_perf` enables
+That build uses the default UBI backend, with the PEB pool sized in
+`boards/nrf5340dk_nrf5340_cpuapp.conf`. For the `flash_area` column add
+`-DCONFIG_BLOB_DB_BACKEND_FLASH_AREA=y`, and **erase the partition raw when
+switching between backends** — the two layouts are not interchangeable, and
+UBI only formats a partition it finds erased.
+
+The store must also be one this build can mount. `app_perf` enables
 `CONFIG_BLOB_DB_LARGE_PAYLOADS=y`, which bumps the on-flash format major
 to 2, and this app does not — so after running `app_perf` on the same
 board, mount fails `-ENOTSUP` (a foreign store) *before* `FRESH_START`

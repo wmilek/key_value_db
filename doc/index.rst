@@ -38,6 +38,8 @@ instructions live in the repository ``README.md``.
    :caption: Design — implementation
 
    impl/l1_bucketlog
+   impl/l0_backends
+   impl/l2_kvhash
 
 .. toctree::
    :maxdepth: 1
@@ -50,6 +52,7 @@ instructions live in the repository ``README.md``.
    proposals/2026-08-09-implementation-plan
    proposals/2026-08-16-persondb-case-performance
    proposals/2026-08-16-blob-db-on-ubi
+   proposals/2026-08-20-kvhash-second-level
 
 .. toctree::
    :maxdepth: 1

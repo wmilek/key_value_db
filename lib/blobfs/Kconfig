@@ -5,6 +5,60 @@ config BLOBDB_BLOBFS
 	bool "blobfs (L3)"
 	depends on BLOB_DB
 	select BLOB_ROOTREG
+	select BLOB_CONTAINER_KVHASH
 	help
-	  blobfs — path/file interface: Map directories + Sequence file bodies.
-	  NOT YET IMPLEMENTED — skeleton only.
+	  blobfs — file interface over a Map container: the directory maps a
+	  name to a dirent, and each file body is its own blob (its payload
+	  length is the file size). v1 is a flat namespace — no directories and
+	  no iteration, which waits on an iterate op in the Map shape — and a
+	  file body is one blob payload, so CONFIG_BLOB_DB_MAX_PAYLOAD_LEN caps
+	  file size. See doc/layers/l3_interfaces.md.
+
+if BLOBDB_BLOBFS
+
+config BLOBFS_MAX_NAME_LEN
+	int "Max file name length in bytes"
+	default 12
+	range 1 255
+	help
+	  Longest file name blobfs accepts, excluding the NUL. The default
+	  matches the VFS name field Zephyr uses when no in-tree file system is
+	  enabled; raising it past that requires raising
+	  CONFIG_FILE_SYSTEM_MAX_FILE_NAME too, which the interop shim asserts
+	  at build time.
+
+config BLOBFS_FS_INTEROP
+	bool "Register blobfs as a Zephyr filesystem"
+	depends on FILE_SYSTEM
+	help
+	  Build the struct fs_file_system_t glue and register it at boot, so
+	  blobfs is reachable through the ordinary fs_open()/fs_read()/... API
+	  and through everything layered on it (the file system shell, MCUmgr's
+	  fs_mgmt group, ...). Mount it with .type = BLOBFS_FS_TYPE — see
+	  include/app/lib/blobfs_fs.h.
+
+if BLOBFS_FS_INTEROP
+
+config BLOBFS_FS_TYPE_OFFSET
+	int "Filesystem type offset within the VFS external range"
+	default 0
+	help
+	  Offset added to FS_TYPE_EXTERNAL_BASE to form BLOBFS_FS_TYPE. Change
+	  it only when the image carries several out-of-tree file systems and
+	  they would otherwise claim the same type id.
+
+config BLOBFS_FS_MAX_OPEN_FILES
+	int "Number of files that may be open at once"
+	default 4
+	range 1 32
+	help
+	  Size of the handle pool the interop shim keeps (a name and a file
+	  position each). fs_open() reports -EMFILE once they are all in use.
+
+endif # BLOBFS_FS_INTEROP
+
+module = BLOBDB_BLOBFS
+module-str = BLOBDB_BLOBFS
+source "subsys/logging/Kconfig.template.log_config"
+
+endif # BLOBDB_BLOBFS

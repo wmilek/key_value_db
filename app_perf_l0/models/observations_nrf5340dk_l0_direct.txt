@@ -1,0 +1,96 @@
+*** Booting Zephyr OS build 4a405846193f ***
+l0 perf 1.0.0 — raw flash_area timing
+l0geom part_bytes=8388608 block_bytes=65536 blocks=128 write_align=4 erased_val=0xff region_blocks=32 max_xfer=65536 cycles_per_s=32768 source=hardware timing=real board=nrf5340dk/nrf5340/cpuapp
+partition 8388608 B, 128 blocks of 65536 B, write align 4, erased 0xff
+working region: first 32 block(s) = 2097152 B  (THIS ERASES THEM)
+
+-- erase: cost vs erase size --
+l0raw op=erase blocks=1 ops=3 total_ns=3333709716 ns_per_op=1111236572 ns_per_block=1111236572 min_ns=1111236572 max_ns=1111236572
+  erase                 1 blk x3           1111.236 ms/call      1111.236 ms/block
+l0raw op=erase blocks=2 ops=3 total_ns=6606536865 ns_per_op=2202178955 ns_per_block=1101089477 min_ns=2202178955 max_ns=2202178955
+  erase                 2 blk x3           2202.178 ms/call      1101.089 ms/block
+l0raw op=erase blocks=4 ops=3 total_ns=12950164794 ns_per_op=4316721598 ns_per_block=1079180399 min_ns=4313354492 max_ns=4323455810
+  erase                 4 blk x3           4316.721 ms/call      1079.180 ms/block
+l0raw op=erase blocks=8 ops=3 total_ns=25657623290 ns_per_op=8552541096 ns_per_block=1069067637 min_ns=8394287109 max_ns=8646820068
+  erase                 8 blk x3           8552.541 ms/call      1069.067 ms/block
+l0raw op=erase blocks=16 ops=3 total_ns=50739196775 ns_per_op=16913065591 ns_per_block=1057066599 min_ns=15434906005 max_ns=17677398681
+  erase                16 blk x3          16913.065 ms/call      1057.066 ms/block
+l0raw op=erase blocks=32 ops=3 total_ns=101680145262 ns_per_op=33893381754 ns_per_block=1059168179 min_ns=30768707275 max_ns=35556732177
+  erase                32 blk x3          33893.381 ms/call      1059.168 ms/block
+l0raw op=erase1 blocks=1 ops=32 total_ns=35428253155 ns_per_op=1107132911 ns_per_block=1107132911 min_ns=1050628662 max_ns=1151641845
+  erase1                1 blk x32          1107.132 ms/call  (spread 1050.628..1151.641 ms)
+
+-- read: cost vs transfer size --
+l0raw op=read size=4 ops=546 total_ns=33630371 ns_per_op=61594
+  read                  4 B  x546           61.594 us/op        62 KB/s
+l0raw op=read size=8 ops=819 total_ns=51574707 ns_per_op=62972
+  read                  8 B  x819           62.972 us/op       124 KB/s
+l0raw op=read size=16 ops=546 total_ns=38848876 ns_per_op=71151
+  read                 16 B  x546           71.151 us/op       218 KB/s
+l0raw op=read size=32 ops=546 total_ns=41442871 ns_per_op=75902
+  read                 32 B  x546           75.902 us/op       411 KB/s
+l0raw op=read size=64 ops=819 total_ns=68756103 ns_per_op=83951
+  read                 64 B  x819           83.951 us/op       744 KB/s
+l0raw op=read size=128 ops=409 total_ns=45654296 ns_per_op=111624
+  read                128 B  x409          111.624 us/op      1119 KB/s
+l0raw op=read size=256 ops=409 total_ns=58929443 ns_per_op=144081
+  read                256 B  x409          144.081 us/op      1734 KB/s
+l0raw op=read size=512 ops=234 total_ns=47485351 ns_per_op=202928
+  read                512 B  x234          202.928 us/op      2463 KB/s
+l0raw op=read size=1024 ops=163 total_ns=53802490 ns_per_op=330076
+  read               1024 B  x163          330.076 us/op      3029 KB/s
+l0raw op=read size=2048 ops=86 total_ns=50689697 ns_per_op=589415
+  read               2048 B  x86           589.415 us/op      3392 KB/s
+l0raw op=read size=4096 ops=45 total_ns=49865722 ns_per_op=1108127
+  read               4096 B  x45          1108.127 us/op      3609 KB/s
+l0raw op=read size=8192 ops=23 total_ns=49346923 ns_per_op=2145518
+  read               8192 B  x23          2145.518 us/op      3728 KB/s
+l0raw op=read size=16384 ops=11 total_ns=46478271 ns_per_op=4225297
+  read              16384 B  x11          4225.297 us/op      3786 KB/s
+l0raw op=read size=32768 ops=5 total_ns=41839599 ns_per_op=8367919
+  read              32768 B  x5           8367.919 us/op      3823 KB/s
+l0raw op=read size=65536 ops=2 total_ns=33355712 ns_per_op=16677856
+  read              65536 B  x2          16677.856 us/op      3836 KB/s
+
+-- write: cost vs transfer size --
+l0raw op=write size=4 ops=234 total_ns=48706054 ns_per_op=208145
+  write                 4 B  x234          208.145 us/op        18 KB/s
+l0raw op=write size=8 ops=182 total_ns=46722412 ns_per_op=256716
+  write                 8 B  x182          256.716 us/op        30 KB/s
+l0raw op=write size=16 ops=136 total_ns=48034667 ns_per_op=353196
+  write                16 B  x136          353.196 us/op        43 KB/s
+l0raw op=write size=32 ops=96 total_ns=50567626 ns_per_op=526746
+  write                32 B  x96           526.746 us/op        58 KB/s
+l0raw op=write size=64 ops=54 total_ns=49346923 ns_per_op=913831
+  write                64 B  x54           913.831 us/op        68 KB/s
+l0raw op=write size=128 ops=29 total_ns=49072265 ns_per_op=1692147
+  write               128 B  x29          1692.147 us/op        73 KB/s
+l0raw op=write size=256 ops=15 total_ns=48767089 ns_per_op=3251139
+  write               256 B  x15          3251.139 us/op        76 KB/s
+l0raw op=write size=512 ops=7 total_ns=44738769 ns_per_op=6391252
+  write               512 B  x7           6391.252 us/op        78 KB/s
+l0raw op=write size=1024 ops=3 total_ns=38024902 ns_per_op=12674967
+  write              1024 B  x3          12674.967 us/op        78 KB/s
+l0raw op=write size=2048 ops=1 total_ns=25238037 ns_per_op=25238037
+  write              2048 B  x1          25238.037 us/op        79 KB/s
+l0raw op=write size=4096 ops=1 total_ns=50354003 ns_per_op=50354003
+  write              4096 B  x1          50354.003 us/op        79 KB/s
+l0raw op=write size=8192 ops=1 total_ns=100585937 ns_per_op=100585937
+  write              8192 B  x1         100585.937 us/op        79 KB/s
+l0raw op=write size=16384 ops=1 total_ns=200988769 ns_per_op=200988769
+  write             16384 B  x1         200988.769 us/op        79 KB/s
+l0raw op=write size=32768 ops=1 total_ns=401885986 ns_per_op=401885986
+  write             32768 B  x1         401885.986 us/op        79 KB/s
+l0raw op=write size=65536 ops=1 total_ns=803588867 ns_per_op=803588867
+  write             65536 B  x1         803588.867 us/op        79 KB/s
+
+-- write: page-straddle penalty --
+l0raw op=write_unaligned size=256 ops=64 total_ns=209991455 ns_per_op=3281116
+  write_unalign       256 B  x64          3281.116 us/op        76 KB/s
+l0raw op=write_unaligned size=512 ops=64 total_ns=410919189 ns_per_op=6420612
+  write_unalign       512 B  x64          6420.612 us/op        77 KB/s
+l0raw op=write_unaligned size=4096 ops=64 total_ns=3223236083 ns_per_op=50363063
+  write_unalign      4096 B  x64         50363.063 us/op        79 KB/s
+l0end status=0
+
+done. Feed this capture to tools/l0_timing.py fit.

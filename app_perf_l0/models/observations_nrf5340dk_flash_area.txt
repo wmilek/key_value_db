@@ -1,0 +1,150 @@
+# Observations for `l0_timing.py derive` — nRF5340-DK, MX25R6435F, flash_area
+#
+# NOT a benchmark output. These are the three raw UART captures from
+# app_perf/RESULTS.md that were taken on the flash_area backend, copied here
+# verbatim so a derived model has a checked-in, quotable input. Provenance and
+# board details are in that file; the setup is
+#
+#   nRF5340-DK (PCA10095) cpuapp, storage_partition on the on-board
+#   MX25R6435F QSPI NOR: 8 MB, 64 KB erase blocks, 8 MHz Quad-SPI,
+#   flash_area_align() = 4. Zephyr build 4a405846193f.
+#
+# The UBI capture in RESULTS.md is deliberately NOT here: UBI issues flash
+# operations of its own beneath the seam where CONFIG_BLOB_DB_IOSTATS counts,
+# so its wall-clock includes traffic its counters do not report, and every
+# such observation would push the fitted per-operation costs upward.
+#
+# The `255ce7a` capture is not here either: that commit predates the I/O
+# counters, so its phases have wall-clock and nothing to attribute it to.
+#
+# Regenerate this file if RESULTS.md gains a new flash_area capture:
+#   sed -n '473,600p' app_perf/RESULTS.md >> this file
+## Raw UART capture — `e80f404` (run 3, main)
+
+```
+*** Booting Zephyr OS build 4a405846193f ***
+blob_db perf 1.0.0  (N_OPS=100  VAL_LEN=24  node=32 B)
+bench prepare :  100 ops in  109650 ms  ->    0.911 ops/s  (  1096500 us/op)
+bench prepend :  100 ops in    2123 ms  ->   47.103 ops/s  (    21230 us/op)
+bench read   :  100 ops in      46 ms  -> 2173.913 ops/s  (      460 us/op)
+   io read      : rd    605 ops/    8650 B   wr     0 ops/       0 B   er    0   ampl rd 2.70x wr 0.00x
+bench update :  100 ops in     251 ms  ->  398.406 ops/s  (     2510 us/op)
+   io update    : rd   1000 ops/   14800 B   wr   100 ops/    4800 B   er    0   ampl rd 4.62x wr 1.50x
+prepend checksum: 0xee3fa466
+bench prepare :  100 ops in  110064 ms  ->    0.908 ops/s  (  1100640 us/op)
+bench append :  100 ops in    1552 ms  ->   64.432 ops/s  (    15520 us/op)
+bench read   :  100 ops in      46 ms  -> 2173.913 ops/s  (      460 us/op)
+   io read      : rd    605 ops/    8650 B   wr     0 ops/       0 B   er    0   ampl rd 2.70x wr 0.00x
+bench update :  100 ops in     265 ms  ->  377.358 ops/s  (     2650 us/op)
+   io update    : rd   1198 ops/   17176 B   wr   100 ops/    4800 B   er    0   ampl rd 5.36x wr 1.50x
+append checksum:  0x50f65666
+
+-- large objects (OBJ_LEN=65536  N_LARGE=4  N_PART=32  PART_LEN=64) --
+bench lg write  :    4 ops in  154408 ms  ->      1 KB/s  ( 38602000 us/op)
+   io lg write  : rd    168 ops/    2576 B   wr   269 ops/  269584 B   er  133   ampl rd 0.00x wr 1.02x
+bench lg rewrite:    4 ops in   17918 ms  ->     14 KB/s  (  4479500 us/op)
+   io lg rewrite: rd   1048 ops/   15744 B   wr   277 ops/  269712 B   er    9   ampl rd 0.06x wr 1.02x
+bench lg read   : 4096 ops in    7458 ms  ->     34 KB/s  (     1820 us/op)
+   io lg read   : rd  30755 ops/ 8742276 B   wr     0 ops/       0 B   er    0   ampl rd 33.34x wr 0.00x
+lg read checksum: 0xca1e0000
+bench lg pread q0:   32 ops in     102 ms  ->     19 KB/s  (     3187 us/op)
+   io lg pread q0: rd    710 ops/   89224 B   wr     0 ops/       0 B   er    0   ampl rd 43.56x wr 0.00x
+bench lg pread q1:   32 ops in     104 ms  ->     19 KB/s  (     3250 us/op)
+   io lg pread q1: rd    714 ops/   91270 B   wr     0 ops/       0 B   er    0   ampl rd 44.56x wr 0.00x
+bench lg pread q2:   32 ops in     116 ms  ->     17 KB/s  (     3625 us/op)
+   io lg pread q2: rd    727 ops/   91426 B   wr     0 ops/       0 B   er    0   ampl rd 44.64x wr 0.00x
+bench lg pread q3:   32 ops in     105 ms  ->     19 KB/s  (     3281 us/op)
+   io lg pread q3: rd    727 ops/   91040 B   wr     0 ops/       0 B   er    0   ampl rd 44.45x wr 0.00x
+bench lg pwrite :   32 ops in   72708 ms  ->      0 KB/s  (  2272125 us/op)
+   io lg pwrite : rd   1651 ops/   99708 B   wr   160 ops/   77912 B   er   64   ampl rd 48.68x wr 38.04x
+partial vs whole-object write: 2272125 us vs 4479500 us/op  (1.97x)
+lg objects intact (65536 B each)
+```
+
+## Raw UART capture — `12df53b` (run 2, with the index cache)
+
+```
+*** Booting Zephyr OS build 4a405846193f ***
+blob_db perf 1.0.0  (N_OPS=100  VAL_LEN=24  node=32 B)
+bench prepare :  100 ops in  107166 ms  ->    0.933 ops/s  (  1071660 us/op)
+bench prepend :  100 ops in    2107 ms  ->   47.460 ops/s  (    21070 us/op)
+bench read   :  100 ops in      47 ms  -> 2127.659 ops/s  (      470 us/op)
+   io read      : rd    605 ops/    8650 B   wr     0 ops/       0 B   er    0   ampl rd 2.70x wr 0.00x
+bench update :  100 ops in     236 ms  ->  423.728 ops/s  (     2360 us/op)
+   io update    : rd    800 ops/   11400 B   wr   100 ops/    4800 B   er    0   ampl rd 3.56x wr 1.50x
+prepend checksum: 0xee3fa466
+bench prepare :  100 ops in  109722 ms  ->    0.911 ops/s  (  1097220 us/op)
+bench append :  100 ops in    1537 ms  ->   65.061 ops/s  (    15370 us/op)
+bench read   :  100 ops in      47 ms  -> 2127.659 ops/s  (      470 us/op)
+   io read      : rd    605 ops/    8650 B   wr     0 ops/       0 B   er    0   ampl rd 2.70x wr 0.00x
+bench update :  100 ops in     249 ms  ->  401.606 ops/s  (     2490 us/op)
+   io update    : rd    998 ops/   13776 B   wr   100 ops/    4800 B   er    0   ampl rd 4.30x wr 1.50x
+append checksum:  0x50f65666
+
+-- large objects (OBJ_LEN=65536  N_LARGE=4  N_PART=32  PART_LEN=64) --
+bench lg write  :    4 ops in  154060 ms  ->      1 KB/s  ( 38515000 us/op)
+   io lg write  : rd    168 ops/    2576 B   wr   269 ops/  269584 B   er  133   ampl rd 0.00x wr 1.02x
+bench lg rewrite:    4 ops in   18145 ms  ->     14 KB/s  (  4536250 us/op)
+   io lg rewrite: rd   1040 ops/   14616 B   wr   277 ops/  269712 B   er    9   ampl rd 0.05x wr 1.02x
+bench lg read   : 4096 ops in    7501 ms  ->     34 KB/s  (     1831 us/op)
+   io lg read   : rd  30755 ops/ 8742276 B   wr     0 ops/       0 B   er    0   ampl rd 33.34x wr 0.00x
+lg read checksum: 0xca1e0000
+bench lg pread q0:   32 ops in     103 ms  ->     19 KB/s  (     3218 us/op)
+   io lg pread q0: rd    710 ops/   89224 B   wr     0 ops/       0 B   er    0   ampl rd 43.56x wr 0.00x
+bench lg pread q1:   32 ops in     105 ms  ->     19 KB/s  (     3281 us/op)
+   io lg pread q1: rd    714 ops/   91270 B   wr     0 ops/       0 B   er    0   ampl rd 44.56x wr 0.00x
+bench lg pread q2:   32 ops in     117 ms  ->     17 KB/s  (     3656 us/op)
+   io lg pread q2: rd    727 ops/   91426 B   wr     0 ops/       0 B   er    0   ampl rd 44.64x wr 0.00x
+bench lg pread q3:   32 ops in     105 ms  ->     19 KB/s  (     3281 us/op)
+   io lg pread q3: rd    727 ops/   91040 B   wr     0 ops/       0 B   er    0   ampl rd 44.45x wr 0.00x
+bench lg pwrite :   32 ops in   74050 ms  ->      0 KB/s  (  2314062 us/op)
+   io lg pwrite : rd   1651 ops/   99708 B   wr   160 ops/   77912 B   er   64   ampl rd 48.68x wr 38.04x
+partial vs whole-object write: 2314062 us vs 4536250 us/op  (1.96x)
+lg objects intact (65536 B each)
+```
+
+## Raw UART capture — `8428e35`
+
+Warnings from the leftover foreign store on the partition are elided;
+see "Downgrading" below.
+
+```
+*** Booting Zephyr OS build 4a405846193f ***
+blob_db perf 1.0.0  (N_OPS=100  VAL_LEN=24  node=32 B)
+bench prepare :  100 ops in  101862 ms  ->    0.981 ops/s  (  1018620 us/op)
+bench prepend :  100 ops in    2120 ms  ->   47.169 ops/s  (    21200 us/op)
+bench read   :  100 ops in      46 ms  -> 2173.913 ops/s  (      460 us/op)
+   io read      : rd    605 ops/    8650 B   wr     0 ops/       0 B   er    0   ampl rd 2.70x wr 0.00x
+bench update :  100 ops in     235 ms  ->  425.531 ops/s  (     2350 us/op)
+   io update    : rd    800 ops/   11400 B   wr   100 ops/    4800 B   er    0   ampl rd 3.56x wr 1.50x
+prepend checksum: 0xee3fa466
+bench prepare :  100 ops in  110247 ms  ->    0.907 ops/s  (  1102470 us/op)
+bench append :  100 ops in    1547 ms  ->   64.641 ops/s  (    15470 us/op)
+bench read   :  100 ops in      46 ms  -> 2173.913 ops/s  (      460 us/op)
+   io read      : rd    605 ops/    8650 B   wr     0 ops/       0 B   er    0   ampl rd 2.70x wr 0.00x
+bench update :  100 ops in     248 ms  ->  403.225 ops/s  (     2480 us/op)
+   io update    : rd    998 ops/   13776 B   wr   100 ops/    4800 B   er    0   ampl rd 4.30x wr 1.50x
+append checksum:  0x50f65666
+
+-- large objects (OBJ_LEN=65536  N_LARGE=4  N_PART=32  PART_LEN=64) --
+bench lg write  :    4 ops in  153981 ms  ->      1 KB/s  ( 38495250 us/op)
+   io lg write  : rd    168 ops/    2576 B   wr   269 ops/  269584 B   er  133   ampl rd 0.00x wr 1.02x
+bench lg rewrite:    4 ops in   18249 ms  ->     14 KB/s  (  4562250 us/op)
+   io lg rewrite: rd   1040 ops/   14616 B   wr   277 ops/  269712 B   er    9   ampl rd 0.05x wr 1.02x
+bench lg read   : 4096 ops in   13331 ms  ->     19 KB/s  (     3254 us/op)
+   io lg read   : rd  92135 ops/11623044 B   wr     0 ops/       0 B   er    0   ampl rd 44.33x wr 0.00x
+lg read checksum: 0xca1e0000
+bench lg pread q0:   32 ops in     102 ms  ->     19 KB/s  (     3187 us/op)
+   io lg pread q0: rd    710 ops/   89224 B   wr     0 ops/       0 B   er    0   ampl rd 43.56x wr 0.00x
+bench lg pread q1:   32 ops in     104 ms  ->     19 KB/s  (     3250 us/op)
+   io lg pread q1: rd    714 ops/   91270 B   wr     0 ops/       0 B   er    0   ampl rd 44.56x wr 0.00x
+bench lg pread q2:   32 ops in     116 ms  ->     17 KB/s  (     3625 us/op)
+   io lg pread q2: rd    727 ops/   91426 B   wr     0 ops/       0 B   er    0   ampl rd 44.64x wr 0.00x
+bench lg pread q3:   32 ops in     105 ms  ->     19 KB/s  (     3281 us/op)
+   io lg pread q3: rd    727 ops/   91040 B   wr     0 ops/       0 B   er    0   ampl rd 44.45x wr 0.00x
+bench lg pwrite :   32 ops in   74761 ms  ->      0 KB/s  (  2336281 us/op)
+   io lg pwrite : rd   1651 ops/   99708 B   wr   160 ops/   77912 B   er   64   ampl rd 48.68x wr 38.04x
+partial vs whole-object write: 2336281 us vs 4562250 us/op  (1x)
+lg objects intact (65536 B each)
+```
+

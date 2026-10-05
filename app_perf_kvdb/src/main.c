@@ -429,7 +429,7 @@ int main(void)
 
 	if (rc != 0) {
 		LOG_ERR("mount: %d", rc);
-		return 0;
+		goto out;
 	}
 
 	if (IS_ENABLED(CONFIG_APP_PERF_KVDB_FRESH_START)) {
@@ -449,7 +449,12 @@ int main(void)
 
 	struct kvdb_config cfg = {
 		.backend = KVDB_BACKEND_HASH,
-		.initial_capacity = N_KEYS / 2,
+		/* Declare the population, not a bucket count. This used to say
+		 * N_KEYS / 2, meaning "about two entries per bucket" — which the
+		 * container read as a bucket count and then silently clamped to
+		 * 127 (FINDINGS.md K9). */
+		.expected_entries = N_KEYS,
+		.typical_entry_bytes = VAL_LEN + sizeof("k0000"),
 	};
 	kvdb_t db;
 
@@ -573,8 +578,6 @@ int main(void)
 out:
 	blob_db_unmount();
 #ifdef CONFIG_ARCH_POSIX
-	/* On native_sim, terminate the process so shell reruns are one-liners;
-	 * exit code reflects the verify outcome. */
 	posix_exit(rc == 0 ? 0 : 1);
 #endif
 	return 0;

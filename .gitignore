@@ -10,9 +10,10 @@
 /build*
 /twister-out*
 
-# native_sim flash-simulator backing file (default name when running
-# zephyr.exe without --flash=<path>)
-flash.bin
+# native_sim flash-simulator backing files. Every binary defaults to
+# ./flash.bin; the docs ask for a per-app name because a store written in
+# one app's flash geometry is unreadable by another.
+*.bin
 
 __pycache__/
 

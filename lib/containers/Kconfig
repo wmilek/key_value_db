@@ -27,9 +27,11 @@ config BLOB_CONTAINER_KVLIST
 config BLOB_CONTAINER_KVHASH
 	bool "kvhash — O(1) map container"
 	help
-	  Map shape (map_ops) backed by a fixed directory of hash buckets, each
-	  bucket a packed pair-list blob. Lookups are O(load factor). The bucket
-	  count is fixed at create time from map_config.initial_capacity.
+	  Map shape (map_ops) backed by a directory of hash buckets, each bucket
+	  a packed pair-list blob. Lookups are O(load factor). The geometry —
+	  one level, or a directory of sub-directories when one cannot address
+	  enough buckets — is derived at create time from the population the
+	  caller declares in map_config, and is fixed thereafter.
 
 if BLOB_CONTAINER_KVHASH
 module = BLOB_CONTAINER_KVHASH

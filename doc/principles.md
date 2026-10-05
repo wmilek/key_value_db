@@ -8,9 +8,10 @@ When two principles conflict, the earlier-numbered one wins.
 Use Zephyr mechanisms, not parallel inventions: Kconfig + CMake
 (`add_subdirectory_ifdef`) for build, `<zephyr/sys/crc.h>` / logging /
 `BUILD_ASSERT` for utilities, ztest + twister (`native_sim` first) for tests.
-**Storage is never raw flash**: every layer talks to a high-level interface
-(`flash_area` today; a UBI-like provider is just another layer behind the same
-kind of interface).
+**Storage is never raw flash**: every layer talks to a high-level interface.
+`blob_db` addresses blocks through the `blob_db_store` seam, and the provider
+behind it — a UBI volume by default, or `flash_area` over a raw partition — is
+a build-time choice that nothing above L1 can observe.
 
 ## P2 — Embedded
 

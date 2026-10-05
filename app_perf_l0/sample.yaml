@@ -1,0 +1,7 @@
+sample:
+  description: raw flash_area timing benchmark (L0 cost model)
+  name: l0-perf
+common:
+  build_only: true
+tests:
+  perf.l0.default: {}
