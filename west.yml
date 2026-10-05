@@ -10,8 +10,6 @@ manifest:
       url-base: https://github.com/zephyrproject-rtos
     - name: kamil-kielbasa
       url-base: https://github.com/kamil-kielbasa
-    - name: wmilek
-      url-base: https://github.com/wmilek
 
   projects:
     - name: zephyr
@@ -25,13 +23,16 @@ manifest:
           - hal_nordic # required by the custom_plank board (Nordic based)
           - hal_stm32  # required by the nucleo_f302r8 board (STM32 based)
           - zcbor      # CBOR codec used by app_cbor_persondb (CONFIG_ZCBOR)
+          # PSA Crypto provider for zephyr-ubi, which seals its metadata with
+          # AES-CMAC under HKDF-SHA256-derived keys (CONFIG_PSA_CRYPTO).
+          - mbedtls
+          - tf-psa-crypto
     # UBI flash-virtualization layer — provides the wear-leveled volume
-    # substrate that the key-value store builds on. The UBI backend needs the
-    # in-place partial-update API (ubi_leb_write_at) and the "compile only when
-    # enabled" build guard, which live on this branch pending the upstream PR
-    # (kamil-kielbasa/ubi). Flip back to a kamil-kielbasa release tag once it
-    # lands.
-    - name: ubi
-      remote: wmilek
-      revision: feature/leb-partial-update
-      path: ubi
+    # substrate that the key-value store builds on (CONFIG_BLOB_DB_BACKEND_UBI).
+    # Pinned to a release tag: the on-flash format and the API are versioned
+    # by it, and the backend in lib/blob_db/blob_db_store_ubi.c is written
+    # against exactly this one.
+    - name: zephyr-ubi
+      remote: kamil-kielbasa
+      revision: v0.1.0
+      path: modules/lib/zephyr-ubi

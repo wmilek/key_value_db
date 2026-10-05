@@ -26,6 +26,7 @@
 #ifndef LIB_BLOB_DB_STORE_H_
 #define LIB_BLOB_DB_STORE_H_
 
+#include <stdbool.h>
 #include <stddef.h>
 #include <sys/types.h>
 
@@ -39,8 +40,14 @@ struct blob_db_store_geom {
 /*
  * Open the backing store and report its geometry. On success the store is
  * ready for read/write/erase. Returns 0 or a negative errno.
+ *
+ * discard is true when the caller is about to erase the whole store
+ * (blob_db_format()). A backend that keeps metadata of its own may then
+ * replace a substrate it cannot otherwise open — one written by another
+ * backend or another release — instead of refusing it. With discard false it
+ * must refuse such a substrate and leave it untouched.
  */
-int blob_db_store_open(struct blob_db_store_geom *geom);
+int blob_db_store_open(struct blob_db_store_geom *geom, bool discard);
 
 /* Release the backing store. Idempotent. */
 void blob_db_store_close(void);
@@ -57,6 +64,21 @@ int blob_db_store_write(off_t off, const void *buf, size_t len);
  * back as the erased value (0xff).
  */
 int blob_db_store_erase(off_t off, size_t len);
+
+/*
+ * Replace the PEB at off with len bytes from buf: the PEB reads as buf
+ * followed by the erased value, and later writes may append after it. Equal to
+ * blob_db_store_erase(off, peb_size) then blob_db_store_write(off, buf, len),
+ * except that a backend reporting blob_db_store_replace_is_atomic() promises
+ * a power loss leaves either the old contents or the new ones, never a mix
+ * and never an erased PEB. off is PEB-aligned and len fits one PEB.
+ */
+int blob_db_store_replace(off_t off, const void *buf, size_t len);
+
+/* Whether blob_db_store_replace() is atomic across power loss. When it is,
+ * compaction replaces a bucket in one call instead of staging the image
+ * through the scratch sector. */
+bool blob_db_store_replace_is_atomic(void);
 
 /* I/O accounting, counted here so it covers both backends and every caller
  * uniformly (CONFIG_BLOB_DB_IOSTATS; compiles to nothing when disabled). */

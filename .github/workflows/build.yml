@@ -99,13 +99,13 @@ jobs:
 
       - name: Build app — flash_area backend (ARM)
         run: |
-          west build -p always -b nrf5340dk/nrf5340/cpuapp -d build/nrf_flash key_value_db/app
+          west build -p always -b nrf5340dk/nrf5340/cpuapp -d build/nrf_flash key_value_db/app -- \
+            -DCONFIG_BLOB_DB_BACKEND_FLASH_AREA=y
 
       - name: Build app — UBI backend (ARM)
         run: |
           west build -p always -b nrf5340dk/nrf5340/cpuapp -d build/nrf_ubi key_value_db/app -- \
-            -DCONFIG_BLOB_DB_BACKEND_UBI=y \
-            -DCONFIG_UBI_MAX_NR_OF_DATA_PEBS=126
+            -DCONFIG_BLOB_DB_BACKEND_UBI=y
 
       - name: Build app — kvdb L3 (ARM)
         run: |
