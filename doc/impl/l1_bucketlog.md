@@ -118,9 +118,10 @@ Costs achieved by this design (satisfying contract §3):
 | `count` / `iterate` | 2045 (full scan) | 0 | O(1) |
 | `compact_bucket` | 1 + master writes | 1 scratch + 1 bucket restore + 2 master | O(1) |
 
-¹ Mount scans all buckets to recover write cursors and the max id — ~8 MB of
-reads, ≈100–200 ms on typical NOR (full sectors are read because each slot's
-`val_len` is needed to skip to the next slot).
+¹ Mount walks every bucket's slot headers only to recover the highest id ever
+used; no write cursor is kept (§13.2). It reads the 4 B slot header and the
+8 B id of each slot, using `val_len` to step to the next one, so its cost
+grows with the number of slots, not with partition bytes.
 ² Release builds perform no existence check — `update` on a dead id is UB
 (contract §2). A debug build may spend one bucket read to verify and assert
 (§13.5).
@@ -303,7 +304,7 @@ if state == COMPACTING: finish/abort per crash table (§6.1), write CLEAN master
 max_id_seen = next_id_hint
 for bid in [0..N):
     walk slots: max_id_seen = max(max_id_seen, slot.id)   # tombstones count too
-    write_cursor[bid] = end of log
+    # nothing else is kept: write cursors are re-derived per write (§13.2)
 next_id = max_id_seen + 1                                  # but see §13.1
 ```
 
@@ -319,10 +320,12 @@ return id
 
 ```
 bid = id % N
-ensure bucket formatted (header write on first use)
-if write_cursor[bid] + slot_size(len) > sector_end:
-    compact_bucket(bid); if still no room: return -ENOSPC
-build slot in stack buffer; flash_area_write at write cursor
+ensure bucket formatted (header write on first use; cursor = 16)
+else cursor = scan_bucket_for(bid, …).write_cursor        # walk slot headers (§3.4)
+if cursor + slot_size(len) > sector_end:
+    compact_bucket(bid); cursor = scan_bucket_for(…).write_cursor
+    if still no room: return -ENOSPC
+build slot in the staging buffer; one write at cursor
 ```
 
 On rebind the previous slot for the id becomes garbage until compaction.
@@ -600,8 +603,11 @@ draft implementation and will be reworked against the final API; the
    empty payload (rootreg §6), not by re-allocating it.
 2. **Steady-state RAM story.** *(Resolved: re-scan.)* The implementation
    keeps **no** `write_cursor[N]` array; each write re-walks the target
-   bucket (`walk_bucket`) to find the append cursor (+1 read on
-   `update`/`delete`), honoring contract R1 (O(1) steady-state RAM).
+   bucket's slot headers (`scan_bucket_for`) to find the append cursor —
+   one 12 B read per slot plus one probe of the erased tail, the same walk
+   that locates the id's current slot — and walks again after a compaction.
+   This honors contract R1 (O(1) steady-state RAM) and leaves no RAM state
+   that a compaction, remount or crash could make stale.
 3. **Sector-size portability.** *(Resolved.)* The sector buffers are sized by
    `BLOB_DB_SECTOR_BUF_SIZE` and mount refuses a partition whose sector is
    larger. Slot staging moved off the stack into the compaction scratch, so
