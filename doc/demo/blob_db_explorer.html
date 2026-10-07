@@ -334,7 +334,7 @@ const bucketOf = (id) => id % cfg.N;
 const secName = (sec) => sec === 0 ? 'master A' : sec === 1 ? 'master B' : sec === 2 ? 'scratch' : 'bucket ' + (sec - 3);
 
 function derive(c) {
-  const sust = Math.floor((c.S - HDR) / 2) - OVH;
+  const sust = Math.floor(Math.floor((c.S - HDR) / 2) / c.W) * c.W - OVH;
   const segLen = Math.min(Math.floor(c.S / 4), c.P - 12);
   const idxCap = Math.floor((c.P - 16) / 8);
   const segMax = Math.min(idxCap, MAXSEG);

@@ -484,11 +484,18 @@ static int store_open_and_validate(bool discard)
 	 * append-only log, so a rebind needs two slots to coexist before
 	 * compaction can reclaim the first — hence half the data area, not all
 	 * of it. Checked here because peb_size is a runtime property (P2); a
-	 * compile-time range cannot express it. */
+	 * compile-time range cannot express it.
+	 *
+	 * The bound is on slot size, which slot_size_for() rounds up to the
+	 * write alignment, so the half is rounded down to that alignment first:
+	 * on a 4 KB sector a 2026 B payload is a 2040 B slot at W <= 8 but a
+	 * 2048 B one at W = 16, and two of those overflow the 4080 B data area. */
 	{
-		const size_t sustainable =
-			(st.peb_size - BLOB_DB_BUCKET_DATA_OFF) / 2 -
-			BLOB_DB_SLOT_OVERHEAD;
+		const size_t a = st.write_align;
+		const size_t half =
+			((st.peb_size - BLOB_DB_BUCKET_DATA_OFF) / 2) & ~(a - 1);
+		const size_t sustainable = half > BLOB_DB_SLOT_OVERHEAD
+			? half - BLOB_DB_SLOT_OVERHEAD : 0;
 
 		if (CONFIG_BLOB_DB_MAX_PAYLOAD_LEN > sustainable) {
 			LOG_ERR("CONFIG_BLOB_DB_MAX_PAYLOAD_LEN=%u exceeds the "

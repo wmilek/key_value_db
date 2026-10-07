@@ -1,0 +1,15 @@
+common:
+  tags: [storage, blob_db]
+  platform_allow: native_sim
+# Mount refuses a MAX_PAYLOAD_LEN whose slot cannot be rebound, i.e. two
+# slots of it do not fit in one bucket. With 4 KB sectors and a 16 B write
+# unit the largest such payload is 2018 B: (4096 - 16) / 2 = 2040, rounded down
+# to 16 is 2032, minus the 14 B slot overhead. The unaligned formula said 2026,
+# whose slot rounds up to 2048 B, and 2 x 2048 overflows the 4080 B data area.
+tests:
+  lib.blob_db_geometry.refused:
+    extra_configs:
+      - CONFIG_BLOB_DB_MAX_PAYLOAD_LEN=2026
+  lib.blob_db_geometry.at_limit:
+    extra_configs:
+      - CONFIG_BLOB_DB_MAX_PAYLOAD_LEN=2018

@@ -614,7 +614,9 @@ draft implementation and will be reworked against the final API; the
    the payload cap no longer drives stack depth (contract R7). The cap itself
    is checked against the geometry at mount: a bucket is an append-only log,
    so a rebind needs two slots to coexist, bounding the payload at
-   `(sector − 16) / 2 − 14` — about 2026 B on 4 KB sectors, 32 746 B on 64 KB.
+   `round_down((sector − 16) / 2, W) − 14`, where `W` is the write alignment
+   slots are padded to — about 2026 B on 4 KB sectors (2018 B at `W = 16`),
+   32 746 B on 64 KB.
 4. **Master format version field.** *(Resolved.)* Superseded by the frozen
    compatibility prefix (§3.1): `format_major` / `format_minor` / `hdr_len`
    under their own CRC, so software of any vintage can classify a store it did
