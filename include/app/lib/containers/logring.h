@@ -221,7 +221,7 @@ int logring_iterate(uint64_t root, logring_iter_cb_t cb, void *user);
  * @brief Usable record-data bytes in one ring (payload minus the fixed header).
  *
  * The largest single record is this value minus the per-record header
- * (@ref LOGRING_REC_OVERHEAD). Both are derived from
+ * (`LOGRING_REC_OVERHEAD`). Both are derived from
  * `CONFIG_BLOB_DB_MAX_PAYLOAD_LEN`.
  */
 #define LOGRING_HDR_SIZE     20u
