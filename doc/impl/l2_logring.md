@@ -1,7 +1,15 @@
 # Implementation design — `logring` bounded circular log (L2)
 
-Status: v1 · **Implemented.** This document records the on-flash format and
-algorithms of `lib/containers/logring/logring.c`. The normative contract is
+> **⚠ Superseded — describes the v1 *single-i-node* implementation** currently
+> on branch `claude/log-container-type-0xl2dp` (PR #32). The accepted design
+> direction is the **per-entry-i-node chain** in
+> `doc/proposals/2026-10-08-logring.md`; when that lands, this document is
+> rewritten (proposal §9). The format and algorithms below apply **only** to
+> the single-i-node code they document — read the proposal for the current
+> design.
+
+Status: v1 · Records the on-flash format and algorithms of the single-i-node
+`lib/containers/logring/logring.c`. The normative contract is
 `doc/layers/l2_containers.md` §4.5; the container invariants there (§5) and the
 mutation protocol (§2.2) govern this design. Upper layers depend only on the
 public API in `include/app/lib/containers/logring.h`, never on the layout
