@@ -46,7 +46,7 @@ jobs:
       CMAKE_PREFIX_PATH: /opt/toolchains
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           path: key_value_db
           persist-credentials: false
@@ -86,7 +86,7 @@ jobs:
       CMAKE_PREFIX_PATH: /opt/toolchains
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           path: key_value_db
           persist-credentials: false
