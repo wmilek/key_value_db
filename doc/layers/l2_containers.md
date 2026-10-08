@@ -114,10 +114,16 @@ the planned interfaces:
 
 > Implemented so far (`include/app/lib/containers/shape_map.h`): the point
 > subset `create(root, map_config) · get · set · del · destroy`, plus
-> `map_config` for create-time hints (e.g. hash bucket count). `open`
-> collapses into "resolve root, then call these"; `has` is an L3 convenience
-> over `get`; `iterate` is deferred until an ordered backend (kvtree) needs
-> it.
+> `map_config` for create-time hints (e.g. hash bucket count), plus `next` for
+> enumeration. `open` collapses into "resolve root, then call these"; `has` is
+> an L3 convenience over `get`.
+>
+> `next` takes the place of a callback `iterate` in the Map shape. It is
+> stateless: the caller passes the last key it saw and gets the one after it,
+> in a provider-defined order fixed by the keys alone. So there is no iterator
+> to hold, a walk resumes from a saved key after a reboot, and mutating between
+> calls is allowed (the callback rule below does not apply to it).
+> `shape_map.h` holds the full contract.
 >
 > `destroy` is the one op an L3 caller cannot assemble for itself: only the
 > provider knows which i-nodes its root reaches, so releasing them has to be

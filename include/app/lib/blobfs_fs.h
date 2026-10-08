@@ -46,8 +46,8 @@ extern "C" {
  * and `fs_rename`.
  *
  * Not supported, and left NULL so the VFS reports -ENOTSUP: `fs_mkdir`,
- * `fs_opendir`/`fs_readdir`/`fs_closedir` (v1 is a flat namespace and the
- * Map shape has no enumeration op) and `fs_statvfs` (blob_db exposes no
+ * `fs_opendir`/`fs_readdir`/`fs_closedir` (v1 is a flat namespace and
+ * blobfs does not yet wire the Map shape's `next`) and `fs_statvfs` (blob_db exposes no
  * free-space accounting). `fs_sync` is a no-op that succeeds: every write
  * is already durable when it returns.
  *

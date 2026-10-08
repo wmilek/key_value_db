@@ -683,6 +683,194 @@ static int kvhash_del(uint64_t root, const void *key, size_t klen)
 }
 
 /*
+ * Enumeration order, per shape_map.h `next`.
+ *
+ * A key's place is (top index, sub index, hash, klen, key bytes). The first two
+ * are where the key lives, so walking directories and buckets in index order
+ * is walking the order; the rest breaks ties inside one bucket. Every term is a
+ * function of the key and the fixed geometry, never of where the entry sits in
+ * its bucket -- a set moves its entry to the end, so position is not stable,
+ * and a deleted key has no position at all.
+ *
+ * This compares two keys already known to share a bucket.
+ */
+static int order_cmp(uint32_t ha, const uint8_t *ka, size_t la,
+		     uint32_t hb, const uint8_t *kb, size_t lb)
+{
+	if (ha != hb) {
+		return ha < hb ? -1 : 1;
+	}
+	if (la != lb) {
+		return la < lb ? -1 : 1;
+	}
+	return memcmp(ka, kb, la);
+}
+
+/*
+ * Find the first entry of the bucket in @buf, in enumeration order, that sorts
+ * after the cursor (or the first outright when @cursor is NULL). The bucket is
+ * unsorted on flash, so this is a linear pass -- the whole bucket is already in
+ * RAM, which is the same cost bkt_find pays. Returns its offset or SIZE_MAX.
+ */
+static size_t bkt_first_after(const uint8_t *buf, size_t used,
+			      const uint8_t *cursor, size_t clen, uint32_t ch)
+{
+	size_t best = SIZE_MAX;
+	uint32_t best_h = 0;
+	size_t off = 0;
+
+	while (off + ENTRY_HDR_LEN <= used) {
+		size_t kl = get_u16(&buf[off]);
+		size_t elen = ENTRY_HDR_LEN + kl + get_u16(&buf[off + 2]);
+
+		if (off + elen > used) {
+			break; /* truncated / corrupt — stop, as bkt_find does */
+		}
+
+		const uint8_t *k = &buf[off + ENTRY_HDR_LEN];
+		uint32_t h = key_hash(k, kl);
+
+		if ((cursor == NULL || order_cmp(h, k, kl, ch, cursor, clen) > 0) &&
+		    (best == SIZE_MAX ||
+		     order_cmp(h, k, kl, best_h, &buf[best + ENTRY_HDR_LEN],
+			       get_u16(&buf[best])) < 0)) {
+			best = off;
+			best_h = h;
+		}
+		off += elen;
+	}
+	return best;
+}
+
+/*
+ * Search the leaf directory in dir_buf from bucket @start onwards. The cursor
+ * applies to bucket @start only: every later bucket sorts wholly after it.
+ * Leaves the hit's bucket in bkt_buf and its offset in *off.
+ */
+static int leaf_first_after(uint16_t n, uint16_t start, const uint8_t *cursor,
+			    size_t clen, uint32_t ch, size_t *off)
+{
+	for (uint16_t i = start; i < n; i++) {
+		uint64_t bid = dir_child(dir_buf, i);
+
+		if (bid == 0) {
+			continue;
+		}
+
+		size_t used = 0;
+		int rc = blob_db_get(bid, bkt_buf, sizeof(bkt_buf), &used);
+
+		if (rc != 0) {
+			return rc;
+		}
+
+		*off = bkt_first_after(bkt_buf, used,
+				       i == start ? cursor : NULL, clen, ch);
+		if (*off != SIZE_MAX) {
+			return 0;
+		}
+	}
+	return -ENODATA;
+}
+
+/* Search a whole two-level map from sub-map @top_start onwards. */
+static int tree_first_after(uint64_t root, uint16_t n_top, uint16_t top_start,
+			    const uint8_t *cursor, size_t clen, uint32_t ch,
+			    size_t *off)
+{
+	for (uint16_t t = top_start; t < n_top; t++) {
+		/* Walking a sub-map loads its directory over the top one, so
+		 * the top is re-read on each step across a sub-map boundary. */
+		if (t != top_start) {
+			uint16_t n;
+			int rc = dir_load(root, &n, NULL);
+
+			if (rc != 0) {
+				return rc;
+			}
+		}
+
+		uint64_t sub = dir_child(dir_buf, t);
+		uint16_t sub_n;
+		uint8_t sub_depth;
+
+		if (sub == 0) {
+			return -EIO; /* sub-maps are created eagerly; 0 is corruption */
+		}
+
+		int rc = dir_load(sub, &sub_n, &sub_depth);
+
+		if (rc != 0) {
+			return rc;
+		}
+		if (sub_depth != 1) {
+			return -EIO;
+		}
+
+		bool here = (t == top_start && cursor != NULL);
+
+		rc = leaf_first_after(sub_n, here ? idx_sub(ch, sub_n) : 0,
+				      here ? cursor : NULL, clen, ch, off);
+		if (rc != -ENODATA) {
+			return rc;
+		}
+	}
+	return -ENODATA;
+}
+
+static int kvhash_next(uint64_t root, const void *key, size_t klen,
+		       void *kout, size_t kout_sz, size_t *kout_len,
+		       void *vout, size_t vout_sz, size_t *vout_len)
+{
+	if ((key == NULL && klen != 0) || klen > 0xffffu ||
+	    (kout == NULL && kout_sz != 0) || (vout == NULL && vout_sz != 0)) {
+		return -EINVAL;
+	}
+
+	/* klen == 0 starts the walk: get/set reject empty keys, so no stored
+	 * key can be confused with the start. */
+	const uint8_t *cursor = (klen != 0) ? key : NULL;
+	uint32_t ch = cursor ? key_hash(key, klen) : 0;
+	uint16_t n;
+	uint8_t depth;
+	size_t off = 0;
+	int rc = dir_load(root, &n, &depth);
+
+	if (rc != 0) {
+		return rc;
+	}
+
+	if (depth == 1) {
+		rc = leaf_first_after(n, cursor ? idx_sub(ch, n) : 0,
+				      cursor, klen, ch, &off);
+	} else {
+		rc = tree_first_after(root, n, cursor ? idx_top(ch, n) : 0,
+				      cursor, klen, ch, &off);
+	}
+	if (rc != 0) {
+		return rc;
+	}
+
+	size_t kl = get_u16(&bkt_buf[off]);
+	size_t vl = get_u16(&bkt_buf[off + 2]);
+
+	if (kout_len) {
+		*kout_len = kl;
+	}
+	if (vout_len) {
+		*vout_len = vl;
+	}
+	if (kl > kout_sz || vl > vout_sz) {
+		return -ENOMEM;
+	}
+	memcpy(kout, &bkt_buf[off + ENTRY_HDR_LEN], kl);
+	if (vl) {
+		memcpy(vout, &bkt_buf[off + ENTRY_HDR_LEN + kl], vl);
+	}
+	return 0;
+}
+
+/*
  * Destroy, per l2_containers.md 2.4.
  *
  * Stamping the directory's magic is the commit: one atomic update that takes
@@ -827,5 +1015,6 @@ const struct map_ops kvhash_map_ops = {
 	.get = kvhash_get,
 	.set = kvhash_set,
 	.del = kvhash_del,
+	.next = kvhash_next,
 	.destroy = kvhash_destroy,
 };

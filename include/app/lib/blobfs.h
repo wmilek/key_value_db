@@ -47,9 +47,9 @@ extern "C" {
  * @section blobfs_v1 v1 scope
  *
  * The namespace is **flat**: one directory, holding files. `mkdir` and
- * directory iteration are not provided — iteration needs an enumeration op
- * on @ref map_ops that the shipped Map shape does not define, and nesting
- * waits on it. Paths are therefore a single name, with or without a leading
+ * directory iteration are not provided — the Map shape's enumeration op
+ * (@ref map_ops `next`) is not wired into blobfs yet, and nesting waits on
+ * it. Paths are therefore a single name, with or without a leading
  * slash (`"cfg"` and `"/cfg"` name the same file); an embedded `/` reports
  * -ENOENT because no such directory can exist, and `"."`/`".."` are
  * refused (-EINVAL) so every stored name stays addressable through

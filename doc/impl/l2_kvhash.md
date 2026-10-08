@@ -185,12 +185,56 @@ copied into the bucket buffer first. That buffer is free during a destroy —
 nothing is being packed — and a directory that fits one payload fits it by
 construction.
 
-## 4. Open implementation items
+## 4. `next`
+
+The caller's contract is `shape_map.h` (`map_ops.next`). This is how it is met.
+
+### 4.1 The order is the layout
+
+A key's place in the enumeration order is
+
+```
+(top index, sub index, crc32(key), klen, key bytes)
+```
+
+The first two terms are where the key lives, so walking directories and
+buckets in index order already walks the order; the rest breaks ties inside one
+bucket. Every term is a function of the key and the geometry fixed at create,
+which is what the contract needs: a deleted key, or one never stored, still
+has a place, and so a successor. Nothing on flash changed to get this.
+
+Position within a bucket is deliberately *not* a term. A bucket is packed in
+write order and `set` moves its entry to the end, so position changes on every
+replace, and a deleted key has none at all.
+
+### 4.2 One call
+
+`next(K)` resolves K's leaf exactly as `get` does, then:
+
+1. reads K's bucket and takes the smallest entry that sorts after K. The bucket
+   is unsorted on flash, so this is a linear pass over a buffer already in RAM
+   — what `bkt_find` pays;
+2. failing that, takes the first entry of the next non-zero bucket id in the
+   same directory — every entry there sorts after K, so no comparison is
+   needed;
+3. at depth 2, failing that, moves to the next sub-map. Loading a sub-map
+   overwrites the top directory in `dir_buf`, so the top is re-read on each
+   sub-map crossing rather than kept in a third buffer.
+
+A walk of n entries is therefore about n × (depth + 1) blob reads, plus one per
+allocated-but-empty bucket passed over: `del` rewrites an emptied bucket as an
+empty payload rather than releasing it, so the directory still names it.
+
+Because no state survives a call, `set` and `del` between calls are safe. This
+is the stateless form of the "collect-then-mutate" pattern §2 asks of a
+callback `iterate`.
+
+## 5. Open implementation items
 
 Known deltas against the layer documents, each pinned by a test in
 `tests/lib/containers` so it cannot regress silently.
 
-### 4.1 Wrong-type root returns `-EIO`, not `-EINVAL`
+### 5.1 Wrong-type root returns `-EIO`, not `-EINVAL`
 
 `l2_containers.md` §2.3 specifies `-EINVAL` for a root of the wrong type.
 `dir_load_raw()` returns `-EIO` on a magic mismatch.
@@ -201,7 +245,7 @@ function that answers "this is not a kvhash root" is the same one that answers
 (the designated home for type validation) fixes it properly; short of that it is
 a hand-written special case.
 
-### 4.2 `create` on a populated root orphans its buckets
+### 5.2 `create` on a populated root orphans its buckets
 
 `create` re-initialises the directory unconditionally. Called on a root that
 already holds a map, it makes every existing bucket unreachable without
@@ -211,12 +255,17 @@ The correct sequence today is `destroy` then `create` at a fresh id. Either
 `create` should learn `-EEXIST`, or the shape should state that the caller
 guarantees create-once.
 
-### 4.3 A bucket that fills has no recovery
+### 5.3 A bucket that fills has no recovery
 
 A bucket that outgrows one payload returns `-ENOSPC`, and the map cannot grow
-to escape it — the geometry is fixed at create, and K6 (no iteration) means the
-contents cannot be copied into a larger map either. The only point at which
-this is preventable is the declaration passed to `create`.
+in place to escape it — the geometry is fixed at create. The only point at
+which this is *preventable* is the declaration passed to `create`.
+
+It is no longer unrecoverable. K6 (no iteration) used to rule out copying the
+contents into a larger map; `next` (§4) removes that, so a caller can walk the
+full map into a fresh one built at a larger declaration and destroy the old.
+That costs a full copy and twice the space while it runs, so it is a recovery,
+not a substitute for sizing the map at `create`.
 
 An earlier revision tried to soften that with a near-full warning: `set`
 already knows how full the record it just rewrote is, so it returned a positive

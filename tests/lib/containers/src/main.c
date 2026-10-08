@@ -118,6 +118,7 @@ ZTEST(map_contract, test_op_vector_is_complete)
 		zassert_not_null(p->ops->get, "%s: get missing", p->name);
 		zassert_not_null(p->ops->set, "%s: set missing", p->name);
 		zassert_not_null(p->ops->del, "%s: del missing", p->name);
+		zassert_not_null(p->ops->next, "%s: next missing", p->name);
 		zassert_not_null(p->ops->destroy, "%s: destroy missing", p->name);
 	}
 }
@@ -495,16 +496,10 @@ ZTEST(map_contract, test_replace_a_map_at_a_fresh_id)
 	}
 }
 
-/* ================================================================== */
-/* Tier 2 — UNSPECIFIED: pins today's behaviour, pending a shape edit  */
-/* ================================================================== */
-
 /*
- * UNSPECIFIED-4: the key/value domain.
- *
- * kvhash rejects a NULL or empty key with -EINVAL. shape_map.h says nothing
- * about it, so a second provider is free to accept an empty key and nobody
- * would notice until two backends behaved differently on the same data.
+ * The key domain: a key is non-empty, so a NULL or empty key is -EINVAL.
+ * Formerly UNSPECIFIED-4; the shape states it now, because `next` gives the
+ * empty key a meaning of its own (the start of a walk).
  */
 ZTEST(map_contract, test_rejects_null_and_empty_keys)
 {
@@ -530,9 +525,7 @@ ZTEST(map_contract, test_rejects_null_and_empty_keys)
 	}
 }
 
-/*
- * UNSPECIFIED-4: a NULL value pointer is only legal when the length is zero.
- */
+/* A NULL value pointer is only legal when the length is zero. */
 ZTEST(map_contract, test_rejects_null_value_with_nonzero_len)
 {
 	FOR_EACH_PROVIDER(p) {
@@ -544,9 +537,9 @@ ZTEST(map_contract, test_rejects_null_value_with_nonzero_len)
 }
 
 /*
- * UNSPECIFIED-4: an empty *value* is legal even though an empty *key* is not,
- * and it is a stored key, not an absent one. This is the asymmetry most
- * likely to be got wrong by a second provider.
+ * An empty *value* is legal even though an empty *key* is not, and it is a
+ * stored key, not an absent one. This is the asymmetry most likely to be got
+ * wrong by a second provider.
  */
 ZTEST(map_contract, test_empty_value_is_a_stored_value)
 {
@@ -570,6 +563,383 @@ ZTEST(map_contract, test_empty_value_is_a_stored_value)
 		zassert_ok(p->ops->del(root, "empty", 5), "%s: del", p->name);
 	}
 }
+
+/* ------------------------------------------------------------------ */
+/* next — stateless enumeration                                        */
+/* ------------------------------------------------------------------ */
+
+#define WALK_MAX 160
+#define WKEY     16
+
+/* The keys of one walk, in the order `next` returned them. */
+struct walk {
+	size_t n;
+	char key[WALK_MAX][WKEY];
+	size_t klen[WALK_MAX];
+};
+
+/* Large enough to be worth keeping off the ztest stack. */
+static struct walk walk_a, walk_b;
+
+/* Store n keys "k000".. with values "v000".. */
+static void fill(const struct provider *p, uint64_t root, int n)
+{
+	char key[8], val[8];
+
+	for (int i = 0; i < n; i++) {
+		snprintf(key, sizeof(key), "k%03d", i);
+		snprintf(val, sizeof(val), "v%03d", i);
+		zassert_ok(p->ops->set(root, key, 4, val, 4), "%s: set %s",
+			   p->name, key);
+	}
+}
+
+/* Append to @w the rest of the walk that follows @cur (klen 0: from start). */
+static void walk_from(const struct provider *p, uint64_t root,
+		      const void *cur, size_t clen, struct walk *w)
+{
+	char k[WKEY], v[16];
+	size_t kl = 0, vl = 0;
+	int rc;
+
+	while ((rc = p->ops->next(root, cur, clen, k, sizeof(k), &kl,
+				  v, sizeof(v), &vl)) == 0) {
+		zassert_true(w->n < WALK_MAX, "%s: walk does not end", p->name);
+		memcpy(w->key[w->n], k, kl);
+		w->klen[w->n] = kl;
+		cur = w->key[w->n];
+		clen = kl;
+		w->n++;
+	}
+	zassert_equal(rc, -ENODATA, "%s: walk ended with %d", p->name, rc);
+}
+
+static void walk_all(const struct provider *p, uint64_t root, struct walk *w)
+{
+	w->n = 0;
+	walk_from(p, root, NULL, 0, w);
+}
+
+static bool walks_equal(const struct walk *a, const struct walk *b)
+{
+	if (a->n != b->n) {
+		return false;
+	}
+	for (size_t i = 0; i < a->n; i++) {
+		if (a->klen[i] != b->klen[i] ||
+		    memcmp(a->key[i], b->key[i], a->klen[i]) != 0) {
+			return false;
+		}
+	}
+	return true;
+}
+
+/* Every key of @w is "k%03d" below @n, and each appears exactly once. */
+static void assert_each_once(const char *name, const struct walk *w, int n)
+{
+	static bool seen[WALK_MAX];
+	int i;
+
+	memset(seen, 0, sizeof(seen));
+	zassert_equal(w->n, (size_t)n, "%s: walk returned %zu of %d keys",
+		      name, w->n, n);
+	for (size_t j = 0; j < w->n; j++) {
+		zassert_equal(w->klen[j], 4, "%s: key length", name);
+		zassert_equal(sscanf(w->key[j], "k%3d", &i), 1, "%s: key", name);
+		zassert_true(i >= 0 && i < n, "%s: foreign key", name);
+		zassert_false(seen[i], "%s: k%03d returned twice", name, i);
+		seen[i] = true;
+	}
+}
+
+/* "an empty map answers this to the first call" -- including one emptied. */
+ZTEST(map_contract, test_next_on_empty_map_is_enodata)
+{
+	FOR_EACH_PROVIDER(p) {
+		uint64_t root = fresh_map(p, 8);
+		char k[WKEY], v[16];
+		size_t kl = 0, vl = 0;
+
+		zassert_equal(p->ops->next(root, NULL, 0, k, sizeof(k), &kl,
+					   v, sizeof(v), &vl),
+			      -ENODATA, "%s: fresh map", p->name);
+
+		zassert_ok(p->ops->set(root, "k", 1, "v", 1));
+		zassert_ok(p->ops->del(root, "k", 1));
+		zassert_equal(p->ops->next(root, NULL, 0, k, sizeof(k), &kl,
+					   v, sizeof(v), &vl),
+			      -ENODATA, "%s: emptied map", p->name);
+	}
+}
+
+/* A walk returns every key exactly once, each with its own value. */
+ZTEST(map_contract, test_next_visits_every_key_once)
+{
+	const int n = 40;
+
+	FOR_EACH_PROVIDER(p) {
+		uint64_t root = fresh_map(p, n);
+		char k[WKEY], v[16], val[8];
+		size_t kl = 0, vl = 0;
+
+		fill(p, root, n);
+		walk_all(p, root, &walk_a);
+		assert_each_once(p->name, &walk_a, n);
+
+		/* And each carries its own value, not a neighbour's. */
+		for (size_t j = 0; j < walk_a.n; j++) {
+			const void *cur = j ? walk_a.key[j - 1] : NULL;
+			size_t clen = j ? walk_a.klen[j - 1] : 0;
+
+			zassert_ok(p->ops->next(root, cur, clen, k, sizeof(k), &kl,
+						v, sizeof(v), &vl));
+			snprintf(val, sizeof(val), "v%.3s", &k[1]);
+			zassert_equal(vl, 4, "%s: value length", p->name);
+			zassert_mem_equal(v, val, 4, "%s: %.4s's value", p->name, k);
+		}
+	}
+}
+
+/*
+ * The cursor need not be present: a deleted key still has the successor it
+ * had while it was there. Every other key is deleted, so each cursor here is
+ * gone and its successor is not.
+ */
+ZTEST(map_contract, test_next_from_a_deleted_key)
+{
+	FOR_EACH_PROVIDER(p) {
+		uint64_t root = fresh_map(p, 40);
+		char k[WKEY], v[16];
+		size_t kl = 0, vl = 0;
+
+		fill(p, root, 40);
+		walk_all(p, root, &walk_a);
+		zassert_equal(walk_a.n, 40, "%s", p->name);
+
+		for (size_t i = 0; i < walk_a.n; i += 2) {
+			zassert_ok(p->ops->del(root, walk_a.key[i], walk_a.klen[i]));
+		}
+
+		for (size_t i = 0; i < walk_a.n; i += 2) {
+			int rc = p->ops->next(root, walk_a.key[i], walk_a.klen[i],
+					      k, sizeof(k), &kl, v, sizeof(v), &vl);
+
+			if (i + 1 == walk_a.n) {
+				zassert_equal(rc, -ENODATA, "%s: past the last",
+					      p->name);
+				continue;
+			}
+			zassert_ok(rc, "%s: next(deleted %.4s)", p->name,
+				   walk_a.key[i]);
+			zassert_equal(kl, walk_a.klen[i + 1], "%s", p->name);
+			zassert_mem_equal(k, walk_a.key[i + 1], kl,
+					  "%s: successor of deleted %.4s moved",
+					  p->name, walk_a.key[i]);
+		}
+
+		/* A key that never existed is a valid cursor too. */
+		int rc = p->ops->next(root, "never-stored", 12, k, sizeof(k), &kl,
+				      v, sizeof(v), &vl);
+
+		zassert_true(rc == 0 || rc == -ENODATA,
+			     "%s: next(absent key) = %d", p->name, rc);
+	}
+}
+
+/*
+ * The order is a function of the keys alone: replacing every value, churning
+ * other keys in and out, and remounting all leave it as it was.
+ */
+ZTEST(map_contract, test_next_order_is_stable)
+{
+	FOR_EACH_PROVIDER(p) {
+		uint64_t root = fresh_map(p, 40);
+		char key[8];
+
+		fill(p, root, 30);
+		walk_all(p, root, &walk_a);
+
+		for (size_t i = 0; i < walk_a.n; i++) {
+			zassert_ok(p->ops->set(root, walk_a.key[i], walk_a.klen[i],
+					       "replaced", 8));
+		}
+		for (int i = 0; i < 10; i++) {
+			snprintf(key, sizeof(key), "x%03d", i);
+			zassert_ok(p->ops->set(root, key, 4, "t", 1));
+		}
+		for (int i = 0; i < 10; i++) {
+			snprintf(key, sizeof(key), "x%03d", i);
+			zassert_ok(p->ops->del(root, key, 4));
+		}
+		zassert_ok(blob_db_unmount());
+		zassert_ok(blob_db_mount());
+
+		walk_all(p, root, &walk_b);
+		zassert_true(walks_equal(&walk_a, &walk_b),
+			     "%s: order changed under value/neighbour churn",
+			     p->name);
+	}
+}
+
+/*
+ * Mutation between calls is allowed. Here every returned key is deleted at
+ * once and a new key is inserted per step; every original key, present until
+ * the walk reaches it, must still be returned exactly once.
+ */
+ZTEST(map_contract, test_next_survives_mutation_between_calls)
+{
+	const int n = 30;
+
+	FOR_EACH_PROVIDER(p) {
+		uint64_t root = fresh_map(p, 2 * n);
+		char cur[WKEY], k[WKEY], v[16], key[16];
+		size_t clen = 0, kl = 0, vl = 0;
+		int seen[30] = { 0 };
+		int added = 0, steps = 0;
+		int rc;
+
+		fill(p, root, n);
+
+		while ((rc = p->ops->next(root, cur, clen, k, sizeof(k), &kl,
+					  v, sizeof(v), &vl)) == 0) {
+			int i;
+
+			zassert_true(steps++ < 2 * n, "%s: walk does not end",
+				     p->name);
+			if (k[0] == 'k' && sscanf(k, "k%3d", &i) == 1) {
+				seen[i]++;
+			}
+
+			zassert_ok(p->ops->del(root, k, kl), "%s: del mid-walk",
+				   p->name);
+			if (added < n) {
+				snprintf(key, sizeof(key), "n%03d", added++);
+				zassert_ok(p->ops->set(root, key, 4, "new", 3));
+			}
+
+			memcpy(cur, k, kl);
+			clen = kl;
+		}
+		zassert_equal(rc, -ENODATA, "%s: walk ended with %d", p->name, rc);
+
+		for (int i = 0; i < n; i++) {
+			zassert_equal(seen[i], 1, "%s: k%03d returned %d times",
+				      p->name, i, seen[i]);
+		}
+	}
+}
+
+/* The key is the whole cursor: a walk resumes from it after a remount. */
+ZTEST(map_contract, test_next_resumes_after_remount)
+{
+	FOR_EACH_PROVIDER(p) {
+		uint64_t root = fresh_map(p, 40);
+		char saved[WKEY];
+		size_t saved_len;
+
+		fill(p, root, 40);
+		walk_all(p, root, &walk_a);
+		zassert_equal(walk_a.n, 40, "%s", p->name);
+
+		/* Take the first 15 steps, then lose all RAM state. */
+		walk_b.n = 15;
+		memcpy(walk_b.key, walk_a.key, sizeof(walk_a.key[0]) * 15);
+		memcpy(walk_b.klen, walk_a.klen, sizeof(walk_a.klen[0]) * 15);
+		saved_len = walk_a.klen[14];
+		memcpy(saved, walk_a.key[14], saved_len);
+
+		zassert_ok(blob_db_unmount());
+		zassert_ok(blob_db_mount());
+
+		walk_from(p, root, saved, saved_len, &walk_b);
+		zassert_true(walks_equal(&walk_a, &walk_b),
+			     "%s: resumed walk diverged", p->name);
+	}
+}
+
+/*
+ * A buffer too small is -ENOMEM with both true lengths reported, and since
+ * nothing moved, the same cursor with larger buffers then succeeds.
+ */
+ZTEST(map_contract, test_next_too_small_reports_lengths)
+{
+	FOR_EACH_PROVIDER(p) {
+		uint64_t root = fresh_map(p, 8);
+		char k[WKEY], v[16];
+		size_t kl = 0, vl = 0;
+
+		zassert_ok(p->ops->set(root, "abcdef", 6, "12345", 5));
+
+		zassert_equal(p->ops->next(root, NULL, 0, k, 2, &kl, v, sizeof(v), &vl),
+			      -ENOMEM, "%s: small key buffer", p->name);
+		zassert_equal(kl, 6, "%s", p->name);
+		zassert_equal(vl, 5, "%s", p->name);
+
+		kl = vl = 0;
+		zassert_equal(p->ops->next(root, NULL, 0, k, sizeof(k), &kl, v, 2, &vl),
+			      -ENOMEM, "%s: small value buffer", p->name);
+		zassert_equal(kl, 6, "%s", p->name);
+		zassert_equal(vl, 5, "%s", p->name);
+
+		kl = vl = 0;
+		zassert_equal(p->ops->next(root, NULL, 0, NULL, 0, &kl, NULL, 0, &vl),
+			      -ENOMEM, "%s: size probe", p->name);
+		zassert_equal(kl, 6, "%s", p->name);
+		zassert_equal(vl, 5, "%s", p->name);
+
+		zassert_ok(p->ops->next(root, NULL, 0, k, kl, &kl, v, vl, &vl),
+			   "%s: retry at the reported sizes", p->name);
+		zassert_mem_equal(k, "abcdef", 6, "%s", p->name);
+		zassert_mem_equal(v, "12345", 5, "%s", p->name);
+	}
+}
+
+/* -ENOENT means "not a map" and is never the end of a walk. */
+ZTEST(map_contract, test_next_on_a_non_map_is_enoent)
+{
+	FOR_EACH_PROVIDER(p) {
+		uint64_t unbound = blob_db_alloc_id();
+		uint64_t root = fresh_map(p, 8);
+		char k[WKEY], v[16];
+		size_t kl = 0, vl = 0;
+
+		zassert_not_equal(unbound, 0);
+		zassert_equal(p->ops->next(unbound, NULL, 0, k, sizeof(k), &kl,
+					   v, sizeof(v), &vl),
+			      -ENOENT, "%s: unbound root", p->name);
+
+		zassert_ok(p->ops->set(root, "k", 1, "v", 1));
+		zassert_ok(p->ops->destroy(root));
+		zassert_equal(p->ops->next(root, NULL, 0, k, sizeof(k), &kl,
+					   v, sizeof(v), &vl),
+			      -ENOENT, "%s: destroyed root", p->name);
+	}
+}
+
+ZTEST(map_contract, test_next_rejects_bad_arguments)
+{
+	FOR_EACH_PROVIDER(p) {
+		uint64_t root = fresh_map(p, 8);
+		char k[WKEY], v[16];
+		size_t kl = 0, vl = 0;
+
+		zassert_ok(p->ops->set(root, "k", 1, "v", 1));
+
+		zassert_equal(p->ops->next(root, NULL, 3, k, sizeof(k), &kl,
+					   v, sizeof(v), &vl),
+			      -EINVAL, "%s: NULL cursor with a length", p->name);
+		zassert_equal(p->ops->next(root, NULL, 0, NULL, 4, &kl,
+					   v, sizeof(v), &vl),
+			      -EINVAL, "%s: NULL key buffer with a size", p->name);
+		zassert_equal(p->ops->next(root, NULL, 0, k, sizeof(k), &kl,
+					   NULL, 4, &vl),
+			      -EINVAL, "%s: NULL value buffer with a size", p->name);
+	}
+}
+
+/* ================================================================== */
+/* Tier 2 — UNSPECIFIED: pins today's behaviour, pending a shape edit  */
+/* ================================================================== */
 
 /*
  * UNSPECIFIED-6: -ENOENT is overloaded.
@@ -956,6 +1326,35 @@ ZTEST(kvhash_layout, test_create_on_populated_root_orphans_its_buckets)
 		      "expected the orphaned buckets to still be live (leak); "
 		      "if this now fails, create() learned to clean up and the "
 		      "test should assert that instead");
+}
+
+/*
+ * A walk of a two-level map crosses every sub-map, and skips buckets that
+ * were allocated and then emptied rather than reporting them.
+ */
+ZTEST(kvhash_layout, test_next_walks_a_two_level_map)
+{
+	struct map_config cfg = { .expected_entries = 128 };
+	struct map_info info = { 0 };
+	uint64_t root = blob_db_alloc_id();
+	char k[WKEY], v[16];
+	size_t kl = 0, vl = 0;
+
+	zassert_not_equal(root, 0);
+	zassert_ok(kvhash_map_ops.create(root, &cfg));
+	zassert_ok(kvhash_map_ops.stat(root, &info));
+	zassert_equal(info.depth, 2);
+
+	fill(&kvhash, root, 100);
+	walk_all(&kvhash, root, &walk_a);
+	assert_each_once("kvhash", &walk_a, 100);
+
+	for (size_t i = 0; i < walk_a.n; i++) {
+		zassert_ok(kvhash_map_ops.del(root, walk_a.key[i], walk_a.klen[i]));
+	}
+	zassert_equal(kvhash_map_ops.next(root, NULL, 0, k, sizeof(k), &kl,
+					  v, sizeof(v), &vl),
+		      -ENODATA, "emptied buckets must be skipped, not returned");
 }
 
 #endif /* CONFIG_BLOB_CONTAINER_KVHASH */

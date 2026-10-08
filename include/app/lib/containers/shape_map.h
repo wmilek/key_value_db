@@ -91,6 +91,14 @@ struct map_info {
  *
  * Single-threaded, like everything below it (blob_db v1): the caller
  * serializes all calls.
+ *
+ * **Keys and values.** A key is a non-empty byte string: a NULL key or a
+ * @c klen of 0 is -EINVAL on @ref get, @ref set and @ref del. That keeps the
+ * empty key free to mean "the start" for @ref next. A value may be empty, and
+ * an empty value is stored like any other — @ref get finds it with length 0,
+ * which is not the same as -ENOENT. A NULL @c val is legal only when
+ * @c vlen is 0. Upper bounds on key and value length are the provider's (see
+ * @ref map_info.entry_bytes_limit).
  */
 struct map_ops {
 	/**
@@ -140,6 +148,7 @@ struct map_ops {
 	 * @retval 0        found; value copied, *out_len set
 	 * @retval -ENOENT  key not present
 	 * @retval -ENOMEM  out_sz too small (key exists; *out_len set)
+	 * @retval -EINVAL  @p key NULL or @p klen 0
 	 */
 	int (*get)(uint64_t root, const void *key, size_t klen,
 		   void *out, size_t out_sz, size_t *out_len);
@@ -153,6 +162,8 @@ struct map_ops {
 	 *                  meets this has no recovery beyond rebuilding at a
 	 *                  larger declaration — size the map at @ref create,
 	 *                  which is the only point where this is preventable.
+	 * @retval -EINVAL  @p key NULL or @p klen 0, or @p val NULL with a
+	 *                  non-zero @p vlen
 	 * @retval -EIO     flash error
 	 */
 	int (*set)(uint64_t root, const void *key, size_t klen,
@@ -163,8 +174,76 @@ struct map_ops {
 	 *
 	 * @retval 0        removed
 	 * @retval -ENOENT  key not present
+	 * @retval -EINVAL  @p key NULL or @p klen 0
 	 */
 	int (*del)(uint64_t root, const void *key, size_t klen);
+
+	/**
+	 * @brief Return the entry that follows @p key in the map's enumeration
+	 *        order: copy its key into @p kout and its value into @p vout.
+	 *
+	 * Enumeration is stateless: the key *is* the cursor. The map holds no
+	 * iterator, so there is nothing to open, close or invalidate, and a walk
+	 * can be resumed from a saved key at any later time — after a reboot
+	 * included. A walk starts with @p klen == 0 (@p key is then ignored and
+	 * may be NULL) and continues by passing back each key it is given, until
+	 * the call answers -ENODATA.
+	 *
+	 * **Order.** A provider-defined total order on keys. It is not sorted
+	 * and not insertion order, and callers must not assume either. It is a
+	 * function of the key bytes and of what @ref create fixed, nothing else,
+	 * which is what makes the following hold:
+	 *
+	 * - The cursor need not be present. A deleted key, or one that never
+	 *   existed, still has a well-defined successor.
+	 * - The order never changes: not across reboots, not when other keys are
+	 *   inserted or deleted, and not when a key's value is replaced.
+	 * - Every key present for the whole of a walk is returned exactly once,
+	 *   and the walk ends: each call returns a key strictly after its cursor.
+	 *   A key inserted or deleted during the walk may or may not be returned,
+	 *   depending on which side of the cursor it falls.
+	 *
+	 * **Mutation between calls is allowed.** @ref set and @ref del may be
+	 * called freely between two @c next calls, including on the key just
+	 * returned; the walk stays correct, per the rules above.
+	 *
+	 * **Buffers.** @p kout may be NULL when @p kout_sz is 0, and @p vout when
+	 * @p vout_sz is 0. On 0 and on -ENOMEM, @p kout_len and @p vout_len (each
+	 * when non-NULL) are set to the found entry's true key and value lengths.
+	 * If either buffer is too small the call returns -ENOMEM, and the buffer
+	 * contents are unspecified; nothing has moved, so the caller retries the
+	 * same cursor with larger buffers. A caller that wants to continue the
+	 * walk needs the key, so in practice @p kout_len is non-NULL.
+	 *
+	 * **Cost.** Each call is independent, so each pays a lookup of its
+	 * cursor plus a forward search to the next entry; a walk of n entries is
+	 * n such calls. It is meant for enumeration (listing, export, rebuilding
+	 * a map at a new geometry), not as a hot data path.
+	 *
+	 * @param root      the map
+	 * @param key       cursor key, or ignored when @p klen is 0
+	 * @param klen      cursor key length; 0 starts at the first entry
+	 * @param kout      receives the next entry's key
+	 * @param kout_sz   capacity of @p kout
+	 * @param kout_len  receives the next entry's key length (may be NULL)
+	 * @param vout      receives the next entry's value
+	 * @param vout_sz   capacity of @p vout
+	 * @param vout_len  receives the next entry's value length (may be NULL)
+	 *
+	 * @retval 0        entry returned; key and value copied, lengths set
+	 * @retval -ENODATA no entry follows @p key (an empty map answers this to
+	 *                  the first call)
+	 * @retval -ENOMEM  @p kout_sz or @p vout_sz too small; lengths set
+	 * @retval -ENOENT  @p root does not identify a map (never built, or
+	 *                  destroyed) — distinct from the end of a walk
+	 * @retval -EINVAL  @p key NULL with a non-zero @p klen, @p klen longer
+	 *                  than any storable key, or a NULL buffer with a
+	 *                  non-zero size
+	 * @retval -EIO     flash error
+	 */
+	int (*next)(uint64_t root, const void *key, size_t klen,
+		    void *kout, size_t kout_sz, size_t *kout_len,
+		    void *vout, size_t vout_sz, size_t *vout_len);
 
 	/**
 	 * @brief Destroy the map at @p root, releasing every blob it owns.
