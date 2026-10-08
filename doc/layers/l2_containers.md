@@ -115,7 +115,8 @@ the planned interfaces:
 > Implemented so far (`include/app/lib/containers/shape_map.h`): the point
 > subset `create(root, map_config) · get · set · del · destroy`, plus
 > `map_config` for create-time hints (e.g. hash bucket count), plus `next` for
-> enumeration. `open` collapses into "resolve root, then call these"; `has` is
+> enumeration and `count` for the number of keys (computed by a walk, never
+> stored — meant for mount and recovery). `open` collapses into "resolve root, then call these"; `has` is
 > an L3 convenience over `get`.
 >
 > `next` takes the place of a callback `iterate` in the Map shape. It is

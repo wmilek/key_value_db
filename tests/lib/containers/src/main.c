@@ -119,6 +119,7 @@ ZTEST(map_contract, test_op_vector_is_complete)
 		zassert_not_null(p->ops->set, "%s: set missing", p->name);
 		zassert_not_null(p->ops->del, "%s: del missing", p->name);
 		zassert_not_null(p->ops->next, "%s: next missing", p->name);
+		zassert_not_null(p->ops->count, "%s: count missing", p->name);
 		zassert_not_null(p->ops->destroy, "%s: destroy missing", p->name);
 	}
 }
@@ -937,6 +938,138 @@ ZTEST(map_contract, test_next_rejects_bad_arguments)
 	}
 }
 
+/* ------------------------------------------------------------------ */
+/* count                                                               */
+/* ------------------------------------------------------------------ */
+
+/* The number of keys a full `next` walk returns -- count's reference. */
+static size_t walk_len(const struct provider *p, uint64_t root)
+{
+	walk_all(p, root, &walk_b);
+	return walk_b.n;
+}
+
+static size_t count_of(const struct provider *p, uint64_t root)
+{
+	size_t c = SIZE_MAX;
+
+	zassert_ok(p->ops->count(root, &c), "%s: count", p->name);
+	return c;
+}
+
+/* A fresh map and an emptied one both count 0. */
+ZTEST(map_contract, test_count_of_empty_map_is_zero)
+{
+	FOR_EACH_PROVIDER(p) {
+		uint64_t root = fresh_map(p, 8);
+
+		zassert_equal(count_of(p, root), 0, "%s: fresh map", p->name);
+
+		zassert_ok(p->ops->set(root, "k", 1, "v", 1));
+		zassert_ok(p->ops->del(root, "k", 1));
+		zassert_equal(count_of(p, root), 0, "%s: emptied map", p->name);
+	}
+}
+
+/*
+ * Inserts add one each; a replace, and a del of a missing key, change
+ * nothing; a successful del removes one. At every step the figure agrees with
+ * a full walk.
+ */
+ZTEST(map_contract, test_count_follows_inserts_and_deletes)
+{
+	const int n = 40;
+
+	FOR_EACH_PROVIDER(p) {
+		uint64_t root = fresh_map(p, n);
+		char key[8];
+
+		for (int i = 0; i < n; i++) {
+			snprintf(key, sizeof(key), "k%03d", i);
+			zassert_ok(p->ops->set(root, key, 4, "v", 1));
+			zassert_equal(count_of(p, root), (size_t)i + 1,
+				      "%s: after insert %d", p->name, i);
+		}
+
+		for (int i = 0; i < n; i += 3) {
+			snprintf(key, sizeof(key), "k%03d", i);
+			zassert_ok(p->ops->set(root, key, 4, "replaced", 8));
+		}
+		zassert_equal(count_of(p, root), (size_t)n,
+			      "%s: a replace changed the count", p->name);
+
+		zassert_equal(p->ops->del(root, "absent", 6), -ENOENT);
+		zassert_equal(count_of(p, root), (size_t)n,
+			      "%s: a missed del changed the count", p->name);
+
+		for (int i = 0; i < n; i += 2) {
+			snprintf(key, sizeof(key), "k%03d", i);
+			zassert_ok(p->ops->del(root, key, 4));
+		}
+		zassert_equal(count_of(p, root), (size_t)n / 2,
+			      "%s: after deleting half", p->name);
+		zassert_equal(count_of(p, root), walk_len(p, root),
+			      "%s: count disagrees with a full walk", p->name);
+	}
+}
+
+/* Computed from flash: the same figure after a remount, nothing cached. */
+ZTEST(map_contract, test_count_survives_remount)
+{
+	FOR_EACH_PROVIDER(p) {
+		uint64_t root = fresh_map(p, 40);
+
+		fill(p, root, 25);
+		zassert_ok(blob_db_unmount());
+		zassert_ok(blob_db_mount());
+		zassert_equal(count_of(p, root), 25, "%s", p->name);
+		zassert_equal(walk_len(p, root), 25, "%s", p->name);
+	}
+}
+
+/* count never writes. */
+ZTEST(map_contract, test_count_writes_nothing)
+{
+	FOR_EACH_PROVIDER(p) {
+		uint64_t root = fresh_map(p, 8);
+		size_t blobs;
+
+		fill(p, root, 5);
+		blobs = blob_db_count();
+		zassert_equal(count_of(p, root), 5, "%s", p->name);
+		zassert_equal(blob_db_count(), blobs,
+			      "%s: count changed the store", p->name);
+	}
+}
+
+ZTEST(map_contract, test_count_on_a_non_map_is_enoent)
+{
+	FOR_EACH_PROVIDER(p) {
+		uint64_t unbound = blob_db_alloc_id();
+		uint64_t root = fresh_map(p, 8);
+		size_t c = 42;
+
+		zassert_not_equal(unbound, 0);
+		zassert_equal(p->ops->count(unbound, &c), -ENOENT,
+			      "%s: unbound root", p->name);
+
+		zassert_ok(p->ops->set(root, "k", 1, "v", 1));
+		zassert_ok(p->ops->destroy(root));
+		zassert_equal(p->ops->count(root, &c), -ENOENT,
+			      "%s: destroyed root", p->name);
+		zassert_equal(c, 42, "%s: *out written on failure", p->name);
+	}
+}
+
+ZTEST(map_contract, test_count_rejects_null_out)
+{
+	FOR_EACH_PROVIDER(p) {
+		uint64_t root = fresh_map(p, 8);
+
+		zassert_equal(p->ops->count(root, NULL), -EINVAL, "%s", p->name);
+	}
+}
+
 /* ================================================================== */
 /* Tier 2 — UNSPECIFIED: pins today's behaviour, pending a shape edit  */
 /* ================================================================== */
@@ -1355,6 +1488,60 @@ ZTEST(kvhash_layout, test_next_walks_a_two_level_map)
 	zassert_equal(kvhash_map_ops.next(root, NULL, 0, k, sizeof(k), &kl,
 					  v, sizeof(v), &vl),
 		      -ENODATA, "emptied buckets must be skipped, not returned");
+}
+
+/*
+ * count at both depths, with buckets that del emptied but left allocated:
+ * those are still named by their directory and must count as zero, not be
+ * skipped wrongly or miscounted.
+ */
+static void count_with_emptied_buckets(size_t declared, uint8_t want_depth)
+{
+	struct map_config cfg = { .expected_entries = declared };
+	struct map_info info = { 0 };
+	uint64_t root = blob_db_alloc_id();
+	char key[8];
+	size_t c = SIZE_MAX;
+
+	zassert_not_equal(root, 0);
+	zassert_ok(kvhash_map_ops.create(root, &cfg));
+	zassert_ok(kvhash_map_ops.stat(root, &info));
+	zassert_equal(info.depth, want_depth);
+
+	fill(&kvhash, root, 100);
+	zassert_ok(kvhash_map_ops.count(root, &c));
+	zassert_equal(c, 100, "depth %u: full map", want_depth);
+
+	/* Empty most buckets entirely: delete all but every tenth key. */
+	for (int i = 0; i < 100; i++) {
+		if (i % 10 != 0) {
+			snprintf(key, sizeof(key), "k%03d", i);
+			zassert_ok(kvhash_map_ops.del(root, key, 4));
+		}
+	}
+	zassert_ok(kvhash_map_ops.count(root, &c));
+	zassert_equal(c, 10, "depth %u: after emptying buckets", want_depth);
+	walk_all(&kvhash, root, &walk_a);
+	zassert_equal(c, walk_a.n, "depth %u: count %zu, walk %zu",
+		      want_depth, c, walk_a.n);
+
+	/* All gone: every bucket allocated and empty. */
+	for (int i = 0; i < 100; i += 10) {
+		snprintf(key, sizeof(key), "k%03d", i);
+		zassert_ok(kvhash_map_ops.del(root, key, 4));
+	}
+	zassert_ok(kvhash_map_ops.count(root, &c));
+	zassert_equal(c, 0, "depth %u: all buckets emptied", want_depth);
+}
+
+ZTEST(kvhash_layout, test_count_at_depth_one)
+{
+	count_with_emptied_buckets(100, 1);
+}
+
+ZTEST(kvhash_layout, test_count_at_depth_two)
+{
+	count_with_emptied_buckets(128, 2);
 }
 
 #endif /* CONFIG_BLOB_CONTAINER_KVHASH */

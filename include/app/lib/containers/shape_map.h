@@ -72,7 +72,8 @@ struct map_config {
  * the entry count and the largest stored entry. Neither can be produced
  * without either maintaining a counter on the write path or walking every
  * record, and a diagnostic that costs a write per insert is worse than no
- * diagnostic.
+ * diagnostic. The entry count is available, at the cost of that walk, from
+ * @ref map_ops.count.
  */
 struct map_info {
 	/** Levels of indirection above the records (1 = flat). */
@@ -244,6 +245,46 @@ struct map_ops {
 	int (*next)(uint64_t root, const void *key, size_t klen,
 		    void *kout, size_t kout_sz, size_t *kout_len,
 		    void *vout, size_t vout_sz, size_t *vout_len);
+
+	/**
+	 * @brief Report how many keys the map holds.
+	 *
+	 * @p *out is the number of keys present: exactly the keys for which
+	 * @ref get would return 0. An empty or freshly created map reports 0.
+	 *
+	 * **Exact at any time**, including on the first call after a power cut
+	 * at any point during @ref set or @ref del. The count is computed from
+	 * what is on flash, so it always agrees with @ref get and with a full
+	 * @ref next walk.
+	 *
+	 * **Nothing stored, nothing written.** The map keeps no counter: count
+	 * never writes, @ref create, @ref set and @ref del write nothing extra
+	 * on its behalf, and no state is kept between calls. Every call walks
+	 * the map's records.
+	 *
+	 * **Cost** is per record, not per entry: the provider reads each of its
+	 * internal records once (for a hash, every directory and every allocated
+	 * bucket), so it grows with the map's geometry, and a large map costs
+	 * many reads. It is meant for mount and recovery, not per request.
+	 *
+	 * **Expected use** (not enforced): call it once at mount, then keep the
+	 * figure yourself — add one when a @ref set inserts a new key, subtract
+	 * one when a @ref del returns 0. Telling an insert from a replace is
+	 * the caller's job (for instance, by a @ref get probe before the
+	 * @ref set).
+	 *
+	 * @param root  the map
+	 * @param out   receives the number of keys
+	 *
+	 * @retval 0        *out set
+	 * @retval -ENOENT  @p root does not identify a map (never built), or a
+	 *                  @ref destroy has begun on it
+	 * @retval -EINVAL  @p out is NULL
+	 * @retval -EIO     flash error, or @p root holds something that is not
+	 *                  a valid map. *out is unchanged, and the call may be
+	 *                  repeated.
+	 */
+	int (*count)(uint64_t root, size_t *out);
 
 	/**
 	 * @brief Destroy the map at @p root, releasing every blob it owns.

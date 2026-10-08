@@ -871,6 +871,131 @@ static int kvhash_next(uint64_t root, const void *key, size_t klen,
 }
 
 /*
+ * Count, per shape_map.h `count`.
+ *
+ * Exactness needs no help from the write path: every set and del commits in
+ * one atomic bucket update, and a fresh bucket is published by a directory
+ * update only after its contents are written. So what a walk of the
+ * directories finds is always exactly what get answers for, whichever of
+ * those steps a power cut fell between. A fresh bucket orphaned by a cut is
+ * unreachable from the directory, so it is invisible to get and to the count
+ * alike.
+ *
+ * Entries are parsed exactly as bkt_find parses them -- a truncated tail ends
+ * the bucket -- so the count cannot disagree with get on a damaged bucket
+ * either.
+ */
+static size_t bkt_entries(const uint8_t *buf, size_t used)
+{
+	size_t off = 0, n = 0;
+
+	while (off + ENTRY_HDR_LEN <= used) {
+		size_t elen = ENTRY_HDR_LEN + get_u16(&buf[off]) +
+			      get_u16(&buf[off + 2]);
+
+		if (off + elen > used) {
+			break; /* truncated / corrupt — stop, as bkt_find does */
+		}
+		n++;
+		off += elen;
+	}
+	return n;
+}
+
+/* Add up the buckets named by the leaf directory in dir_buf. An allocated
+ * bucket that del has emptied still costs its lookup: it is still named. */
+static int leaf_count(uint16_t n, size_t *acc)
+{
+	for (uint16_t i = 0; i < n; i++) {
+		uint64_t bid = dir_child(dir_buf, i);
+
+		if (bid == 0) {
+			continue;
+		}
+
+		size_t used = 0;
+		int rc = blob_db_get(bid, bkt_buf, sizeof(bkt_buf), &used);
+
+		if (rc != 0) {
+			return rc;
+		}
+		*acc += bkt_entries(bkt_buf, used);
+	}
+	return 0;
+}
+
+static int kvhash_count(uint64_t root, size_t *out)
+{
+	if (out == NULL) {
+		return -EINVAL;
+	}
+
+	uint16_t n;
+	uint8_t depth;
+	size_t total = 0;
+	int rc = dir_load(root, &n, &depth);
+
+	if (rc != 0) {
+		return rc;
+	}
+
+	if (depth == 1) {
+		rc = leaf_count(n, &total);
+		if (rc == 0) {
+			*out = total;
+		}
+		return rc;
+	}
+
+	/*
+	 * Two levels. A sub-map's directory is loaded over the top one, and the
+	 * bucket buffer is needed for the buckets, so the top's child ids are
+	 * not kept: each one after the first is fetched with an 8-byte partial
+	 * read of the top, rather than re-reading the whole top directory or
+	 * spending a third payload-sized buffer.
+	 */
+	uint64_t sub = dir_child(dir_buf, 0);
+
+	for (uint16_t t = 0; t < n; t++) {
+		if (t != 0) {
+			size_t got = 0;
+			uint8_t raw[8];
+
+			rc = blob_db_read(root, DIR_HDR_LEN + (size_t)t * 8u,
+					  raw, sizeof(raw), &got);
+			if (rc != 0) {
+				return rc;
+			}
+			if (got != sizeof(raw)) {
+				return -EIO;
+			}
+			sub = get_u64(raw);
+		}
+		if (sub == 0) {
+			return -EIO; /* sub-maps are created eagerly; 0 is corruption */
+		}
+
+		uint16_t sub_n;
+		uint8_t sub_depth;
+
+		rc = dir_load(sub, &sub_n, &sub_depth);
+		if (rc != 0) {
+			return rc;
+		}
+		if (sub_depth != 1) {
+			return -EIO;
+		}
+		rc = leaf_count(sub_n, &total);
+		if (rc != 0) {
+			return rc;
+		}
+	}
+
+	*out = total;
+	return 0;
+}
+
+/*
  * Destroy, per l2_containers.md 2.4.
  *
  * Stamping the directory's magic is the commit: one atomic update that takes
@@ -1016,5 +1141,6 @@ const struct map_ops kvhash_map_ops = {
 	.set = kvhash_set,
 	.del = kvhash_del,
 	.next = kvhash_next,
+	.count = kvhash_count,
 	.destroy = kvhash_destroy,
 };

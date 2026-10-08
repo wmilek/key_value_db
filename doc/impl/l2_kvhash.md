@@ -229,12 +229,47 @@ Because no state survives a call, `set` and `del` between calls are safe. This
 is the stateless form of the "collect-then-mutate" pattern §2 asks of a
 callback `iterate`.
 
-## 5. Open implementation items
+## 5. `count`
+
+The caller's contract is `shape_map.h` (`map_ops.count`). kvhash keeps no
+counter, so the figure is computed on every call by walking the map.
+
+### 5.1 Exact without help from the write path
+
+Every `set` and `del` commits in one atomic bucket update, and a fresh bucket
+is published by a directory update only after its contents are written. So
+whichever step a power cut falls between, a walk of the directories finds
+exactly the entries `get` would find. A fresh bucket orphaned by a cut is
+named by no directory, so it is invisible to `get` and to the count alike.
+Buckets are parsed exactly as `bkt_find` parses them (a truncated tail ends
+the bucket), so the two cannot disagree on a damaged bucket either. Nothing
+was added to `create`, `set` or `del`.
+
+### 5.2 Cost
+
+| Depth | Blob reads |
+|---|---|
+| 1 | 1 directory + 1 per allocated bucket |
+| 2 | 1 top + (fanout − 1) 8-byte partial reads of the top + fanout sub-directories + 1 per allocated bucket |
+
+Two departures from "one read per directory plus one per non-empty bucket":
+
+- **Emptied buckets cost a lookup.** `del` rewrites an emptied bucket as an
+  empty payload rather than releasing it, so the directory still names it, and
+  only a lookup can tell that it is empty. That lookup copies no payload.
+  Avoiding it would take a release and a directory write in `del`.
+- **The top is re-read in 8-byte pieces at depth 2.** Loading a sub-directory
+  reuses `dir_buf`, and `bkt_buf` is busy with buckets, so the top's child ids
+  are not kept. Each sub-map after the first is located by a partial read of
+  its 8-byte slot, not a full re-read. Keeping the top whole would need a third
+  payload-sized static buffer.
+
+## 6. Open implementation items
 
 Known deltas against the layer documents, each pinned by a test in
 `tests/lib/containers` so it cannot regress silently.
 
-### 5.1 Wrong-type root returns `-EIO`, not `-EINVAL`
+### 6.1 Wrong-type root returns `-EIO`, not `-EINVAL`
 
 `l2_containers.md` §2.3 specifies `-EINVAL` for a root of the wrong type.
 `dir_load_raw()` returns `-EIO` on a magic mismatch.
@@ -245,7 +280,7 @@ function that answers "this is not a kvhash root" is the same one that answers
 (the designated home for type validation) fixes it properly; short of that it is
 a hand-written special case.
 
-### 5.2 `create` on a populated root orphans its buckets
+### 6.2 `create` on a populated root orphans its buckets
 
 `create` re-initialises the directory unconditionally. Called on a root that
 already holds a map, it makes every existing bucket unreachable without
@@ -255,7 +290,7 @@ The correct sequence today is `destroy` then `create` at a fresh id. Either
 `create` should learn `-EEXIST`, or the shape should state that the caller
 guarantees create-once.
 
-### 5.3 A bucket that fills has no recovery
+### 6.3 A bucket that fills has no recovery
 
 A bucket that outgrows one payload returns `-ENOSPC`, and the map cannot grow
 in place to escape it — the geometry is fixed at create. The only point at
