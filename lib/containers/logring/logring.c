@@ -129,6 +129,9 @@ static int root_load(uint64_t root, struct clog_root *r)
 	size_t got;
 	int rc = blob_db_get(root, buf, sizeof(buf), &got);
 
+	if (rc == -ENOMEM) {
+		return -ENOTSUP;   /* bigger than a clog_root → foreign payload */
+	}
 	if (rc < 0) {
 		return rc;
 	}
