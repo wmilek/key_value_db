@@ -223,6 +223,126 @@ static uint32_t io_line(const char *what)
 #define io_line(what)   ((uint32_t)0)
 #endif
 
+/*
+ * Value placement. Every value access in this app goes through kv_get /
+ * kv_set / kv_delete / kv_next, so the two layouts run the identical
+ * workload and their bench and io lines compare phase for phase.
+ *
+ * Inline (default): the value is stored in the kvhash bucket next to its key.
+ *
+ * VALUE_BLOBS: the map stores key -> u64 blob id and the value is that blob's
+ * payload. Each mutation is still made of single atomic ops, ordered so a
+ * reader never sees a dangling id:
+ *
+ *   set, key present : blob_db_update(id, val)     the whole mutation
+ *   set, key absent  : alloc, update(id, val), then kvdb_set(key, id) —
+ *                      the map write is the commit point
+ *   delete           : kvdb_delete(key) (commit), then blob_db_delete(id)
+ *
+ * A power cut between the two steps of an insert or a delete leaves an
+ * unreferenced value blob — never a wrong value. Nothing here reclaims it;
+ * that is a cost of the layout this benchmark does not hide.
+ */
+#if defined(CONFIG_APP_PERF_KVDB_VALUE_BLOBS)
+#define STORE_NAME   "perf_vb"
+#define LAYOUT_NAME  "value blobs"
+#define MAP_VAL_LEN  sizeof(uint64_t)
+
+static int ref_get(kvdb_t *db, const char *key, uint64_t *id)
+{
+	size_t len;
+	int rc = kvdb_get(db, key, id, sizeof(*id), &len);
+
+	if (rc == 0 && len != sizeof(*id)) {
+		return -EIO;
+	}
+	return rc;
+}
+
+static int kv_get(kvdb_t *db, const char *key, void *out, size_t out_sz,
+		  size_t *out_len)
+{
+	uint64_t id;
+	int rc = ref_get(db, key, &id);
+
+	if (rc != 0) {
+		return rc;
+	}
+	return blob_db_get(id, out, out_sz, out_len);
+}
+
+static int kv_set(kvdb_t *db, const char *key, const void *val, size_t len)
+{
+	uint64_t id;
+	int rc = ref_get(db, key, &id);
+
+	if (rc == 0) {
+		return blob_db_update(id, val, len);
+	}
+	if (rc != -ENOENT) {
+		return rc;
+	}
+	id = blob_db_alloc_id();
+	if (id == 0) {
+		return -ENOSPC;
+	}
+	rc = blob_db_update(id, val, len);
+	if (rc != 0) {
+		return rc;
+	}
+	return kvdb_set(db, key, &id, sizeof(id));
+}
+
+static int kv_delete(kvdb_t *db, const char *key)
+{
+	uint64_t id;
+	int rc = ref_get(db, key, &id);
+
+	if (rc != 0) {
+		return rc;
+	}
+	rc = kvdb_delete(db, key);
+	if (rc != 0) {
+		return rc;
+	}
+	return blob_db_delete(id);
+}
+
+static int kv_next(kvdb_t *db, const void *cur, size_t clen,
+		   void *kout, size_t kout_sz, size_t *klen,
+		   void *vout, size_t vout_sz, size_t *vlen)
+{
+	uint64_t id;
+	size_t idlen;
+	int rc = db->ops->next(db->root, cur, clen, kout, kout_sz, klen,
+			       &id, sizeof(id), &idlen);
+
+	if (rc != 0) {
+		return rc;
+	}
+	if (idlen != sizeof(id)) {
+		return -EIO;
+	}
+	return blob_db_get(id, vout, vout_sz, vlen);
+}
+#else
+#define STORE_NAME   "perf"
+#define LAYOUT_NAME  "inline"
+#define MAP_VAL_LEN  VAL_LEN
+
+#define kv_get     kvdb_get
+#define kv_set     kvdb_set
+#define kv_delete  kvdb_delete
+
+static int kv_next(kvdb_t *db, const void *cur, size_t clen,
+		   void *kout, size_t kout_sz, size_t *klen,
+		   void *vout, size_t vout_sz, size_t *vlen)
+{
+	return db->ops->next(db->root, cur, clen, kout, kout_sz, klen,
+			     vout, vout_sz, vlen);
+}
+#endif
+
 /* Check every key (and the ghost) against the expectation for generation G.
  * Returns 0 on full match, -EILSEQ on any mismatch (logged). Timed. */
 static int verify_generation(kvdb_t *db, uint32_t G, const char *label)
@@ -238,7 +358,7 @@ static int verify_generation(kvdb_t *db, uint32_t G, const char *label)
 	io_reset();
 	for (uint32_t i = 0; i < N_KEYS; i++) {
 		key_name(key, sizeof(key), i);
-		int rc = kvdb_get(db, key, &got, sizeof(got), &len);
+		int rc = kv_get(db, key, &got, sizeof(got), &len);
 
 		ops++;
 		if (rc != 0 || len != sizeof(got)) {
@@ -255,7 +375,7 @@ static int verify_generation(kvdb_t *db, uint32_t G, const char *label)
 	}
 
 	/* Ghost: present iff G is odd, stamped by the last odd gen <= G. */
-	int rc = kvdb_get(db, GHOST_KEY, &got, sizeof(got), &len);
+	int rc = kv_get(db, GHOST_KEY, &got, sizeof(got), &len);
 
 	ops++;
 	if (G % 2 == 1) {
@@ -369,9 +489,9 @@ static int walk_verify(kvdb_t *db, uint32_t G, const char *label,
 
 	io_reset();
 	for (;;) {
-		rc = db->ops->next(db->root, cur, clen,
-				   kout, sizeof(kout) - 1, &klen,
-				   &got, sizeof(got), &vlen);
+		rc = kv_next(db, cur, clen,
+			     kout, sizeof(kout) - 1, &klen,
+			     &got, sizeof(got), &vlen);
 		ops++;
 		if (rc == -ENODATA) {
 			break;
@@ -514,7 +634,7 @@ static int populate(kvdb_t *db)
 	for (uint32_t i = 0; i < N_KEYS; i++) {
 		key_name(key, sizeof(key), i);
 		make_val(&v, 1, i);
-		int rc = kvdb_set(db, key, &v, sizeof(v));
+		int rc = kv_set(db, key, &v, sizeof(v));
 
 		if (rc != 0) {
 			LOG_ERR("populate set(%s): %d", key, rc);
@@ -524,7 +644,7 @@ static int populate(kvdb_t *db)
 	}
 
 	make_val(&v, 1, GHOST_IDX);           /* gen 1 is odd -> ghost present */
-	int rc = kvdb_set(db, GHOST_KEY, &v, sizeof(v));
+	int rc = kv_set(db, GHOST_KEY, &v, sizeof(v));
 
 	if (rc != 0) {
 		return rc;
@@ -533,7 +653,7 @@ static int populate(kvdb_t *db)
 
 	struct gen_rec rec = { .gen = 1, .n_keys = N_KEYS, .val_len = VAL_LEN };
 
-	rc = kvdb_set(db, GEN_KEY, &rec, sizeof(rec));  /* commit point */
+	rc = kv_set(db, GEN_KEY, &rec, sizeof(rec));  /* commit point */
 	if (rc != 0) {
 		return rc;
 	}
@@ -559,7 +679,7 @@ static int modify(kvdb_t *db, uint32_t G)
 
 	/* Step 1: durable declaration that gen G+1 is in flight. */
 	struct intent_rec intent = { .to_gen = next };
-	int irc = kvdb_set(db, INTENT_KEY, &intent, sizeof(intent));
+	int irc = kv_set(db, INTENT_KEY, &intent, sizeof(intent));
 
 	if (irc != 0) {
 		LOG_ERR("modify intent: %d", irc);
@@ -575,7 +695,7 @@ static int modify(kvdb_t *db, uint32_t G)
 		}
 		key_name(key, sizeof(key), i);
 		make_val(&v, next, i);
-		int rc = kvdb_set(db, key, &v, sizeof(v));
+		int rc = kv_set(db, key, &v, sizeof(v));
 
 		if (rc != 0) {
 			LOG_ERR("modify set(%s): %d", key, rc);
@@ -588,9 +708,9 @@ static int modify(kvdb_t *db, uint32_t G)
 
 	if (next % 2 == 1) {
 		make_val(&v, next, GHOST_IDX);
-		rc = kvdb_set(db, GHOST_KEY, &v, sizeof(v));
+		rc = kv_set(db, GHOST_KEY, &v, sizeof(v));
 	} else {
-		rc = kvdb_delete(db, GHOST_KEY);
+		rc = kv_delete(db, GHOST_KEY);
 	}
 	if (rc != 0) {
 		LOG_ERR("modify ghost: %d", rc);
@@ -601,14 +721,14 @@ static int modify(kvdb_t *db, uint32_t G)
 	/* Step 3: commit point. */
 	struct gen_rec rec = { .gen = next, .n_keys = N_KEYS, .val_len = VAL_LEN };
 
-	rc = kvdb_set(db, GEN_KEY, &rec, sizeof(rec));
+	rc = kv_set(db, GEN_KEY, &rec, sizeof(rec));
 	if (rc != 0) {
 		return rc;
 	}
 	ops++;
 
 	/* Step 4: bump complete — drop the intent. */
-	rc = kvdb_delete(db, INTENT_KEY);
+	rc = kv_delete(db, INTENT_KEY);
 	if (rc != 0) {
 		LOG_ERR("modify intent clear: %d", rc);
 		return rc;
@@ -637,7 +757,7 @@ static int recovery_verify(kvdb_t *db, uint32_t G)
 	io_reset();
 	for (uint32_t i = 0; i < N_KEYS; i++) {
 		key_name(key, sizeof(key), i);
-		int rc = kvdb_get(db, key, &got, sizeof(got), &len);
+		int rc = kv_get(db, key, &got, sizeof(got), &len);
 
 		ops++;
 		if (rc != 0 || len != sizeof(got)) {
@@ -660,7 +780,7 @@ static int recovery_verify(kvdb_t *db, uint32_t G)
 
 	/* Ghost: exactly one of gen G / G+1 has it present (odd gens). Absent
 	 * always matches the even one; present must match the odd one's stamp. */
-	int rc = kvdb_get(db, GHOST_KEY, &got, sizeof(got), &len);
+	int rc = kv_get(db, GHOST_KEY, &got, sizeof(got), &len);
 
 	ops++;
 	if (rc == 0) {
@@ -692,9 +812,10 @@ static int recovery_verify(kvdb_t *db, uint32_t G)
 
 int main(void)
 {
-	printk("kvdb perf %s  (N_KEYS=%u  VAL_LEN=%u  STRIDE=%u  val=%u B)\n",
+	printk("kvdb perf %s  (N_KEYS=%u  VAL_LEN=%u  STRIDE=%u  val=%u B  "
+	       "layout=%s)\n",
 	       APP_VERSION_STRING, (unsigned)N_KEYS, (unsigned)VAL_LEN,
-	       (unsigned)STRIDE, (unsigned)sizeof(struct val));
+	       (unsigned)STRIDE, (unsigned)sizeof(struct val), LAYOUT_NAME);
 
 	int64_t t = k_uptime_get();
 	int rc = blob_db_mount();
@@ -726,11 +847,11 @@ int main(void)
 		 * container read as a bucket count and then silently clamped to
 		 * 127 (FINDINGS.md K9). */
 		.expected_entries = N_KEYS,
-		.typical_entry_bytes = VAL_LEN + sizeof("k0000"),
+		.typical_entry_bytes = MAP_VAL_LEN + sizeof("k0000"),
 	};
 	kvdb_t db;
 
-	rc = kvdb_open(&db, "perf", &cfg);
+	rc = kvdb_open(&db, STORE_NAME, &cfg);
 	if (rc != 0) {
 		LOG_ERR("kvdb_open: %d", rc);
 		goto out;
@@ -754,7 +875,7 @@ int main(void)
 	struct gen_rec rec;
 	size_t len;
 
-	rc = kvdb_get(&db, GEN_KEY, &rec, sizeof(rec), &len);
+	rc = kv_get(&db, GEN_KEY, &rec, sizeof(rec), &len);
 	if (rc == 0 && len == sizeof(rec) &&
 	    (rec.n_keys != N_KEYS || rec.val_len != VAL_LEN)) {
 		/* Store was populated by a build with different geometry —
@@ -778,7 +899,7 @@ int main(void)
 		}
 		rc = rootreg_init();
 		if (rc == 0) {
-			rc = kvdb_open(&db, "perf", &cfg);
+			rc = kvdb_open(&db, STORE_NAME, &cfg);
 		}
 		if (rc != 0) {
 			LOG_ERR("reopen after wipe: %d", rc);
@@ -806,7 +927,7 @@ int main(void)
 	bool torn = false;
 	struct intent_rec intent;
 
-	rc = kvdb_get(&db, INTENT_KEY, &intent, sizeof(intent), &len);
+	rc = kv_get(&db, INTENT_KEY, &intent, sizeof(intent), &len);
 	if (rc == 0 && len == sizeof(intent)) {
 		if (intent.to_gen == G + 1) {
 			printk("POWER LOSS detected: gen %u -> %u bump was in flight\n",
@@ -815,7 +936,7 @@ int main(void)
 		} else if (intent.to_gen == G) {
 			printk("POWER LOSS detected after commit of gen %u — clearing intent\n",
 			       G);
-			rc = kvdb_delete(&db, INTENT_KEY);
+			rc = kv_delete(&db, INTENT_KEY);
 			if (rc != 0) {
 				LOG_ERR("intent clear: %d", rc);
 				goto out;
