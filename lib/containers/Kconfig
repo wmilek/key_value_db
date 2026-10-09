@@ -14,6 +14,7 @@ config BLOB_CONTAINERS_INTENT
 
 config BLOB_CONTAINER_LOGRING
 	bool "logring — bounded per-entry log container"
+	select ENTROPY_GENERATOR
 	help
 	  A log-specialized container: a forward-linked chain of per-entry
 	  i-nodes with pre-reserved ids, so an append writes one new blob and
@@ -22,6 +23,10 @@ config BLOB_CONTAINER_LOGRING
 	  waypoint for recovery and batch oldest-first eviction. Reads use an
 	  opaque, portable cursor with a per-log epoch that rejects a stale
 	  moniker. Scales to near the whole partition. Self-contained on L1.
+
+	  Selects ENTROPY_GENERATOR: the per-log epoch is drawn with
+	  sys_rand32_get() (the non-crypto random subsystem — not PSA), so the
+	  module pulls its own randomness regardless of the blob_db backend.
 	  See doc/layers/l2_containers.md §4.5 and
 	  doc/proposals/2026-10-08-logring.md.
 

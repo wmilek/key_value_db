@@ -112,10 +112,14 @@ versioning, and integrity protection.
 ## 8. Epoch
 
 A per-log random `epoch` (`sys_rand32_get()`, forced non-zero) set at `create`
-and stored in the root tags the incarnation. A moniker carries it; `next`
-rejects a mismatch, so a moniker from a destroyed+recreated log (ids reused) or
-a random value is `-ESTALE` rather than a misread. This is defense-in-depth,
-not a security control — a crafted value with the live epoch is stopped only by
+and stored in the root tags the incarnation. `sys_rand32_get()` is the
+**non-crypto** random subsystem, not PSA, so the module `select`s
+`ENTROPY_GENERATOR` to pull its own randomness regardless of the blob_db
+backend (it does not depend on the UBI backend's PSA stack). A moniker carries
+the epoch; `next` rejects a mismatch, so a moniker from a destroyed+recreated
+log (ids reused) or a random value is `-ESTALE` rather than a misread. This is
+defense-in-depth, not a security control — a crafted value with the live epoch
+is stopped only by
 the caller's own integrity check.
 
 ## 9. Invariant checklist (`l2_containers.md` §5)
