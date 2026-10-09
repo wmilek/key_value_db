@@ -603,10 +603,13 @@ static void walk_from(const struct provider *p, uint64_t root,
 	size_t kl = 0, vl = 0;
 	int rc;
 
-	while ((rc = p->ops->next(root, cur, clen, k, sizeof(k), &kl,
+	/* One byte short, so every recorded key can be NUL-terminated for the
+	 * sscanf-based checks below. */
+	while ((rc = p->ops->next(root, cur, clen, k, WKEY - 1, &kl,
 				  v, sizeof(v), &vl)) == 0) {
 		zassert_true(w->n < WALK_MAX, "%s: walk does not end", p->name);
 		memcpy(w->key[w->n], k, kl);
+		w->key[w->n][kl] = '\0';
 		w->klen[w->n] = kl;
 		cur = w->key[w->n];
 		clen = kl;
@@ -1027,16 +1030,26 @@ ZTEST(map_contract, test_count_survives_remount)
 	}
 }
 
-/* count never writes. */
+/* count never writes: not a byte reaches the store, and not a blob changes. */
 ZTEST(map_contract, test_count_writes_nothing)
 {
 	FOR_EACH_PROVIDER(p) {
 		uint64_t root = fresh_map(p, 8);
+		struct blob_db_iostats io;
 		size_t blobs;
 
 		fill(p, root, 5);
 		blobs = blob_db_count();
+		blob_db_iostats_reset();
+
 		zassert_equal(count_of(p, root), 5, "%s", p->name);
+
+		blob_db_iostats_get(&io);
+		zassert_equal(io.writes, 0, "%s: count issued %u write(s)",
+			      p->name, io.writes);
+		zassert_equal(io.erases, 0, "%s: count issued %u erase(s)",
+			      p->name, io.erases);
+		zassert_true(io.reads > 0, "%s: count read nothing", p->name);
 		zassert_equal(blob_db_count(), blobs,
 			      "%s: count changed the store", p->name);
 	}

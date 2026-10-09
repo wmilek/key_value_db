@@ -194,12 +194,13 @@ The caller's contract is `shape_map.h` (`map_ops.next`). This is how it is met.
 A key's place in the enumeration order is
 
 ```
-(top index, sub index, crc32(key), klen, key bytes)
+(top index, sub index, klen, key bytes)
 ```
 
 The first two terms are where the key lives, so walking directories and
-buckets in index order already walks the order; the rest breaks ties inside one
-bucket. Every term is a function of the key and the geometry fixed at create,
+buckets in index order already walks the order; the last two break ties inside
+one bucket, and length-then-bytes is already a total order, so no hash is
+needed there. Every term is a function of the key and the geometry fixed at create,
 which is what the contract needs: a deleted key, or one never stored, still
 has a place, and so a successor. Nothing on flash changed to get this.
 
@@ -250,18 +251,20 @@ was added to `create`, `set` or `del`.
 | Depth | Blob reads |
 |---|---|
 | 1 | 1 directory + 1 per allocated bucket |
-| 2 | 1 top + (fanout − 1) 8-byte partial reads of the top + fanout sub-directories + 1 per allocated bucket |
+| 2 | fanout reads of the top + fanout sub-directories + 1 per allocated bucket |
 
 Two departures from "one read per directory plus one per non-empty bucket":
 
 - **Emptied buckets cost a lookup.** `del` rewrites an emptied bucket as an
   empty payload rather than releasing it, so the directory still names it, and
-  only a lookup can tell that it is empty. That lookup copies no payload.
-  Avoiding it would take a release and a directory write in `del`.
-- **The top is re-read in 8-byte pieces at depth 2.** Loading a sub-directory
+  only a lookup can tell that it is empty. Avoiding it would take a release and
+  a directory write in `del`.
+- **The top is re-read once per sub-map at depth 2.** Loading a sub-directory
   reuses `dir_buf`, and `bkt_buf` is busy with buckets, so the top's child ids
-  are not kept. Each sub-map after the first is located by a partial read of
-  its 8-byte slot, not a full re-read. Keeping the top whole would need a third
+  are not kept and the top is read again on each crossing — the same step
+  `next` takes, through the same helper. A partial `blob_db_read` of the one
+  8-byte slot would not be cheaper: blob_db stages an inline payload in full
+  before any partial copy. Keeping the top whole would need a third
   payload-sized static buffer.
 
 ## 6. Open implementation items

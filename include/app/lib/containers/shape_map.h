@@ -237,9 +237,10 @@ struct map_ops {
 	 * @retval -ENOMEM  @p kout_sz or @p vout_sz too small; lengths set
 	 * @retval -ENOENT  @p root does not identify a map (never built, or
 	 *                  destroyed) — distinct from the end of a walk
-	 * @retval -EINVAL  @p key NULL with a non-zero @p klen, @p klen longer
-	 *                  than any storable key, or a NULL buffer with a
-	 *                  non-zero size
+	 * @retval -EINVAL  @p key NULL with a non-zero @p klen, or a NULL
+	 *                  buffer with a non-zero size. A provider may also
+	 *                  refuse a @p klen its key-length field cannot hold;
+	 *                  short of that, a cursor need not be a storable key.
 	 * @retval -EIO     flash error
 	 */
 	int (*next)(uint64_t root, const void *key, size_t klen,

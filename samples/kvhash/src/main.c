@@ -5,7 +5,8 @@
  * kvhash sample — the L2 Map shape, one operation at a time.
  *
  * kvhash is a *container*, not an interface. It exports exactly one thing,
- * the op vector `kvhash_map_ops` (create / get / set / del), and every op
+ * the op vector `kvhash_map_ops` (create / stat / get / set / del / next /
+ * count / destroy), and every op
  * takes the map's **root id** as its first argument. There is no handle to
  * keep alive, nothing to close, and no RAM state between calls: the
  * `uint64_t` root id, stored somewhere durable, *is* the map.
