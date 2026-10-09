@@ -34,5 +34,5 @@ manifest:
     # against exactly this one.
     - name: zephyr-ubi
       remote: kamil-kielbasa
-      revision: v0.1.0
+      revision: v0.1.3
       path: modules/lib/zephyr-ubi

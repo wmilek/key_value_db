@@ -38,6 +38,7 @@
 
 #include <app/lib/blob_db_ubi.h>
 
+#include "blob_db_internal.h"
 #include "blob_db_store.h"
 
 LOG_MODULE_REGISTER(blob_db_store, CONFIG_BLOB_DB_LOG_LEVEL);
@@ -45,11 +46,9 @@ LOG_MODULE_REGISTER(blob_db_store, CONFIG_BLOB_DB_LOG_LEVEL);
 #define BLOB_DB_UBI_PARTITION   storage_partition
 #define BLOB_DB_UBI_VOL_NAME    "blobdb"
 
-/* LEBs left out of the volume, on top of the three UBI holds back for its
- * volume table. They give relocation a block to move onto and absorb blocks
- * retired after a failed write, so neither turns into -ENOSPC once every LEB
- * of the volume is mapped. */
-#define BLOB_DB_UBI_SPARE_LEBS  4
+/* LEBs left out of the volume, on top of the ones UBI holds back for its
+ * volume table (CONFIG_BLOB_DB_UBI_SPARE_LEBS). */
+#define BLOB_DB_UBI_SPARE_LEBS  CONFIG_BLOB_DB_UBI_SPARE_LEBS
 
 /* Separates this partition's derived keys from any other partition sealed
  * under the same keying material (struct ubi_config.key_context). */
@@ -371,6 +370,10 @@ int blob_db_store_open(struct blob_db_store_geom *geom, bool discard)
 	geom->peb_size = g_leb_size;
 	geom->write_align = info.write_block_size ? info.write_block_size : 1;
 	geom->n_pebs = (uint16_t)leb_count;
+	/* A fresh bucket's first write takes an erased block from UBI's free
+	 * pool, which blob_db_store_maintain() keeps full; formatting buckets
+	 * ahead would only spend that pool early. */
+	geom->preformat = false;
 	return 0;
 
 err_deinit:
@@ -447,6 +450,7 @@ int blob_db_store_erase(off_t off, size_t len)
 	}
 
 	relocate_step();
+	blob_db_maint_kick();
 	return 0;
 }
 
@@ -472,11 +476,76 @@ int blob_db_store_replace(off_t off, const void *buf, size_t len)
 		return rc;
 	}
 
+	/* The block it released waits for a reclaim. */
 	relocate_step();
+	blob_db_maint_kick();
 	return 0;
 }
 
 bool blob_db_store_replace_is_atomic(void)
 {
 	return IS_ENABLED(CONFIG_BLOB_DB_UBI_ATOMIC_REPLACE);
+}
+
+/* Refill the free pool first, then level wear: a relocation needs a free
+ * block to move onto, and the fuller the pool the more worn the block it
+ * finds. -EBADMSG is a block relocation refused to move; UBI never picks it
+ * again, so it is not a reason to stop. */
+int blob_db_store_maintain(uint32_t budget, uint32_t *performed, bool *more)
+{
+	static const enum ubi_maintenance_op ops[] = {
+		UBI_MAINTENANCE_RECLAIM,
+		UBI_MAINTENANCE_RELOCATE,
+	};
+
+	*performed = 0;
+	*more = false;
+
+	for (size_t i = 0; i < ARRAY_SIZE(ops); i++) {
+		struct ubi_maintenance_result res = { 0 };
+		const int rc = ubi_maintenance(g_ubi, ops[i], budget - *performed,
+					       &res);
+
+		*performed += res.performed;
+		if (res.remaining != 0) {
+			*more = true;
+		}
+		if (rc == -EBADMSG) {
+			LOG_WRN("ubi_maintenance(%d): a block failed verification "
+				"and stays where it is", (int)ops[i]);
+		} else if (rc != 0) {
+			LOG_ERR("ubi_maintenance(%d): %d", (int)ops[i], rc);
+			return rc;
+		}
+	}
+	return 0;
+}
+
+int blob_db_ubi_device_info(struct ubi_device_info *info)
+{
+	int rc = -ENODEV;
+
+	blob_db_lock();
+	if (g_ubi != NULL) {
+		rc = ubi_device_get_info(g_ubi, info);
+	}
+	blob_db_unlock();
+	return rc;
+}
+
+int blob_db_ubi_maintenance(enum ubi_maintenance_op op, uint32_t budget,
+			    struct ubi_maintenance_result *result)
+{
+	struct ubi_maintenance_result res = { 0 };
+	int rc = -ENODEV;
+
+	blob_db_lock();
+	if (g_ubi != NULL) {
+		rc = ubi_maintenance(g_ubi, op, budget, &res);
+	}
+	blob_db_unlock();
+	if (result != NULL) {
+		*result = res;
+	}
+	return rc;
 }

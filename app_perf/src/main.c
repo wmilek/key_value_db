@@ -9,12 +9,13 @@
  *   - the head id is stored at BLOB_DB_ROOT_ID (empty root == empty list)
  *
  * Four workloads are measured. Each phase runs erase_all() followed by
- * blob_db_prepare(N_OPS), so the timed loop measures the append-only write
- * path — the one-time sector-erase cost is paid up-front by prepare() and
- * reported separately.
- *   prepare — pre-format N_OPS buckets ahead of the alloc cursor (one 64 KB
- *             sector erase per bucket on mx25r64; the append/prepend loops
- *             below never trigger a bucket format because of this)
+ * blob_db_maintain() until nothing is left, so the timed loop measures the
+ * append-only write path — the erases blob_db can do ahead are paid up-front
+ * and reported separately.
+ *   maint   — on flash_area, format every fresh bucket (one 64 KB sector
+ *             erase each on mx25r64); on UBI, reclaim the blocks waiting
+ *             for an erase. Either way the append/prepend loops below find
+ *             an erased block for every bucket they first write.
  *   prepend — alloc_id + bind(new, next=head) + update(root=new_id)
  *   append  — alloc_id + bind(new, next=0) + update(prev_tail, next=new_id)
  *             (O(1) via a caller-side tail cache)
@@ -189,6 +190,23 @@ static int list_traverse(uint32_t *checksum_out)
 }
 
 /* --- benchmark harness ------------------------------------------------- */
+
+/* Run blob_db_maintain() until nothing is left; returns the steps taken. */
+static int maintain_all(void)
+{
+	struct blob_db_maint_result res;
+	int steps = 0;
+
+	do {
+		const int rc = blob_db_maintain(1, &res);
+
+		if (rc < 0) {
+			return rc;
+		}
+		steps += (int)res.performed;
+	} while (res.more);
+	return steps;
+}
 
 static void bench_line(const char *what, int ops, int64_t ms)
 {
@@ -384,7 +402,7 @@ static int bench_large(void)
 	fill_obj(0x5a);
 
 	/* Cold: buckets are unformatted, so every segment pays a sector erase.
-	 * Deliberately NOT prepare()d — the contrast with the warm pass below
+	 * Deliberately NOT maintained — the contrast with the warm pass below
 	 * is what quantifies the erase cost. */
 	io_reset();
 	int64_t t = k_uptime_get();
@@ -561,13 +579,13 @@ int main(void)
 	}
 
 	int64_t tp = k_uptime_get();
-	int prepared = blob_db_prepare(N_OPS);
+	int maintained = maintain_all();
 
-	if (prepared < 0) {
-		LOG_ERR("prepare: %d", prepared);
+	if (maintained < 0) {
+		LOG_ERR("maintain: %d", maintained);
 		goto out;
 	}
-	bench_line("prepare", prepared, k_uptime_delta(&tp));
+	bench_line("maint", maintained, k_uptime_delta(&tp));
 
 	int64_t t0 = k_uptime_get();
 
@@ -603,12 +621,12 @@ int main(void)
 	}
 
 	tp = k_uptime_get();
-	prepared = blob_db_prepare(N_OPS);
-	if (prepared < 0) {
-		LOG_ERR("prepare: %d", prepared);
+	maintained = maintain_all();
+	if (maintained < 0) {
+		LOG_ERR("maintain: %d", maintained);
 		goto out;
 	}
-	bench_line("prepare", prepared, k_uptime_delta(&tp));
+	bench_line("maint", maintained, k_uptime_delta(&tp));
 
 	int64_t t1 = k_uptime_get();
 	uint64_t tail = 0;   /* caller-side tail cache; O(1) append */

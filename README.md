@@ -409,7 +409,7 @@ for out-of-tree Zephyr structure.
 ## Zephyr version
 
 The manifest tracks Zephyr `main`. The UBI layer is pinned to the
-[zephyr-ubi][ubi] `v0.1.0` release, which targets Zephyr 4.4; the backend in
+[zephyr-ubi][ubi] `v0.1.3` release, which targets Zephyr 4.4; the backend in
 `lib/blob_db/blob_db_store_ubi.c` is written against that release's API and
 on-flash format.
 

@@ -6,8 +6,9 @@
  *
  * Parsing and printing only, over the public introspection API
  * (<app/lib/blob_db_inspect.h>, CONFIG_BLOB_DB_INSPECT). No command
- * writes to flash. blob_db is not thread-safe and this runs on the shell
- * thread, so use it while the application is not calling blob_db.
+ * writes to flash. Every blob_db call takes the blob_db lock, so commands
+ * are safe while the application uses the store; a command that reads
+ * several buckets sees each as it is then, not one snapshot.
  */
 
 #include <errno.h>

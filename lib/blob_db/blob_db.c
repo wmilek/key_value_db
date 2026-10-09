@@ -78,8 +78,8 @@ static inline void idx_invalidate(void);
 #endif
 
 /* Upper bound on the sector size we can hold in RAM. mount refuses larger
- * partitions. Two full-sector buffers live in .bss (below); the library is
- * single-threaded per contract §5 so sharing them across calls is safe. */
+ * partitions. Two full-sector buffers live in .bss (below); every public call
+ * holds g_lock for its whole duration, so sharing them across calls is safe. */
 #define BLOB_DB_SECTOR_BUF_MAX CONFIG_BLOB_DB_SECTOR_BUF_SIZE
 
 /* Sector-sized scratch buffers. g_bbuf is used by every read-a-bucket op
@@ -93,7 +93,23 @@ static uint8_t g_bbuf_new[BLOB_DB_SECTOR_BUF_MAX];
  * compiles the assert away and this stays a dead store. */
 static bool g_bbuf_new_busy;
 
-/* Single global instance. v1 is single-threaded; caller serializes. */
+/* Serializes every public call (contract §5). Recursive, so a public call
+ * made from inside another — an iterate callback, or the library calling its
+ * own API — does not deadlock. Everything below, the sector buffers included,
+ * is touched only with it held. */
+static K_MUTEX_DEFINE(g_lock);
+
+void blob_db_lock(void)
+{
+	(void)k_mutex_lock(&g_lock, K_FOREVER);
+}
+
+void blob_db_unlock(void)
+{
+	(void)k_mutex_unlock(&g_lock);
+}
+
+/* Single global instance, guarded by g_lock. */
 static struct {
 	bool      mounted;
 	size_t    fa_size;         /* total addressable bytes (n_pebs * peb_size) */
@@ -107,6 +123,9 @@ static struct {
 	uint64_t  next_id_hint;    /* durable leading ceiling (see internal.h) */
 	uint64_t  seg_owner;       /* segmented write in flight; 0 = none */
 	bool      wedged;          /* a torn compaction makes further writes unsafe */
+	bool      preformat;       /* backend wants fresh buckets formatted ahead */
+	uint16_t  maint_start;     /* first bucket blob_db_maintain() looks at */
+	uint16_t  maint_scanned;   /* buckets it has looked at since */
 } st;
 
 static inline off_t peb_offset(uint16_t peb)
@@ -145,13 +164,17 @@ void blob_db_io_note(enum blob_db_io_op op, size_t bytes)
 void blob_db_iostats_get(struct blob_db_iostats *out)
 {
 	if (out) {
+		blob_db_lock();
 		*out = g_io;
+		blob_db_unlock();
 	}
 }
 
 void blob_db_iostats_reset(void)
 {
+	blob_db_lock();
 	memset(&g_io, 0, sizeof(g_io));
+	blob_db_unlock();
 }
 #endif /* CONFIG_BLOB_DB_IOSTATS */
 
@@ -453,6 +476,7 @@ static int store_open_and_validate(bool discard)
 	st.write_align = geom.write_align ? geom.write_align : 1;
 	st.n_pebs = geom.n_pebs;
 	st.fa_size = (size_t)geom.n_pebs * geom.peb_size;
+	st.preformat = geom.preformat;
 
 	if (st.peb_size > BLOB_DB_SECTOR_BUF_MAX) {
 		LOG_ERR("sector size %zu exceeds CONFIG_BLOB_DB_SECTOR_BUF_SIZE=%u",
@@ -509,7 +533,7 @@ err_close:
 	return rc;
 }
 
-int blob_db_mount(void)
+static int mount_impl(void)
 {
 	if (st.mounted) {
 		return -EALREADY;
@@ -695,7 +719,7 @@ err_close:
 	return rc;
 }
 
-int blob_db_unmount(void)
+static int unmount_impl(void)
 {
 	if (!st.mounted) {
 		return 0;
@@ -1481,7 +1505,9 @@ enum blob_db_test_cut blob_db_test_cut;
 
 void blob_db_test_wedge(void)
 {
+	blob_db_lock();
 	st.wedged = true;
+	blob_db_unlock();
 }
 
 /* Stop dead at a chosen step of §6.4, leaving flash exactly as a power cut
@@ -2265,7 +2291,7 @@ static int seg_update(uint64_t id, const void *payload, size_t len,
 }
 #endif /* CONFIG_BLOB_DB_LARGE_PAYLOADS */
 
-uint64_t blob_db_alloc_id(void)
+static uint64_t alloc_id_impl(void)
 {
 	if (!st.mounted) {
 		return 0;   /* 0 is never a valid id */
@@ -2291,7 +2317,7 @@ uint64_t blob_db_alloc_id(void)
 	return id;
 }
 
-int blob_db_get(uint64_t id, void *out, size_t out_sz, size_t *out_len)
+static int get_impl(uint64_t id, void *out, size_t out_sz, size_t *out_len)
 {
 	if (!st.mounted) {
 		return -ENODEV;
@@ -2355,7 +2381,7 @@ int blob_db_get(uint64_t id, void *out, size_t out_sz, size_t *out_len)
 	return 0;
 }
 
-int blob_db_update(uint64_t id, const void *payload, size_t len)
+static int update_impl(uint64_t id, const void *payload, size_t len)
 {
 	if (!st.mounted) {
 		return -ENODEV;
@@ -2530,7 +2556,7 @@ int blob_db_update(uint64_t id, const void *payload, size_t len)
 	return 0;
 }
 
-int blob_db_delete(uint64_t id)
+static int delete_impl(uint64_t id)
 {
 	if (!st.mounted) {
 		return -ENODEV;
@@ -2646,7 +2672,7 @@ int blob_db_delete(uint64_t id)
 	return 0;
 }
 
-bool blob_db_exists(uint64_t id)
+static bool exists_impl(uint64_t id)
 {
 	if (!st.mounted || id == 0) {
 		return false;
@@ -2742,7 +2768,7 @@ static int count_visitor(uint64_t id, const uint8_t *p, uint16_t l, void *user)
 	return 0;
 }
 
-size_t blob_db_count(void)
+static size_t count_impl(void)
 {
 	if (!st.mounted) {
 		return 0;
@@ -2774,7 +2800,7 @@ static int iterate_visitor(uint64_t id, const uint8_t *p, uint16_t l, void *u)
 	return t->user_cb(id, p, l, t->user);
 }
 
-int blob_db_iterate(blob_db_iter_cb_t cb, void *user)
+static int iterate_impl(blob_db_iter_cb_t cb, void *user)
 {
 	if (!st.mounted) {
 		return -ENODEV;
@@ -2851,7 +2877,7 @@ bool blob_db_core_bucket_hdr_valid(const uint8_t *buf, uint16_t bid)
 }
 #endif /* CONFIG_BLOB_DB_INSPECT */
 
-int blob_db_size(uint64_t id, size_t *out_size)
+static int size_impl(uint64_t id, size_t *out_size)
 {
 	if (!st.mounted) {
 		return -ENODEV;
@@ -2952,8 +2978,8 @@ static int seg_read_range(uint64_t id, const struct blob_db_index_hdr *h,
 }
 #endif
 
-int blob_db_read(uint64_t id, size_t offset, void *out, size_t len,
-		 size_t *out_read)
+static int read_impl(uint64_t id, size_t offset, void *out, size_t len,
+		     size_t *out_read)
 {
 	if (!st.mounted) {
 		return -ENODEV;
@@ -3030,7 +3056,8 @@ int blob_db_read(uint64_t id, size_t offset, void *out, size_t len,
 	return 0;
 }
 
-int blob_db_write(uint64_t id, size_t offset, const void *buf, size_t len)
+static int write_impl(uint64_t id, size_t offset, const void *buf,
+		      size_t len)
 {
 	if (!st.mounted) {
 		return -ENODEV;
@@ -3138,7 +3165,7 @@ int blob_db_write(uint64_t id, size_t offset, const void *buf, size_t len)
 			   (uint16_t)need);
 }
 
-int blob_db_format(void)
+static int format_impl(void)
 {
 	bool opened_here = false;
 	int rc;
@@ -3230,7 +3257,7 @@ static int bind_root_empty(void)
 	return rc;
 }
 
-int blob_db_erase_all(void)
+static int erase_all_impl(void)
 {
 	if (!st.mounted) {
 		return -ENODEV;
@@ -3326,53 +3353,302 @@ int blob_db_erase_all(void)
 	return 0;
 }
 
-int blob_db_prepare(size_t n)
+/* Maintenance ------------------------------------------------------------ */
+
+/* Start looking for fresh buckets again, at the one the next allocation
+ * lands in, and have the background helper look too. Called whenever the
+ * set of fresh buckets may have grown: mount, format, erase_all. */
+static void maint_reset(void)
 {
-	if (!st.mounted) {
-		return -ENODEV;
-	}
-	if (st.wedged) {
-		return -EIO;   /* torn compaction; see compact_commit() */
-	}
-	if (n == 0) {
-		return 0;
-	}
-	if (n > st.n_buckets) {
-		n = st.n_buckets;
-	}
+	st.maint_start = (uint16_t)(st.next_id % st.n_buckets);
+	st.maint_scanned = 0;
+	blob_db_maint_kick();
+}
 
+/* Format the next bucket that has never been written, so its first update
+ * does not pay the erase. Buckets ahead of the allocation cursor come first:
+ * those are the ones the next ids land in. The scan only reads headers and
+ * does not count as a step; *formatted says whether a step was taken. */
+static int preformat_step(bool *formatted)
+{
 	const uint16_t root_bid = (uint16_t)(BLOB_DB_ROOT_ID % st.n_buckets);
-	size_t prepared = 0;
 
-	for (size_t i = 0; i < n; i++) {
-		const uint16_t bid =
-			(uint16_t)((st.next_id + i) % st.n_buckets);
+	*formatted = false;
+	while (st.maint_scanned < st.n_buckets) {
+		const uint16_t bid = (uint16_t)((st.maint_start + st.maint_scanned) %
+						st.n_buckets);
+		struct blob_db_bucket_hdr peek;
 
 		if (bid == root_bid) {
+			st.maint_scanned++;
 			continue;
 		}
 
-		/* Peek only the header — no need to pull a full sector into
-		 * g_bbuf just to decide whether formatting is needed. */
-		struct blob_db_bucket_hdr peek;
-		int rc = blob_db_store_read(bucket_offset(bid),
-					 &peek, sizeof(peek));
+		int rc = blob_db_store_read(bucket_offset(bid), &peek, sizeof(peek));
+
 		if (rc < 0) {
-			LOG_ERR("prepare: read bid %u: %d", bid, rc);
+			LOG_ERR("maintain: read bid %u: %d", bid, rc);
 			return rc;
 		}
 		if (bucket_hdr_valid((const uint8_t *)&peek, bid)) {
+			st.maint_scanned++;
 			continue;
 		}
 
 		rc = format_bucket(bid);
 		if (rc < 0) {
-			return rc;
+			return rc;   /* not counted as scanned: the next call retries */
 		}
-		prepared++;
+		st.maint_scanned++;
+		*formatted = true;
+		return 0;
+	}
+	return 0;
+}
+
+int blob_db_maintain(uint32_t budget, struct blob_db_maint_result *result)
+{
+	struct blob_db_maint_result res = { 0 };
+	int rc = 0;
+
+	blob_db_lock();
+	if (!st.mounted) {
+		rc = -ENODEV;
+		goto out;
+	}
+	if (st.wedged) {
+		rc = -EIO;   /* torn compaction; see compact_commit() */
+		goto out;
 	}
 
-	LOG_DBG("prepare(%zu): formatted %zu (cursor=%llu)",
-		n, prepared, (unsigned long long)st.next_id);
-	return (int)prepared;
+	if (st.preformat) {
+		while (res.performed < budget) {
+			bool formatted;
+
+			rc = preformat_step(&formatted);
+			if (rc < 0) {
+				goto out;
+			}
+			if (!formatted) {
+				break;
+			}
+			res.performed++;
+		}
+		res.more = st.maint_scanned < st.n_buckets;
+	}
+
+	uint32_t done = 0;
+	bool more = false;
+
+	rc = blob_db_store_maintain(budget - res.performed, &done, &more);
+	res.performed += done;
+	res.more = res.more || more;
+
+out:
+	blob_db_unlock();
+	if (result != NULL) {
+		*result = res;
+	}
+	return rc;
+}
+
+#if defined(CONFIG_BLOB_DB_MAINT_WORK)
+static void maint_work_handler(struct k_work *work);
+
+static K_WORK_DEFINE(g_maint_work, maint_work_handler);
+
+/* The queue the helper runs on; NULL while stopped. Guarded by g_lock. */
+static struct k_work_q *g_maint_q;
+
+void blob_db_maint_kick(void)
+{
+	if (g_maint_q != NULL) {
+		(void)k_work_submit_to_queue(g_maint_q, &g_maint_work);
+	}
+}
+
+/* One step per run, then back to the end of the queue, so the queue's other
+ * items and every blob_db caller wait at most one erase. */
+static void maint_work_handler(struct k_work *work)
+{
+	ARG_UNUSED(work);
+
+	struct blob_db_maint_result res;
+	const int rc = blob_db_maintain(1, &res);
+
+	if (rc < 0) {
+		/* -ENODEV: unmounted since the kick; mount kicks again. */
+		if (rc != -ENODEV) {
+			LOG_WRN("background maintenance: %d", rc);
+		}
+		return;
+	}
+	if (res.more) {
+		blob_db_lock();
+		blob_db_maint_kick();
+		blob_db_unlock();
+	}
+}
+
+int blob_db_maint_start(struct k_work_q *queue)
+{
+	blob_db_lock();
+	g_maint_q = queue != NULL ? queue : &k_sys_work_q;
+	if (st.mounted) {
+		blob_db_maint_kick();
+	}
+	blob_db_unlock();
+	return 0;
+}
+
+void blob_db_maint_stop(void)
+{
+	struct k_work_sync sync;
+
+	/* Cleared under the lock, so a run that is already past its step
+	 * cannot resubmit; then wait for that run outside it, since the run
+	 * takes the lock itself. */
+	blob_db_lock();
+	g_maint_q = NULL;
+	blob_db_unlock();
+	(void)k_work_cancel_sync(&g_maint_work, &sync);
+}
+#endif /* CONFIG_BLOB_DB_MAINT_WORK */
+
+/* Public API: each call holds g_lock for its whole duration ---------------- */
+
+int blob_db_mount(void)
+{
+	blob_db_lock();
+	const int rc = mount_impl();
+
+	if (rc == 0) {
+		maint_reset();
+	}
+	blob_db_unlock();
+	return rc;
+}
+
+int blob_db_unmount(void)
+{
+	blob_db_lock();
+	const int rc = unmount_impl();
+
+	blob_db_unlock();
+	return rc;
+}
+
+int blob_db_format(void)
+{
+	blob_db_lock();
+	const int rc = format_impl();
+
+	if (rc == 0) {
+		maint_reset();
+	}
+	blob_db_unlock();
+	return rc;
+}
+
+int blob_db_erase_all(void)
+{
+	blob_db_lock();
+	const int rc = erase_all_impl();
+
+	if (rc == 0) {
+		maint_reset();
+	}
+	blob_db_unlock();
+	return rc;
+}
+
+uint64_t blob_db_alloc_id(void)
+{
+	blob_db_lock();
+	const uint64_t id = alloc_id_impl();
+
+	blob_db_unlock();
+	return id;
+}
+
+int blob_db_get(uint64_t id, void *out, size_t out_sz, size_t *out_len)
+{
+	blob_db_lock();
+	const int rc = get_impl(id, out, out_sz, out_len);
+
+	blob_db_unlock();
+	return rc;
+}
+
+int blob_db_update(uint64_t id, const void *payload, size_t len)
+{
+	blob_db_lock();
+	const int rc = update_impl(id, payload, len);
+
+	blob_db_unlock();
+	return rc;
+}
+
+int blob_db_size(uint64_t id, size_t *out_size)
+{
+	blob_db_lock();
+	const int rc = size_impl(id, out_size);
+
+	blob_db_unlock();
+	return rc;
+}
+
+int blob_db_read(uint64_t id, size_t offset, void *out, size_t len,
+		 size_t *out_read)
+{
+	blob_db_lock();
+	const int rc = read_impl(id, offset, out, len, out_read);
+
+	blob_db_unlock();
+	return rc;
+}
+
+int blob_db_write(uint64_t id, size_t offset, const void *buf, size_t len)
+{
+	blob_db_lock();
+	const int rc = write_impl(id, offset, buf, len);
+
+	blob_db_unlock();
+	return rc;
+}
+
+int blob_db_delete(uint64_t id)
+{
+	blob_db_lock();
+	const int rc = delete_impl(id);
+
+	blob_db_unlock();
+	return rc;
+}
+
+bool blob_db_exists(uint64_t id)
+{
+	blob_db_lock();
+	const bool live = exists_impl(id);
+
+	blob_db_unlock();
+	return live;
+}
+
+size_t blob_db_count(void)
+{
+	blob_db_lock();
+	const size_t n = count_impl();
+
+	blob_db_unlock();
+	return n;
+}
+
+int blob_db_iterate(blob_db_iter_cb_t cb, void *user)
+{
+	blob_db_lock();
+	const int rc = iterate_impl(cb, user);
+
+	blob_db_unlock();
+	return rc;
 }

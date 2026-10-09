@@ -80,13 +80,14 @@ happened — compaction erases the scratch block to retire a sealed image — so
 the backend asks for the durable erase, at one flash erase per call, which is
 what the raw partition charges too.
 
-**Atomic replace** (`CONFIG_BLOB_DB_UBI_ATOMIC_REPLACE`, off by default).
+**Atomic replace** (`CONFIG_BLOB_DB_UBI_ATOMIC_REPLACE`, on by default).
 `blob_db_store_replace()` — "this block now holds exactly this image" — maps
 onto `ubi_leb_change()`, which leaves the old contents or the new ones across
 a power loss. blob_db then compacts a bucket in that one call instead of the
 scratch-sector protocol (one erase instead of five), which pays off in
-workloads that compact often (`app_cbor_persondb/RESULTS.md`). The replaced
-block is only queued for reclaim, so its old bytes stay on flash, and UBI
+workloads that compact often (`app_cbor_persondb/RESULTS.md`), and it is what
+lets `blob_db_maintain()` take the erase out of the call (see Maintenance
+below). The replaced block is only queued for reclaim, so its old bytes stay on flash, and UBI
 stands it back up at attach if the newest copy fails the checksum
 `ubi_leb_change()` sealed it with. Nothing may therefore be written in place
 over a replaced block: `blob_db_erase_all()`, which otherwise invalidates a
@@ -129,23 +130,43 @@ every device; an application with a trusted store (PSA ITS, a monotonic
 counter) overrides it. A refusal fails the mount, or every later write, with
 `-EROFS`. Application data is neither encrypted nor authenticated either way.
 
-**Maintenance.** zephyr-ubi has no background thread. A write that finds no
-free block erases one itself, and `ubi_leb_erase()` hands its block straight
-back to the free pool, so blob_db needs no reclaim. Two operations are run on
-blob_db's behalf:
+**Maintenance.** zephyr-ubi has no background thread. A block it no longer
+needs — the old copy `ubi_leb_change()` replaced, or one a device format left
+blank — waits for `UBI_MAINTENANCE_RECLAIM`; a write that finds no erased
+block free erases one of those itself, inline. Keeping erases out of blob_db's
+calls is therefore a matter of reclaiming ahead of them:
 
-- `UBI_MAINTENANCE_REPAIR` at every mount, which restores a degraded volume
-  table and gives retired blocks another chance;
-- `UBI_MAINTENANCE_RELOCATE` after each bucket erase, up to
-  `CONFIG_BLOB_DB_UBI_RELOCATE_BUDGET` (default 1) moves. It moves rarely
-  rewritten data off little-worn blocks — the masters and cold buckets — which
-  the previous UBI backend never did. Most erases find nothing past
-  `CONFIG_UBI_WEAR_LEVELING_THRESHOLD`; one that does pays a block copy and an
-  extra erase. 0 turns it off.
+| erase | where it happens | deferred by |
+|---|---|---|
+| bucket replace (compaction, master write, bucket format) | `ubi_leb_change()` takes a free block; the old one waits | `CONFIG_BLOB_DB_UBI_ATOMIC_REPLACE` (default y). Off, each is a `ubi_leb_erase()`, which erases at once |
+| refilling the free pool | inline, in the write that finds it empty | `blob_db_maintain()`: one `RECLAIM` per step |
+| wear levelling | `CONFIG_BLOB_DB_UBI_RELOCATE_BUDGET` moves after each replace | budget 0, and `blob_db_maintain()` runs `RELOCATE` once nothing is left to reclaim |
 
-Blocks UBI keeps as `CORRUPT` (damage behind a valid erase-counter header) are
-reported at mount but never discarded by blob_db: they may hold the only copy
-of something, and UBI refuses to attach once too many accumulate.
+With atomic replace, budget 0 and `blob_db_maintain()` run while the system
+is idle, no blob_db call erases until the free pool runs dry. Once every bucket
+has been written the pool is the volume's spares,
+`CONFIG_BLOB_DB_UBI_SPARE_LEBS` (default 4): that many replaces between idle
+periods are erase-free, and the next one erases inline. A `blob_db_store_erase()`
+is left only in `blob_db_format()` and in mount's recovery of a compaction torn
+under the scratch-sector protocol.
+
+`blob_db_maintain()` runs on the caller's thread, or on a work queue the
+application names through `blob_db_maint_start()` (`CONFIG_BLOB_DB_MAINT_WORK`).
+blob_db kicks that helper whenever a replace leaves a block waiting; the
+helper takes one step per run and resubmits itself while work is left. When the
+helper is on, `RELOCATE_BUDGET` defaults to 0.
+
+Two operations stay outside `blob_db_maintain()`:
+
+- `UBI_MAINTENANCE_REPAIR` runs to completion at every mount, which restores a
+  degraded volume table and gives retired blocks another chance;
+- `UBI_MAINTENANCE_DISCARD` is never run by blob_db. Blocks UBI keeps as
+  `CORRUPT` (damage behind a valid erase-counter header) are reported at mount
+  but kept: they may hold the only copy of something. UBI refuses to attach
+  once they reach 1/20 of the device, so the application decides when to give
+  them up, through `blob_db_ubi_maintenance(UBI_MAINTENANCE_DISCARD, …)`.
+  `blob_db_ubi_device_info()` reports how many there are, with the free and
+  reclaimable counts.
 
 **Runtime cost.** The LEB→PEB indirection adds a small, fixed cost per flash
 access and nothing per byte, so transaction-heavy paths pay most; the sector
@@ -219,8 +240,10 @@ choice BLOB_DB_BACKEND                        # in lib/blob_db/Kconfig
         choice BLOB_DB_UBI_KEY
             BLOB_DB_UBI_KEY_BUILTIN  (default)   # fixed development key
             BLOB_DB_UBI_KEY_APP                  # blob_db_ubi_ikm_key()
-        BLOB_DB_UBI_RELOCATE_BUDGET  (1)          # wear-leveling moves per erase
-        BLOB_DB_UBI_ATOMIC_REPLACE   (n)          # replace and compact by ubi_leb_change()
+        BLOB_DB_UBI_RELOCATE_BUDGET  (1; 0 with MAINT_WORK)  # wear-leveling moves per replace
+        BLOB_DB_UBI_ATOMIC_REPLACE   (y)          # replace and compact by ubi_leb_change()
+        BLOB_DB_UBI_SPARE_LEBS       (4)          # blocks outside the volume: the erase-free burst
+    BLOB_DB_MAINT_WORK               (n)          # blob_db_maintain() on a work queue
     BLOB_DB_UBI_HEAP_SIZE                     # heap for UBI, from the partition size
 ```
 
@@ -238,6 +261,15 @@ invalidation before erase, …) keep zephyr-ubi's defaults (§3).
   `lib.blob_db.ubi.app_key` adds the application hooks: a wrong key refused
   with `-EBADMSG` and the store intact, a refused state check at mount and at
   run time.
+- The `blob_db_maint` suite runs on every scenario: maintenance drains and
+  changes nothing a reader sees, and two threads interleaving calls under the
+  library lock lose nothing. `lib.blob_db.maint_work` and
+  `lib.blob_db.ubi.maint_work` add the work-queue helper on each backend.
+  On UBI, `test_compaction_defers_its_erase_to_maintain` checks with UBI's
+  erase counters that a compaction erases nothing itself and that
+  `blob_db_maintain()` pays exactly the erases it left;
+  `lib.blob_db.ubi.no_atomic_replace` keeps the scratch-sector protocol
+  covered now that atomic replace is the default.
 - Every other suite (`blob_db_contract`, `kvdb`, `rootreg`) runs on the
   default, i.e. UBI.
 - CI builds `app` on both backends on both targets, and `app_perf` and

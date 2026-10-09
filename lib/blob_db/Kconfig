@@ -85,20 +85,25 @@ endchoice
 
 config BLOB_DB_UBI_RELOCATE_BUDGET
 	int "Wear-leveling relocations per bucket erase"
+	default 0 if BLOB_DB_MAINT_WORK
 	default 1
 	range 0 16
 	help
 	  UBI moves rarely rewritten data off little-worn blocks only when
-	  asked (UBI_MAINTENANCE_RELOCATE). Each bucket erase asks for up to
-	  this many moves. Most erases find nothing worth moving
-	  (CONFIG_UBI_WEAR_LEVELING_THRESHOLD); one that does pays a block
-	  copy and an extra erase.
+	  asked (UBI_MAINTENANCE_RELOCATE). Each bucket erase or replace asks
+	  for up to this many moves, inside the blob_db call that caused it.
+	  Most find nothing worth moving (CONFIG_UBI_WEAR_LEVELING_THRESHOLD);
+	  one that does pays a block copy and an erase on that call.
 
-	  0 leaves static data where it is, so only the blocks blob_db
-	  rewrites are spread, by allocation.
+	  0 keeps that erase out of blob_db's calls. Static data then moves
+	  only when blob_db_maintain() runs, which an application that calls
+	  it while idle wants; the default is 0 when CONFIG_BLOB_DB_MAINT_WORK
+	  runs it. With 0 and no blob_db_maintain(), static data stays where
+	  it is and only the blocks blob_db rewrites are spread.
 
 config BLOB_DB_UBI_ATOMIC_REPLACE
 	bool "Replace blocks with ubi_leb_change()"
+	default y
 	help
 	  blob_db_store_replace() uses ubi_leb_change(), which leaves the old
 	  contents or the new ones across a power loss. blob_db then rewrites
@@ -110,6 +115,30 @@ config BLOB_DB_UBI_ATOMIC_REPLACE
 
 	  The replaced block is queued for reclaim rather than erased, so its
 	  old contents stay readable from raw flash until UBI reuses it.
+	  That is also what makes the erase deferrable: blob_db_maintain()
+	  reclaims those blocks while the system is idle, and with this option
+	  no blob_db call erases a block itself while the free pool lasts.
+	  Without it every compaction, master write and bucket format erases
+	  inline, and blob_db_maintain() cannot help.
+
+config BLOB_DB_UBI_SPARE_LEBS
+	int "Physical blocks kept outside the blob_db volume"
+	default 4
+	range 2 64
+	help
+	  Blocks left out of the UBI volume when blob_db creates it. Once every
+	  bucket has been written, they are what UBI's free pool holds: each
+	  bucket replace takes one and releases the block it replaces for
+	  reclaim. So this is how many replaces (compactions, master writes)
+	  a burst can make without an erase after blob_db_maintain() has
+	  emptied the reclaim queue; the next one erases inline. They also
+	  give relocation a block to move onto and absorb blocks retired
+	  after a failed write.
+
+	  Read only when blob_db creates the volume: on a blank partition, or
+	  when blob_db_format() replaces a partition it could not mount. An
+	  existing volume keeps the size it was created with, formatted or
+	  not. Each spare costs one bucket.
 
 config HEAP_MEM_POOL_ADD_SIZE_BLOB_DB_UBI
 	int
@@ -265,6 +294,26 @@ config BLOB_DB_INSPECT
 	  the bucket-log implementation only, for diagnostics. Containers and
 	  interfaces must not depend on it.
 
+config BLOB_DB_MAINT_WORK
+	bool "Run blob_db_maintain() on a work queue"
+	help
+	  Add blob_db_maint_start(): a work item that runs blob_db_maintain()
+	  one step at a time whenever there is work, on a work queue the
+	  application names (the system work queue by default). Costs one
+	  struct k_work; no thread of its own.
+
+	  One step erases a block, so every other item on the queue waits
+	  that long, and the queue's thread needs the stack of one step. On
+	  UBI that is a header read and seal: CONFIG_UBI_IO_CHUNK_SIZE
+	  buffers and the PSA AES-CMAC over each erased block's header; on
+	  flash_area, a bucket header write. The system work queue's default
+	  (CONFIG_SYSTEM_WORKQUEUE_STACK_SIZE, 1 KB) may not hold the UBI
+	  step. Measure on the target with CONFIG_THREAD_ANALYZER, and raise
+	  that size or give the helper a queue of the application's own.
+
+	  Without this option, call blob_db_maintain() from wherever the
+	  application has idle time.
+
 config BLOB_DB_SHELL
 	bool "Shell commands to inspect the store"
 	depends on SHELL
@@ -276,9 +325,10 @@ config BLOB_DB_SHELL
 	  an id lives, and a hex dump of a blob. Read-only: no command writes
 	  to flash.
 
-	  blob_db is not thread-safe and the shell runs on its own thread, so
-	  use these while the application is not calling blob_db. A full-store
-	  scan reads every bucket sector, which takes a while on large parts.
+	  Every blob_db call the commands make takes the blob_db lock, so they
+	  are safe while the application uses the store, which waits out each
+	  one. A full-store scan reads every bucket sector, which takes a
+	  while on large parts, and is not a snapshot.
 
 config BLOB_DB_AUTOFORMAT_ON_CORRUPT
 	bool "Format when both master sectors are unreadable"
