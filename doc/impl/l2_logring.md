@@ -84,6 +84,19 @@ cleared by the next checkpoint write; deletes are best-effort (a failed delete
 leaves reclaimable garbage, no correctness impact). Evicted ids are found by
 following the chain, never by id range (the id space is shared across logs).
 
+**Reset (commit-before-cleanup).** `logring_reset` must not delete the chain
+and write the root last: a power loss then leaves the committed root's `head`
+pointing at an already-deleted entry, which bricks the log — reads loop on
+`-ESTALE`, and every later checkpoint fails reading the head, so eviction stops
+and, once full, appends fail for good. Instead reset shrinks from the head
+through the same eviction path: it calls `checkpoint(force)` repeatedly until
+only the tail remains — each commits `head` to a *live* entry before deleting
+the run it detached — then commits an empty root carrying the lone tail as the
+inline intent and reclaims it via the suffix-first `run_delete`. A crash at any
+step leaves a valid (possibly non-empty) log that `open` recovers and a rerun
+of `reset` finishes; it can never brick. This path is the one
+`eventlog_ll_clear_all` drives, so its crash-safety is load-bearing.
+
 ## 6. Open / recovery
 
 `open` loads and type-checks the root, finishes any interrupted eviction
@@ -137,8 +150,12 @@ the caller's own integrity check.
 
 - **Per-step crash injection.** `blob_db_test_cut` cuts within one segmented
   `blob_db` op, not between logring's op sequence. The unit suite covers
-  recovery via unmount/mount (handle rebuild, interrupted-eviction re-run);
-  a logring-level cut hook to assert each §4/§5 step's residue is a follow-up.
+  recovery via unmount/mount (handle rebuild, interrupted-eviction re-run); a
+  host harness additionally injects a power loss at every `blob_db`
+  update/delete boundary of `reset` and asserts the log is never bricked (it
+  reopens, drains to `-ENOENT` not `-ESTALE`, still appends and evicts, and a
+  rerun empties it). A logring-level cut hook inside the on-target suite, to
+  assert each §4/§5 step's residue, is still a follow-up.
 - **Waypoint far behind.** If the live set shrinks below one checkpoint
   interval the waypoint could be evicted; `open` then falls back to a walk from
   `head_id`. Rare; handled, not optimized.

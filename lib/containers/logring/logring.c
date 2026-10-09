@@ -561,24 +561,27 @@ int logring_reset(logring_t *h)
 		return -EINVAL;
 	}
 
-	/* Delete the live chain. */
-	uint64_t cur = h->head_id;
-
-	while (cur != 0 && cur != h->next_free) {
-		uint64_t nxt;
-		int rc = entry_read(cur, &nxt, NULL, 0, NULL);
+	/* Crash-safe, commit-before-cleanup. Draining the chain by deleting it
+	 * first and writing the root last would, on a power loss, leave the
+	 * committed root's head pointing at an already-deleted entry — bricking
+	 * reads (-ESTALE forever) and eviction (checkpoint fails reading the
+	 * head). Instead shrink from the head via the normal eviction path:
+	 * each checkpoint(force) advances the committed head to a LIVE entry
+	 * before deleting the run it detached, so a crash leaves a valid —
+	 * possibly non-empty — log, and rerunning reset finishes it. */
+	while (h->head_id != 0 && h->head_id != h->tail_id) {
+		int rc = checkpoint(h, true);
 
 		if (rc < 0) {
-			break;
+			return rc;
 		}
-		uint64_t del = cur;
-
-		cur = nxt;
-		(void)blob_db_delete(del);
 	}
 
-	/* Re-init to empty, keeping the epoch (same incarnation). A fresh
-	 * reservation anchors the new (empty) chain. */
+	/* At most one entry (the tail) remains. Commit the empty state first,
+	 * recording that entry as the inline eviction intent, then reclaim it
+	 * (idempotent; open re-runs it after a crash). */
+	uint64_t old_tail = h->tail_id;          /* 0 if already empty */
+	uint64_t old_frontier = h->next_free;
 	uint64_t first = blob_db_alloc_id();
 
 	if (first == 0) {
@@ -590,5 +593,14 @@ int logring_reset(logring_t *h)
 	h->live_bytes = 0;
 	h->count = 0;
 	h->since_ckpt = 0;
-	return root_write(h, 0, 0);
+
+	int rc = root_write(h, old_tail, old_tail ? old_frontier : 0);   /* COMMIT */
+
+	if (rc < 0) {
+		return rc;
+	}
+	if (old_tail != 0) {
+		run_delete(old_tail, old_frontier);
+	}
+	return 0;
 }
