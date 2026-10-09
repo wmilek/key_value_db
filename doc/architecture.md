@@ -17,7 +17,7 @@ Status: v2 · Top-level document; per-layer detail lives in `doc/layers/`
 | `doc/layers/l2_containers.md` | L2 — containers: seq, kvlist, kvhash, kvtree, logring |
 | `doc/layers/l3_interfaces.md` | L3 — access interfaces: kvdb, blobfs, settings |
 | `doc/impl/l1_bucketlog.md` | **Implementation design** (non-normative): the v1 bucket-log allocator — formats, algorithms, costs, open items |
-| `doc/impl/l2_logring.md` | **Implementation design**: the `logring` bounded circular log — format, algorithms, crash model |
+| `doc/impl/l2_logring.md` | **Implementation design**: the `logring` per-entry log — format, algorithms, crash model |
 | `doc/proposals/` | **Change proposals** (non-normative until accepted): analysis + design for a change that spans a contract and its implementation |
 | `doc/reviews/*.md` | Dated reviews of this document set, with findings and their resolution |
 
@@ -39,8 +39,9 @@ Above L1, the first vertical slice is **implemented and tested on
 runs that slice end to end on hardware with cross-reboot verification and
 power-loss classification. The `logring` bounded-log container
 (`lib/containers/logring`, `tests/lib/containers/logring`) is also implemented
-— a single-i-node structure whose every mutation is one atomic
-`blob_db_update` (no intent, no residue). The rest of the module tree — the
+— a forward chain of per-entry i-nodes with pre-reserved links and a
+checkpointed waypoint, self-contained on L1 (its eviction intent is inline, so
+it needs no shared intent helper). The rest of the module tree — the
 `seq`, `kvlist` and `kvtree` containers, the shared intent helper, and
 `blobfs` — remains **scaffolded** (build-wired, Kconfig-gated `default n`) but
 not yet implemented.

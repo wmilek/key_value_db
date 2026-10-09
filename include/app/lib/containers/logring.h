@@ -14,220 +14,285 @@ extern "C" {
 #endif
 
 /**
- * @defgroup lib_container_logring logring — bounded circular log (L2)
+ * @defgroup lib_container_logring logring — bounded per-entry log (L2)
  * @ingroup lib
  * @{
  *
- * @brief A log-specialized container: an append-only ring of records that
- *        auto-evicts its oldest entries so writes never fail for space.
+ * @brief A large, append-only device log: a bounded ring of records, each its
+ *        own blob_db i-node, drained forward through a portable cursor.
  *
- * @section logring_role Why a dedicated log container
+ * @section logring_model Model
  *
- * The generic `seq` container (doc/layers/l2_containers.md §4.1) grows without
- * bound and is index-addressed. Logging wants the opposite trade: a *bounded*
- * store that keeps the most recent N events and silently drops the oldest —
- * the classic embedded "flight recorder" for boot reasons, fault codes, or the
- * last few lines before a crash. `logring` is that structure.
+ * A log is a forward-linked chain of per-entry i-nodes rooted at one id. Each
+ * entry is `{ next_id, bytes }`; `next_id` points at an id blob_db has already
+ * reserved (`blob_db_alloc_id`) but not yet bound, so an append just binds that
+ * pre-reserved id — one new blob written, nothing rewritten. The whole log is
+ * reachable from the single root id; persist that id however you persist any
+ * structure root (typically a `rootreg` entry per log). Many logs coexist,
+ * each its own root and handle, sharing only the global id space. Capacity is
+ * not fixed — a log may grow toward the whole partition — and per-operation
+ * cost is independent of the log's size.
  *
- * Records are stored inline in a single i-node, oldest → newest. Appending a
- * record that would not fit evicts whole records from the front until it does,
- * so `logring_append()` returns `-ENOSPC` only when a *single* record is larger
- * than the ring's entire capacity — never merely because the ring is full.
+ * @section logring_handle Handle
  *
- * @section logring_seq Sequence numbers & gap detection
+ * `logring_open()` fills a caller-allocated ::logring_t — a small RAM handle
+ * caching the tail so appends are O(1) and the root i-node is written only
+ * occasionally (at checkpoints), not on every append. The handle holds no
+ * record data, only pointers; it is rebuilt cheaply at `open` and may be
+ * discarded at any time (every append is already durable). Treat ::logring_t
+ * and ::logring_cursor as opaque — their fields are internal.
  *
- * Every appended record is stamped with a strictly increasing `uint64_t`
- * sequence number that is **never reused**, not even across eviction, reset, or
- * remount. A consumer that remembers the last sequence number it processed can
- * therefore tell exactly how many records were dropped while it was away: if it
- * last saw seq S and the oldest surviving record is seq S+K (K>1), K-1 records
- * were evicted unseen. The sequence space is the log's one piece of durable
- * "where was I" state — the same single-integer-reachability idea L1 applies to
- * ids (P5).
+ * @section logring_read Reading
  *
- * @section logring_crash Crash model
+ * Reads are forward only (oldest to newest) through an opaque cursor, in the
+ * style of the systemd-journal / lseek position APIs: `logring_seek_oldest()`
+ * / `logring_seek_newest()` choose an end, `logring_next()` delivers the entry
+ * at the cursor and advances. `logring_seek_newest()` reaches the real end in
+ * O(1) (read the latest, or follow entries appended from now). There is no
+ * backward "last N" scan.
  *
- * Like `rootreg`, `logring` keeps its whole state in one i-node and commits
- * every mutation with exactly **one** `blob_db_update()` — the single
- * linearization point (l2_containers.md §2.2). There is no prepare/cleanup
- * phase and therefore no residue: a crash leaves either the complete old ring
- * or the complete new one, and `open` needs no recovery pass. Sequence numbers
- * stay monotonic across the boundary because `next_seq` is part of the same
- * atomically-written image.
+ * @section logring_moniker Monikers
+ *
+ * To persist or transmit a read position, export it with
+ * `logring_cursor_to_moniker()` into a ::logring_moniker — a struct with public
+ * fields — and reconstruct it later with `logring_cursor_from_moniker()`.
+ * logring defines no wire format and makes no durability or security guarantee
+ * for a moniker: the framing, versioning, and any integrity/secrecy protection
+ * are the caller's responsibility before it crosses a trust boundary. The
+ * moniker's `epoch` is a per-log random tag that lets `logring_next()` reject a
+ * moniker left over from a previous incarnation of the log (e.g. after a
+ * reformat, which reuses ids) or a random/forged value — reported as `-ESTALE`.
+ * This is defense-in-depth; a crafted value carrying the live epoch is stopped
+ * only by the caller's own integrity check.
+ *
+ * @section logring_retention Retention
+ *
+ * The ring is bounded by a soft `capacity_bytes` budget: when exceeded, the
+ * oldest entries are evicted. The budget is a hint, not a hard limit — the ring
+ * sits approximately, not exactly, at it — with a hard out-of-space backstop so
+ * a full partition never wedges the log. A read position that has since been
+ * evicted is reported `-ESTALE`.
  *
  * @section logring_concurrency Concurrency
  *
- * Single-threaded, inheriting L1's v1 contract: the caller serializes all
- * calls. The library holds no state between calls — every operation re-reads
- * the ring image from flash, so there is nothing to cache or lock (P3).
+ * Single-threaded, inheriting blob_db's v1 contract: the caller serializes all
+ * calls on a given log.
  *
- * Full design: doc/layers/l2_containers.md §4.5, doc/impl/l2_logring.md.
+ * Design of record: `doc/proposals/2026-10-08-logring.md`; contract:
+ * `doc/layers/l2_containers.md` §4.5.
  */
 
+/** Create-time configuration for a new log. */
+struct logring_cfg {
+	/** Soft retention bound in bytes — a hint, not a hard limit (see the
+	 *  Retention section). Must be non-zero. */
+	uint32_t capacity_bytes;
+};
+
+/** Snapshot of a log's state. `oldest_id`/`newest_id` are exact; `count` and
+ *  `bytes` are approximate hints. */
+struct logring_stats {
+	uint64_t oldest_id;   /**< id of the oldest surviving entry, 0 if empty */
+	uint64_t newest_id;   /**< id of the newest entry, 0 if empty */
+	uint32_t count;       /**< approximate live entry count */
+	uint32_t bytes;       /**< approximate live record-byte total */
+};
+
 /**
- * @brief Create a fresh, empty log ring.
+ * @brief Portable read position. Public fields — the caller serializes it.
  *
- * Allocates an i-node (`blob_db_alloc_id`) and binds it with an empty ring
- * image in a single atomic `update`. The returned id is the ring's root — the
- * one integer from which the whole structure is reachable after reboot. The
- * caller is responsible for persisting it (typically via `rootreg`); an id that
- * is allocated but whose bind was interrupted is simply re-created on the next
- * call and leaks nothing.
+ * Exported from a cursor by `logring_cursor_to_moniker()` and restored by
+ * `logring_cursor_from_moniker()`. logring imposes no wire format; see the
+ * Monikers section for the division of responsibility.
+ */
+struct logring_moniker {
+	uint32_t epoch;   /**< log-incarnation tag; rejects a stale/foreign moniker */
+	uint64_t id;      /**< entry position within the log */
+};
+
+/**
+ * @brief Opaque RAM handle for an open log. Caller-allocated; treat as opaque.
  *
- * The first record appended to a brand-new ring is stamped sequence number 1.
+ * Holds the root id plus a cached tail and soft accounting. Filled by
+ * `logring_open()`; carries no record data and needs no flush.
+ */
+typedef struct logring {
+	/* --- internal; do not touch --- */
+	uint64_t root;           /* root i-node id */
+	uint64_t tail_id;        /* cached newest entry id (0 if empty) */
+	uint64_t next_free;      /* reserved id the next append will bind */
+	uint64_t head_id;        /* cached oldest entry id, hint (0 if empty) */
+	uint32_t epoch;          /* per-log incarnation tag */
+	uint32_t capacity_bytes; /* retention bound from cfg */
+	uint32_t live_bytes;     /* soft byte accounting, hint */
+	uint32_t count;          /* soft live-entry count, hint */
+	uint32_t since_ckpt;     /* appends since the last root checkpoint */
+} logring_t;
+
+/**
+ * @brief Opaque, caller-allocated read cursor. Treat as opaque.
  *
- * @param out_root  (out) receives the root id on success
+ * Drives `logring_seek_oldest()` / `logring_seek_newest()` / `logring_next()`.
+ * Its in-memory layout is internal; the portable form is ::logring_moniker.
+ */
+typedef struct logring_cursor {
+	uint64_t pos;    /* internal: id of the next entry to deliver, 0 = oldest */
+	uint32_t epoch;  /* internal: incarnation this position belongs to */
+} logring_cursor;
+
+/**
+ * @brief Create a new, empty log and return its root id.
  *
- * @retval 0        created; *out_root filled
- * @retval -EINVAL  out_root is NULL
- * @retval -ENODEV  blob_db not mounted
+ * Allocates the root i-node, draws a random epoch, and binds an empty log.
+ * Persist the returned id (e.g. in a `rootreg` entry); call `logring_open()`
+ * to operate on the log.
+ *
+ * @param cfg       configuration (soft `capacity_bytes`, non-zero)
+ * @param out_root  (out) receives the new log's root id
+ *
+ * @retval 0        created
+ * @retval -EINVAL  @p cfg or @p out_root is NULL, or `capacity_bytes` is 0
  * @retval -ENOSPC  partition full / id ceiling could not be persisted
+ * @retval -ENODEV  blob_db not mounted
  * @retval -EIO     flash I/O error
  */
-int logring_create(uint64_t *out_root);
+int logring_create(const struct logring_cfg *cfg, uint64_t *out_root);
 
 /**
- * @brief Validate that @p root identifies a log ring.
+ * @brief Open an existing log into a caller-allocated handle.
  *
- * Reads the root i-node and checks the `CLOG` magic and version. No scan is
- * performed and no handle is allocated — the root id *is* the handle.
+ * Validates the root's type, finishes any interrupted eviction, and rebuilds
+ * the cached tail by a short bounded walk from the last checkpoint.
  *
- * @param root      candidate root id
+ * @param root  root id previously returned by `logring_create()`
+ * @param h     (out) handle to fill
  *
- * @retval 0        it is a valid log ring
- * @retval -EINVAL  root is 0
+ * @retval 0        opened
+ * @retval -EINVAL  @p root is 0 or @p h is NULL
  * @retval -ENOENT  no blob with that id
- * @retval -ENOTSUP the blob is not a `logring` (wrong magic/version)
+ * @retval -ENOTSUP the blob is not a log (wrong magic/version)
  * @retval -ENODEV  blob_db not mounted
  * @retval -EIO     flash I/O error
  */
-int logring_open(uint64_t root);
+int logring_open(uint64_t root, logring_t *h);
 
 /**
- * @brief Append a record, evicting the oldest records if necessary.
+ * @brief Delete every entry and the root. The handle is invalid afterwards.
  *
- * The record is copied to the tail of the ring and stamped with the next
- * sequence number. If it does not fit, whole records are dropped from the head
- * (oldest first) until it does. The updated ring is committed with one atomic
- * `blob_db_update`.
- *
- * A zero-length record is allowed (it still consumes a record slot and a
- * sequence number — useful as a heartbeat / marker).
- *
- * @param root      ring root id
- * @param data      record bytes (may be NULL only if @p len == 0)
- * @param len       record length in bytes
- * @param out_seq   (out, optional) sequence number assigned to this record
- *
- * @retval 0        appended; *out_seq filled if non-NULL
- * @retval -EINVAL  root is 0, or data is NULL with len > 0
- * @retval -ENOTSUP root is not a log ring
- * @retval -ENOSPC  the record alone exceeds the ring's total capacity
- *                  (see @ref logring_capacity); nothing was written
+ * @param h  open log handle
+ * @retval 0        destroyed
+ * @retval -EINVAL  @p h is NULL
  * @retval -ENODEV  blob_db not mounted
  * @retval -EIO     flash I/O error
  */
-int logring_append(uint64_t root, const void *data, size_t len,
-		   uint64_t *out_seq);
+int logring_destroy(logring_t *h);
 
 /**
- * @brief Number of records currently held.
+ * @brief Append one record; durable on return.
  *
- * @param root      ring root id
- * @param out_count (out) receives the live record count
+ * Copies @p rec into a new entry, evicting the oldest entries if the soft
+ * budget (or the partition) requires. O(1) on the warm path.
  *
- * @retval 0        success
- * @retval -EINVAL  root is 0 or out_count is NULL
- * @retval -ENOTSUP root is not a log ring
- * @retval -ENODEV  blob_db not mounted
- * @retval -EIO     flash I/O error
+ * @param h       open log handle
+ * @param rec     record bytes (may be NULL only if @p len == 0)
+ * @param len     record length; must fit one blob_db payload
+ * @param out_id  (out, optional) id assigned to the new entry
+ *
+ * @retval 0         appended; *out_id filled if non-NULL
+ * @retval -EINVAL   @p h is NULL, or @p rec is NULL with @p len > 0
+ * @retval -EMSGSIZE @p len exceeds one entry payload (no record spanning)
+ * @retval -ENOSPC   partition full and nothing left to evict
+ * @retval -ENODEV   blob_db not mounted
+ * @retval -EIO      flash I/O error
  */
-int logring_count(uint64_t root, size_t *out_count);
+int logring_append(logring_t *h, const void *rec, size_t len, uint64_t *out_id);
 
 /**
- * @brief Sequence number of the oldest / newest surviving record.
+ * @brief Position a cursor at the oldest surviving entry.
  *
- * Together with @ref logring_count these let a consumer reason about what it
- * has and has not seen without reading every record.
- *
- * @param root      ring root id
- * @param out_seq   (out) receives the sequence number
- *
- * @retval 0        success; *out_seq filled
- * @retval -ENOENT  the ring is empty
- * @retval -EINVAL  root is 0 or out_seq is NULL
- * @retval -ENOTSUP root is not a log ring
- * @retval -ENODEV  blob_db not mounted
- * @retval -EIO     flash I/O error
+ * @param h  open log handle
+ * @param c  (out) cursor to initialize
+ * @retval 0 positioned · -EINVAL @p h or @p c is NULL
  */
-int logring_oldest_seq(uint64_t root, uint64_t *out_seq);
-int logring_newest_seq(uint64_t root, uint64_t *out_seq);
+int logring_seek_oldest(logring_t *h, logring_cursor *c);
 
 /**
- * @brief Drop every record but keep the sequence space monotonic.
+ * @brief Position a cursor at the newest entry (the real end). O(1).
  *
- * After this call the ring is empty, but the next appended record still gets a
- * sequence number strictly greater than any ever issued — so a reset is
- * indistinguishable, to a sequence-tracking consumer, from having evicted every
- * record. Committed with one atomic `update`.
+ * The next `logring_next()` delivers the newest entry; after that it reports
+ * `-ENOENT` until a new entry is appended (follow-from-end). On an empty log
+ * the next `logring_next()` reports `-ENOENT`.
  *
- * @param root      ring root id
- *
- * @retval 0        cleared
- * @retval -EINVAL  root is 0
- * @retval -ENOTSUP root is not a log ring
- * @retval -ENODEV  blob_db not mounted
- * @retval -EIO     flash I/O error
+ * @param h  open log handle
+ * @param c  (out) cursor to position
+ * @retval 0 positioned · -EINVAL @p h or @p c is NULL
  */
-int logring_reset(uint64_t root);
+int logring_seek_newest(logring_t *h, logring_cursor *c);
 
 /**
- * @brief Per-record callback for @ref logring_iterate.
+ * @brief Deliver the entry at the cursor and advance it (forward only).
  *
- * @param seq   the record's sequence number
- * @param data  record bytes — transient, valid only for the callback's
- *              duration (points into a stack buffer); copy to keep it
- * @param len   record length
- * @param user  opaque pointer passed through from `iterate`
+ * @param h        open log handle
+ * @param c        read cursor
+ * @param out      (out) buffer for the record bytes
+ * @param out_sz   capacity of @p out
+ * @param out_len  (out, optional) actual record length delivered
+ * @param out_id   (out, optional) the delivered entry's id
  *
- * @return 0 to continue; non-zero to stop early (the value is returned by
- *         `logring_iterate`).
+ * @retval 0         a record was delivered
+ * @retval -ENOENT   caught up — no entry at/after the cursor yet
+ * @retval -ESTALE   the position was evicted, or the cursor belongs to another
+ *                   incarnation of the log; the cursor is reset to the oldest
+ *                   surviving entry (retry to resume from there)
+ * @retval -EMSGSIZE @p out_sz is smaller than the record; cursor not advanced
+ * @retval -EINVAL   @p h or @p c is NULL, or @p out is NULL with @p out_sz > 0
+ * @retval -ENODEV   blob_db not mounted
+ * @retval -EIO      flash I/O error
  */
-typedef int (*logring_iter_cb_t)(uint64_t seq, const void *data, size_t len,
-				 void *user);
+int logring_next(logring_t *h, logring_cursor *c, void *out, size_t out_sz,
+		 size_t *out_len, uint64_t *out_id);
 
 /**
- * @brief Walk every record oldest → newest.
+ * @brief Export a cursor's position as a portable moniker.
  *
- * Mutating the ring from inside the callback is undefined behavior
- * (l2_containers.md §2.2) — collect first, mutate after.
+ * The caller owns the moniker's serialization, versioning, and integrity
+ * protection (see the Monikers section).
  *
- * @param root      ring root id
- * @param cb        per-record callback
- * @param user      opaque pointer forwarded to @p cb
- *
- * @retval 0        full walk completed
- * @retval other    the non-zero value a callback returned to stop early
- * @retval -EINVAL  root is 0 or cb is NULL
- * @retval -ENOTSUP root is not a log ring
- * @retval -ENODEV  blob_db not mounted
- * @retval -EIO     flash I/O error
+ * @param c    cursor to export
+ * @param out  (out) moniker
  */
-int logring_iterate(uint64_t root, logring_iter_cb_t cb, void *user);
+void logring_cursor_to_moniker(const logring_cursor *c,
+			       struct logring_moniker *out);
 
 /**
- * @def LOGRING_CAPACITY
- * @anchor logring_capacity
- * @brief Usable record-data bytes in one ring (payload minus the fixed header).
+ * @brief Rebuild a cursor from a moniker previously exported.
  *
- * The largest single record is this value minus the per-record header
- * (`LOGRING_REC_OVERHEAD`). Both are derived from
- * `CONFIG_BLOB_DB_MAX_PAYLOAD_LEN`.
+ * Does not validate against any log — a stale or foreign moniker is detected
+ * by the following `logring_next()` (`-ESTALE`).
+ *
+ * @param c  (out) cursor to fill
+ * @param m  moniker
+ * @retval 0 ok · -EINVAL @p c or @p m is NULL
  */
-#define LOGRING_HDR_SIZE     20u
-#define LOGRING_REC_OVERHEAD 10u
-#define LOGRING_CAPACITY     (CONFIG_BLOB_DB_MAX_PAYLOAD_LEN - LOGRING_HDR_SIZE)
-#define LOGRING_MAX_RECORD   (LOGRING_CAPACITY - LOGRING_REC_OVERHEAD)
+int logring_cursor_from_moniker(logring_cursor *c,
+				const struct logring_moniker *m);
+
+/**
+ * @brief Read a log's current statistics.
+ *
+ * @param h    open log handle
+ * @param out  (out) stats
+ * @retval 0 filled · -EINVAL @p h or @p out is NULL · -ENODEV not mounted · -EIO flash error
+ */
+int logring_stats(logring_t *h, struct logring_stats *out);
+
+/**
+ * @brief Drop every entry; the log becomes empty.
+ *
+ * @param h  open log handle
+ * @retval 0 cleared · -EINVAL @p h is NULL · -ENODEV not mounted · -EIO flash error
+ */
+int logring_reset(logring_t *h);
 
 /** @} */
 

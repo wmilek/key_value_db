@@ -2,17 +2,19 @@
  * Copyright (c) 2026
  * SPDX-License-Identifier: Apache-2.0
  *
- * logring — bounded circular log container (L2).
+ * logring — bounded per-entry log container (L2).
  *
- * A log-specialized structure: one i-node holds an inline, oldest->newest run
- * of variable-length records, each stamped with a monotonic sequence number.
- * Appending evicts records from the head until the newcomer fits, so a write
- * fails for space only when a single record exceeds the whole ring. Every
- * mutation is a single atomic blob_db_update(root, ...) — the rootreg pattern
- * (basic flow, no intent, no residue). Deliberately stateless: each op
- * re-reads the ring image from flash and validates it; nothing is cached.
+ * A forward-linked chain of per-entry i-nodes with pre-reserved ids: each
+ * entry's next_id points at an id alloc_id() returned but not yet bound, so an
+ * append binds that id (one new blob, nothing rewritten). A RAM handle caches
+ * the tail; the root i-node is written only at checkpoints (~every K appends)
+ * and carries a waypoint near the end to rebuild the tail at open. Eviction is
+ * batched onto the checkpoint write, its intent held inline in the root and its
+ * run deleted suffix-first for re-enterable recovery. Reads use an opaque
+ * cursor exporting a public {epoch, id} moniker; the per-log random epoch
+ * rejects a stale/foreign moniker.
  *
- * Contract: doc/layers/l2_containers.md §4.5; design: doc/impl/l2_logring.md.
+ * Design of record: doc/proposals/2026-10-08-logring.md.
  */
 
 #include <errno.h>
@@ -20,6 +22,7 @@
 
 #include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
+#include <zephyr/random/random.h>
 #include <zephyr/toolchain.h>
 
 #include <app/lib/blob_db.h>
@@ -31,311 +34,558 @@ LOG_MODULE_REGISTER(logring, CONFIG_BLOB_CONTAINER_LOGRING_LOG_LEVEL);
 static const uint8_t CLOG_MAGIC[4] = { 'C', 'L', 'O', 'G' };
 #define CLOG_VERSION 1
 
-struct __packed clog_hdr {
+/* Root i-node payload: pointers + hints + the inline eviction intent. */
+struct __packed clog_root {
 	uint8_t  magic[4];
 	uint8_t  version;
-	uint8_t  rsvd;
-	uint16_t count;     /* live records */
-	uint16_t used;      /* bytes of data[] occupied by records */
-	uint16_t rsvd2;
-	uint64_t next_seq;  /* sequence number the next append will assign */
+	uint8_t  flags;
+	uint16_t rsvd;
+	uint32_t epoch;           /* per-log incarnation tag (non-zero) */
+	uint32_t capacity_bytes;  /* soft retention bound */
+	uint32_t live_bytes;      /* hint: sum of live record lengths */
+	uint32_t count;           /* hint: live entry count */
+	uint64_t waypoint_id;     /* live entry near the end; open walks from here */
+	uint64_t head_id;         /* oldest live entry (0 = empty) */
+	uint64_t evict_from;      /* inline eviction intent: run start (0 = none) */
+	uint64_t evict_to;        /* run end, exclusive */
 };
-BUILD_ASSERT(sizeof(struct clog_hdr) == LOGRING_HDR_SIZE, "clog_hdr layout drift");
+BUILD_ASSERT(sizeof(struct clog_root) == 56, "clog_root layout drift");
+BUILD_ASSERT(sizeof(struct clog_root) <= CONFIG_BLOB_DB_MAX_PAYLOAD_LEN,
+	     "clog_root exceeds BLOB_DB_MAX_PAYLOAD_LEN");
 
-struct __packed clog_rec {
-	uint64_t seq;
-	uint16_t len;
-	/* len bytes of payload follow */
+/* Entry i-node payload: a forward link + the opaque record. */
+struct __packed clog_entry_hdr {
+	uint64_t next_id;         /* reserved id of the next entry (unbound = end) */
+	uint16_t len;             /* record length; len bytes follow */
 };
-BUILD_ASSERT(sizeof(struct clog_rec) == LOGRING_REC_OVERHEAD, "clog_rec layout drift");
+#define CLOG_ENTRY_HDR 10u
+BUILD_ASSERT(sizeof(struct clog_entry_hdr) == CLOG_ENTRY_HDR, "clog_entry_hdr drift");
 
-/* A ring must be able to hold at least one 1-byte record. */
-BUILD_ASSERT(CONFIG_BLOB_DB_MAX_PAYLOAD_LEN >=
-	     LOGRING_HDR_SIZE + LOGRING_REC_OVERHEAD + 1,
-	     "BLOB_DB_MAX_PAYLOAD_LEN too small for a logring record");
+#define CLOG_MAX_RECORD (CONFIG_BLOB_DB_MAX_PAYLOAD_LEN - CLOG_ENTRY_HDR)
 
-/* RAM image of the whole ring (one i-node payload). */
-struct clog_image {
-	struct clog_hdr hdr;
-	uint8_t         data[LOGRING_CAPACITY];
-};
+/* Checkpoint interval K: appends between root writes, and the most entries a
+ * single checkpoint evicts (so a full interval's worth can be reclaimed at
+ * once). The eviction run buffer is sized to it. */
+#define CLOG_K CONFIG_BLOB_CONTAINER_LOGRING_CHECKPOINT
+BUILD_ASSERT(CLOG_K >= 1 && CLOG_K <= 64, "checkpoint interval must be 1..64");
 
-/* Read + validate the ring image from @p root.
- *
- * Returns 0 with the parsed image; -ENOTSUP if the blob is not a v1 logring;
- * -ENOENT if the id holds no blob; or a blob_db error. -EIO signals a blob
- * that claims to be a logring but whose record run is internally inconsistent.
- */
-static int clog_load(uint64_t root, struct clog_image *img)
+/* ---- entry I/O --------------------------------------------------------- */
+
+/* Read an entry: its next_id (always), and optionally its payload into out.
+ * Returns -EMSGSIZE if out_sz < len (nothing copied), -ENOENT if unbound/dead. */
+static int entry_read(uint64_t id, uint64_t *next_id,
+		      void *out, size_t out_sz, size_t *out_len)
 {
 	uint8_t buf[CONFIG_BLOB_DB_MAX_PAYLOAD_LEN];
+	size_t got;
+	int rc = blob_db_get(id, buf, sizeof(buf), &got);
+
+	if (rc < 0) {
+		return rc;
+	}
+	if (got < CLOG_ENTRY_HDR) {
+		return -EIO;
+	}
+
+	struct clog_entry_hdr h;
+
+	memcpy(&h, buf, CLOG_ENTRY_HDR);
+	if ((size_t)CLOG_ENTRY_HDR + h.len != got) {
+		return -EIO;
+	}
+	if (next_id) {
+		*next_id = h.next_id;
+	}
+	if (out) {
+		if (h.len > out_sz) {
+			return -EMSGSIZE;
+		}
+		memcpy(out, buf + CLOG_ENTRY_HDR, h.len);
+	}
+	if (out_len) {
+		*out_len = h.len;
+	}
+	return 0;
+}
+
+static int entry_write(uint64_t id, uint64_t next_id,
+		       const void *rec, size_t len)
+{
+	uint8_t buf[CONFIG_BLOB_DB_MAX_PAYLOAD_LEN];
+	struct clog_entry_hdr h = { .next_id = next_id, .len = (uint16_t)len };
+
+	memcpy(buf, &h, CLOG_ENTRY_HDR);
+	if (len) {
+		memcpy(buf + CLOG_ENTRY_HDR, rec, len);
+	}
+	return blob_db_update(id, buf, CLOG_ENTRY_HDR + len);
+}
+
+/* ---- root I/O ---------------------------------------------------------- */
+
+static int root_load(uint64_t root, struct clog_root *r)
+{
+	uint8_t buf[sizeof(struct clog_root)];
 	size_t got;
 	int rc = blob_db_get(root, buf, sizeof(buf), &got);
 
 	if (rc < 0) {
 		return rc;
 	}
-	if (got < sizeof(struct clog_hdr)) {
-		return -ENOTSUP;   /* empty root or foreign payload */
+	if (got < sizeof(*r)) {
+		return -ENOTSUP;   /* too small / foreign payload */
 	}
-
-	memcpy(&img->hdr, buf, sizeof(img->hdr));
-	if (memcmp(img->hdr.magic, CLOG_MAGIC, 4) != 0 ||
-	    img->hdr.version != CLOG_VERSION) {
+	memcpy(r, buf, sizeof(*r));
+	if (memcmp(r->magic, CLOG_MAGIC, 4) != 0 || r->version != CLOG_VERSION) {
 		return -ENOTSUP;
 	}
-	if (img->hdr.used > LOGRING_CAPACITY ||
-	    got != sizeof(struct clog_hdr) + img->hdr.used) {
-		LOG_ERR("ring image inconsistent (used=%u got=%zu)",
-			img->hdr.used, got);
-		return -EIO;
-	}
-	memcpy(img->data, buf + sizeof(struct clog_hdr), img->hdr.used);
-
-	/* Walk the record run: it must partition [0, used) exactly into
-	 * `count` well-formed records. Cheap O(count) integrity check that
-	 * turns silent corruption into an honest -EIO. */
-	size_t off = 0;
-	uint16_t seen = 0;
-
-	while (off < img->hdr.used) {
-		struct clog_rec r;
-
-		if (img->hdr.used - off < sizeof(struct clog_rec)) {
-			goto corrupt;
-		}
-		memcpy(&r, img->data + off, sizeof(r));
-		off += sizeof(struct clog_rec);
-		if (r.len > img->hdr.used - off) {
-			goto corrupt;
-		}
-		off += r.len;
-		seen++;
-	}
-	if (off != img->hdr.used || seen != img->hdr.count) {
-		goto corrupt;
-	}
 	return 0;
-
-corrupt:
-	LOG_ERR("ring record run corrupt (count=%u used=%u)",
-		img->hdr.count, img->hdr.used);
-	return -EIO;
 }
 
-/* Serialize + commit the image with ONE atomic update of the root. */
-static int clog_store(uint64_t root, const struct clog_image *img)
+/* Serialize the handle's state into the root and commit it. */
+static int root_write(logring_t *h, uint64_t evict_from, uint64_t evict_to)
 {
-	uint8_t buf[CONFIG_BLOB_DB_MAX_PAYLOAD_LEN];
-	const size_t len = sizeof(struct clog_hdr) + img->hdr.used;
+	struct clog_root r = { 0 };
 
-	memcpy(buf, &img->hdr, sizeof(img->hdr));
-	memcpy(buf + sizeof(struct clog_hdr), img->data, img->hdr.used);
-
-	return blob_db_update(root, buf, len);
+	memcpy(r.magic, CLOG_MAGIC, 4);
+	r.version        = CLOG_VERSION;
+	r.epoch          = h->epoch;
+	r.capacity_bytes = h->capacity_bytes;
+	r.live_bytes     = h->live_bytes;
+	r.count          = h->count;
+	r.waypoint_id    = h->tail_id ? h->tail_id : h->next_free;
+	r.head_id        = h->head_id;
+	r.evict_from     = evict_from;
+	r.evict_to       = evict_to;
+	return blob_db_update(h->root, &r, sizeof(r));
 }
 
-int logring_create(uint64_t *out_root)
+/* ---- eviction ---------------------------------------------------------- */
+
+/* Delete the run [from, to) suffix-first (from is deleted last), so a crash
+ * mid-delete leaves a prefix still walkable from `from` for idempotent
+ * recovery. Best-effort: delete errors leave reclaimable garbage, no
+ * correctness impact. */
+static void run_delete(uint64_t from, uint64_t to)
 {
-	if (!out_root) {
+	uint64_t run[CLOG_K];
+	int n = 0;
+	uint64_t cur = from;
+
+	while (n < (int)ARRAY_SIZE(run) && cur != to) {
+		uint64_t nxt;
+		int rc = entry_read(cur, &nxt, NULL, 0, NULL);
+
+		if (rc == -ENOENT) {
+			break;   /* reached the already-deleted suffix */
+		}
+		if (rc < 0) {
+			break;   /* best-effort */
+		}
+		run[n++] = cur;
+		cur = nxt;
+	}
+	for (int i = n - 1; i >= 0; i--) {
+		(void)blob_db_delete(run[i]);
+	}
+}
+
+/* Checkpoint: optionally evict a run of oldest entries (when over the soft
+ * budget, or when @p force), then commit the root — a single write that
+ * advances head, refreshes the waypoint, and records the inline eviction
+ * intent. The evicted run is deleted suffix-first after the commit. */
+static int checkpoint(logring_t *h, bool force)
+{
+	uint64_t run[CLOG_K];
+	int n = 0;
+	uint32_t freed = 0;
+	uint64_t from = 0, to = 0;
+	bool want = force || h->live_bytes > h->capacity_bytes;
+
+	if (want && h->head_id != 0) {
+		uint64_t cur = h->head_id;
+
+		while (n < (int)ARRAY_SIZE(run) && cur != 0 && cur != h->tail_id) {
+			uint64_t nxt;
+			size_t len;
+			int rc = entry_read(cur, &nxt, NULL, 0, &len);
+
+			if (rc < 0) {
+				return rc;
+			}
+			run[n++] = cur;
+			freed += (uint32_t)len;
+			cur = nxt;
+			if (!force &&
+			    (h->live_bytes - freed) <= h->capacity_bytes) {
+				break;
+			}
+		}
+		if (n > 0) {
+			from = h->head_id;
+			to = cur;
+			h->head_id = cur;
+			h->live_bytes -= freed;
+			h->count -= (uint32_t)n;
+		}
+	}
+
+	int rc = root_write(h, from, to);   /* COMMIT */
+
+	if (rc < 0) {
+		return rc;
+	}
+	if (n > 0) {
+		run_delete(from, to);   /* suffix-first, best-effort */
+	}
+	h->since_ckpt = 0;
+	return 0;
+}
+
+/* ---- lifecycle --------------------------------------------------------- */
+
+int logring_create(const struct logring_cfg *cfg, uint64_t *out_root)
+{
+	if (!cfg || !out_root || cfg->capacity_bytes == 0) {
 		return -EINVAL;
 	}
 
-	uint64_t id = blob_db_alloc_id();
+	uint64_t root = blob_db_alloc_id();
+	uint64_t first = blob_db_alloc_id();
 
-	if (id == 0) {
-		return -EIO;   /* not mounted, or id ceiling not persistable */
+	if (root == 0 || first == 0) {
+		return -EIO;   /* not mounted / id ceiling */
 	}
 
-	struct clog_image img = {
-		.hdr = { .version = CLOG_VERSION, .count = 0, .used = 0,
-			 .next_seq = 1 },
+	uint32_t epoch = sys_rand32_get();
+
+	if (epoch == 0) {
+		epoch = 1;   /* 0 is the "unchecked" sentinel in a cursor */
+	}
+
+	logring_t h = {
+		.root = root, .epoch = epoch, .capacity_bytes = cfg->capacity_bytes,
+		.tail_id = 0, .next_free = first, .head_id = 0,
+		.live_bytes = 0, .count = 0, .since_ckpt = 0,
 	};
 
-	memcpy(img.hdr.magic, CLOG_MAGIC, 4);
-
-	int rc = clog_store(id, &img);   /* one atomic bind */
+	int rc = root_write(&h, 0, 0);   /* bind the empty log (waypoint = first) */
 
 	if (rc < 0) {
 		return rc;
 	}
-	*out_root = id;
-	LOG_DBG("created ring root=%llu", (unsigned long long)id);
+	*out_root = root;
+	LOG_DBG("created log root=%llu epoch=%u", (unsigned long long)root, epoch);
 	return 0;
 }
 
-int logring_open(uint64_t root)
+int logring_open(uint64_t root, logring_t *h)
 {
-	if (root == 0) {
+	if (root == 0 || !h) {
 		return -EINVAL;
 	}
 
-	struct clog_image img;
-
-	return clog_load(root, &img);
-}
-
-int logring_append(uint64_t root, const void *data, size_t len,
-		   uint64_t *out_seq)
-{
-	if (root == 0 || (!data && len > 0)) {
-		return -EINVAL;
-	}
-	if (len > LOGRING_MAX_RECORD) {
-		return -ENOSPC;   /* no eviction can ever make room */
-	}
-
-	struct clog_image img;
-	int rc = clog_load(root, &img);
+	struct clog_root r;
+	int rc = root_load(root, &r);
 
 	if (rc < 0) {
 		return rc;
 	}
 
-	const size_t need = sizeof(struct clog_rec) + len;
-
-	/* Evict whole records from the head until the newcomer fits. Bounded:
-	 * `need` <= LOGRING_CAPACITY (checked above), so the loop terminates at
-	 * or before count == 0. */
-	while ((size_t)img.hdr.used + need > LOGRING_CAPACITY &&
-	       img.hdr.count > 0) {
-		struct clog_rec front;
-
-		memcpy(&front, img.data, sizeof(front));
-
-		const size_t fsz = sizeof(struct clog_rec) + front.len;
-
-		memmove(img.data, img.data + fsz, img.hdr.used - fsz);
-		img.hdr.used -= (uint16_t)fsz;
-		img.hdr.count--;
+	/* Finish an interrupted eviction (idempotent, suffix-first). */
+	if (r.evict_from != 0) {
+		run_delete(r.evict_from, r.evict_to);
 	}
 
-	const uint64_t seq = img.hdr.next_seq;
-	struct clog_rec nr = { .seq = seq, .len = (uint16_t)len };
+	/* Rebuild the tail: walk from the waypoint to the first unbound id.
+	 * ids strictly increase along the chain, which bounds the walk and
+	 * catches a cycle. The walk also recovers the exact count/bytes of the
+	 * entries appended since the last checkpoint (those from the waypoint
+	 * onward), so the hints stay exact across reopen rather than lagging. */
+	uint64_t cur = r.waypoint_id, tail = 0, next_free = r.waypoint_id;
+	uint32_t w_bound = 0;
+	uint64_t w_bytes = 0;
+	size_t first_len = 0;
+	bool first = true;
 
-	memcpy(img.data + img.hdr.used, &nr, sizeof(nr));
-	if (len > 0) {
-		memcpy(img.data + img.hdr.used + sizeof(nr), data, len);
-	}
-	img.hdr.used += (uint16_t)need;
-	img.hdr.count++;
-	img.hdr.next_seq++;
+	for (;;) {
+		uint64_t nxt;
+		size_t len;
+		int rc2 = entry_read(cur, &nxt, NULL, 0, &len);
 
-	rc = clog_store(root, &img);   /* COMMIT */
-	if (rc < 0) {
-		return rc;
-	}
-	if (out_seq) {
-		*out_seq = seq;
-	}
-	return 0;
-}
-
-int logring_count(uint64_t root, size_t *out_count)
-{
-	if (root == 0 || !out_count) {
-		return -EINVAL;
-	}
-
-	struct clog_image img;
-	int rc = clog_load(root, &img);
-
-	if (rc < 0) {
-		return rc;
-	}
-	*out_count = img.hdr.count;
-	return 0;
-}
-
-int logring_oldest_seq(uint64_t root, uint64_t *out_seq)
-{
-	if (root == 0 || !out_seq) {
-		return -EINVAL;
-	}
-
-	struct clog_image img;
-	int rc = clog_load(root, &img);
-
-	if (rc < 0) {
-		return rc;
-	}
-	if (img.hdr.count == 0) {
-		return -ENOENT;
-	}
-
-	struct clog_rec front;
-
-	memcpy(&front, img.data, sizeof(front));
-	*out_seq = front.seq;
-	return 0;
-}
-
-int logring_newest_seq(uint64_t root, uint64_t *out_seq)
-{
-	if (root == 0 || !out_seq) {
-		return -EINVAL;
-	}
-
-	struct clog_image img;
-	int rc = clog_load(root, &img);
-
-	if (rc < 0) {
-		return rc;
-	}
-	if (img.hdr.count == 0) {
-		return -ENOENT;
-	}
-	/* The tail is always the most-recently appended record (eviction only
-	 * touches the head), so its seq is next_seq - 1. */
-	*out_seq = img.hdr.next_seq - 1;
-	return 0;
-}
-
-int logring_reset(uint64_t root)
-{
-	if (root == 0) {
-		return -EINVAL;
-	}
-
-	struct clog_image img;
-	int rc = clog_load(root, &img);
-
-	if (rc < 0) {
-		return rc;
-	}
-	/* Keep next_seq: a reset is, to a seq-tracking consumer, the same as
-	 * evicting everything. */
-	img.hdr.count = 0;
-	img.hdr.used = 0;
-	return clog_store(root, &img);
-}
-
-int logring_iterate(uint64_t root, logring_iter_cb_t cb, void *user)
-{
-	if (root == 0 || !cb) {
-		return -EINVAL;
-	}
-
-	struct clog_image img;
-	int rc = clog_load(root, &img);
-
-	if (rc < 0) {
-		return rc;
-	}
-
-	size_t off = 0;
-
-	for (uint16_t i = 0; i < img.hdr.count; i++) {
-		struct clog_rec r;
-
-		memcpy(&r, img.data + off, sizeof(r));
-		off += sizeof(struct clog_rec);
-
-		rc = cb(r.seq, img.data + off, r.len, user);
-		if (rc) {
-			return rc;
+		if (rc2 == -ENOENT) {
+			next_free = cur;   /* unbound frontier */
+			break;
 		}
-		off += r.len;
+		if (rc2 < 0) {
+			return rc2;
+		}
+		if (nxt <= cur) {
+			return -EIO;   /* ids must increase */
+		}
+		if (first) {
+			first_len = len;
+			first = false;
+		}
+		w_bound++;
+		w_bytes += len;
+		tail = cur;
+		cur = nxt;
+	}
+
+	h->root = root;
+	h->epoch = r.epoch;
+	h->capacity_bytes = r.capacity_bytes;
+	h->tail_id = tail;
+	h->next_free = next_free;
+	h->head_id = r.head_id;
+	h->since_ckpt = 0;
+
+	if (r.head_id == 0) {
+		/* Empty, or a pre-first-checkpoint crash: the root's totals are
+		 * virgin and the waypoint (if bound) is an uncounted entry. */
+		h->count = w_bound;
+		h->live_bytes = (uint32_t)w_bytes;
+		if (tail != 0) {
+			h->head_id = r.waypoint_id;   /* the oldest, nothing evicted yet */
+		}
+	} else {
+		/* The waypoint was the tail at the last checkpoint (already in
+		 * the root totals); add only the entries after it. */
+		h->count = r.count + (w_bound - 1);
+		h->live_bytes = r.live_bytes + (uint32_t)(w_bytes - first_len);
 	}
 	return 0;
+}
+
+int logring_destroy(logring_t *h)
+{
+	if (!h) {
+		return -EINVAL;
+	}
+
+	/* Finish any pending eviction, then delete the live chain, then the
+	 * root. Best-effort on individual deletes. */
+	struct clog_root r;
+
+	if (root_load(h->root, &r) == 0 && r.evict_from != 0) {
+		run_delete(r.evict_from, r.evict_to);
+	}
+
+	uint64_t cur = h->head_id;
+
+	while (cur != 0 && cur != h->next_free) {
+		uint64_t nxt;
+		int rc = entry_read(cur, &nxt, NULL, 0, NULL);
+
+		if (rc < 0) {
+			break;
+		}
+		uint64_t del = cur;
+
+		cur = nxt;
+		(void)blob_db_delete(del);
+	}
+	return blob_db_delete(h->root);
+}
+
+/* ---- append ------------------------------------------------------------ */
+
+int logring_append(logring_t *h, const void *rec, size_t len, uint64_t *out_id)
+{
+	if (!h || (!rec && len > 0)) {
+		return -EINVAL;
+	}
+	if (len > CLOG_MAX_RECORD) {
+		return -EMSGSIZE;
+	}
+
+	uint64_t r_id = h->next_free;
+	uint64_t r2 = blob_db_alloc_id();
+
+	if (r2 == 0) {
+		return -EIO;
+	}
+
+	int rc = entry_write(r_id, r2, rec, len);
+
+	if (rc == -ENOSPC) {
+		/* Hard backstop: free space by evicting, then retry the bind.
+		 * Loop until it fits or the log cannot shrink further. */
+		while (rc == -ENOSPC && h->head_id != 0 &&
+		       h->head_id != h->tail_id) {
+			int ec = checkpoint(h, true);
+
+			if (ec < 0) {
+				return ec;
+			}
+			rc = entry_write(r_id, r2, rec, len);
+		}
+	}
+	if (rc < 0) {
+		return rc;   /* -ENOSPC exhausted, or -EIO */
+	}
+
+	bool was_empty = (h->tail_id == 0);
+
+	h->tail_id = r_id;
+	h->next_free = r2;
+	h->live_bytes += (uint32_t)len;
+	h->count += 1;
+	h->since_ckpt += 1;
+
+	if (was_empty) {
+		h->head_id = r_id;
+		rc = checkpoint(h, false);   /* persist head + waypoint */
+	} else if (h->since_ckpt >= CLOG_K) {
+		rc = checkpoint(h, false);
+	}
+	if (rc < 0) {
+		/* The entry is committed and reachable; only the checkpoint
+		 * hint write failed. Report success — open rebuilds from the
+		 * last good checkpoint. */
+		LOG_WRN("checkpoint after append failed: %d", rc);
+	}
+
+	if (out_id) {
+		*out_id = r_id;
+	}
+	return 0;
+}
+
+/* ---- reading ----------------------------------------------------------- */
+
+int logring_seek_oldest(logring_t *h, logring_cursor *c)
+{
+	if (!h || !c) {
+		return -EINVAL;
+	}
+	c->pos = 0;          /* 0 = oldest; resolved at next() */
+	c->epoch = h->epoch;
+	return 0;
+}
+
+int logring_seek_newest(logring_t *h, logring_cursor *c)
+{
+	if (!h || !c) {
+		return -EINVAL;
+	}
+	c->pos = h->tail_id; /* 0 if empty → next() returns -ENOENT */
+	c->epoch = h->epoch;
+	return 0;
+}
+
+int logring_next(logring_t *h, logring_cursor *c, void *out, size_t out_sz,
+		 size_t *out_len, uint64_t *out_id)
+{
+	if (!h || !c || (!out && out_sz > 0)) {
+		return -EINVAL;
+	}
+	if (c->epoch != 0 && c->epoch != h->epoch) {
+		c->pos = 0;
+		c->epoch = h->epoch;
+		return -ESTALE;   /* moniker from another incarnation */
+	}
+
+	uint64_t start = c->pos ? c->pos : h->head_id;
+
+	if (start == 0) {
+		return -ENOENT;   /* empty log */
+	}
+
+	uint64_t nxt;
+	size_t len;
+	int rc = entry_read(start, &nxt, out, out_sz, &len);
+
+	if (rc == -ENOENT) {
+		if (start < h->next_free) {
+			c->pos = 0;
+			c->epoch = h->epoch;
+			return -ESTALE;   /* was allocated, now evicted */
+		}
+		return -ENOENT;           /* unbound frontier → caught up */
+	}
+	if (rc < 0) {
+		return rc;                /* -EMSGSIZE (no advance) or -EIO */
+	}
+
+	c->pos = nxt;
+	c->epoch = h->epoch;
+	if (out_len) {
+		*out_len = len;
+	}
+	if (out_id) {
+		*out_id = start;
+	}
+	return 0;
+}
+
+void logring_cursor_to_moniker(const logring_cursor *c,
+			       struct logring_moniker *out)
+{
+	out->epoch = c->epoch;
+	out->id = c->pos;
+}
+
+int logring_cursor_from_moniker(logring_cursor *c,
+				const struct logring_moniker *m)
+{
+	if (!c || !m) {
+		return -EINVAL;
+	}
+	c->pos = m->id;
+	c->epoch = m->epoch;
+	return 0;
+}
+
+/* ---- introspection / maintenance -------------------------------------- */
+
+int logring_stats(logring_t *h, struct logring_stats *out)
+{
+	if (!h || !out) {
+		return -EINVAL;
+	}
+	out->oldest_id = h->head_id;
+	out->newest_id = h->tail_id;
+	out->count = h->count;
+	out->bytes = h->live_bytes;
+	return 0;
+}
+
+int logring_reset(logring_t *h)
+{
+	if (!h) {
+		return -EINVAL;
+	}
+
+	/* Delete the live chain. */
+	uint64_t cur = h->head_id;
+
+	while (cur != 0 && cur != h->next_free) {
+		uint64_t nxt;
+		int rc = entry_read(cur, &nxt, NULL, 0, NULL);
+
+		if (rc < 0) {
+			break;
+		}
+		uint64_t del = cur;
+
+		cur = nxt;
+		(void)blob_db_delete(del);
+	}
+
+	/* Re-init to empty, keeping the epoch (same incarnation). A fresh
+	 * reservation anchors the new (empty) chain. */
+	uint64_t first = blob_db_alloc_id();
+
+	if (first == 0) {
+		return -EIO;
+	}
+	h->tail_id = 0;
+	h->next_free = first;
+	h->head_id = 0;
+	h->live_bytes = 0;
+	h->count = 0;
+	h->since_ckpt = 0;
+	return root_write(h, 0, 0);
 }

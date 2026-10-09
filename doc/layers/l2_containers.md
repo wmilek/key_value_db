@@ -202,41 +202,47 @@ one root `update` as the commit, then dead-path `delete`s. At fan-out 8, 100k
 keys ⇒ depth ≈ 6 ⇒ ~6 flash reads per lookup. Splits/merges follow standard
 B-tree rules, still committed by the single root write.
 
-### 4.5 `logring` — bounded circular log
+### 4.5 `logring` — bounded per-entry log
 
 Where `seq` (§4.1) is an *unbounded, index-addressed* sequence — the right
-shape for file bodies and chunk chains — `logring` is its opposite trade,
-purpose-built for **logging**: a *bounded* store that keeps the most recent
-records and silently drops the oldest. It is the embedded "flight recorder" —
-boot reasons, fault codes, the last lines before a crash — and so it does not
-implement the generic `seq_ops`; it exports its own small append/scan API
+shape for file bodies and chunk chains — `logring` is purpose-built for
+**logging**: a *bounded* store that keeps the most recent records and drops the
+oldest, scaling from a couple of MB up to near the whole partition. It does not
+implement the generic `seq_ops`; it exports its own append/scan API
 (`logring.h`). **Implemented**, not scaffolded.
 
 ```
-root { magic 'CLOG', version, count, used, next_seq, rec[]… }
-rec  { seq (u64), len (u16), bytes… }         packed, oldest → newest
+root  { magic 'CLOG', version, epoch, capacity_bytes, live_bytes, count,
+        waypoint_id, head_id, evict_from, evict_to }
+entry { next_id, len, bytes… }                       one i-node PER record
 ```
 
-The entire ring lives inline in the **one** root i-node, exactly like
-`rootreg` (`l1_root_registry.md`): every mutation — `append`, `reset`,
-`create` — is a single atomic `blob_db_update(root, …)`, the sole
-linearization point (§2.2). There is no prepare/cleanup phase, hence **no
-residue and no recovery pass** — `open` only validates the magic. `append`
-evicts whole records from the head until the newcomer fits, so it returns
-`-ENOSPC` only when a *single* record exceeds the ring's capacity
-(`BLOB_DB_MAX_PAYLOAD_LEN` − header), never merely because the ring is full.
+Each log record is **its own i-node** (R2). Entries form a forward chain using
+`blob_db`'s reserve-then-bind: `next_id` points at an id `alloc_id()` returned
+but not yet bound, so an `append` just *binds* that pre-reserved id — one new
+blob written, **nothing rewritten** (~1× write amplification, versus the
+rewrite-amplification of packing records into a shared node). A small RAM
+**handle** (`l2_containers.md` §2.3) caches the tail so warm appends are O(1)
+and the root is written only at **checkpoints** (~every `CHECKPOINT` appends),
+which also carry a **waypoint** near the end that `open` rebuilds the exact
+tail from, and which **batch eviction** of the oldest entries. Eviction's
+intent lives **inline** in that same root write and its run is deleted
+suffix-first for re-enterable recovery — so `logring` needs no shared intent
+helper and is self-contained on L1. The soft `capacity_bytes` budget is a hint
+(§5-invariant-friendly: the ring sits *near* it), with a hard `-ENOSPC`
+backstop.
 
-Each record carries a strictly-increasing, never-reused `uint64_t` **sequence
-number** — durable across eviction, `reset`, and remount (it lives in
-`next_seq`, written atomically with the ring). A consumer that remembers the
-last sequence number it processed can therefore detect exactly how many
-records were dropped while it was away (oldest surviving seq − last seen − 1):
-the same single-integer "where was I" idea L1 applies to ids (P5), applied to
-the log cursor. Capacity is one i-node payload; for larger retention, run
-several rings (e.g. per subsystem) side by side — each is one `uint64_t` root.
+Reads are **forward only**, through an opaque cursor in the journal/`lseek`
+idiom: `seek_oldest` / `seek_newest` (O(1), reaches the real end) / `next`. The
+cursor exports a public **moniker `{epoch, id}`** the caller serializes and
+integrity-protects itself; the per-log random `epoch` lets `next` reject a
+moniker from another incarnation (e.g. after a reformat, which reuses ids) or a
+random value — `-ESTALE`, not a misread. An evicted position is likewise
+`-ESTALE`.
 
-Cost: `append` = 1 read + 1 write, O(payload) transient RAM; `iterate` walks
-the inline run oldest→newest. Design detail: `doc/impl/l2_logring.md`.
+Cost: `append` = 1 write, 0 reads (warm); `open` = 1 read + a bounded walk;
+`next` = 1–2 reads. Every op is O(1) in the log's size. Design detail:
+`doc/impl/l2_logring.md`; rationale: `doc/proposals/2026-10-08-logring.md`.
 
 ## 5. Container invariants
 
