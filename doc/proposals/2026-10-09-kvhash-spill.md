@@ -245,9 +245,15 @@ items 1–5: policies lowered, raised, zeroed and disabled with no data moved an
 the same walk order, lazy migration on rewrite, reuse of spilled parts, `del`,
 remount, a v2 map, forced fingerprint collisions (including 150 B keys that
 differ in the last byte, and inline and spilled keys of one length in one
-bucket), and leak checks through `destroy`. **Not yet covered: item 6, power
-loss inside set and delete** (open item O4), and spilled values larger than one
-slot under `CONFIG_BLOB_DB_LARGE_PAYLOADS`.
+bucket), and leak checks through `destroy`.
+
+Item 6, power loss inside set and delete, is the `kvhash_spill_crash` suite
+(`src/spill_crash.c`). A test hook cuts power after each of kvhash's flash
+writes in turn, across eight scenarios, and every cut leaves the key wholly old
+or wholly new, with at most the unreferenced blobs §5 allows: key and value,
+plus the bucket for an insert into a fresh one. Swapping `del`'s release and
+commit makes the suite fail, as it should. **Not yet covered:** spilled values
+larger than one slot under `CONFIG_BLOB_DB_LARGE_PAYLOADS`.
 
 `app_perf_kvdb` with `-DCONFIG_BLOB_CONTAINER_KVHASH_VAL_INLINE_MAX=0` (every
 value spilled by kvhash itself) matches the app-level `VALUE_BLOBS` variant on
@@ -255,5 +261,4 @@ every read and write count, except `populate`: 26 788 reads against 46 982,
 because a new key no longer pays a separate lookup before it is inserted. See
 `app_perf_kvdb/RESULTS.md`.
 
-- **O4** Power-loss tests for spilled set and delete, using the intent harness or
-  blob_db's crash hooks.
+- **O4** Power-loss tests for spilled set and delete: done (`kvhash_spill_crash`).
