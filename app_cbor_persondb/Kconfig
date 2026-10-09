@@ -23,10 +23,12 @@ config APP_CBOR_PERSONDB_FRONTEND_BENCH
 config APP_CBOR_PERSONDB_FRONTEND_SHELL
 	bool "Interactive shell"
 	select SHELL
+	imply BLOB_DB_SHELL
 	help
 	  The same operations under "persondb <cmd>", for poking a live store
 	  on the board — including power-cutting a fill and inspecting what
-	  survived.
+	  survived. The read-only "blob_db <cmd>" group (BLOB_DB_SHELL) comes
+	  with it, to see how that data lies across the buckets.
 
 endchoice
 

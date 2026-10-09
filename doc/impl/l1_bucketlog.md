@@ -426,6 +426,39 @@ crash during the sweep itself.
 Bucket-by-bucket full scan; callback runs against the resident sector buffer.
 Order is not id-sorted.
 
+### 5.7a Inspection (`CONFIG_BLOB_DB_INSPECT`, `CONFIG_BLOB_DB_SHELL`)
+
+`blob_db_info_get()` returns the geometry and master state from RAM.
+`blob_db_bucket_stat()` reads one bucket sector and classifies every slot the
+way compaction would (§5.6) — *live* if it is the newest for its id and not a
+tombstone, otherwise *garbage* — and splits the slot stream into
+
+```
+live + garbage + torn + free == sector − bucket header
+```
+
+where *torn* is anything programmed past the readable log (a torn append, or a
+slot whose CRC failed and what follows it in the resident walk) and *free* is
+the erased remainder. A bucket without a valid header counts as entirely free:
+the next write formats it.
+
+`CONFIG_BLOB_DB_SHELL` puts a read-only `blob_db` command group over both:
+
+```
+blob_db info                      geometry, format, master, id counter
+blob_db stats [top_n]             whole store: bytes by class, ids per bucket,
+                                  fill histogram, fullest buckets
+blob_db buckets [first [count]]   per-bucket table (never-used buckets skipped)
+blob_db bucket <bid>              every slot of one bucket, oldest first
+blob_db id <id>                   its bucket, size, and its slot history
+blob_db dump <id> [max_bytes]     hex dump of the payload
+blob_db iostats [reset]           flash I/O counters (CONFIG_BLOB_DB_IOSTATS)
+```
+
+These are diagnostics on the implementation, not part of the contract (P6).
+Like the rest of the API they are unsynchronised: the shell runs on its own
+thread, so use them while the application is not calling blob_db.
+
 ### 5.8 Batch operations (optional, `CONFIG_BLOB_DB_MULTI`)
 
 Contract §4 / decision D6: unordered set, per-element result, no cross-element
@@ -508,6 +541,8 @@ BLOB_DB_MAX_OBJECT_LEN         int, default 131072   # validated at mount
 BLOB_DB_MAX_SEGMENTS           int, default 128      # 16 B of .bss each
 BLOB_DB_SEGMENT_LEN            int, default 0        # 0 = sector/4, clamped
 BLOB_DB_MULTI                  bool, default n   # batch ops (§5.8, contract D6)
+BLOB_DB_INSPECT                bool, default n   # info / bucket_stat (§5.7a)
+BLOB_DB_SHELL                  bool, depends on SHELL, select INSPECT
 module = BLOB_DB (standard LOG pattern)
 ```
 

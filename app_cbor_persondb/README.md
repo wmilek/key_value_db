@@ -339,6 +339,11 @@ persondb assign <id> <card> | unassign <card>
 persondb reset                    erase and start over
 ```
 
+The shell frontend also brings in the read-only `blob_db` group
+(`CONFIG_BLOB_DB_SHELL`) to see how that data lies on flash — `blob_db stats`
+for the fill across buckets, `blob_db bucket <bid>` / `blob_db id <id>` for
+the slots themselves. See `doc/impl/l1_bucketlog.md` §5.7a.
+
 ## What this app does *not* show you
 
 Worth stating, because a practices guide is read as a checklist:

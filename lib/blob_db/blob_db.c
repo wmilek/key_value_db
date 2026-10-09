@@ -2800,6 +2800,157 @@ int blob_db_iterate(blob_db_iter_cb_t cb, void *user)
 	return 0;
 }
 
+#if defined(CONFIG_BLOB_DB_INSPECT)
+/* Introspection ---------------------------------------------------------- */
+
+int blob_db_info_get(struct blob_db_info *out)
+{
+	if (!out) {
+		return -EINVAL;
+	}
+	if (!st.mounted) {
+		return -ENODEV;
+	}
+
+	*out = (struct blob_db_info){
+		.partition_size  = st.fa_size,
+		.sector_size     = st.peb_size,
+		.write_align     = st.write_align,
+		.n_sectors       = st.n_pebs,
+		.n_buckets       = st.n_buckets,
+		.bucket_capacity = st.peb_size - BLOB_DB_BUCKET_DATA_OFF,
+		.max_payload_len = CONFIG_BLOB_DB_MAX_PAYLOAD_LEN,
+		.slot_overhead   = BLOB_DB_SLOT_OVERHEAD,
+		.format_major    = BLOB_DB_FORMAT_MAJOR,
+		.format_minor    = BLOB_DB_FORMAT_MINOR,
+		.active_master   = st.active_master,
+		.master_gen      = st.master_gen,
+		.next_id         = st.next_id,
+		.next_id_hint    = st.next_id_hint,
+		.seg_owner       = st.seg_owner,
+		.wedged          = st.wedged,
+	};
+	return 0;
+}
+
+int blob_db_bucket_stat(uint16_t bid, struct blob_db_bucket_stats *out,
+			blob_db_slot_cb_t cb, void *user)
+{
+	if (!out) {
+		return -EINVAL;
+	}
+	if (!st.mounted) {
+		return -ENODEV;
+	}
+	if (bid >= st.n_buckets) {
+		return -EINVAL;
+	}
+
+	const uint32_t capacity = st.peb_size - BLOB_DB_BUCKET_DATA_OFF;
+
+	*out = (struct blob_db_bucket_stats){
+		.capacity   = capacity,
+		.free_bytes = capacity,
+	};
+
+	int rc = read_bucket(bid, g_bbuf);
+
+	if (rc < 0) {
+		return rc;
+	}
+	if (!bucket_hdr_valid(g_bbuf, bid)) {
+		/* Never used, or invalidated by erase_all: the next write
+		 * formats it, so all of it is available. */
+		return 0;
+	}
+
+	out->formatted = true;
+	out->gen = ((const struct blob_db_bucket_hdr *)g_bbuf)->gen;
+
+	/* Same liveness rule as compaction (build_compacted_image): a slot is
+	 * kept iff it is the newest for its id and not a tombstone. */
+	off_t cursor = BLOB_DB_BUCKET_DATA_OFF;
+
+	for (;;) {
+		struct slot_view sv;
+
+		if (!slot_view_at(g_bbuf, cursor, &sv)) {
+			break;
+		}
+
+		bool superseded = false;
+		off_t scan = cursor + sv.total_size;
+
+		for (;;) {
+			struct slot_view future;
+
+			if (!slot_view_at(g_bbuf, scan, &future)) {
+				break;
+			}
+			if (future.id == sv.id) {
+				superseded = true;
+				break;
+			}
+			scan += future.total_size;
+		}
+
+		struct blob_db_slot_info si = {
+			.offset  = (uint32_t)cursor,
+			.size    = (uint32_t)sv.total_size,
+			.id      = sv.id,
+			.val_len = sv.val_len,
+			.flags   = sv.flags,
+			.segment = IS_ENABLED(CONFIG_BLOB_DB_LARGE_PAYLOADS) &&
+				   (sv.flags & BLOB_DB_SLOT_F_SEGMENT),
+			.index   = IS_ENABLED(CONFIG_BLOB_DB_LARGE_PAYLOADS) &&
+				   (sv.flags & BLOB_DB_SLOT_F_INDEXED),
+		};
+
+		if (sv.flags & BLOB_DB_SLOT_F_TOMBSTONE) {
+			si.state = BLOB_DB_SLOT_TOMBSTONE;
+			out->tombstones++;
+			out->garbage_bytes += si.size;
+		} else if (superseded) {
+			si.state = BLOB_DB_SLOT_SUPERSEDED;
+			out->superseded++;
+			out->garbage_bytes += si.size;
+		} else {
+			si.state = BLOB_DB_SLOT_LIVE;
+			if (si.segment) {
+				out->segments++;
+			} else {
+				out->objects++;
+			}
+			out->live_bytes += si.size;
+			out->payload_bytes += si.val_len;
+		}
+
+		if (cb) {
+			rc = cb(&si, user);
+			if (rc) {
+				return rc;
+			}
+		}
+
+		cursor += sv.total_size;
+	}
+
+	/* Anything programmed past the readable log — a torn append, or a slot
+	 * whose CRC failed and everything behind it — is neither live nor free:
+	 * it is reclaimed only by the next compaction. */
+	off_t end = (off_t)st.peb_size;
+
+	while (end > cursor && g_bbuf[end - 1] == 0xff) {
+		end--;
+	}
+
+	out->tail_bytes = (uint32_t)(end - cursor);
+	out->free_bytes = capacity - out->live_bytes - out->garbage_bytes -
+			  out->tail_bytes;
+	return 0;
+}
+#endif /* CONFIG_BLOB_DB_INSPECT */
+
 int blob_db_size(uint64_t id, size_t *out_size)
 {
 	if (!st.mounted) {

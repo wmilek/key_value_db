@@ -249,6 +249,32 @@ config BLOB_DB_IOSTATS
 	  A handful of counters and one call per store operation; leave it off
 	  in production builds.
 
+config BLOB_DB_INSPECT
+	bool "Introspection API (geometry, per-bucket occupancy)"
+	help
+	  Compile in blob_db_info_get() and blob_db_bucket_stat(): the store's
+	  geometry and allocator state, and for each bucket how its sector
+	  splits into live data, garbage awaiting compaction, unreadable tail
+	  and erased space, with an optional per-slot walk.
+
+	  Diagnostics only. The figures describe the bucket-log implementation,
+	  not the blob_db contract, so nothing above L1 should depend on them.
+
+config BLOB_DB_SHELL
+	bool "Shell commands to inspect the store"
+	depends on SHELL
+	select BLOB_DB_INSPECT
+	help
+	  Add a `blob_db` shell command group: geometry and master state, a
+	  whole-store occupancy summary with the fill distribution across
+	  buckets, a per-bucket table, a slot-by-slot view of one bucket, where
+	  an id lives, and a hex dump of a blob. Read-only: no command writes
+	  to flash.
+
+	  blob_db is not thread-safe and the shell runs on its own thread, so
+	  use these while the application is not calling blob_db. A full-store
+	  scan reads every bucket sector, which takes a while on large parts.
+
 config BLOB_DB_AUTOFORMAT_ON_CORRUPT
 	bool "Format when both master sectors are unreadable"
 	default y
