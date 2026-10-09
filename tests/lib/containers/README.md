@@ -40,6 +40,16 @@ behaviour, and both say so in a comment:
   `test_destroy_releases_every_blob_it_owned` — the same `blob_db_count()`
   measurement, with the opposite expectation.
 
+## `kvhash_spill` (`src/spill.c`)
+
+kvhash's spilling of large keys and values into blobs of their own
+(`doc/proposals/2026-10-09-kvhash-spill.md`). The requirement it pins: the
+inline thresholds are a write policy, not a format. Entries written under one
+threshold must read, walk and count identically under any other, and move only
+when their key is next set. Placement is read off `blob_db_count()`. Fingerprint
+collisions are forced with `CONFIG_BLOB_CONTAINER_KVHASH_TEST_HOOKS` (set in
+`prj.conf`). Power loss inside a spilled set or delete is not covered yet.
+
 ## Running
 
 ```sh

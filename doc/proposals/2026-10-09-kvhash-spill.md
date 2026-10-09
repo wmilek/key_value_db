@@ -1,6 +1,7 @@
 # Design change proposal — spilling large keys and values out of `kvhash` buckets
 
-Status: **proposed — not implemented** · 2026-10-09
+Status: **implemented** · 2026-10-09 · what shipped, and where it differs from
+this design: §9
 · Target contract: `doc/layers/l2_containers.md` §4.2 (inlining) and §4.3
 · Target implementation: `lib/containers/kvhash/kvhash.c`
 · Evidence: `app_perf_kvdb/RESULTS.md`, "On values as blob ids"
@@ -211,3 +212,48 @@ point (`VAL_INLINE_MAX = 0`), and gains a run at the default threshold.
   maps whose value sizes differ widely.
 - **O3** DK measurement of a spilled `get` (the scaling in `app_perf_kvdb/RESULTS.md`
   predicts ≈1.33× per spilled hit) before the defaults are finalised.
+
+## 9. As implemented
+
+Built as designed in §1–§5, in `lib/containers/kvhash/kvhash.c`, with these
+decisions made along the way:
+
+- **Shipped defaults never spill** (both thresholds 32767), not the 64 / 32 of
+  §7. At 64, `app_cbor_persondb`'s ~380 B person records would spill, adding a
+  blob read to every person lookup — a performance change to an existing app
+  that §7 did not intend, and that O3's DK measurement should decide.
+  `app_perf_kvdb`'s inline counters are unchanged byte for byte at the default,
+  and `app_cbor_persondb` verifies with no bucket overflows.
+- **Run-time setter.** `kvhash_set_inline_max(key, val)` (`kvhash.h`) changes the
+  policy for all maps, which is what the tests use to write under one policy
+  and read under another in one binary. Per-map thresholds (O2) are not built.
+- **Error codes.** A key or value of 0x8000–0xffff bytes is `-ENOSPC` (it cannot
+  be stored, as before); a spilled key longer than one blob_db slot is
+  `-ENOSPC`, since a lookup must be able to hold it. `get`/`del` of a key
+  longer than 0x7fff is `-ENOENT`. Above 0xffff is still `-EINVAL`.
+- **Key compares.** A lookup reads a spilled key whole into the free directory
+  buffer (one blob read on a fingerprint match). The order's fingerprint-tie
+  path streams both keys through the stack in 64 B pieces instead, because the
+  walk is still using both buffers there.
+- **`destroy` at depth 2** re-reads the top directory for each sub-map, since
+  the bucket buffer now holds each bucket while its spilled blobs are released.
+- **A build-time guard** asserts `CONFIG_BLOB_DB_MAX_PAYLOAD_LEN <= 0x7fff`, the
+  condition that keeps bit 15 free; blob_db cannot mount a larger cap anyway.
+
+Tests (`tests/lib/containers/src/spill.c`, suite `kvhash_spill`) cover §6
+items 1–5: policies lowered, raised, zeroed and disabled with no data moved and
+the same walk order, lazy migration on rewrite, reuse of spilled parts, `del`,
+remount, a v2 map, forced fingerprint collisions (including 150 B keys that
+differ in the last byte, and inline and spilled keys of one length in one
+bucket), and leak checks through `destroy`. **Not yet covered: item 6, power
+loss inside set and delete** (open item O4), and spilled values larger than one
+slot under `CONFIG_BLOB_DB_LARGE_PAYLOADS`.
+
+`app_perf_kvdb` with `-DCONFIG_BLOB_CONTAINER_KVHASH_VAL_INLINE_MAX=0` (every
+value spilled by kvhash itself) matches the app-level `VALUE_BLOBS` variant on
+every read and write count, except `populate`: 26 788 reads against 46 982,
+because a new key no longer pays a separate lookup before it is inserted. See
+`app_perf_kvdb/RESULTS.md`.
+
+- **O4** Power-loss tests for spilled set and delete, using the intent harness or
+  blob_db's crash hooks.

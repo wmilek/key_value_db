@@ -217,7 +217,8 @@ packed pair list. A map is one or two levels deep, and the root says which.
 root   { magic 'KVHA', n, version, depth, child_id[n] }   geometry fixed at create
   depth 1: child_id[i] is a bucket
   depth 2: child_id[i] is a sub-directory, itself a depth-1 root
-bucket = ( u16 klen, u16 vlen, key bytes, val bytes )*   0 = empty, created lazily
+bucket = ( u16 klen|KS, u16 vlen|VS, key part, val part )*  0 = empty, created lazily
+         KS/VS set: that part is a blob id (key: + u32 fingerprint) — see l2_kvhash.md §1
 ```
 
 A directory must fit one i-node payload, so one level addresses at most

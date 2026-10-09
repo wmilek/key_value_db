@@ -362,6 +362,26 @@ why `l2_containers.md` §4.2 planned an inline threshold (`KVLIST_INLINE_MAX`,
 64 B) rather than either extreme. The DK capture, when it exists, should
 replace this scaling.
 
+### The same layout, done by kvhash itself
+
+kvhash can now spill values on its own (`doc/proposals/2026-10-09-kvhash-spill.md`).
+Building the inline app with `-DCONFIG_BLOB_CONTAINER_KVHASH_VAL_INLINE_MAX=0`
+puts every value in a blob of its own, the layout of this section, without the
+app's wrappers. Every read and write count matches `VALUE_BLOBS` (the gen 2 → 3
+rerun above, phase for phase, with `modify` ~1.5 % fewer reads), except store
+creation:
+
+| `populate` | inline | `VALUE_BLOBS` (app) | `VAL_INLINE_MAX=0` (kvhash) |
+|---|--:|--:|--:|
+| flash reads | 25 248 | 46 982 | **26 788** |
+| writes | 1 027 | 1 800 | 1 800 |
+| flash-only prediction, DK | 3.342 s | 5.355 s | **3.849 s** |
+
+The app had to look a key up before inserting it to learn whether a value blob
+already existed; kvhash finds that out in the bucket it is already rewriting.
+So the indirection's cost at creation is the extra writes, not extra lookups.
+At the default thresholds (never spill) every counter in this file is unchanged.
+
 ## Raw native_sim capture — rerun (gen 2 -> 3), I/O counters
 
 ```

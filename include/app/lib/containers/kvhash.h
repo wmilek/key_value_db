@@ -20,6 +20,32 @@ extern "C" {
  */
 extern const struct map_ops kvhash_map_ops;
 
+/**
+ * @brief Set the spill thresholds for writes from now on.
+ *
+ * A key longer than @p key_max, or a value longer than @p val_max, is stored
+ * in a blob of its own instead of inside its bucket. The thresholds are a
+ * write policy only: every entry records its own placement and every read goes
+ * by that, so changing them never invalidates stored data. Existing entries
+ * keep their placement until their key is next set. Maps created before
+ * kvhash v3 never spill, whatever the thresholds.
+ *
+ * Initialised from CONFIG_BLOB_CONTAINER_KVHASH_KEY_INLINE_MAX and
+ * CONFIG_BLOB_CONTAINER_KVHASH_VAL_INLINE_MAX. Values above 32767 are
+ * clamped to 32767 (never spill).
+ */
+void kvhash_set_inline_max(size_t key_max, size_t val_max);
+
+#if defined(CONFIG_BLOB_CONTAINER_KVHASH_TEST_HOOKS)
+/**
+ * @brief AND-mask applied to every key fingerprint (default all ones).
+ *
+ * Test builds only: 0 makes every fingerprint equal, so lookups and the
+ * enumeration order must fall back to comparing key bytes.
+ */
+extern uint32_t kvhash_test_fp_mask;
+#endif
+
 #ifdef __cplusplus
 }
 #endif
