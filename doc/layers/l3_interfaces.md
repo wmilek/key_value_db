@@ -98,8 +98,9 @@ Backend profiles:
 | `KVDB_BACKEND_TREE` (kvtree) | O(log n), sorted scans | ordered iteration matters | planned |
 
 The API is identical across backends; only costs change. Ordered iteration
-(`kvdb_foreach`) is **deferred**: it needs an `iterate` op on `map_ops`, which
-the shipped Map shape does not yet define. It lands with the first backend that
+(`kvdb_foreach`) is **deferred**. The Map shape now has the op it needs,
+`map_ops.next` (stateless, key-as-cursor; implemented by kvhash in hash order),
+but kvdb does not wire it yet. Sorted order lands with the first backend that
 can order keys (kvtree).
 
 ## 4. `blobfs` — filesystem-like interface
@@ -169,8 +170,9 @@ replaced.
 Two gaps are structural rather than unfinished work, and both report
 `-ENOTSUP` rather than pretending:
 
-- **`mkdir` / `readdir`** wait on an enumeration op in the Map shape (§3) —
-  the same op `kvdb_foreach` waits on. Nested directories follow it.
+- **`mkdir` / `readdir`** need enumeration of a directory Map. The shape now
+  has it (`map_ops.next`, §3), but blobfs does not wire it yet — the same gap
+  as `kvdb_foreach`. Nested directories follow it.
 - **File size** is capped by one inline blob payload
   (`CONFIG_BLOB_DB_MAX_PAYLOAD_LEN`); blob_db's segmented objects are what
   lift it.

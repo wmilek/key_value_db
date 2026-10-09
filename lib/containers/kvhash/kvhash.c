@@ -271,6 +271,26 @@ static int resolve_leaf(uint64_t root, const void *key, size_t klen,
 }
 
 /*
+ * The one parser of a packed bucket. Reports the entry at @off: its key and
+ * value lengths, and true; or false at the end of the bucket. A truncated
+ * tail -- an entry header that runs past @used -- ends the bucket, and this
+ * is the only place that rule lives, so get, next and count can never
+ * disagree about what a damaged record holds.
+ *
+ *   for (off = 0; bkt_entry(buf, used, off, &kl, &vl); off += ENTRY_HDR_LEN + kl + vl)
+ */
+static bool bkt_entry(const uint8_t *buf, size_t used, size_t off,
+		      size_t *kl, size_t *vl)
+{
+	if (off + ENTRY_HDR_LEN > used) {
+		return false;
+	}
+	*kl = get_u16(&buf[off]);
+	*vl = get_u16(&buf[off + 2]);
+	return off + ENTRY_HDR_LEN + *kl + *vl <= used;
+}
+
+/*
  * Scan a packed bucket for @key. On a hit, returns the byte offset of its
  * entry and fills *entry_len / *val_off / *val_len. On a miss, returns
  * SIZE_MAX.
@@ -279,19 +299,13 @@ static size_t bkt_find(const uint8_t *buf, size_t used,
 		       const void *key, size_t klen,
 		       size_t *entry_len, size_t *val_off, size_t *val_len)
 {
-	size_t off = 0;
+	size_t kl, vl;
 
-	while (off + ENTRY_HDR_LEN <= used) {
-		size_t kl = get_u16(&buf[off]);
-		size_t vl = get_u16(&buf[off + 2]);
-		size_t elen = ENTRY_HDR_LEN + kl + vl;
-
-		if (off + elen > used) {
-			break; /* truncated / corrupt — stop */
-		}
+	for (size_t off = 0; bkt_entry(buf, used, off, &kl, &vl);
+	     off += ENTRY_HDR_LEN + kl + vl) {
 		if (kl == klen && memcmp(&buf[off + ENTRY_HDR_LEN], key, klen) == 0) {
 			if (entry_len) {
-				*entry_len = elen;
+				*entry_len = ENTRY_HDR_LEN + kl + vl;
 			}
 			if (val_off) {
 				*val_off = off + ENTRY_HDR_LEN + kl;
@@ -301,9 +315,49 @@ static size_t bkt_find(const uint8_t *buf, size_t used,
 			}
 			return off;
 		}
-		off += elen;
 	}
 	return SIZE_MAX;
+}
+
+/*
+ * Load the depth-1 sub-map @sub of a two-level map into dir_buf. Sub-maps are
+ * created eagerly, so an id of 0 is corruption, as is anything but depth 1.
+ */
+static int sub_load(uint64_t sub, uint16_t *sub_n)
+{
+	uint8_t sub_depth;
+	int rc;
+
+	if (sub == 0) {
+		return -EIO;
+	}
+	rc = dir_load(sub, sub_n, &sub_depth);
+	if (rc != 0) {
+		return rc;
+	}
+	return sub_depth == 1 ? 0 : -EIO;
+}
+
+/*
+ * Re-fetch child @t of the top directory at @root after a sub-map has been
+ * loaded over it. A whole directory read: blob_db stages an inline payload
+ * in full before any partial copy, so an 8-byte blob_db_read would cost the
+ * same flash traffic, and a third payload-sized buffer is what keeping the
+ * top would cost in RAM.
+ */
+static int top_child(uint64_t root, uint16_t t, uint64_t *sub)
+{
+	uint16_t n;
+	int rc = dir_load(root, &n, NULL);
+
+	if (rc != 0) {
+		return rc;
+	}
+	if (t >= n) {
+		return -EIO;
+	}
+	*sub = dir_child(dir_buf, t);
+	return 0;
 }
 
 /*
@@ -683,6 +737,267 @@ static int kvhash_del(uint64_t root, const void *key, size_t klen)
 }
 
 /*
+ * Enumeration order, per shape_map.h `next`.
+ *
+ * A key's place is (top index, sub index, klen, key bytes). The first two are
+ * where the key lives, so walking directories and buckets in index order is
+ * walking the order; the last two break ties inside one bucket, and need no
+ * hash to do it -- length then bytes is already total. Every term is a
+ * function of the key and the fixed geometry, never of where the entry sits in
+ * its bucket: a set moves its entry to the end, so position is not stable, and
+ * a deleted key has no position at all.
+ *
+ * This compares two keys already known to share a bucket.
+ */
+static int order_cmp(const uint8_t *ka, size_t la, const uint8_t *kb, size_t lb)
+{
+	if (la != lb) {
+		return la < lb ? -1 : 1;
+	}
+	return memcmp(ka, kb, la);
+}
+
+/*
+ * Find the first entry of the bucket in @buf, in enumeration order, that sorts
+ * after the cursor (or the first outright when @cursor is NULL). The bucket is
+ * unsorted on flash, so this is a linear pass -- the whole bucket is already in
+ * RAM, which is the same cost bkt_find pays. Returns its offset or SIZE_MAX.
+ */
+static size_t bkt_first_after(const uint8_t *buf, size_t used,
+			      const uint8_t *cursor, size_t clen)
+{
+	size_t best = SIZE_MAX, best_kl = 0;
+	size_t kl, vl;
+
+	for (size_t off = 0; bkt_entry(buf, used, off, &kl, &vl);
+	     off += ENTRY_HDR_LEN + kl + vl) {
+		const uint8_t *k = &buf[off + ENTRY_HDR_LEN];
+
+		if ((cursor == NULL || order_cmp(k, kl, cursor, clen) > 0) &&
+		    (best == SIZE_MAX ||
+		     order_cmp(k, kl, &buf[best + ENTRY_HDR_LEN], best_kl) < 0)) {
+			best = off;
+			best_kl = kl;
+		}
+	}
+	return best;
+}
+
+/*
+ * Search the leaf directory in dir_buf from bucket @start onwards. The cursor
+ * applies to bucket @start only: every later bucket sorts wholly after it.
+ * Leaves the hit's bucket in bkt_buf and its offset in *off.
+ */
+static int leaf_first_after(uint16_t n, uint16_t start, const uint8_t *cursor,
+			    size_t clen, size_t *off)
+{
+	for (uint16_t i = start; i < n; i++) {
+		uint64_t bid = dir_child(dir_buf, i);
+
+		if (bid == 0) {
+			continue;
+		}
+
+		size_t used = 0;
+		int rc = blob_db_get(bid, bkt_buf, sizeof(bkt_buf), &used);
+
+		if (rc != 0) {
+			return rc;
+		}
+
+		*off = bkt_first_after(bkt_buf, used,
+				       i == start ? cursor : NULL, clen);
+		if (*off != SIZE_MAX) {
+			return 0;
+		}
+	}
+	return -ENODATA;
+}
+
+/* Search a whole two-level map from sub-map @top_start onwards. */
+static int tree_first_after(uint64_t root, uint16_t n_top, uint16_t top_start,
+			    const uint8_t *cursor, size_t clen, uint32_t ch,
+			    size_t *off)
+{
+	for (uint16_t t = top_start; t < n_top; t++) {
+		/* Walking a sub-map loads its directory over the top one, so
+		 * the top is re-read on each step across a sub-map boundary. */
+		uint64_t sub = dir_child(dir_buf, t);
+		uint16_t sub_n;
+		int rc;
+
+		if (t != top_start) {
+			rc = top_child(root, t, &sub);
+			if (rc != 0) {
+				return rc;
+			}
+		}
+		rc = sub_load(sub, &sub_n);
+		if (rc != 0) {
+			return rc;
+		}
+
+		bool here = (t == top_start && cursor != NULL);
+
+		rc = leaf_first_after(sub_n, here ? idx_sub(ch, sub_n) : 0,
+				      here ? cursor : NULL, clen, off);
+		if (rc != -ENODATA) {
+			return rc;
+		}
+	}
+	return -ENODATA;
+}
+
+static int kvhash_next(uint64_t root, const void *key, size_t klen,
+		       void *kout, size_t kout_sz, size_t *kout_len,
+		       void *vout, size_t vout_sz, size_t *vout_len)
+{
+	if ((key == NULL && klen != 0) || klen > 0xffffu ||
+	    (kout == NULL && kout_sz != 0) || (vout == NULL && vout_sz != 0)) {
+		return -EINVAL;
+	}
+
+	/* klen == 0 starts the walk: get/set reject empty keys, so no stored
+	 * key can be confused with the start. */
+	const uint8_t *cursor = (klen != 0) ? key : NULL;
+	uint32_t ch = cursor ? key_hash(key, klen) : 0;
+	uint16_t n;
+	uint8_t depth;
+	size_t off = 0;
+	int rc = dir_load(root, &n, &depth);
+
+	if (rc != 0) {
+		return rc;
+	}
+
+	if (depth == 1) {
+		rc = leaf_first_after(n, cursor ? idx_sub(ch, n) : 0,
+				      cursor, klen, &off);
+	} else {
+		rc = tree_first_after(root, n, cursor ? idx_top(ch, n) : 0,
+				      cursor, klen, ch, &off);
+	}
+	if (rc != 0) {
+		return rc;
+	}
+
+	size_t kl = get_u16(&bkt_buf[off]);
+	size_t vl = get_u16(&bkt_buf[off + 2]);
+
+	if (kout_len) {
+		*kout_len = kl;
+	}
+	if (vout_len) {
+		*vout_len = vl;
+	}
+	if (kl > kout_sz || vl > vout_sz) {
+		return -ENOMEM;
+	}
+	memcpy(kout, &bkt_buf[off + ENTRY_HDR_LEN], kl);
+	if (vl) {
+		memcpy(vout, &bkt_buf[off + ENTRY_HDR_LEN + kl], vl);
+	}
+	return 0;
+}
+
+/*
+ * Count, per shape_map.h `count`.
+ *
+ * Exactness needs no help from the write path: every set and del commits in
+ * one atomic bucket update, and a fresh bucket is published by a directory
+ * update only after its contents are written. So what a walk of the
+ * directories finds is always exactly what get answers for, whichever of
+ * those steps a power cut fell between. A fresh bucket orphaned by a cut is
+ * unreachable from the directory, so it is invisible to get and to the count
+ * alike.
+ *
+ * Entries are parsed by bkt_entry, the same parser get uses, so the count
+ * cannot disagree with get on a damaged bucket either.
+ */
+static size_t bkt_entries(const uint8_t *buf, size_t used)
+{
+	size_t kl, vl, n = 0;
+
+	for (size_t off = 0; bkt_entry(buf, used, off, &kl, &vl);
+	     off += ENTRY_HDR_LEN + kl + vl) {
+		n++;
+	}
+	return n;
+}
+
+/* Add up the buckets named by the leaf directory in dir_buf. An allocated
+ * bucket that del has emptied still costs its lookup: it is still named. */
+static int leaf_count(uint16_t n, size_t *acc)
+{
+	for (uint16_t i = 0; i < n; i++) {
+		uint64_t bid = dir_child(dir_buf, i);
+
+		if (bid == 0) {
+			continue;
+		}
+
+		size_t used = 0;
+		int rc = blob_db_get(bid, bkt_buf, sizeof(bkt_buf), &used);
+
+		if (rc != 0) {
+			return rc;
+		}
+		*acc += bkt_entries(bkt_buf, used);
+	}
+	return 0;
+}
+
+static int kvhash_count(uint64_t root, size_t *out)
+{
+	if (out == NULL) {
+		return -EINVAL;
+	}
+
+	uint16_t n;
+	uint8_t depth;
+	size_t total = 0;
+	int rc = dir_load(root, &n, &depth);
+
+	if (rc != 0) {
+		return rc;
+	}
+
+	if (depth == 1) {
+		rc = leaf_count(n, &total);
+		if (rc == 0) {
+			*out = total;
+		}
+		return rc;
+	}
+
+	/* Two levels: the same walk as next, with the top re-read on each
+	 * sub-map crossing (see top_child). */
+	uint64_t sub = dir_child(dir_buf, 0);
+
+	for (uint16_t t = 0; t < n; t++) {
+		uint16_t sub_n;
+
+		if (t != 0) {
+			rc = top_child(root, t, &sub);
+			if (rc != 0) {
+				return rc;
+			}
+		}
+		rc = sub_load(sub, &sub_n);
+		if (rc != 0) {
+			return rc;
+		}
+		rc = leaf_count(sub_n, &total);
+		if (rc != 0) {
+			return rc;
+		}
+	}
+
+	*out = total;
+	return 0;
+}
+
+/*
  * Destroy, per l2_containers.md 2.4.
  *
  * Stamping the directory's magic is the commit: one atomic update that takes
@@ -827,5 +1142,7 @@ const struct map_ops kvhash_map_ops = {
 	.get = kvhash_get,
 	.set = kvhash_set,
 	.del = kvhash_del,
+	.next = kvhash_next,
+	.count = kvhash_count,
 	.destroy = kvhash_destroy,
 };
