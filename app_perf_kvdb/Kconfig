@@ -14,7 +14,8 @@ config APP_PERF_KVDB_N_KEYS
 	range 8 2048
 	help
 	  Size of the predicted key set ("k000".."kNNN"). Every run verifies
-	  all of them (twice) and rewrites every 4th one. Sized so a rerun on
+	  all of them (twice), enumerates them (twice: a count call and a
+	  full next walk) and rewrites every 4th one. Sized so a rerun on
 	  the nRF5340-DK's QSPI NOR lasts about a minute at the default (from
 	  app_perf/RESULTS.md: ~34 ms per get, ~51 ms per set). Keep the
 	  per-bucket packed size under CONFIG_BLOB_DB_MAX_PAYLOAD_LEN (see
