@@ -19,6 +19,8 @@
 #include <zephyr/sys/crc.h>
 
 #include <app/lib/blob_db.h>
+#include <app/lib/blob_db_iostats.h>
+#include <app/lib/blob_db_test.h>
 
 #include "blob_db_internal.h"
 #include "blob_db_store.h"

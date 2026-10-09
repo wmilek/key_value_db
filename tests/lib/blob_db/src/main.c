@@ -16,6 +16,7 @@
 #include <zephyr/ztest.h>
 
 #include <app/lib/blob_db.h>
+#include <app/lib/blob_db_test.h>
 #if defined(CONFIG_BLOB_DB_INSPECT)
 #include <app/lib/blob_db_inspect.h>
 #endif

@@ -557,7 +557,10 @@ Partition geometry discovered at runtime (`flash_area_get_size/_get_sectors`).
 
 ```
 lib/blob_db/{blob_db.c, alloc_bucketlog.c, blob_db_internal.h, Kconfig, CMakeLists.txt}
-include/app/lib/blob_db.h
+include/app/lib/blob_db.h          the L1 contract — nothing else
+include/app/lib/blob_db_inspect.h  bucket-log diagnostics (§5.7a)
+include/app/lib/blob_db_iostats.h  flash I/O counters (CONFIG_BLOB_DB_IOSTATS)
+include/app/lib/blob_db_test.h     crash-test hooks (CONFIG_BLOB_DB_TEST_CRASH_HOOKS)
 tests/lib/blob_db/          unit suite (this doc §11)
 tests/lib/blob_db_contract/ model-container acceptance suite (crash injection)
 app/boards/native_sim.overlay   16 MB sim-flash; 8 MB storage_partition

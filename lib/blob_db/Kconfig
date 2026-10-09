@@ -228,6 +228,8 @@ config BLOB_DB_TEST_CRASH_HOOKS
 
 	  For tests only. Leave off in production builds — it adds a comparison
 	  on the write path and exports a symbol that can corrupt a store.
+	  The hooks are declared in <app/lib/blob_db_test.h>, not in the
+	  contract header.
 
 endif # BLOB_DB_LARGE_PAYLOADS
 
@@ -235,7 +237,8 @@ config BLOB_DB_IOSTATS
 	bool "Count flash operations and bytes"
 	help
 	  Count reads, writes and erases — operations and bytes — at the
-	  storage seam, and expose them through blob_db_iostats_get(). Both
+	  storage seam, and expose them through blob_db_iostats_get()
+	  (<app/lib/blob_db_iostats.h>, outside the blob_db contract). Both
 	  counts are kept because they can disagree: a change that moves fewer
 	  bytes may issue more transactions, and on a serial part each
 	  transaction carries a fixed command-and-address cost.

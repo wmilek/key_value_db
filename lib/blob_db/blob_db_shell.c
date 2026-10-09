@@ -19,6 +19,7 @@
 
 #include <app/lib/blob_db.h>
 #include <app/lib/blob_db_inspect.h>
+#include <app/lib/blob_db_iostats.h>
 
 /* Fullest buckets listed by `stats` when no count is given, and the most
  * it will track. */

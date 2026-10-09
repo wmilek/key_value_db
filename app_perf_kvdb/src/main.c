@@ -93,6 +93,7 @@
 #include <zephyr/sys/printk.h>
 
 #include <app/lib/blob_db.h>
+#include <app/lib/blob_db_iostats.h>
 #include <app/lib/rootreg.h>
 #include <app/lib/kvdb.h>
 
