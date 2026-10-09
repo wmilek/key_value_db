@@ -1,6 +1,6 @@
 # L2 containers — test suite
 
-Two ztest suites, both in `src/main.c`.
+Two ztest suites in `src/main.c`, plus the `logring/` subdir suite.
 
 ## `map_contract`
 
@@ -39,6 +39,15 @@ behaviour, and both say so in a comment:
   `-EEXIST`. Its opposite number is `map_contract`'s
   `test_destroy_releases_every_blob_it_owned` — the same `blob_db_count()`
   measurement, with the opposite expectation.
+
+## `logring/`
+
+A separate suite under `logring/` for the per-entry log container, which has
+its own append/scan API rather than the Map shape: append/drain order and
+increasing ids, pre-reservation, tail rebuild and exact counts across
+unmount/mount, soft-budget eviction and evicted-position detection, cursor
+resume via a portable moniker, a per-log epoch rejecting stale/foreign
+monikers, zero-length/binary records, reset and destroy.
 
 ## Running
 

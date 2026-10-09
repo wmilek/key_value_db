@@ -14,10 +14,11 @@ Status: v2 · Top-level document; per-layer detail lives in `doc/layers/`
 | `doc/layers/l1_blob_db.md` | L1 — `blob_db` **contract & requirements** (implementation-agnostic) |
 | `doc/layers/l1_model_container.md` | L1 — the model container: **sufficiency proof** that the blob_db contract can carry the layers above; reference pattern + acceptance-test blueprint |
 | `doc/layers/l1_root_registry.md` | L1½ — root registry (optional helper): key → structure-root map; owns id = 1 when enabled |
-| `doc/layers/l2_containers.md` | L2 — containers: seq, kvlist, kvhash, kvtree |
+| `doc/layers/l2_containers.md` | L2 — containers: seq, kvlist, kvhash, kvtree, logring |
 | `doc/layers/l3_interfaces.md` | L3 — access interfaces: kvdb, blobfs, settings |
 | `doc/impl/l1_bucketlog.md` | **Implementation design** (non-normative): the v1 bucket-log allocator — formats, algorithms, costs, open items |
 | `doc/impl/l0_backends.md` | **Implementation design** (non-normative): the two L0 providers — operation mapping, geometry overhead, measured costs |
+| `doc/impl/l2_logring.md` | **Implementation design**: the `logring` per-entry log — format, algorithms, crash model |
 | `doc/proposals/` | **Change proposals** (non-normative until accepted): analysis + design for a change that spans a contract and its implementation |
 | `doc/reviews/*.md` | Dated reviews of this document set, with findings and their resolution |
 
@@ -48,10 +49,14 @@ Above L1, the first vertical slice is **implemented and tested on
 `kvhash` Map container (`lib/containers/kvhash`), and the `kvdb` interface
 (`lib/kvdb`, `tests/lib/kvdb`, exercising kvhash through it). `app_perf_kvdb`
 runs that slice end to end on hardware with cross-reboot verification and
-power-loss classification. The rest of the module tree — the `seq`, `kvlist`
-and `kvtree` containers, the shared intent helper, and `blobfs` — remains
-**scaffolded** (build-wired, Kconfig-gated `default n`) but not yet
-implemented.
+power-loss classification. The `logring` bounded-log container
+(`lib/containers/logring`, `tests/lib/containers/logring`) is also implemented
+— a forward chain of per-entry i-nodes with pre-reserved links and a
+checkpointed waypoint, self-contained on L1 (its eviction intent is inline, so
+it needs no shared intent helper). The rest of the module tree — the
+`seq`, `kvlist` and `kvtree` containers, the shared intent helper, and
+`blobfs` — remains **scaffolded** (build-wired, Kconfig-gated `default n`) but
+not yet implemented.
 
 ## 2. The stack
 

@@ -40,6 +40,7 @@ instructions live in the repository ``README.md``.
    impl/l1_bucketlog
    impl/l0_backends
    impl/l2_kvhash
+   impl/l2_logring
 
 .. toctree::
    :maxdepth: 1
@@ -51,6 +52,7 @@ instructions live in the repository ``README.md``.
    proposals/2026-08-09-rootreg-kvdb-impact
    proposals/2026-08-09-implementation-plan
    proposals/2026-08-20-kvhash-second-level
+   proposals/2026-10-08-logring
 
 .. toctree::
    :maxdepth: 1

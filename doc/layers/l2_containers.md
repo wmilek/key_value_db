@@ -152,7 +152,7 @@ to the caller), and **mutating the container from inside the callback is
 undefined behavior** — collect-then-mutate is the supported pattern.
 Iteration is a diagnostic/repair facility, not a data path.
 
-## 4. The four containers
+## 4. The containers
 
 | Container | Shape | Lookup | Ordered | Kconfig |
 |---|---|---|---|---|
@@ -160,6 +160,7 @@ Iteration is a diagnostic/repair facility, not a data path.
 | §4.2 `kvlist` — simple k→v list | Map | O(n) | insertion | `CONTAINER_KVLIST` |
 | §4.3 `kvhash` — k→v hash | Map | O(1) avg | no | `CONTAINER_KVHASH` |
 | §4.4 `kvtree` — k→v tree | Map | O(log n) | by key | `CONTAINER_KVTREE` |
+| §4.5 `logring` — bounded log | *(own API)* | append/scan | insertion | `CONTAINER_LOGRING` |
 
 The normative parts of each container are its shape, cost class, the §2.2
 discipline, and the §5 invariants. The node layouts sketched below are
@@ -178,7 +179,9 @@ chunk { next_id, nelems, elem[]… }          each elem: { len, bytes… }
 Chunking (several elements per i-node, up to the payload limit) keeps read
 amplification low; a chunk splits when an insert doesn't fit. `append` is O(1)
 (tail id known from the root); `get(index)` is O(n/chunk_factor). Intended use:
-logs, queues, file-data chunk chains — not random access at scale.
+queues, file-data chunk chains — not random access at scale. For *bounded*
+logging with automatic eviction of old records, use `logring` (§4.5) instead
+of an ever-growing `seq`.
 
 ### 4.2 `kvlist` — simple k→v list
 
@@ -260,6 +263,48 @@ one root `update` as the commit, then dead-path `delete`s. At fan-out 8, 100k
 keys ⇒ depth ≈ 6 ⇒ ~6 flash reads per lookup. Splits/merges follow standard
 B-tree rules, still committed by the single root write.
 
+### 4.5 `logring` — bounded per-entry log
+
+Where `seq` (§4.1) is an *unbounded, index-addressed* sequence — the right
+shape for file bodies and chunk chains — `logring` is purpose-built for
+**logging**: a *bounded* store that keeps the most recent records and drops the
+oldest, scaling from a couple of MB up to near the whole partition. It does not
+implement the generic `seq_ops`; it exports its own append/scan API
+(`logring.h`). **Implemented**, not scaffolded.
+
+```
+root  { magic 'CLOG', version, epoch, capacity_bytes, live_bytes, count,
+        waypoint_id, head_id, evict_from, evict_to }
+entry { next_id, len, bytes… }                       one i-node PER record
+```
+
+Each log record is **its own i-node** (R2). Entries form a forward chain using
+`blob_db`'s reserve-then-bind: `next_id` points at an id `alloc_id()` returned
+but not yet bound, so an `append` just *binds* that pre-reserved id — one new
+blob written, **nothing rewritten** (~1× write amplification, versus the
+rewrite-amplification of packing records into a shared node). A small RAM
+**handle** (`l2_containers.md` §2.3) caches the tail so warm appends are O(1)
+and the root is written only at **checkpoints** (~every `CHECKPOINT` appends),
+which also carry a **waypoint** near the end that `open` rebuilds the exact
+tail from, and which **batch eviction** of the oldest entries. Eviction's
+intent lives **inline** in that same root write and its run is deleted
+suffix-first for re-enterable recovery — so `logring` needs no shared intent
+helper and is self-contained on L1. The soft `capacity_bytes` budget is a hint
+(§5-invariant-friendly: the ring sits *near* it), with a hard `-ENOSPC`
+backstop.
+
+Reads are **forward only**, through an opaque cursor in the journal/`lseek`
+idiom: `seek_oldest` / `seek_newest` (O(1), reaches the real end) / `next`. The
+cursor exports a public **moniker `{epoch, id}`** the caller serializes and
+integrity-protects itself; the per-log random `epoch` lets `next` reject a
+moniker from another incarnation (e.g. after a reformat, which reuses ids) or a
+random value — `-ESTALE`, not a misread. An evicted position is likewise
+`-ESTALE`.
+
+Cost: `append` = 1 write, 0 reads (warm); `open` = 1 read + a bounded walk;
+`next` = 1–2 reads. Every op is O(1) in the log's size. Design detail:
+`doc/impl/l2_logring.md`; rationale: `doc/proposals/2026-10-08-logring.md`.
+
 ## 5. Container invariants
 
 Every implementation must uphold (checklist for reviews and tests):
@@ -286,7 +331,12 @@ config CONTAINER_KVHASH            bool "Key→value hash"        select CONTAIN
 config CONTAINER_KVHASH_BUCKETS    int  "Default bucket count"  default 64
 config CONTAINER_KVTREE            bool "Key→value tree"
 config CONTAINER_KVTREE_FANOUT     int  "B-tree fan-out"        default 8
+config CONTAINER_LOGRING           bool "Bounded circular log"
 ```
+
+`logring` needs no capacity tunable of its own: its ring is one i-node payload,
+so `CONFIG_BLOB_DB_MAX_PAYLOAD_LEN` alone bounds it (a `BUILD_ASSERT` keeps the
+20-byte header + a one-byte record within the payload).
 
 Each container is its own translation unit under `lib/containers/<name>/`,
 included via `add_subdirectory_ifdef` — a disabled container costs zero flash
@@ -306,10 +356,12 @@ implementation design under `doc/impl/`.
 lib/containers/
   CMakeLists.txt   Kconfig
   seq/  kvlist/  kvhash/  kvtree/        each { <name>.c, Kconfig, CMakeLists.txt }
+  logring/                              logring.c (implemented)
 include/app/lib/containers/
-  seq_ops.h  map_ops.h  seq.h  kvlist.h  kvhash.h  kvtree.h
+  seq_ops.h  map_ops.h  seq.h  kvlist.h  kvhash.h  kvtree.h  logring.h
 tests/lib/containers/
   seq/  kvlist/  kvhash/  kvtree/        ztest per container
+  logring/                              ztest (implemented)
 ```
 
 ## 8. Testing strategy (per container)
@@ -329,3 +381,9 @@ provider), so backends stay behaviorally interchangeable:
 7. capacity: fill to `-ENOSPC`, verify structure still consistent
 8. `kvhash`: distribution sanity; collision chains. `kvtree`: split/merge at
    fan-out boundaries; range scans.
+9. `logring`: append/iterate order; oldest-first eviction past capacity;
+   sequence numbers monotonic, contiguous, and durable across eviction /
+   `reset` / remount; over-capacity record rejected with `-ENOSPC`;
+   wrong-type `open` → `-ENOTSUP`. (`logring` uses its own append/scan API,
+   not `seq_ops`/`map_ops`, so it is exercised by its own suite rather than
+   the shared shape-conformance suite.)
