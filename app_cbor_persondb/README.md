@@ -1,11 +1,11 @@
 # `app_cbor_persondb` — good practices for building on this stack
 
-A worked example: a CBOR-serialized person/credential database holding 10 000
+A worked example: a CBOR-serialized person/credential database holding 8 000
 people, with the access decision, crash safety and capacity planning a real
 product would need.
 
 **What it measures is time per operation** — 44 µs to resolve a credential and
-decide, on `native_sim` at the full 10 000 persons; 14.605 ms on the DK, where
+decide, on `native_sim` at the full 8 000 persons; 14.605 ms on the DK, where
 the largest run so far is 1 000 persons and the full-scale figure is expected
 near 24 ms (`RESULTS.md` §5, `FINDINGS.md` N1). The ~4 MiB of
 data it carries (about half the board's external flash) is *ballast*: it exists
@@ -41,21 +41,41 @@ above it. Acceptance criterion **A7** checks this rather than trusting it.
 
 ### 2. Use the highest layer whose *shape* matches — then drop down
 
-`kvdb` (L3) is the ergonomic interface and it does not fit a sharded dataset:
-one instance per name means **seventeen** registry entries, seventeen meta blobs
-and thirty-four sector reads at boot, and it overruns
-`CONFIG_ROOTREG_MAX_ROOTS` (default 8) twice over. Dropping to the L2 Map shape
-— one registry key, one app-owned superblock, seventeen map roots — costs
-**two** sector reads at boot.
+`kvdb` (L3) is the ergonomic interface, and its unit — one named instance —
+is not this application's unit of structure. This application is two
+collections: people and credentials. So it is **two L2 containers behind one
+root**: one registry key, one app-owned superblock, two `kvhash` instances.
+L3 would wrap each container in an instance to give it a name the app never
+uses and a backend record it never varies.
 
-*What it prevents:* paying for an abstraction whose shape you are fighting. The
-comparison is tabulated in `DESIGN.md` §12; the decision is not "L2 is faster",
-it is "L3's unit of naming is not this application's unit of structure".
+*What it prevents:* paying for an abstraction whose shape you are fighting.
+
+*And the same rule, applied downward.* This dataset was sixteen person maps
+plus a credential index until `DESIGN.md` §12.2 — not because the domain has
+sixteen of anything, but because a bucket burst at a 4 KB payload cap. That is
+a workaround for the layer below, and it made the application faster: sixteen
+small maps move 4 756 B per lookup against 18 228 B for one. It was removed
+anyway, and the app is 4.1× slower on its read path and no longer completes its
+own headline scale. Two findings (**K12**, **K13**) were sitting underneath it,
+unreachable while it was there. A model application does not get to keep a
+workaround because the workaround wins the benchmark.
+
+*And re-check it.* This decision was first argued from boot I/O (thirty-four
+sector reads against two) and from `CONFIG_ROOTREG_MAX_ROOTS` defaulting to 8.
+Neither argument stands: the first expired when `blob_db` learned to walk
+buckets by slot header, and the second was never valid — a database is
+reachable from one root, so it takes **one** registry entry, and a layout that
+wants seventeen is misusing the registry rather than outgrowing it. A third —
+that sharding keeps lookups cheap — turned out to be a workaround arguing for
+its own survival, and went with the shards. The decision held anyway, on the
+shape argument above. A
+rationale is a claim about the code as it is today; `DESIGN.md` §12.1 re-runs
+this one and records which parts survived.
 
 ### 3. Make every persistent structure reachable from one integer
 
 ```
-rootreg[ROOTREG_KEY('PADB', 1)] -> superblock -> people_root[0..15], cred_root
+rootreg[ROOTREG_KEY('PADB', 0)] -> superblock -> people_root, cred_root
 ```
 
 `persondb_open()` reads one registry entry and one blob, and has the whole
@@ -66,7 +86,7 @@ where recovery depends on state that recovery is supposed to reconstruct.
 
 ### 4. Publish a multi-blob structure with a single final write
 
-`create_store()` allocates seventeen map roots and creates each map, then binds
+`create_store()` allocates both map roots and creates each map, then binds
 the superblock **last**. Until that one atomic write lands, none of it is
 reachable and the next boot simply builds it again.
 
@@ -195,13 +215,13 @@ the population size or `CONFIG_BLOB_DB_MAX_PAYLOAD_LEN` changes.**
 *What it prevents:* discovering your capacity plan was wrong several hours into
 a provisioning run, with no repair path short of a reformat.
 
-**Then freeze the number.** Sizing is a one-time act. 10 000 persons was chosen
+**Then freeze the number.** Sizing is a one-time act. 8 000 persons was chosen
 to put the store near half the board's flash; `tools/sizing.py` takes that as
 its input and answers the question that follows from it — how many map shards
 the population needs. From that point the person count is a constant of the
 benchmark, because two runs are only comparable if they used the same one. The
 *fill percentage*
-that results is an output — and if a future stack stores the same 10 000 people
+that results is an output — and if a future stack stores the same 8 000 people
 in 40 % of the flash instead of 51.6 %, that is the improvement being measured,
 not a target to restore by growing the dataset (`RESULTS.md` §3a).
 
@@ -258,7 +278,7 @@ crash safety at all: `persondb fill 500`, pull the power, reboot,
 
 ### 14. Ship a configuration small enough to run in CI
 
-`sample.yaml` builds the headline 10 000-person configuration and the shell,
+`sample.yaml` builds the headline 8 000-person configuration and the shell,
 and *runs* a 200-person `smoke` scenario under a console harness. Fill, verify,
 mutate and re-verify are regression-tested in seconds even though the real
 configuration takes hours.
@@ -337,8 +357,10 @@ Worth stating, because a practices guide is read as a checklist:
 - **Corrupt *records*, on the other hand, are handled**: a record that fails to
   decode returns `-EILSEQ` and is counted as a bad record by `verify` rather
   than crashing the run.
-- **The full-scale board run.** `RESULTS.md` §5 is 1 000 persons. Acceptance
-  criterion **A4** is not met until the 10 000-person run exists.
+- **The full-scale board run.** `RESULTS.md` §5 is 1 000 persons and §5d is
+  5 000 — both of the *sixteen-shard* build. Acceptance criterion **A4** is not
+  met until a full-scale run of the current two-instance layout exists, at the
+  re-sized 8 000 persons (`DESIGN.md` §6.5).
 
 ## Rerunning
 

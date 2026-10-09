@@ -161,6 +161,14 @@ struct bench_result {
 	uint64_t    store_ops;      /* persondb get/set/delete this phase performed */
 	uint64_t    flash_ops;      /* flash reads + writes + erases underneath */
 	uint64_t    flash_bytes;    /* bytes actually moved, measured underneath */
+	/* The same totals split by class. Kept separate because the three cost
+	 * wildly different amounts on real flash — an erase is ~1.09 s per 64 KB
+	 * block against ~69 us for a read — so a single "flash ops" figure cannot
+	 * be converted into time. app_perf_l0's model prices them apart, and
+	 * tools/l0_timing.py turns these six numbers into predicted hardware
+	 * milliseconds from a run that never touched hardware. */
+	uint64_t    reads, writes, erases;
+	uint64_t    bytes_read, bytes_written, bytes_erased;
 	uint64_t    payload_bytes;  /* what the application actually asked for */
 	uint32_t    amplification;  /* flash_bytes / payload_bytes */
 	bool        measured;       /* false if CONFIG_BLOB_DB_IOSTATS is off */

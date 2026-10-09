@@ -268,12 +268,7 @@ static int write_master(uint8_t slot, uint32_t gen, uint8_t state,
 			uint16_t compacting_bid, uint64_t next_id_hint)
 {
 	const uint64_t seg_owner = st.seg_owner;
-
-	int rc = blob_db_store_erase(peb_offset(slot), st.peb_size);
-	if (rc < 0) {
-		LOG_ERR("master %u erase failed: %d", slot, rc);
-		return rc;
-	}
+	int rc;
 
 	/* Staged 0xff-filled so any write-alignment padding matches erased
 	 * flash rather than introducing zero bits. */
@@ -306,7 +301,7 @@ static int write_master(uint8_t slot, uint32_t gen, uint8_t state,
 		return -ENOTSUP;
 	}
 
-	rc = blob_db_store_write(peb_offset(slot), buf, len);
+	rc = blob_db_store_replace(peb_offset(slot), buf, len);
 	if (rc < 0) {
 		LOG_ERR("master %u write failed: %d", slot, rc);
 		return rc;
@@ -439,11 +434,13 @@ static int format_masters_fresh(void)
  * the store closed if anything is rejected. Shared by mount and by the
  * format-an-unmountable-store path, which needs exactly the same checks:
  * every buffer and bucket-arithmetic assumption below rests on them, and a
- * format writes through the same primitives a mount does. */
-static int store_open_and_validate(void)
+ * format writes through the same primitives a mount does. discard is passed
+ * to the backend: only the format path may have it replace a substrate it
+ * cannot open (blob_db_store.h). */
+static int store_open_and_validate(bool discard)
 {
 	struct blob_db_store_geom geom;
-	int rc = blob_db_store_open(&geom);
+	int rc = blob_db_store_open(&geom, discard);
 
 	if (rc < 0) {
 		LOG_ERR("store open: %d", rc);
@@ -519,7 +516,7 @@ int blob_db_mount(void)
 	IDX_INVALIDATE();
 	st.wedged = false;   /* recovery below re-establishes a safe state */
 
-	int rc = store_open_and_validate();
+	int rc = store_open_and_validate(false);
 
 	if (rc < 0) {
 		return rc;
@@ -828,13 +825,6 @@ static int read_bucket(uint16_t bid, uint8_t *buf)
 
 static int format_bucket(uint16_t bid)
 {
-	int rc = blob_db_store_erase(bucket_offset(bid), st.peb_size);
-
-	if (rc < 0) {
-		LOG_ERR("bucket %u erase: %d", bid, rc);
-		return rc;
-	}
-
 	struct blob_db_bucket_hdr bhdr = {
 		.bucket_id = bid,
 		.reserved  = 0,
@@ -843,9 +833,10 @@ static int format_bucket(uint16_t bid)
 	memcpy(bhdr.magic, BUCKET_MAGIC, 4);
 	bhdr.hdr_crc32 = hdr_crc32(&bhdr, sizeof(bhdr));
 
-	rc = blob_db_store_write(bucket_offset(bid), &bhdr, sizeof(bhdr));
+	const int rc = blob_db_store_replace(bucket_offset(bid), &bhdr,
+					     sizeof(bhdr));
 	if (rc < 0) {
-		LOG_ERR("bucket %u header write: %d", bid, rc);
+		LOG_ERR("bucket %u format: %d", bid, rc);
 	}
 	return rc;
 }
@@ -1228,10 +1219,31 @@ static int compact_commit(uint16_t bid, const uint8_t *new_buf, size_t new_len)
 		return -ENOSPC;
 	}
 
-	/* Step 1: enter atomic window. */
+	/* A backend that replaces a block atomically needs none of the window
+	 * below: the bucket holds the old image or the new one whatever the
+	 * power does, so there is nothing for recover_compaction() to settle and
+	 * no reason to stamp COMPACTING. A failed replace leaves the old image,
+	 * so it is reported rather than wedging the store. */
+	if (blob_db_store_replace_is_atomic()) {
+		return blob_db_store_replace(bucket_off, new_buf, new_len);
+	}
+
+	/* Step 1: enter atomic window.
+	 *
+	 * Every master this function stamps carries st.next_id_hint, not
+	 * st.next_id. The field is a leading ceiling (§13.1), and alloc_id
+	 * batches its master writes: it persists a ceiling BLOB_DB_ID_HINT_STEP
+	 * ids ahead, then hands ids out from RAM until it reaches that ceiling.
+	 * Writing the allocation pointer here would publish a master below the
+	 * ceiling alloc_id is still allocating against — lowering the durable
+	 * bound without lowering the RAM copy alloc_id compares to, so nothing
+	 * would re-persist it before the next mount. Mount's bucket scan would
+	 * repair the bound ids, but the ceiling exists to cover the ids a scan
+	 * cannot see: allocated-but-unbound. Carry the ceiling forward instead.
+	 */
 	uint8_t inactive = !st.active_master;
 	int rc = write_master(inactive, st.master_gen + 1,
-			      BLOB_DB_STATE_COMPACTING, bid, st.next_id);
+			      BLOB_DB_STATE_COMPACTING, bid, st.next_id_hint);
 	if (rc < 0) {
 		return rc;
 	}
@@ -1284,7 +1296,7 @@ static int compact_commit(uint16_t bid, const uint8_t *new_buf, size_t new_len)
 	/* Step 5: leave atomic window. */
 	inactive = !st.active_master;
 	COMPACT_OR_WEDGE(write_master(inactive, st.master_gen + 1,
-				      BLOB_DB_STATE_CLEAN, 0, st.next_id));
+				      BLOB_DB_STATE_CLEAN, 0, st.next_id_hint));
 #undef COMPACT_OR_WEDGE
 	st.active_master = inactive;
 	st.master_gen++;
@@ -1373,8 +1385,12 @@ static int recover_compaction(uint16_t bid)
 
 	const uint8_t inactive = !st.active_master;
 
+	/* The ceiling, for the reason given in compact_commit(). Only mount
+	 * calls this, and mount has just set next_id = next_id_hint, so the two
+	 * are equal here today; naming the ceiling keeps that an observation
+	 * rather than something this write depends on. */
 	rc = write_master(inactive, st.master_gen + 1,
-			  BLOB_DB_STATE_CLEAN, 0, st.next_id);
+			  BLOB_DB_STATE_CLEAN, 0, st.next_id_hint);
 	if (rc < 0) {
 		return rc;
 	}
@@ -3083,7 +3099,7 @@ int blob_db_format(void)
 	 * Nothing above blob_db can open the substrate on our behalf, so open
 	 * it here, with the same geometry checks a mount applies. */
 	if (!st.mounted) {
-		rc = store_open_and_validate();
+		rc = store_open_and_validate(true);
 		if (rc < 0) {
 			return rc;
 		}
@@ -3192,7 +3208,15 @@ int blob_db_erase_all(void)
 	 * bytes, rounded up to the device's write-block-size; the extra bytes
 	 * land inside the bucket header and programming them to 0x00 is
 	 * equally legal. Skip buckets that already look unformatted so we do
-	 * not touch fresh sectors. */
+	 * not touch fresh sectors.
+	 *
+	 * Not in place when the backend replaces atomically: there a bucket last
+	 * written by blob_db_store_replace() carries a checksum over its header
+	 * (ubi_leb_change), and the block it replaced is still on flash awaiting
+	 * reclaim. Zeroing the magic under that checksum makes the next attach
+	 * reject the newest copy and stand the older one back up — bringing
+	 * back the blobs this call deleted. Replacing the bucket with the zeroed
+	 * header instead leaves a newest copy that verifies, at no erase. */
 	for (uint16_t bid = 0; bid < st.n_buckets; bid++) {
 		if (bid == root_bid) {
 			continue;
@@ -3208,9 +3232,11 @@ int blob_db_erase_all(void)
 		if (memcmp(peek, BUCKET_MAGIC, 4) != 0) {
 			continue;
 		}
-		rc = blob_db_store_write(
-				      peb_offset(BLOB_DB_FIRST_BUCKET + bid),
-				      zeros, zlen);
+		const off_t off = peb_offset(BLOB_DB_FIRST_BUCKET + bid);
+
+		rc = blob_db_store_replace_is_atomic()
+			     ? blob_db_store_replace(off, zeros, zlen)
+			     : blob_db_store_write(off, zeros, zlen);
 		if (rc < 0) {
 			LOG_ERR("erase_all: invalidate bid %u: %d", bid, rc);
 			return rc;

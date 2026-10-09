@@ -9,6 +9,27 @@ Every wall-clock figure here comes from the board. On `native_sim` they
 are all `0 ms`, because the flash simulator models no latency; only the
 `io …` counters are meaningful there.
 
+That is no longer the end of the story: `app_perf_l0` measures what an
+L0 operation costs, and `app_perf_l0/tools/l0_timing.py predict` turns
+these counters into predicted wall-clock, so a `native_sim` run at this
+board's geometry produces the timings below without the board. The
+captures here are what that model was first checked against — see
+`app_perf_l0/RESULTS.md` §2–§4.
+
+**The `io …` line gained a field after these captures were taken.** It
+now reports erase *bytes* as well as erase calls (`er 9 ops/ 589824 B`),
+because one call may cover one block or the whole partition and a cost
+model fed only the count cannot tell those apart. The captures below
+predate it and show `er 9` alone; nothing else about them changed.
+
+Everything below is the **`flash_area` backend** unless a section says
+otherwise. Note that this is no longer the default: `blob_db` defaults to
+`CONFIG_BLOB_DB_BACKEND_UBI`, and "The UBI backend" measures it. The tables
+here remain flash_area because that is where the four-commit history was
+taken, and because it is still the faster substrate and a supported
+opt-out — but a default build gets UBI's numbers, not these. The two are
+separate substrates and their figures are not interchangeable.
+
 Four commits were measured on the same board, so each change under review
 can be read straight off the tables:
 
@@ -278,6 +299,302 @@ anticipates rather than a surprise regression.
 The second `update` phase shows the same shift (998 → 1198 reads,
 2490 → 2650 µs), so it is systematic and not a one-phase artifact.
 
+## The UBI backend on zephyr-ubi v0.1.0
+
+PR #35 moved the UBI backend from the `wmilek/ubi` fork to the
+[zephyr-ubi](https://github.com/kamil-kielbasa/zephyr-ubi) `v0.1.0` release.
+Measured on `99a2ca6`, same board and harness as the rest of this file
+(Zephyr `4a405846193f`, SDK 1.0.1), defaults, built-in UBI key, two runs
+agreeing within 1 %. The last column adds `CONFIG_BLOB_DB_UBI_ATOMIC_REPLACE=y`
+(`36e9169`).
+
+| phase (µs/op) | `flash_area` (`e80f404`) | old fork (`f1100f1`) | **v0.1.0 (`99a2ca6`)** | + `ATOMIC_REPLACE` |
+|---|--:|--:|--:|--:|
+| `read` | 460 | 1 130 | **500** | 500 |
+| `update` (prepend / append) | 2 510 / 2 650 | 3 620 / 3 970 | **2 550 / 2 690** | 2 460 / 2 610 |
+| `prepend` | 21 230 | 33 690 | **21 170** | 21 120 |
+| `append` | 15 520 | 17 150 | **15 010** | 15 300 |
+| `lg read` | 1 820 | 2 686 | **1 918** | 1 927 |
+| `lg pread` q0–q3 | 3 187–3 625 | 5 750–6 031 | **3 406–3 781** | 3 437–3 812 |
+| `prepare` | 1 096 500 | 1 076 300 | 1 090 620–1 117 590 | 1 022 920–1 117 600 |
+| `lg rewrite` | 4 479 500 | 4 497 500 | 4 367 500 | 4 297 750 |
+| `lg pwrite` | 2 272 125 | 2 287 625 | 2 208 125 | 2 272 687 |
+| `lg write` (cold) | 38 602 000 | 31 919 750 | 36 931 000 | 36 668 250 |
+| FLASH / RAM (B) | 55 400 / 239 448 | 78 424 / 242 856 | 96 080 / 255 772 | 96 600 / 255 772 |
+
+The checksums and the blob_db-level I/O counters are identical to the
+old-fork capture, so the difference is UBI's own cost, not less work.
+
+- **The read penalty is gone.** Every phase is within 2–9 % of `flash_area`.
+  Fitting the reads gives UBI about 7–13 µs per flash access over
+  `flash_area`, against the old fork's ~112 µs. The 1.5–2.5× slowdown in the
+  next section no longer applies.
+- **Cold `lg write` is 16 % slower than on the old fork, and that is the
+  honest figure.** Its 126 erases now happen (`ubi_leb_erase()`, about 1.11 s
+  each on 64 KB blocks); the old fork's `unmap` deferred them, so its 31.9 s
+  only looked faster.
+- **Erase-bound phases** (`prepare`, `lg rewrite`, `lg pwrite`) are unchanged.
+- **Footprint is now the cost:** +40.7 KB of flash and +16.3 KB of RAM over
+  `flash_area`. The RAM is the 6.2 KB UBI heap, about 8.5 KB of Mbed TLS AES
+  tables built in RAM (`FT0..3`, `RT0..3`, S-boxes) and about 1 KB of PSA
+  state; the flash is split below.
+  Crypto is software (TF-PSA-Crypto's built-in drivers); the CMAC runs only
+  when a block header is written or verified, never on an ordinary read.
+- **Where the footprint goes.** Attributed with `rom_report`/`ram_report` on
+  `app` for the DK (UBI against `flash_area`, Arm GNU 13.2, so indicative):
+
+  | | flash | RAM |
+  |---|--:|--:|
+  | zephyr-ubi code | 15.2 KB | — |
+  | zephyr-ubi log strings (`CONFIG_UBI_LOG_LEVEL_OFF=y` saves 11.0 KB with the call sites) | ~8 KB | — |
+  | PSA Crypto / Mbed TLS: AES + CMAC ~5.6 KB, HKDF (SHA-256, HMAC) ~2.3 KB, PSA core ~5.0 KB, RNG ~1.7 KB | 14.9 KB | 10.0 KB |
+  | heap allocator and mutexes, and the UBI heap | 2.5 KB | 6.2 KB |
+  | `blob_db_store_ubi.c` | 1.1 KB | — |
+  | **total** | **41.8 KB** | **16.3 KB** |
+
+  Crypto is about a third of the flash and most of the RAM.
+  `CONFIG_MBEDTLS_AES_ROM_TABLES=y` (with its default compact tables) trades
+  8.7 KB of RAM for 2.0 KB of flash.
+- **`ATOMIC_REPLACE` moves nothing here**, because `app_perf` rarely
+  compacts, and every other replace (master rewrites, bucket formats) still
+  pays one erase inline: blob_db never runs `UBI_MAINTENANCE_RECLAIM` and the
+  volume has about four spare blocks. Its gain shows in
+  `app_cbor_persondb/RESULTS.md` §5g.
+- **Logs:** the old fork's `<err> No volumes present on device` lines at
+  mount are gone, so the `<err>` note below is historical.
+
+## The UBI backend — the first hardware numbers
+
+> **Historical: the old `wmilek/ubi` fork.** Superseded by the section
+> above. The per-transaction cost, the read slowdown, the footprint and the
+> operational notes below describe that release, not zephyr-ubi v0.1.0.
+
+`CONFIG_BLOB_DB_BACKEND_UBI` stores blobs on a dynamic UBI volume instead
+of the raw partition, for wear-levelling and bad-block handling. Until
+this run it had **never been measured on hardware**: every figure above,
+and every figure in the other apps' `RESULTS.md`, is `flash_area`, and CI
+builds UBI compile-only. Measured on `f1100f1` with
+`-DCONFIG_BLOB_DB_BACKEND_UBI=y -DCONFIG_UBI_MAX_NR_OF_DATA_PEBS=126`,
+same board, same defaults, partition wiped blank first.
+
+| phase | `flash_area` | **UBI** | |
+|---|--:|--:|--:|
+| `read` | 460 µs | **1 130 µs** | **2.46× slower** |
+| `update` | 2 510 / 2 650 µs | 3 620 / 3 970 µs | 1.44–1.50× slower |
+| `prepend` | 21 230 µs | 33 690 µs | 1.59× slower |
+| `append` | 15 520 µs | 17 150 µs | 1.11× slower |
+| `lg read` | 1 820 µs | 2 686 µs | 1.48× slower |
+| `lg pread q0..q3` | 3 187–3 625 µs | 5 750–6 031 µs | ~1.8× slower, still flat |
+| `prepare` | 1 096 500 µs | 1 076 300 µs | same |
+| `lg rewrite` | 4 479 500 µs | 4 497 500 µs | same |
+| `lg pwrite` | 2 272 125 µs | 2 287 625 µs | same |
+| `lg write` (cold) | 38 602 000 µs | **31 919 750 µs** | 1.21× *faster* |
+| FLASH / RAM | 55 388 / 239 448 B | 78 424 / 242 856 B | **+23 036 / +3 408 B** |
+
+All three checksums match across backends (`0xee3fa466`, `0x50f65666`,
+`0xca1e0000`), so this is the same logical work on a different substrate.
+Contract R2 still holds — the quartiles stay flat.
+
+### The overhead is per transaction, and nothing per byte
+
+`io read` and `io update` are **byte-identical** between the backends
+(605 ops / 8 650 B; 1 000 ops / 14 800 B), so UBI issues no extra
+blob_db-level operations. Re-fitting the two constants to UBI's `read` and
+`lg read`:
+
+| | `flash_area` | UBI |
+|---|--:|--:|
+| per flash transaction | 65.5 µs | **178 µs** (+112, ×2.7) |
+| per byte | 0.63 µs | **0.616 µs** (unchanged) |
+
+UBI's LEB→PEB indirection costs ~112 µs per transaction and nothing per
+byte. Two consequences follow.
+
+**`blob_db_iostats` undercounts on UBI.** The counters instrument the
+blob_db→store seam, which sits *above* UBI's own header reads, so the
+identical counters do not mean identical flash traffic — they mean
+identical *blob_db* traffic. On this backend the counters can no longer be
+used to predict time without the inflated per-transaction constant.
+
+**Transaction-heavy paths are hit hardest, and PR 2 deliberately made the
+read path transaction-heavy.** It still wins here — six small reads at
+178 µs beat one 64 KB sector read by ~36× — but the margin narrows, and
+`FINDINGS.md` N1 sharpens considerably: on UBI, fixed transaction cost is
+~90% of a small read.
+
+### UBI does not avoid the erase
+
+Worth stating because the opposite looks true at first glance. An aborted
+first attempt reported `prepare` at **1 280 µs/op**, which suggested UBI
+had turned the 1.1 s sector erase into a cheap LEB remap. It had not: that
+run had *just formatted* the device, so every LEB was already erased. On a
+steady-state volume `prepare` is 1 076 300 µs/op — the same as
+`flash_area`.
+
+So B2's compaction cost and the erase-bound conclusions elsewhere in this
+repo stand unchanged on UBI. The one exception is cold `lg write`, 1.21×
+faster with 127 erases against 133, where UBI had some pre-erased PEBs to
+hand.
+
+### Where a large write's seconds actually go
+
+The `flash_area` figures decompose cleanly, which is what rules out
+algorithmic waste as the explanation:
+
+| per 64 KB object | warm (`lg rewrite`) | cold (`lg write`) |
+|---|--:|--:|
+| erases | 2.25 × 1.09 s = **2.45 s** | 33.25 × 1.09 s = **36.2 s** |
+| programming (≈263 NOR pages) | **2.0 s** | 2.0 s |
+| reads + transactions | 22 ms | 22 ms |
+| **predicted** | **4.47 s** | **38.2 s** |
+| **measured** | **4.48 s** | **38.6 s** |
+
+**~55% erase, ~45% page programming, and write amplification of 1.02×** —
+blob_db writes almost exactly the bytes asked of it. There are no wasted
+bytes to reclaim, so erase is the only lever, and UBI does not move it.
+
+Read the page count per object, as the column says: the `io lg rewrite` counter
+reports **269 712 B for the whole phase**, and the phase writes `N_LARGE = 4`
+objects, so it is 67 428 B and ~263 pages each — not the 1 054 that a per-phase
+count gives.
+
+### What this row is, and what it is not
+
+The 2.0 s is `blob_db`'s cost of putting 67 428 B on flash. It is **not** the
+part's page-program time, and dividing one by the other to get "~7.6 ms per
+256 B page" is wrong — an earlier revision of this section did exactly that and
+concluded the MX25R64 was running ~4× slower than typical.
+
+`app_perf_l0` measures L0 directly, with no storage stack in the image, and
+settles it (`app_perf_l0/RESULTS.md` §6):
+
+| per byte written | |
+|---|--:|
+| this phase, measured through `blob_db` | 29.7 µs |
+| **flash_area alone, measured directly** | **12.16 µs** |
+| ⇒ a 256 B page program | **3.11 ms**, unremarkable for this part |
+
+**59 % of the per-byte cost in this table is CPU above L0** — slot walking,
+header parsing, CRC and memcpy — not flash. The same holds for reads: 0.63 µs/B
+here against **258 ns/B** at L0.
+
+So the throughput figures this table supports are stack figures, and should be
+labelled as such:
+
+| sequential write to pre-erased blocks | |
+|---|--:|
+| **through `blob_db`** | **~32 kiB/s** |
+| **`flash_area` alone** | **~80 kB/s** |
+| through `blob_db`, with one 64 KB erase | ~21 kiB/s |
+| as measured warm, at 2.25 erases per object | 14 kiB/s |
+
+The 8 MHz quad bus, good for ~4 MB/s, is nowhere near the constraint either
+way. But the constraint is not simply "the part": for a large sequential write
+the part will take bytes 2.5× faster than this stack hands them over.
+
+None of this moves the erase/programming split above, which is computed from
+the seconds and not the pages, nor the conclusion that follows from it — `lg
+write` is still erase-bound, and erase is still the only lever that matters
+there.
+
+### Operational notes, each of which cost a run
+
+- **Switching a board between backends needs a raw erase.** The layouts
+  are not interchangeable. `ubi_device_init()` formats on first use *only*
+  if it finds an erased partition; hand it one holding a `flash_area`
+  store and it reports `no active reserved PEBs` and fails `-EIO`. A wipe
+  tool that "verifies" by mounting blob_db afterwards defeats itself,
+  because mounting writes a store.
+- **UBI logs recoverable conditions at `<err>` level.** Volume probing
+  emits `No volumes present on device` per probed id before creating one,
+  and block recovery emits `EC header corrupt on PEB n`. Any monitor
+  treating `<err>` as failure aborts on a healthy run.
+- **UBI repaired a PEB that `flash_area` would have lost.** A reflash
+  interrupted a UBI write; the next boot logged
+  `EC header corrupt on PEB 78` and then `Torture recovered PEB 78`,
+  self-healing in 2.3 s. The same interruption on `flash_area` leaves the
+  mx25r64 answering a null JEDEC id and needs `nrfutil device recover`.
+  That is the backend's purpose, observed by accident rather than by test.
+- **`CONFIG_UBI_MAX_NR_OF_DATA_PEBS` must match the geometry** — 126 on
+  the DK's 64 KB PEBs, 2 046 on native_sim's 4 KB. It defaults to **14**,
+  which builds fine and then hangs at runtime.
+
+### What this costs as the default
+
+**UBI is now the default** (`default BLOB_DB_BACKEND_UBI`), so this table is
+what a default build gets and the `flash_area` column is the opt-out. The
+price is stated plainly rather than buried: a **1.5–2.5× regression on every
+read**, plus 23 KB of flash and 3.4 KB of RAM, in exchange for wear-levelling
+and bad-block handling. The sector-erase cost that dominates writes is
+unchanged.
+
+The judgement behind that trade is that a store which survives a torn write
+is worth more than a faster one — and the failure it prevents was observed
+here by accident, not argued: an interrupted reflash corrupted a PEB and UBI
+repaired it in 2.3 s, where the same interruption on `flash_area` leaves the
+part needing `nrfutil device recover`.
+
+Two effects only visible once the other apps were measured on it:
+
+- **`fill` gets slightly cheaper, not dearer.** `app_cbor_persondb`'s fill is
+  1.10× faster on UBI (809 s → 733 s), because that phase is ~97% erase — the
+  one cost UBI does not inflate. Its full-scale `A4` floor improves from
+  ≈2.2 h to ≈2.0 h.
+- **First-time store creation can halve.** `app_perf_kvdb`'s format+prepare
+  goes 274.5 s → 145.5 s, because `flash_area` erases the partition and then
+  erases every bucket again, while UBI reuses the blocks its own format just
+  erased. That discount applies only where the format erased everything;
+  `app_perf_mc` and `app_cbor_persondb` see no such gain, which is the
+  clearest evidence that **UBI moves erase cost in time rather than removing
+  it.**
+
+Choosing `flash_area` remains a one-line opt-out, and is the right choice
+where the flash is known-good and reads dominate.
+
+## Raw UART capture — UBI backend (`f1100f1`)
+
+Volume-probe and PEB-recovery lines elided; see the operational notes.
+
+```
+*** Booting Zephyr OS build 4a405846193f ***
+blob_db perf 1.0.0  (N_OPS=100  VAL_LEN=24  node=32 B)
+bench prepare :  100 ops in  107630 ms  ->    0.929 ops/s  (  1076300 us/op)
+bench prepend :  100 ops in    3369 ms  ->   29.682 ops/s  (    33690 us/op)
+bench read   :  100 ops in     113 ms  ->  884.955 ops/s  (     1130 us/op)
+   io read      : rd    605 ops/    8650 B   wr     0 ops/       0 B   er    0   ampl rd 2.70x wr 0.00x
+bench update :  100 ops in     362 ms  ->  276.243 ops/s  (     3620 us/op)
+   io update    : rd   1000 ops/   14800 B   wr   100 ops/    4800 B   er    0   ampl rd 4.62x wr 1.50x
+prepend checksum: 0xee3fa466
+bench prepare :  100 ops in  110188 ms  ->    0.907 ops/s  (  1101880 us/op)
+bench append :  100 ops in    1715 ms  ->   58.309 ops/s  (    17150 us/op)
+bench read   :  100 ops in     113 ms  ->  884.955 ops/s  (     1130 us/op)
+   io read      : rd    605 ops/    8650 B   wr     0 ops/       0 B   er    0   ampl rd 2.70x wr 0.00x
+bench update :  100 ops in     397 ms  ->  251.889 ops/s  (     3970 us/op)
+   io update    : rd   1198 ops/   17176 B   wr   100 ops/    4800 B   er    0   ampl rd 5.36x wr 1.50x
+append checksum:  0x50f65666
+
+-- large objects (OBJ_LEN=65536  N_LARGE=4  N_PART=32  PART_LEN=64) --
+bench lg write  :    4 ops in  127679 ms  ->      2 KB/s  ( 31919750 us/op)
+   io lg write  : rd    180 ops/    2720 B   wr   263 ops/  269488 B   er  127   ampl rd 0.01x wr 1.02x
+bench lg rewrite:    4 ops in   17990 ms  ->     14 KB/s  (  4497500 us/op)
+   io lg rewrite: rd   1084 ops/   16176 B   wr   277 ops/  269712 B   er    9   ampl rd 0.06x wr 1.02x
+bench lg read   : 4096 ops in   11003 ms  ->     23 KB/s  (     2686 us/op)
+   io lg read   : rd  31531 ops/ 8751588 B   wr     0 ops/       0 B   er    0   ampl rd 33.38x wr 0.00x
+lg read checksum: 0xca1e0000
+bench lg pread q0:   32 ops in     184 ms  ->     10 KB/s  (     5750 us/op)
+   io lg pread q0: rd    726 ops/   89416 B   wr     0 ops/       0 B   er    0   ampl rd 43.66x wr 0.00x
+bench lg pread q1:   32 ops in     187 ms  ->     10 KB/s  (     5843 us/op)
+   io lg pread q1: rd    735 ops/   91522 B   wr     0 ops/       0 B   er    0   ampl rd 44.68x wr 0.00x
+bench lg pread q2:   32 ops in     193 ms  ->     10 KB/s  (     6031 us/op)
+   io lg pread q2: rd    724 ops/   91390 B   wr     0 ops/       0 B   er    0   ampl rd 44.62x wr 0.00x
+bench lg pread q3:   32 ops in     185 ms  ->     10 KB/s  (     5781 us/op)
+   io lg pread q3: rd    726 ops/   91028 B   wr     0 ops/       0 B   er    0   ampl rd 44.44x wr 0.00x
+bench lg pwrite :   32 ops in   73204 ms  ->      0 KB/s  (  2287625 us/op)
+   io lg pwrite : rd   1609 ops/   99204 B   wr   160 ops/   77912 B   er   64   ampl rd 48.43x wr 38.04x
+partial vs whole-object write: 2287625 us vs 4497500 us/op  (1.97x)
+lg objects intact (65536 B each)
+```
+
 ## Raw UART capture — `e80f404` (run 3, main)
 
 ```
@@ -465,6 +782,15 @@ west build -p always -b nrf5340dk/nrf5340/cpuapp -d build/dk_perf app_perf
 nrfutil device program --firmware build/dk_perf/zephyr/zephyr.hex \
     --options chip_erase_mode=ERASE_RANGES_TOUCHED_BY_FIRMWARE,reset=RESET_SYSTEM \
     --serial-number <your-jlink-sn>
+```
+
+For the UBI backend, add the geometry-specific PEB count — without it the
+build succeeds and hangs at runtime — and wipe the partition raw first,
+since the two layouts are not interchangeable:
+
+```bash
+west build -p always -b nrf5340dk/nrf5340/cpuapp -d build/ubi_perf app_perf -- \
+    -DCONFIG_BLOB_DB_BACKEND_UBI=y -DCONFIG_UBI_MAX_NR_OF_DATA_PEBS=126
 ```
 
 Start the console capture **before** programming and let the

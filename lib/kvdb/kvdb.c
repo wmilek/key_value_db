@@ -97,7 +97,9 @@ static int create_instance(kvdb_t *db, uint64_t meta_id, const char *name,
 	}
 
 	struct map_config mc = {
-		.initial_capacity = cfg ? cfg->initial_capacity : 0,
+		.expected_entries = cfg ? cfg->expected_entries : 0,
+		.typical_entry_bytes = cfg ? cfg->typical_entry_bytes : 0,
+		.max_entry_bytes = cfg ? cfg->max_entry_bytes : 0,
 	};
 	int rc = ops->create(struct_root, &mc);
 
