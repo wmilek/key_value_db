@@ -15,6 +15,14 @@ faster, but steady-state reads cost ~1.65× more, so this app's rerun goes
 12.8 s → 19.7 s. It lands the opposite way from `app_cbor_persondb`, and the
 reason is read/write mix.
 
+**v1.1.0 adds two enumeration phases, `count` and `walk`, for kvhash's
+`map_ops.count` and `map_ops.next`.** They have not run on the DK yet; "On
+`count` and `next`" gives their flash I/O from a `native_sim` run and what
+that predicts for the board, and says which figure is measured and which is
+not. Every other table in this file predates them and is unaffected: the
+new phases read only, and sit between phases that were already timed
+separately.
+
 **`blob_db` now defaults to the UBI backend, and the tables below are
 `flash_area`.** Both are measured — see "On the UBI backend", which is also
 where this app's most interesting result lives: **UBI halves the cost of
@@ -180,6 +188,116 @@ apps bracket it.
 Note `prepare` formats **100** buckets against 116: the two-level container's
 structure occupies more of the volume up front.
 
+## On `count` and `next`
+
+kvhash gained `count` (the number of keys, computed by a walk and never
+stored) and `next` (stateless enumeration, the key itself is the cursor) —
+`shape_map.h` has the contracts, `doc/impl/l2_kvhash.md` §4–5 the
+implementation. kvdb does not wire either yet, so the app reaches them
+through the Map op vector its handle bound at open. Four phases were added,
+all read-only:
+
+| phase     | what                                                    | checked against                               |
+| --------- | ------------------------------------------------------- | --------------------------------------------- |
+| `count`   | one `count` call on the inherited store                 | the gen-G prediction; zero write ops          |
+| `walk`    | a full `next` walk, empty key to `-ENODATA`             | every predicted key once, with its gen-G value, nothing else; then `count` again, which must equal the walk |
+| `recount` | `count` after the modify phase                          | same, at gen G+1                              |
+| `rewalk`  | the walk after the modify phase                         | same, at gen G+1                              |
+
+So the walk is a second proof of the store's content, independent of the
+`get` loop: it has no prediction to drive it and must still find exactly the
+predicted set. `rewalk` runs after the subset rewrite, the ghost toggle and
+an intent insert+delete, so the order's stability under mutation is
+exercised on every run, and `walk` on a rerun exercises it across a reboot.
+
+### No board yet: I/O counters, and what they predict
+
+`native_sim`, default (UBI) backend, the DK's flash geometry from
+`boards/native_sim.overlay`, `CONFIG_BLOB_DB_IOSTATS=y` (on for this board
+only — see `boards/native_sim.conf`). The map built from the declaration is
+**depth 2, fanout 16, 256 buckets**. A rerun at gen 2 -> 3:
+
+| phase      |  ops | flash reads | bytes read | reads / op | flash-only prediction, DK |
+| ---------- | ---: | ----------: | ---------: | ---------: | ------------------------: |
+| `verify`   |  769 |      26 102 |    558 063 |       33.9 |                   1.949 s |
+| `count`    |    1 |       2 406 |     52 631 |          — |                   0.180 s |
+| `walk`     |  770 |      28 508 |    610 709 |       37.0 |                   2.129 s |
+| `modify`   |  196 |       7 894 |    157 883 |       40.3 |                   0.892 s |
+| `reverify` |  769 |      26 715 |    565 551 |       34.7 |                   1.993 s |
+| `recount`  |    1 |       2 602 |     55 016 |          — |                   0.194 s |
+| `rewalk`   |  771 |      29 356 |    621 364 |       38.1 |                   2.190 s |
+
+The last column is `app_perf_l0/tools/l0_timing.py predict` over
+`models/mx25r64_nrf5340dk_full.json`: flash cost only, no CPU, and no UBI
+per-transaction overhead, so it is a floor rather than a forecast. The ratios
+between rows are the usable part, because every row pays those missing terms
+in the same proportion:
+
+- **A `next` walk costs 1.09× a `get` loop over the same keys** — 28 508
+  reads against 26 102, 610 709 B against 558 063 B. That is the
+  "n × (depth + 1) blob reads" of `l2_kvhash.md` §4.2 made concrete: each
+  call resolves its cursor exactly as `get` does and usually finds the
+  successor in the bucket it already has; the 9 % is the bucket-to-bucket and
+  sub-map crossings. Scaled against the DK's measured two-level `verify`
+  (9 923 µs per `get`, "On the two-level `kvhash`"), **a full walk of 770
+  entries is ≈ 8.3 s on the board, ≈ 10.8 ms per entry** — a scaling, not a
+  measurement.
+- **`count` costs 9.2 % of a `get` loop**: 2 406 reads for at most 288 blob
+  reads (16 of the top directory, 16 sub-directories, up to 256 buckets),
+  against 2 307 blob reads for 769 `get`s (three each at depth 2). Per record, as the contract says, not per
+  entry — the same 2 406 reads would count 8 keys or 2 000. The same scaling
+  puts it at **≈ 0.7 s on the board**, against the model's 0.18 s floor; the
+  gap is UBI's ~178 µs per transaction, which `count` pays once per
+  record-read like everything else here.
+- **`count` wrote nothing** (`wr 0 ops`) — the app fails the run otherwise.
+  Neither did the walks.
+- **Both drift by exactly +196 reads per generation** (`count` 2 210 →
+  2 406 → 2 602 across gens 1, 2, 3), and 196 is the number of blob updates
+  `modify` makes. Each update appends a slot to its blob_db bucket log, and
+  every later lookup in that bucket scans one more 12-byte slot header
+  (`l1_bucketlog.md` §1.5) until compaction. It is an L1 property, not
+  kvhash's: `verify` drifts the same way (+613 per generation, spread over
+  769 lookups). Deterministic, so it is a regression guard, and it is what
+  "cost is per record" turns into once the records have a history.
+
+Putting the scalings together, the four phases add ≈ 18 s to a DK rerun that
+"On the two-level `kvhash`" measured at ≈ 19.7 s. The `N_KEYS` help text's
+one-minute budget is back to about half spent.
+
+The native_sim capture is below; the DK capture, when it exists, belongs in
+its place and this section's scalings replaced by it.
+
+## Raw native_sim capture — rerun (gen 2 -> 3), I/O counters
+
+```
+*** Booting Zephyr OS build bbc6385f0a2c ***
+kvdb perf 1.1.0  (N_KEYS=768  VAL_LEN=16  STRIDE=4  val=24 B)
+mount+open   :              0 ms
+map geometry : depth 2, fanout 16, 256 buckets, entry limit 1020 B
+state: rerun, store at gen 2
+bench verify   :  769 ops in      0 ms  ->     0.000 ops/s  (      0 us/op)
+   io verify   : rd  26102 ops/  558063 B   wr     0 ops/       0 B   er    0 ops/       0 B
+VERIFY PASS (gen 2)
+bench count    :    1 ops in      0 ms  ->     0.000 ops/s  (      0 us/op)
+   io count    : rd   2406 ops/   52631 B   wr     0 ops/       0 B   er    0 ops/       0 B
+COUNT PASS (gen 2): 769 keys
+bench walk     :  770 ops in      0 ms  ->     0.000 ops/s  (      0 us/op)
+   io walk     : rd  28508 ops/  610709 B   wr     0 ops/       0 B   er    0 ops/       0 B
+WALK PASS (gen 2): 769 entries, each exactly once
+bench modify   :  196 ops in      0 ms  ->     0.000 ops/s  (      0 us/op)
+   io modify   : rd   7894 ops/  157883 B   wr   196 ops/   22420 B   er    0 ops/       0 B
+bench reverify :  769 ops in      0 ms  ->     0.000 ops/s  (      0 us/op)
+   io reverify : rd  26715 ops/  565551 B   wr     0 ops/       0 B   er    0 ops/       0 B
+VERIFY PASS (gen 3)
+bench recount  :    1 ops in      0 ms  ->     0.000 ops/s  (      0 us/op)
+   io recount  : rd   2602 ops/   55016 B   wr     0 ops/       0 B   er    0 ops/       0 B
+COUNT PASS (gen 3): 770 keys
+bench rewalk   :  771 ops in      0 ms  ->     0.000 ops/s  (      0 us/op)
+   io rewalk   : rd  29356 ops/  621364 B   wr     0 ops/       0 B   er    0 ops/       0 B
+WALK PASS (gen 3): 770 entries, each exactly once
+done — store at gen 3; rerun to verify persistence
+```
+
 ## Raw UART capture — UBI, first run (`FRESH_START`, gen 1 -> 2)
 
 UBI's volume-probe lines are elided; it logs them at `<err>` level.
@@ -314,6 +432,16 @@ gets a chance to format. Erase the partition first; see the
 
 Attach exactly one reader to the console tty. Two concurrent `cat`s split
 the byte stream and silently shred the capture.
+
+For the I/O counters without a board, on the DK's flash geometry:
+
+```bash
+west build -p always -b native_sim -d build/kvdb_sim app_perf_kvdb
+./build/kvdb_sim/zephyr/zephyr.exe --flash=kvdb.bin --flash_erase   # first run
+./build/kvdb_sim/zephyr/zephyr.exe --flash=kvdb.bin | tee rerun.log  # rerun
+python3 app_perf_l0/tools/l0_timing.py predict \
+    -m app_perf_l0/models/mx25r64_nrf5340dk_full.json rerun.log
+```
 
 ## Power-loss field note
 

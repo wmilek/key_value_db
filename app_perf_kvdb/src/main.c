@@ -14,11 +14,26 @@
  *                         store and repopulates instead of failing verify)
  *   run r (r >= 2)      : 1. VERIFY every key against the expectation for
  *                            the stored generation G (timed get loop)
- *                         2. MODIFY: rewrite the deterministic subset
+ *                         2. COUNT the keys (one timed map_ops.count call)
+ *                            and WALK them (timed map_ops.next loop),
+ *                            checking both against the gen-G prediction
+ *                         3. MODIFY: rewrite the deterministic subset
  *                            { i : i % STRIDE == (G+1) % STRIDE }, toggle
  *                            the "ghost" key (present iff gen is odd),
  *                            then commit gen = G+1 (timed set loop)
- *                         3. RE-VERIFY at G+1 (timed get loop)
+ *                         4. RE-VERIFY at G+1 (timed get loop)
+ *                         5. RECOUNT and REWALK at G+1
+ *
+ * Enumeration (count and walk) measures kvhash's `count` and `next`
+ * (shape_map.h). kvdb does not wire either yet (l3_interfaces.md §3), so
+ * this app reaches them through the Map op vector the kvdb handle bound at
+ * open — the same vector kvdb_get() itself forwards to. Besides the timing,
+ * the walk is a second, independent proof of the store's content: a
+ * key-as-cursor walk must return every predicted key exactly once, with
+ * its gen-G value, and nothing else; and count must agree with it. Both
+ * run on the inherited store (after a reboot) and again after the modify
+ * phase, so the order's stability across reboots, inserts, deletes and
+ * updates is exercised, not just asserted.
  *
  * Expected value of key i at generation G is derived from the *last
  * generation that wrote i* — computable from the modification rule alone,
@@ -96,6 +111,7 @@ LOG_MODULE_REGISTER(app_perf_kvdb, CONFIG_APP_PERF_KVDB_LOG_LEVEL);
 #define INTENT_KEY "intent" /* present only while a gen bump is in flight */
 #define GHOST_KEY "ghost"   /* present iff gen is odd — exercises delete */
 #define GHOST_IDX 0xffffu
+#define KEY_BUF   16        /* longest key here is "intent" (6) + NUL */
 
 /* Every stored value carries its provenance and a derived fill pattern —
  * verification checks all of it byte for byte. */
@@ -166,6 +182,46 @@ static void bench_line(const char *what, int ops, int64_t ms)
 	       (unsigned long long)us_per_op);
 }
 
+#if defined(CONFIG_BLOB_DB_IOSTATS)
+/* Flash actually touched by the phase just measured — the one figure a
+ * native_sim run produces that means anything, since the simulator models
+ * no latency and every wall-clock line rounds to zero there. The enumeration
+ * phases are what this is for: their cost is "reads per record", and that
+ * count is deterministic, so it is a regression guard where ms is not.
+ * Enabled per board (boards/native_sim.conf); the DK build leaves it off so
+ * its timings stay comparable with earlier RESULTS.md captures. */
+static struct blob_db_iostats io_mark;
+
+static void io_reset(void)
+{
+	blob_db_iostats_get(&io_mark);
+}
+
+/* Prints the delta and returns the number of write operations in it. */
+static uint32_t io_line(const char *what)
+{
+	struct blob_db_iostats now;
+
+	blob_db_iostats_get(&now);
+
+	const uint32_t rd = now.reads - io_mark.reads;
+	const uint32_t wr = now.writes - io_mark.writes;
+	const uint32_t er = now.erases - io_mark.erases;
+
+	/* Same shape as app_perf's line, so app_perf_l0/tools/l0_timing.py
+	 * can turn a native_sim capture into predicted hardware time. */
+	printk("   io %-8s : rd %6u ops/%8llu B   wr %5u ops/%8llu B   "
+	       "er %4u ops/%8llu B\n",
+	       what, rd, (unsigned long long)(now.bytes_read - io_mark.bytes_read),
+	       wr, (unsigned long long)(now.bytes_written - io_mark.bytes_written),
+	       er, (unsigned long long)(now.bytes_erased - io_mark.bytes_erased));
+	return wr;
+}
+#else
+#define io_reset()      ((void)0)
+#define io_line(what)   ((uint32_t)0)
+#endif
+
 /* Check every key (and the ghost) against the expectation for generation G.
  * Returns 0 on full match, -EILSEQ on any mismatch (logged). Timed. */
 static int verify_generation(kvdb_t *db, uint32_t G, const char *label)
@@ -178,6 +234,7 @@ static int verify_generation(kvdb_t *db, uint32_t G, const char *label)
 
 	int64_t t = k_uptime_get();
 
+	io_reset();
 	for (uint32_t i = 0; i < N_KEYS; i++) {
 		key_name(key, sizeof(key), i);
 		int rc = kvdb_get(db, key, &got, sizeof(got), &len);
@@ -213,12 +270,219 @@ static int verify_generation(kvdb_t *db, uint32_t G, const char *label)
 	}
 
 	bench_line(label, ops, k_uptime_delta(&t));
+	(void)io_line(label);
 
 	if (bad) {
 		printk("VERIFY FAIL (gen %u): %d bad entries\n", G, bad);
 		return -EILSEQ;
 	}
 	printk("VERIFY PASS (gen %u)\n", G);
+	return 0;
+}
+
+/* Keys present at generation G with no bump in flight: the N_KEYS data
+ * keys, the gen key, and the ghost on odd generations. */
+static size_t expected_count(uint32_t G)
+{
+	return (size_t)N_KEYS + 1u + ((G % 2u == 1u) ? 1u : 0u);
+}
+
+/* Parse "kNNN" back into its index. Returns false for any other key. */
+static bool parse_key_idx(const char *k, size_t klen, uint32_t *idx)
+{
+	uint32_t v = 0;
+
+	if (klen < 2 || k[0] != 'k') {
+		return false;
+	}
+	for (size_t j = 1; j < klen; j++) {
+		if (k[j] < '0' || k[j] > '9') {
+			return false;
+		}
+		v = v * 10u + (uint32_t)(k[j] - '0');
+	}
+	*idx = v;
+	return true;
+}
+
+/* One map_ops.count call, timed, checked against the prediction for G. The
+ * contract says count writes nothing, so under IOSTATS a write op in it is
+ * a FAIL. */
+static int count_check(kvdb_t *db, uint32_t G, const char *label)
+{
+	size_t n = 0;
+
+	int64_t t = k_uptime_get();
+
+	io_reset();
+	int rc = db->ops->count(db->root, &n);
+	int64_t ms = k_uptime_delta(&t);
+
+	if (rc != 0) {
+		LOG_ERR("%s: count rc=%d", label, rc);
+		return rc;
+	}
+	bench_line(label, 1, ms);
+	uint32_t wr = io_line(label);
+
+	if (n != expected_count(G)) {
+		printk("COUNT FAIL (gen %u): %zu keys, expected %zu\n",
+		       G, n, expected_count(G));
+		return -EILSEQ;
+	}
+	if (wr != 0) {
+		printk("COUNT FAIL (gen %u): %u write ops — count must not write\n",
+		       G, wr);
+		return -EILSEQ;
+	}
+	printk("COUNT PASS (gen %u): %zu keys\n", G, n);
+	return 0;
+}
+
+/* A full key-as-cursor walk with map_ops.next: start from the empty key,
+ * feed each returned key back as the cursor, stop at -ENODATA. Every
+ * predicted key must come back exactly once with its gen-G value, and no
+ * other key may appear. Timed; ops counts the next() calls, so the final
+ * -ENODATA is one op too. *n_out receives the number of entries returned. */
+static int walk_verify(kvdb_t *db, uint32_t G, const char *label,
+		       size_t *n_out)
+{
+	static uint8_t seen[(N_KEYS + 7) / 8];
+	char cur[KEY_BUF], kout[KEY_BUF];
+	size_t clen = 0, klen = 0, vlen = 0;
+	union {
+		struct val v;
+		struct gen_rec g;
+		struct intent_rec i;
+	} got;
+	struct val want;
+	size_t entries = 0;
+	bool ghost_seen = false;
+	int bad = 0;
+	int ops = 0;
+	int rc;
+
+	memset(seen, 0, sizeof(seen));
+
+	int64_t t = k_uptime_get();
+
+	io_reset();
+	for (;;) {
+		rc = db->ops->next(db->root, cur, clen,
+				   kout, sizeof(kout) - 1, &klen,
+				   &got, sizeof(got), &vlen);
+		ops++;
+		if (rc == -ENODATA) {
+			break;
+		}
+		if (rc != 0) {
+			LOG_ERR("%s: next(%.*s) rc=%d", label, (int)clen, cur, rc);
+			bad++;
+			break;
+		}
+		entries++;
+		kout[klen] = '\0';
+
+		uint32_t idx;
+
+		if (parse_key_idx(kout, klen, &idx)) {
+			if (idx >= N_KEYS) {
+				LOG_ERR("%s: key %s out of range", label, kout);
+				bad++;
+			} else if (seen[idx / 8] & (1u << (idx % 8))) {
+				LOG_ERR("%s: key %s returned twice", label, kout);
+				bad++;
+			} else {
+				seen[idx / 8] |= (uint8_t)(1u << (idx % 8));
+				make_val(&want, last_writer(idx, G), idx);
+				if (vlen != sizeof(want) ||
+				    memcmp(&got.v, &want, sizeof(want)) != 0) {
+					LOG_ERR("%s: %s value wrong (len %zu)",
+						label, kout, vlen);
+					bad++;
+				}
+			}
+		} else if (strcmp(kout, GEN_KEY) == 0) {
+			if (vlen != sizeof(got.g) || got.g.gen != G ||
+			    got.g.n_keys != N_KEYS || got.g.val_len != VAL_LEN) {
+				LOG_ERR("%s: gen record wrong", label);
+				bad++;
+			}
+		} else if (strcmp(kout, GHOST_KEY) == 0) {
+			make_val(&want, G, GHOST_IDX);
+			if (ghost_seen || G % 2 != 1 || vlen != sizeof(want) ||
+			    memcmp(&got.v, &want, sizeof(want)) != 0) {
+				LOG_ERR("%s: ghost wrong (gen %u)", label, G);
+				bad++;
+			}
+			ghost_seen = true;
+		} else {
+			LOG_ERR("%s: unexpected key '%s'", label, kout);
+			bad++;
+		}
+
+		/* The returned key is the next cursor. */
+		memcpy(cur, kout, klen);
+		clen = klen;
+	}
+
+	bench_line(label, ops, k_uptime_delta(&t));
+	(void)io_line(label);
+
+	size_t missing = 0;
+
+	for (uint32_t i = 0; i < N_KEYS; i++) {
+		if (!(seen[i / 8] & (1u << (i % 8)))) {
+			missing++;
+		}
+	}
+	if (missing) {
+		LOG_ERR("%s: %zu keys never returned", label, missing);
+		bad++;
+	}
+	if ((G % 2 == 1) && !ghost_seen) {
+		LOG_ERR("%s: ghost never returned", label);
+		bad++;
+	}
+
+	*n_out = entries;
+	if (bad || entries != expected_count(G)) {
+		printk("WALK FAIL (gen %u): %zu entries, %d bad\n", G, entries, bad);
+		return -EILSEQ;
+	}
+	printk("WALK PASS (gen %u): %zu entries, each exactly once\n", G, entries);
+	return 0;
+}
+
+/* The enumeration phase: count, then a full walk, then count again as a
+ * cross-check of the two against each other. The second count is not a
+ * bench line — the first one already is, and this one must agree with it. */
+static int enumerate(kvdb_t *db, uint32_t G, const char *count_label,
+		     const char *walk_label)
+{
+	size_t walked = 0;
+	int rc = count_check(db, G, count_label);
+
+	if (rc != 0) {
+		return rc;
+	}
+	rc = walk_verify(db, G, walk_label, &walked);
+	if (rc != 0) {
+		return rc;
+	}
+
+	size_t n = 0;
+
+	rc = db->ops->count(db->root, &n);
+	if (rc != 0) {
+		LOG_ERR("%s: count rc=%d", count_label, rc);
+		return rc;
+	}
+	if (n != walked) {
+		printk("COUNT FAIL (gen %u): count %zu but walk returned %zu\n",
+		       G, n, walked);
+		return -EILSEQ;
+	}
 	return 0;
 }
 
@@ -244,6 +508,7 @@ static int populate(kvdb_t *db)
 	bench_line("prepare", prepared, k_uptime_delta(&t));
 
 	t = k_uptime_get();
+	io_reset();
 
 	for (uint32_t i = 0; i < N_KEYS; i++) {
 		key_name(key, sizeof(key), i);
@@ -274,6 +539,7 @@ static int populate(kvdb_t *db)
 	ops++;
 
 	bench_line("populate", ops, k_uptime_delta(&t));
+	(void)io_line("populate");
 	return 0;
 }
 
@@ -287,6 +553,8 @@ static int modify(kvdb_t *db, uint32_t G)
 	struct val v;
 	int64_t t = k_uptime_get();
 	int ops = 0;
+
+	io_reset();
 
 	/* Step 1: durable declaration that gen G+1 is in flight. */
 	struct intent_rec intent = { .to_gen = next };
@@ -347,6 +615,7 @@ static int modify(kvdb_t *db, uint32_t G)
 	ops++;
 
 	bench_line("modify", ops, k_uptime_delta(&t));
+	(void)io_line("modify");
 	return 0;
 }
 
@@ -364,6 +633,7 @@ static int recovery_verify(kvdb_t *db, uint32_t G)
 
 	int64_t t = k_uptime_get();
 
+	io_reset();
 	for (uint32_t i = 0; i < N_KEYS; i++) {
 		key_name(key, sizeof(key), i);
 		int rc = kvdb_get(db, key, &got, sizeof(got), &len);
@@ -407,6 +677,7 @@ static int recovery_verify(kvdb_t *db, uint32_t G)
 	}
 
 	bench_line("recover", ops, k_uptime_delta(&t));
+	(void)io_line("recover");
 	printk("torn state: %d keys still at gen <= %u, %d already at gen %u\n",
 	       n_old, G, n_new, next);
 
@@ -464,6 +735,19 @@ int main(void)
 		goto out;
 	}
 	printk("mount+open   :         %6" PRId64 " ms\n", k_uptime_delta(&t));
+
+	/* What the backend built from the declaration above. count's cost is
+	 * per record (every directory and every allocated bucket), so the
+	 * geometry is what its reads are read against. */
+	struct map_info info;
+
+	rc = db.ops->stat(db.root, &info);
+	if (rc != 0) {
+		LOG_ERR("stat: %d", rc);
+		goto out;
+	}
+	printk("map geometry : depth %u, fanout %u, %u buckets, entry limit %zu B\n",
+	       info.depth, info.fanout, info.buckets, info.entry_bytes_limit);
 
 	uint32_t G = 0;
 	struct gen_rec rec;
@@ -555,8 +839,13 @@ int main(void)
 		rc = recovery_verify(&db, G);
 	} else {
 		/* Prove the content (whether just written or inherited) is
-		 * exactly what generation G predicts. */
+		 * exactly what generation G predicts — first by key, then by
+		 * enumeration, which has no prediction to work from and must
+		 * find the same set. */
 		rc = verify_generation(&db, G, "verify");
+		if (rc == 0) {
+			rc = enumerate(&db, G, "count", "walk");
+		}
 	}
 	if (rc != 0) {
 		goto out;   /* leave the store untouched for inspection */
@@ -569,6 +858,12 @@ int main(void)
 		goto out;
 	}
 	rc = verify_generation(&db, G + 1, "reverify");
+	if (rc != 0) {
+		goto out;
+	}
+	/* The order must have survived the subset rewrite, the ghost toggle
+	 * and the intent insert+delete the bump just made. */
+	rc = enumerate(&db, G + 1, "recount", "rewalk");
 	if (rc != 0) {
 		goto out;
 	}
