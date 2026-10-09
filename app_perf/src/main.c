@@ -61,6 +61,7 @@
 #include <zephyr/sys/printk.h>
 
 #include <app/lib/blob_db.h>
+#include <app/lib/blob_db_iostats.h>
 
 #include <zephyr/app_version.h>
 

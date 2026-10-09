@@ -30,6 +30,7 @@
 #include <zephyr/storage/flash_map.h>
 
 #include <app/lib/blob_db.h>
+#include <app/lib/blob_db_iostats.h>
 #include <app/lib/containers/kvhash.h>
 #include <app/lib/rootreg.h>
 

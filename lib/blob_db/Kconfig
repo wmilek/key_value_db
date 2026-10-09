@@ -228,6 +228,8 @@ config BLOB_DB_TEST_CRASH_HOOKS
 
 	  For tests only. Leave off in production builds — it adds a comparison
 	  on the write path and exports a symbol that can corrupt a store.
+	  The hooks are declared in <app/lib/blob_db_test.h>, not in the
+	  contract header.
 
 endif # BLOB_DB_LARGE_PAYLOADS
 
@@ -235,7 +237,8 @@ config BLOB_DB_IOSTATS
 	bool "Count flash operations and bytes"
 	help
 	  Count reads, writes and erases — operations and bytes — at the
-	  storage seam, and expose them through blob_db_iostats_get(). Both
+	  storage seam, and expose them through blob_db_iostats_get()
+	  (<app/lib/blob_db_iostats.h>, outside the blob_db contract). Both
 	  counts are kept because they can disagree: a change that moves fewer
 	  bytes may issue more transactions, and on a serial part each
 	  transaction carries a fixed command-and-address cost.
@@ -248,6 +251,34 @@ config BLOB_DB_IOSTATS
 
 	  A handful of counters and one call per store operation; leave it off
 	  in production builds.
+
+config BLOB_DB_INSPECT
+	bool "Inspection API (geometry, per-bucket occupancy)"
+	help
+	  Build <app/lib/blob_db_inspect.h>: the store's geometry and
+	  allocator state, and for each bucket how its sector splits into live
+	  data, garbage awaiting compaction, unreadable tail and erased space,
+	  with an optional per-slot walk.
+
+	  Kept apart from <app/lib/blob_db.h> on purpose. That header is the
+	  contract every blob_db implementation provides; this one describes
+	  the bucket-log implementation only, for diagnostics. Containers and
+	  interfaces must not depend on it.
+
+config BLOB_DB_SHELL
+	bool "Shell commands to inspect the store"
+	depends on SHELL
+	select BLOB_DB_INSPECT
+	help
+	  Add a `blob_db` shell command group: geometry and master state, a
+	  whole-store occupancy summary with the fill distribution across
+	  buckets, a per-bucket table, a slot-by-slot view of one bucket, where
+	  an id lives, and a hex dump of a blob. Read-only: no command writes
+	  to flash.
+
+	  blob_db is not thread-safe and the shell runs on its own thread, so
+	  use these while the application is not calling blob_db. A full-store
+	  scan reads every bucket sector, which takes a while on large parts.
 
 config BLOB_DB_AUTOFORMAT_ON_CORRUPT
 	bool "Format when both master sectors are unreadable"

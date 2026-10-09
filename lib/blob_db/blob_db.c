@@ -19,6 +19,8 @@
 #include <zephyr/sys/crc.h>
 
 #include <app/lib/blob_db.h>
+#include <app/lib/blob_db_iostats.h>
+#include <app/lib/blob_db_test.h>
 
 #include "blob_db_internal.h"
 #include "blob_db_store.h"
@@ -2799,6 +2801,55 @@ int blob_db_iterate(blob_db_iter_cb_t cb, void *user)
 	}
 	return 0;
 }
+
+#if defined(CONFIG_BLOB_DB_INSPECT)
+/* Hooks for blob_db_inspect.c — see blob_db_internal.h. */
+
+void blob_db_core_state_get(struct blob_db_core_state *out)
+{
+	*out = (struct blob_db_core_state){
+		.mounted       = st.mounted,
+		.wedged        = st.wedged,
+		.fa_size       = st.fa_size,
+		.peb_size      = st.peb_size,
+		.write_align   = st.write_align,
+		.n_pebs        = st.n_pebs,
+		.n_buckets     = st.n_buckets,
+		.active_master = st.active_master,
+		.master_gen    = st.master_gen,
+		.next_id       = st.next_id,
+		.next_id_hint  = st.next_id_hint,
+		.seg_owner     = st.seg_owner,
+	};
+}
+
+uint8_t *blob_db_core_sector_buf(void)
+{
+	return g_bbuf;
+}
+
+bool blob_db_core_slot_at(const uint8_t *buf, off_t off,
+			  struct blob_db_core_slot *out)
+{
+	struct slot_view sv;
+
+	if (!slot_view_at(buf, off, &sv)) {
+		return false;
+	}
+	*out = (struct blob_db_core_slot){
+		.id         = sv.id,
+		.flags      = sv.flags,
+		.val_len    = sv.val_len,
+		.total_size = sv.total_size,
+	};
+	return true;
+}
+
+bool blob_db_core_bucket_hdr_valid(const uint8_t *buf, uint16_t bid)
+{
+	return bucket_hdr_valid(buf, bid);
+}
+#endif /* CONFIG_BLOB_DB_INSPECT */
 
 int blob_db_size(uint64_t id, size_t *out_size)
 {

@@ -12,6 +12,13 @@ tests:
   lib.blob_db:
     extra_configs:
       - CONFIG_BLOB_DB_BACKEND_FLASH_AREA=y
+  # The read-only `blob_db` shell commands. Building them here is what keeps
+  # lib/blob_db/blob_db_shell.c compiling; the suite itself runs unchanged.
+  lib.blob_db.shell:
+    extra_configs:
+      - CONFIG_BLOB_DB_BACKEND_FLASH_AREA=y
+      - CONFIG_SHELL=y
+      - CONFIG_BLOB_DB_SHELL=y
   # Production policy for an unparseable-but-not-erased master: refuse with
   # -EIO instead of reformatting. Exercises the other half of the recovery
   # branch in blob_db_mount().
