@@ -16,6 +16,9 @@
 #include <zephyr/ztest.h>
 
 #include <app/lib/blob_db.h>
+#if defined(CONFIG_BLOB_DB_INSPECT)
+#include <app/lib/blob_db_inspect.h>
+#endif
 
 #define BLOB_DB_TEST_PARTITION_ID  PARTITION_ID(storage_partition)
 
@@ -2655,10 +2658,10 @@ ZTEST(blob_db, test_review_failed_write_orphans_never_swept)
 struct slot_log {
 	uint64_t id;
 	int n;
-	enum blob_db_slot_state state[4];
+	enum blob_db_inspect_slot_state state[4];
 };
 
-static int log_slots_of(const struct blob_db_slot_info *s, void *user)
+static int log_slots_of(const struct blob_db_inspect_slot *s, void *user)
 {
 	struct slot_log *l = user;
 
@@ -2668,7 +2671,7 @@ static int log_slots_of(const struct blob_db_slot_info *s, void *user)
 	return 0;
 }
 
-static void assert_bytes_add_up(const struct blob_db_bucket_stats *bs)
+static void assert_bytes_add_up(const struct blob_db_inspect_bucket *bs)
 {
 	zassert_equal(bs->live_bytes + bs->garbage_bytes + bs->tail_bytes +
 		      bs->free_bytes, bs->capacity,
@@ -2677,31 +2680,31 @@ static void assert_bytes_add_up(const struct blob_db_bucket_stats *bs)
 
 ZTEST(blob_db, test_inspect_info_matches_state)
 {
-	struct blob_db_info in;
+	struct blob_db_inspect_info in;
 
-	zassert_ok(blob_db_info_get(&in));
+	zassert_ok(blob_db_inspect_info_get(&in));
 	zassert_equal(in.n_sectors, in.n_buckets + 3);
 	zassert_equal(in.partition_size, in.sector_size * in.n_sectors);
 	zassert_equal(in.next_id, 2, "format leaves next_id at 2");
 	zassert_false(in.wedged);
 
 	(void)blob_db_alloc_id();
-	zassert_ok(blob_db_info_get(&in));
+	zassert_ok(blob_db_inspect_info_get(&in));
 	zassert_equal(in.next_id, 3);
 
-	zassert_equal(blob_db_info_get(NULL), -EINVAL);
+	zassert_equal(blob_db_inspect_info_get(NULL), -EINVAL);
 	zassert_ok(blob_db_unmount());
-	zassert_equal(blob_db_info_get(&in), -ENODEV);
+	zassert_equal(blob_db_inspect_info_get(&in), -ENODEV);
 }
 
 ZTEST(blob_db, test_inspect_bucket_accounting)
 {
-	struct blob_db_info in;
-	struct blob_db_bucket_stats bs;
+	struct blob_db_inspect_info in;
+	struct blob_db_inspect_bucket bs;
 	uint8_t v[20];
 
 	memset(v, 0xa5, sizeof(v));
-	zassert_ok(blob_db_info_get(&in));
+	zassert_ok(blob_db_inspect_info_get(&in));
 	zassert_true(in.n_buckets > 4, "geometry too small for this case");
 
 	const size_t a = in.write_align ? in.write_align : 1;
@@ -2722,8 +2725,8 @@ ZTEST(blob_db, test_inspect_bucket_accounting)
 
 	struct slot_log log = { .id = ida };
 
-	zassert_ok(blob_db_bucket_stat(ida % in.n_buckets, &bs, log_slots_of,
-				       &log));
+	zassert_ok(blob_db_inspect_bucket_get(ida % in.n_buckets, &bs,
+					      log_slots_of, &log));
 	zassert_true(bs.formatted);
 	zassert_equal(bs.objects, 1);
 	zassert_equal(bs.superseded, 1);
@@ -2734,10 +2737,11 @@ ZTEST(blob_db, test_inspect_bucket_accounting)
 	zassert_equal(bs.tail_bytes, 0);
 	assert_bytes_add_up(&bs);
 	zassert_equal(log.n, 2);
-	zassert_equal(log.state[0], BLOB_DB_SLOT_SUPERSEDED);
-	zassert_equal(log.state[1], BLOB_DB_SLOT_LIVE);
+	zassert_equal(log.state[0], BLOB_DB_INSPECT_SUPERSEDED);
+	zassert_equal(log.state[1], BLOB_DB_INSPECT_LIVE);
 
-	zassert_ok(blob_db_bucket_stat(idb % in.n_buckets, &bs, NULL, NULL));
+	zassert_ok(blob_db_inspect_bucket_get(idb % in.n_buckets, &bs, NULL,
+					      NULL));
 	zassert_equal(bs.objects, 0);
 	zassert_equal(bs.superseded, 1);
 	zassert_equal(bs.tombstones, 1);
@@ -2746,31 +2750,31 @@ ZTEST(blob_db, test_inspect_bucket_accounting)
 	assert_bytes_add_up(&bs);
 
 	/* The root's bucket holds the empty root slot. */
-	zassert_ok(blob_db_bucket_stat(BLOB_DB_ROOT_ID % in.n_buckets, &bs,
-				       NULL, NULL));
+	zassert_ok(blob_db_inspect_bucket_get(BLOB_DB_ROOT_ID % in.n_buckets,
+					      &bs, NULL, NULL));
 	zassert_equal(bs.objects, 1);
 	zassert_equal(bs.live_bytes, slot0);
 
 	/* A bucket nothing has touched since format is all free. */
 	const uint16_t untouched = (uint16_t)((idb + 1) % in.n_buckets);
 
-	zassert_ok(blob_db_bucket_stat(untouched, &bs, NULL, NULL));
+	zassert_ok(blob_db_inspect_bucket_get(untouched, &bs, NULL, NULL));
 	zassert_false(bs.formatted);
 	zassert_equal(bs.free_bytes, bs.capacity);
 	zassert_equal(bs.capacity, in.bucket_capacity);
 
-	zassert_equal(blob_db_bucket_stat(in.n_buckets, &bs, NULL, NULL),
+	zassert_equal(blob_db_inspect_bucket_get(in.n_buckets, &bs, NULL, NULL),
 		      -EINVAL);
 }
 
 ZTEST(blob_db, test_inspect_compaction_reclaims_garbage)
 {
-	struct blob_db_info in;
-	struct blob_db_bucket_stats bs;
+	struct blob_db_inspect_info in;
+	struct blob_db_inspect_bucket bs;
 	uint8_t v[64];
 
 	memset(v, 0x3c, sizeof(v));
-	zassert_ok(blob_db_info_get(&in));
+	zassert_ok(blob_db_inspect_info_get(&in));
 
 	uint64_t id = put_blob(v, sizeof(v));
 	const uint16_t bid = id % in.n_buckets;
@@ -2778,7 +2782,7 @@ ZTEST(blob_db, test_inspect_compaction_reclaims_garbage)
 	/* Rebind until the bucket has compacted at least once. */
 	do {
 		zassert_ok(blob_db_update(id, v, sizeof(v)));
-		zassert_ok(blob_db_bucket_stat(bid, &bs, NULL, NULL));
+		zassert_ok(blob_db_inspect_bucket_get(bid, &bs, NULL, NULL));
 	} while (bs.gen == 1);
 
 	zassert_equal(bs.objects, 1);

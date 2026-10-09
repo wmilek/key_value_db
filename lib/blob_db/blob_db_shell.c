@@ -5,7 +5,7 @@
  * blob_db shell — read-only inspection of the mounted store.
  *
  * Parsing and printing only, over the public introspection API
- * (blob_db_info_get / blob_db_bucket_stat, CONFIG_BLOB_DB_INSPECT). No command
+ * (<app/lib/blob_db_inspect.h>, CONFIG_BLOB_DB_INSPECT). No command
  * writes to flash. blob_db is not thread-safe and this runs on the shell
  * thread, so use it while the application is not calling blob_db.
  */
@@ -18,6 +18,7 @@
 #include <zephyr/sys/util.h>
 
 #include <app/lib/blob_db.h>
+#include <app/lib/blob_db_inspect.h>
 
 /* Fullest buckets listed by `stats` when no count is given, and the most
  * it will track. */
@@ -32,9 +33,9 @@
 #define DUMP_CHUNK   64
 #define DUMP_DEFAULT 256
 
-static int need_info(const struct shell *sh, struct blob_db_info *info)
+static int need_info(const struct shell *sh, struct blob_db_inspect_info *info)
 {
-	int rc = blob_db_info_get(info);
+	int rc = blob_db_inspect_info_get(info);
 
 	if (rc == -ENODEV) {
 		shell_error(sh, "blob_db not mounted");
@@ -66,14 +67,14 @@ static uint32_t permille(uint64_t part, uint64_t whole)
 #define PM_FMT     "%3u.%u%%"
 #define PM_ARG(x)  (unsigned int)((x) / 10), (unsigned int)((x) % 10)
 
-static const char *state_str(const struct blob_db_slot_info *s)
+static const char *state_str(const struct blob_db_inspect_slot *s)
 {
 	switch (s->state) {
-	case BLOB_DB_SLOT_LIVE:
+	case BLOB_DB_INSPECT_LIVE:
 		return s->segment ? "live-seg" : (s->index ? "live-idx" : "live");
-	case BLOB_DB_SLOT_SUPERSEDED:
+	case BLOB_DB_INSPECT_SUPERSEDED:
 		return "stale";
-	case BLOB_DB_SLOT_TOMBSTONE:
+	case BLOB_DB_INSPECT_TOMBSTONE:
 		return "tomb";
 	}
 	return "?";
@@ -83,7 +84,7 @@ static const char *state_str(const struct blob_db_slot_info *s)
 
 static int cmd_info(const struct shell *sh, size_t argc, char **argv)
 {
-	struct blob_db_info in;
+	struct blob_db_inspect_info in;
 
 	ARG_UNUSED(argc);
 	ARG_UNUSED(argv);
@@ -150,7 +151,7 @@ static void top_insert(struct top_entry *top, size_t *n, size_t cap,
 
 static int cmd_stats(const struct shell *sh, size_t argc, char **argv)
 {
-	struct blob_db_info in;
+	struct blob_db_inspect_info in;
 	size_t top_n = TOP_DEFAULT;
 
 	if (need_info(sh, &in) < 0) {
@@ -174,8 +175,8 @@ static int cmd_stats(const struct shell *sh, size_t argc, char **argv)
 	size_t n_top = 0;
 
 	for (uint16_t bid = 0; bid < in.n_buckets; bid++) {
-		struct blob_db_bucket_stats bs;
-		int rc = blob_db_bucket_stat(bid, &bs, NULL, NULL);
+		struct blob_db_inspect_bucket bs;
+		int rc = blob_db_inspect_bucket_get(bid, &bs, NULL, NULL);
 
 		if (rc < 0) {
 			io_err++;
@@ -293,7 +294,7 @@ static int cmd_stats(const struct shell *sh, size_t argc, char **argv)
 
 static int cmd_buckets(const struct shell *sh, size_t argc, char **argv)
 {
-	struct blob_db_info in;
+	struct blob_db_inspect_info in;
 	uint64_t first = 0, count;
 
 	if (need_info(sh, &in) < 0) {
@@ -319,8 +320,8 @@ static int cmd_buckets(const struct shell *sh, size_t argc, char **argv)
 	uint32_t skipped = 0;
 
 	for (uint64_t bid = first; bid < last; bid++) {
-		struct blob_db_bucket_stats bs;
-		int rc = blob_db_bucket_stat((uint16_t)bid, &bs, NULL, NULL);
+		struct blob_db_inspect_bucket bs;
+		int rc = blob_db_inspect_bucket_get((uint16_t)bid, &bs, NULL, NULL);
 
 		if (rc < 0) {
 			shell_error(sh, "%6llu  read error %d",
@@ -348,7 +349,7 @@ static int cmd_buckets(const struct shell *sh, size_t argc, char **argv)
 
 /* blob_db bucket <bid> ---------------------------------------------------- */
 
-static int print_slot(const struct blob_db_slot_info *s, void *user)
+static int print_slot(const struct blob_db_inspect_slot *s, void *user)
 {
 	const struct shell *sh = user;
 
@@ -360,8 +361,8 @@ static int print_slot(const struct blob_db_slot_info *s, void *user)
 
 static int cmd_bucket(const struct shell *sh, size_t argc, char **argv)
 {
-	struct blob_db_info in;
-	struct blob_db_bucket_stats bs;
+	struct blob_db_inspect_info in;
+	struct blob_db_inspect_bucket bs;
 	uint64_t bid;
 
 	ARG_UNUSED(argc);
@@ -381,8 +382,8 @@ static int cmd_bucket(const struct shell *sh, size_t argc, char **argv)
 		    (unsigned long long)(bid + in.n_sectors - in.n_buckets));
 	shell_print(sh, "  offset  size                   id   len flags state");
 
-	int rc = blob_db_bucket_stat((uint16_t)bid, &bs, print_slot,
-				     (void *)sh);
+	int rc = blob_db_inspect_bucket_get((uint16_t)bid, &bs, print_slot,
+					    (void *)sh);
 
 	if (rc < 0) {
 		shell_error(sh, "read: %d", rc);
@@ -414,7 +415,7 @@ struct id_filter {
 	uint32_t hits;
 };
 
-static int print_slot_of(const struct blob_db_slot_info *s, void *user)
+static int print_slot_of(const struct blob_db_inspect_slot *s, void *user)
 {
 	struct id_filter *f = user;
 
@@ -427,8 +428,8 @@ static int print_slot_of(const struct blob_db_slot_info *s, void *user)
 
 static int cmd_id(const struct shell *sh, size_t argc, char **argv)
 {
-	struct blob_db_info in;
-	struct blob_db_bucket_stats bs;
+	struct blob_db_inspect_info in;
+	struct blob_db_inspect_bucket bs;
 	struct id_filter f = { .sh = sh };
 
 	ARG_UNUSED(argc);
@@ -454,7 +455,7 @@ static int cmd_id(const struct shell *sh, size_t argc, char **argv)
 	}
 
 	shell_print(sh, "slots in bucket %u for this id (oldest first):", bid);
-	rc = blob_db_bucket_stat(bid, &bs, print_slot_of, &f);
+	rc = blob_db_inspect_bucket_get(bid, &bs, print_slot_of, &f);
 	if (rc < 0) {
 		shell_error(sh, "read: %d", rc);
 		return rc;

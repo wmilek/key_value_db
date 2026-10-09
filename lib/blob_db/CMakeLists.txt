@@ -5,4 +5,6 @@ zephyr_library_named(blob_db)
 zephyr_library_sources(blob_db.c)
 zephyr_library_sources_ifdef(CONFIG_BLOB_DB_BACKEND_FLASH_AREA blob_db_store_flash.c)
 zephyr_library_sources_ifdef(CONFIG_BLOB_DB_BACKEND_UBI        blob_db_store_ubi.c)
-zephyr_library_sources_ifdef(CONFIG_BLOB_DB_SHELL           blob_db_shell.c)
+# Diagnostics outside the blob_db contract (<app/lib/blob_db_inspect.h>).
+zephyr_library_sources_ifdef(CONFIG_BLOB_DB_INSPECT            blob_db_inspect.c)
+zephyr_library_sources_ifdef(CONFIG_BLOB_DB_SHELL              blob_db_shell.c)

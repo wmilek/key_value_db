@@ -428,9 +428,14 @@ Order is not id-sorted.
 
 ### 5.7a Inspection (`CONFIG_BLOB_DB_INSPECT`, `CONFIG_BLOB_DB_SHELL`)
 
-`blob_db_info_get()` returns the geometry and master state from RAM.
-`blob_db_bucket_stat()` reads one bucket sector and classifies every slot the
-way compaction would (§5.6) — *live* if it is the newest for its id and not a
+Kept out of the contract: `<app/lib/blob_db.h>` carries only what every
+implementation guarantees, and this lives in its own header,
+`<app/lib/blob_db_inspect.h>`, and its own source, `blob_db_inspect.c`, which
+reaches the core through a few internal hooks in `blob_db_internal.h`.
+
+`blob_db_inspect_info_get()` returns the geometry and master state from RAM.
+`blob_db_inspect_bucket_get()` reads one bucket sector and classifies every
+slot the way compaction would (§5.6) — *live* if it is the newest for its id and not a
 tombstone, otherwise *garbage* — and splits the slot stream into
 
 ```
@@ -541,7 +546,7 @@ BLOB_DB_MAX_OBJECT_LEN         int, default 131072   # validated at mount
 BLOB_DB_MAX_SEGMENTS           int, default 128      # 16 B of .bss each
 BLOB_DB_SEGMENT_LEN            int, default 0        # 0 = sector/4, clamped
 BLOB_DB_MULTI                  bool, default n   # batch ops (§5.8, contract D6)
-BLOB_DB_INSPECT                bool, default n   # info / bucket_stat (§5.7a)
+BLOB_DB_INSPECT                bool, default n   # blob_db_inspect.h (§5.7a)
 BLOB_DB_SHELL                  bool, depends on SHELL, select INSPECT
 module = BLOB_DB (standard LOG pattern)
 ```
