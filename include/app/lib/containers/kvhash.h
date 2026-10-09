@@ -6,6 +6,8 @@
 #ifndef APP_LIB_CONTAINERS_KVHASH_H_
 #define APP_LIB_CONTAINERS_KVHASH_H_
 
+#include <stdbool.h>
+
 #include <app/lib/containers/shape_map.h>
 
 #ifdef __cplusplus
@@ -44,6 +46,25 @@ void kvhash_set_inline_max(size_t key_max, size_t val_max);
  * enumeration order must fall back to comparing key bytes.
  */
 extern uint32_t kvhash_test_fp_mask;
+
+/**
+ * @brief Cut power after this many flash writes (default -1: never).
+ *
+ * Test builds only. Counts every blob_db update and delete kvhash issues;
+ * when it reaches 0, that write and every later one fail with -EINTR and do
+ * nothing, as if power had gone. blob_db writes are atomic, so cutting
+ * between writes reaches every state a real power loss can leave. A test then
+ * sets it back to -1 and remounts.
+ */
+extern int kvhash_test_cut_after;
+
+/**
+ * @brief Set when a cut refused a write; the test clears it.
+ *
+ * The operation's return value cannot say this: a release after the commit
+ * point swallows its error, so a cut there still returns 0.
+ */
+extern bool kvhash_test_cut_fired;
 #endif
 
 #ifdef __cplusplus

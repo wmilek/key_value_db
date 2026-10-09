@@ -112,6 +112,48 @@ uint32_t kvhash_test_fp_mask = 0xffffffffu;
 #define FP_MASK 0xffffffffu
 #endif
 
+/*
+ * Every flash write kvhash makes goes through these two, so a test can cut
+ * power between any two of them (kvhash_test_cut_after). blob_db makes each
+ * write atomic, so "between writes" is every state a power cut can leave.
+ */
+#if defined(CONFIG_BLOB_CONTAINER_KVHASH_TEST_HOOKS)
+int kvhash_test_cut_after = -1;
+bool kvhash_test_cut_fired;
+
+static int power_cut(void)
+{
+	if (kvhash_test_cut_after < 0) {
+		return 0;
+	}
+	if (kvhash_test_cut_after == 0) {
+		kvhash_test_cut_fired = true;
+		return -EINTR; /* power is off: this and every later write */
+	}
+	kvhash_test_cut_after--;
+	return 0;
+}
+#else
+static inline int power_cut(void)
+{
+	return 0;
+}
+#endif
+
+static int kv_update(uint64_t id, const void *payload, size_t len)
+{
+	int rc = power_cut();
+
+	return rc != 0 ? rc : blob_db_update(id, payload, len);
+}
+
+static int kv_delete(uint64_t id)
+{
+	int rc = power_cut();
+
+	return rc != 0 ? rc : blob_db_delete(id);
+}
+
 void kvhash_set_inline_max(size_t key_max, size_t val_max)
 {
 	key_inline_max = MIN(key_max, (size_t)ENT_LEN_MASK);
@@ -538,7 +580,7 @@ static void release_part(uint64_t id)
 		return;
 	}
 
-	int rc = blob_db_delete(id);
+	int rc = kv_delete(id);
 
 	if (rc != 0 && rc != -ENOENT) {
 		LOG_WRN("spilled blob %llu not released: %d", (unsigned long long)id, rc);
@@ -719,7 +761,7 @@ static int kvhash_create(uint64_t root, const struct map_config *cfg)
 
 	if (depth == 1) {
 		dir_format(dir_buf, n_top, 1);
-		rc = blob_db_update(root, dir_buf, dir_len(n_top));
+		rc = kv_update(root, dir_buf, dir_len(n_top));
 		if (rc == 0) {
 			LOG_DBG("created map root=%llu depth=1 buckets=%u",
 				(unsigned long long)root, n_top);
@@ -745,14 +787,14 @@ static int kvhash_create(uint64_t root, const struct map_config *cfg)
 		if (sub == 0) {
 			return -ENOSPC;
 		}
-		rc = blob_db_update(sub, bkt_buf, dir_len(n_sub));
+		rc = kv_update(sub, bkt_buf, dir_len(n_sub));
 		if (rc != 0) {
 			return rc;
 		}
 		dir_set_child(dir_buf, i, sub);
 	}
 
-	rc = blob_db_update(root, dir_buf, dir_len(n_top)); /* commit point */
+	rc = kv_update(root, dir_buf, dir_len(n_top)); /* commit point */
 	if (rc == 0) {
 		LOG_DBG("created map root=%llu depth=2 fanout=%u buckets=%u",
 			(unsigned long long)root, n_top,
@@ -879,7 +921,7 @@ static int kvhash_get(uint64_t root, const void *key, size_t klen,
  * the policy in force now, whatever placement the old one had.
  *
  *   spilled value, same placement, same length:
- *       blob_db_update(val_id)                     the whole mutation
+ *       blob_db_update(val_id)                the whole mutation
  *   otherwise:
  *       1. bind fresh blobs for any spilled part   unreferenced so far
  *       2. rewrite the bucket                      COMMIT
@@ -949,7 +991,7 @@ static int kvhash_set(uint64_t root, const void *key, size_t klen,
 				if (old_vid == 0) {
 					return -EIO;
 				}
-				return blob_db_update(old_vid, val, vlen);
+				return kv_update(old_vid, val, vlen);
 			}
 
 			/* Drop the old entry (in-place compaction). */
@@ -978,7 +1020,7 @@ static int kvhash_set(uint64_t root, const void *key, size_t klen,
 		if (kid == 0) {
 			return -EIO;
 		}
-		rc = blob_db_update(kid, key, klen);
+		rc = kv_update(kid, key, klen);
 		if (rc != 0) {
 			return rc;
 		}
@@ -990,7 +1032,7 @@ static int kvhash_set(uint64_t root, const void *key, size_t klen,
 			rc = -EIO;
 			goto undo;
 		}
-		rc = blob_db_update(vid, val, vlen);
+		rc = kv_update(vid, val, vlen);
 		if (rc != 0) {
 			vid = 0;
 			goto undo;
@@ -1028,7 +1070,7 @@ static int kvhash_set(uint64_t root, const void *key, size_t klen,
 		}
 	}
 
-	rc = blob_db_update(bid, bkt_buf, used);
+	rc = kv_update(bid, bkt_buf, used);
 	if (rc != 0) {
 		goto undo;
 	}
@@ -1041,7 +1083,7 @@ static int kvhash_set(uint64_t root, const void *key, size_t klen,
 		 * sub-map's, not the top's — the top is never written again
 		 * after create. */
 		dir_set_child(dir_buf, idx, bid);
-		rc = blob_db_update(leaf, dir_buf, dir_len(leaf_n));
+		rc = kv_update(leaf, dir_buf, dir_len(leaf_n));
 		if (rc != 0) {
 			goto undo;
 		}
@@ -1109,7 +1151,7 @@ static int kvhash_del(uint64_t root, const void *key, size_t klen)
 	memmove(&bkt_buf[off], &bkt_buf[off + e.len], used - off - e.len);
 	used -= e.len;
 
-	rc = blob_db_update(bid, bkt_buf, used);
+	rc = kv_update(bid, bkt_buf, used);
 	if (rc != 0) {
 		return rc;
 	}
@@ -1467,7 +1509,7 @@ static int release_bucket(uint64_t owner, uint16_t i, uint64_t bid)
 				continue;
 			}
 
-			int drc = blob_db_delete(ids[j]);
+			int drc = kv_delete(ids[j]);
 
 			if (drc != 0 && drc != -ENOENT && first_err == 0) {
 				first_err = drc;
@@ -1478,7 +1520,7 @@ static int release_bucket(uint64_t owner, uint16_t i, uint64_t bid)
 		return first_err; /* keep the bucket: it still names the rest */
 	}
 
-	rc = blob_db_delete(bid);
+	rc = kv_delete(bid);
 	if (rc != 0 && rc != -ENOENT) {
 		LOG_WRN("root=%llu: bucket %u (id %llu) not released: %d",
 			(unsigned long long)owner, i, (unsigned long long)bid, rc);
@@ -1542,7 +1584,7 @@ static int kvhash_destroy(uint64_t root)
 
 		memcpy(&dir_buf[0], &magic, sizeof(magic));
 
-		rc = blob_db_update(root, dir_buf, dir_len(n));
+		rc = kv_update(root, dir_buf, dir_len(n));
 		if (rc != 0) {
 			return rc; /* nothing released; the container is intact */
 		}
@@ -1599,7 +1641,7 @@ static int kvhash_destroy(uint64_t root)
 				continue;   /* leave the sub-map naming its rest */
 			}
 
-			int drc = blob_db_delete(sub);
+			int drc = kv_delete(sub);
 
 			if (drc != 0 && drc != -ENOENT && first_err == 0) {
 				first_err = drc;
@@ -1611,7 +1653,7 @@ static int kvhash_destroy(uint64_t root)
 		return first_err; /* still dying; the caller repeats */
 	}
 
-	rc = blob_db_delete(root);
+	rc = kv_delete(root);
 	if (rc == 0) {
 		LOG_DBG("destroyed map root=%llu depth=%u n=%u",
 			(unsigned long long)root, depth, n);

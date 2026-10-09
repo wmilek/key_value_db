@@ -73,10 +73,11 @@ config BLOB_CONTAINER_KVHASH_VAL_INLINE_MAX
 	  The default, 32767, never spills.
 
 config BLOB_CONTAINER_KVHASH_TEST_HOOKS
-	bool "Test hooks (fingerprint collisions)"
+	bool "Test hooks (fingerprint collisions, power cuts)"
 	help
-	  Exposes kvhash_test_fp_mask so a test can force key fingerprints
-	  to collide. Test builds only.
+	  Exposes kvhash_test_fp_mask, so a test can force key fingerprints
+	  to collide, and kvhash_test_cut_after, so it can cut power between
+	  any two of kvhash's flash writes. Test builds only.
 
 module = BLOB_CONTAINER_KVHASH
 module-str = BLOB_CONTAINER_KVHASH
