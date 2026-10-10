@@ -256,6 +256,12 @@ struct __packed blob_db_seg_hdr {
 BUILD_ASSERT(sizeof(struct blob_db_seg_hdr) == 12,
 	     "blob_db_seg_hdr layout drift");
 
+/* The lock every public call holds (recursive k_mutex). For the parts of the
+ * library outside blob_db.c that expose API of their own: the inspection
+ * calls, the UBI backend's maintenance calls and the background helper. */
+void blob_db_lock(void);
+void blob_db_unlock(void);
+
 /* Hooks for the inspection module (CONFIG_BLOB_DB_INSPECT) ---------------
  *
  * blob_db_inspect.c lives outside blob_db.c so that <app/lib/blob_db.h>
@@ -280,8 +286,8 @@ struct blob_db_core_state {
 /* Snapshot of the mount state. */
 void blob_db_core_state_get(struct blob_db_core_state *out);
 
-/* The core's sector-sized scratch buffer. Shared, so only usable between
- * blob_db calls (single-threaded contract). */
+/* The core's sector-sized scratch buffer. Shared, so only usable with the
+ * blob_db lock held. */
 uint8_t *blob_db_core_sector_buf(void);
 
 /* A committed slot, as the core's own walk sees it. */

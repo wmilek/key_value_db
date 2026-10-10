@@ -69,12 +69,23 @@ tests:
       # tests, and these are the scenarios that drive UBI hardest.
       - CONFIG_UBI_SELF_CHECKS=y
       - CONFIG_BLOB_DB_UBI_KEY_APP=y
-  # Compaction by ubi_leb_change() instead of the scratch-sector protocol
-  # (CONFIG_BLOB_DB_UBI_ATOMIC_REPLACE).
-  lib.blob_db.ubi.atomic_replace:
+  # Compaction through the scratch-sector protocol and an erase per replace,
+  # instead of the default ubi_leb_change() (CONFIG_BLOB_DB_UBI_ATOMIC_REPLACE).
+  # Nothing is deferred here, so the maintenance cases that need work skip.
+  lib.blob_db.ubi.no_atomic_replace:
     extra_configs:
       - CONFIG_BLOB_DB_BACKEND_UBI=y
       # zephyr-ubi's own bookkeeping checks after every call: meant for
       # tests, and these are the scenarios that drive UBI hardest.
       - CONFIG_UBI_SELF_CHECKS=y
-      - CONFIG_BLOB_DB_UBI_ATOMIC_REPLACE=y
+      - CONFIG_BLOB_DB_UBI_ATOMIC_REPLACE=n
+  # blob_db_maintain() run by its work-queue helper, on both backends.
+  lib.blob_db.maint_work:
+    extra_configs:
+      - CONFIG_BLOB_DB_BACKEND_FLASH_AREA=y
+      - CONFIG_BLOB_DB_MAINT_WORK=y
+  lib.blob_db.ubi.maint_work:
+    extra_configs:
+      - CONFIG_BLOB_DB_BACKEND_UBI=y
+      - CONFIG_UBI_SELF_CHECKS=y
+      - CONFIG_BLOB_DB_MAINT_WORK=y

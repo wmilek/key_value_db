@@ -90,7 +90,8 @@ not fit, the allocator **compacts** the bucket first — builds an image holding
 only the live slots, dropping tombstones and superseded ones, stages it in the
 scratch sector, then erases the bucket and writes the image back (§5.6). This
 is where a tombstone's bytes finally disappear, and — apart from `format`, and
-`prepare` pre-erasing empty sectors — the only thing that erases at all.
+`blob_db_maintain()` pre-erasing empty sectors — the only thing that erases at
+all.
 
 Compaction reclaims *space*, never *ids*. A deleted id stays permanently spent:
 the id counter is a durable ceiling that never moves backwards (§13.1), so an
@@ -461,8 +462,9 @@ blob_db iostats [reset]           flash I/O counters (CONFIG_BLOB_DB_IOSTATS)
 ```
 
 These are diagnostics on the implementation, not part of the contract (P6).
-Like the rest of the API they are unsynchronised: the shell runs on its own
-thread, so use them while the application is not calling blob_db.
+Like the rest of the API, each call takes the blob_db lock, so the shell may
+run them while the application uses the store. A command that reads several
+buckets sees each as it is then, not one snapshot.
 
 ### 5.8 Batch operations (optional, `CONFIG_BLOB_DB_MULTI`)
 

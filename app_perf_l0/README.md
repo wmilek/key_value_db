@@ -24,9 +24,9 @@ is the one parameter each L0 call has.
 | `write` | transfer size, `write_align` → one erase block, transfers packed back to back as `blob_db` writes them | the same question on the program path — and whether the cost is a line at all |
 | `write_pg` | transfer size, each transfer **pinned to a program-page boundary** | the page-program staircase, isolated: is one byte past a page boundary a whole extra program? |
 | `write_unaligned` | fixed size, offset by one alignment unit | the page-straddle penalty: one transfer, two program pages |
-| `erase` | **erase size** — blocks covered by one call | is a 16-block erase cheaper than sixteen 1-block erases? `blob_db_prepare()` does the latter, `blob_db_erase_all()` the former |
+| `erase` | **erase size** — blocks covered by one call | is a 16-block erase cheaper than sixteen 1-block erases? `blob_db_maintain()` does the latter, `blob_db_erase_all()` the former |
 | `erase1` | one block, repeated over every block in the region | the per-block anchor, and the **distribution** — each sample is emitted individually, because a model carries one number for erase and this is the spread that number stands in for |
-| `erase_erased` | one block that is already erased | does erasing blank flash cost anything less? `blob_db_prepare()` re-erases often enough that it is worth measuring rather than assuming |
+| `erase_erased` | one block that is already erased | does erasing blank flash cost anything less? `blob_db_maintain()` re-erases often enough that it is worth measuring rather than assuming |
 
 Every read and write point is measured **three times** (`CONFIG_APP_PERF_L0_PASSES`).
 The reported cost is the mean; the extremes appear beside it as a `spread`

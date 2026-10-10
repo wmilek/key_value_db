@@ -203,3 +203,76 @@ ZTEST(blob_db_ubi, test_trust_withdrawn_at_run_time_stops_writes)
 	zassert_mem_equal(buf, pl, sizeof(pl));
 #endif
 }
+
+/* The point of maintenance on UBI: with atomic replace, a compaction erases
+ * nothing itself — the block it releases waits for a reclaim — and
+ * blob_db_maintain() later pays exactly those erases. UBI's erase counters
+ * are the witness: an erase anywhere raises total_erase_count. */
+ZTEST(blob_db_ubi, test_compaction_defers_its_erase_to_maintain)
+{
+	Z_TEST_SKIP_IFNDEF(CONFIG_BLOB_DB_UBI_ATOMIC_REPLACE);
+
+	static uint8_t payload[CONFIG_BLOB_DB_MAX_PAYLOAD_LEN];
+	struct blob_db_maint_result res;
+	struct ubi_device_info before;
+	struct ubi_device_info after;
+	const uint64_t id = blob_db_alloc_id();
+
+	/* Start from an empty reclaim queue. */
+	do {
+		zassert_ok(blob_db_maintain(1, &res));
+	} while (res.more);
+	zassert_ok(blob_db_ubi_device_info(&before));
+	zassert_equal(before.reclaimable_pebs, 0);
+
+	/* Rebind until the bucket has compacted at least once. */
+	for (int i = 0; i < 64; i++) {
+		memset(payload, i, sizeof(payload));
+		zassert_ok(blob_db_update(id, payload, sizeof(payload)));
+		zassert_ok(blob_db_ubi_device_info(&after));
+		if (after.reclaimable_pebs >= 2) {
+			break;
+		}
+	}
+	zassert_true(after.reclaimable_pebs >= 2,
+		     "64 rebinds of a full payload must compact");
+	zassert_equal(after.total_erase_count, before.total_erase_count,
+		      "a blob_db call erased a block itself");
+
+	/* Maintenance pays them, one erase per step. */
+	uint32_t steps = 0;
+
+	do {
+		zassert_ok(blob_db_maintain(1, &res));
+		steps += res.performed;
+	} while (res.more);
+	zassert_ok(blob_db_ubi_device_info(&before));
+	zassert_equal(before.reclaimable_pebs, 0);
+	zassert_equal(steps, after.reclaimable_pebs);
+	zassert_equal(before.total_erase_count,
+		      after.total_erase_count + after.reclaimable_pebs);
+
+	/* payload still holds the last value bound. */
+	uint8_t buf[sizeof(payload)];
+	size_t got;
+
+	zassert_ok(blob_db_get(id, buf, sizeof(buf), &got));
+	zassert_mem_equal(buf, payload, sizeof(payload));
+}
+
+/* The by-name call: reports when not mounted, and budget 0 runs nothing. */
+ZTEST(blob_db_ubi, test_maintenance_by_name)
+{
+	struct ubi_maintenance_result res = { .performed = 9 };
+	struct ubi_device_info info;
+
+	zassert_ok(blob_db_ubi_maintenance(UBI_MAINTENANCE_DISCARD, 0, &res));
+	zassert_equal(res.performed, 0);
+	zassert_ok(blob_db_ubi_device_info(&info));
+	zassert_equal(res.remaining, info.corrupt_pebs);
+
+	blob_db_unmount();
+	zassert_equal(blob_db_ubi_maintenance(UBI_MAINTENANCE_RECLAIM, 1, &res),
+		      -ENODEV);
+	zassert_equal(blob_db_ubi_device_info(&info), -ENODEV);
+}

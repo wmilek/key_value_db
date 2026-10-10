@@ -40,7 +40,7 @@
  *                     straddle cases. This is the phase that says whether the
  *                     write cost has page structure at all.
  *   erase           — ERASE SIZE, swept as the number of erase blocks covered
- *                     by one call. This is the question blob_db_prepare() and
+ *                     by one call. This is the question blob_db_maintain() and
  *                     blob_db_erase_all() ask: is a 16-block erase cheaper
  *                     than sixteen 1-block erases, and by how much?
  *
@@ -533,7 +533,7 @@ static void fill_pattern(size_t len, uint8_t seed)
 
 /*
  * Erase is the only L0 operation whose cost the layers above can choose to
- * batch: blob_db_prepare() erases block by block, blob_db_erase_all() erases
+ * batch: blob_db_maintain() erases block by block, blob_db_erase_all() erases
  * the whole partition in one call. Whether that choice matters is a property
  * of the driver and the part, and this phase measures it two ways over the
  * same blocks:
@@ -656,7 +656,7 @@ static int phase_erase(void)
 
 		/* Erasing a block that is already erased. A part that checks
 		 * before erasing would short-circuit; NOR generally does not,
-		 * and blob_db_prepare() re-erases blocks often enough that the
+		 * and blob_db_maintain() re-erases blocks often enough that the
 		 * answer is worth having rather than assuming. */
 		span_start(&s);
 		int rc = flash_area_erase(g_fa, 0, g.block);

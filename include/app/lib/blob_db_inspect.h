@@ -116,8 +116,9 @@ typedef int (*blob_db_inspect_slot_cb_t)(
  * @brief Measure one bucket, optionally visiting each slot.
  *
  * Reads the whole sector; O(n²) in the bucket's slot count, like
- * `blob_db_count()`. Not for a hot path. Not thread-safe, like blob_db
- * itself: the caller serialises it against every other blob_db call.
+ * `blob_db_count()`. Not for a hot path. Holds the blob_db lock for the
+ * whole walk, so other threads' blob_db calls wait for it. @p cb runs with
+ * the sector staged in a buffer blob_db shares, so it must not call blob_db.
  *
  * @param bid   bucket index, `0 .. n_buckets - 1`
  * @param out   filled with the bucket's occupancy
