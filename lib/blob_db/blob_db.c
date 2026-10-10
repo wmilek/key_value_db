@@ -3452,69 +3452,6 @@ out:
 	return rc;
 }
 
-#if defined(CONFIG_BLOB_DB_MAINT_WORK)
-static void maint_work_handler(struct k_work *work);
-
-static K_WORK_DEFINE(g_maint_work, maint_work_handler);
-
-/* The queue the helper runs on; NULL while stopped. Guarded by g_lock. */
-static struct k_work_q *g_maint_q;
-
-void blob_db_maint_kick(void)
-{
-	if (g_maint_q != NULL) {
-		(void)k_work_submit_to_queue(g_maint_q, &g_maint_work);
-	}
-}
-
-/* One step per run, then back to the end of the queue, so the queue's other
- * items and every blob_db caller wait at most one erase. */
-static void maint_work_handler(struct k_work *work)
-{
-	ARG_UNUSED(work);
-
-	struct blob_db_maint_result res;
-	const int rc = blob_db_maintain(1, &res);
-
-	if (rc < 0) {
-		/* -ENODEV: unmounted since the kick; mount kicks again. */
-		if (rc != -ENODEV) {
-			LOG_WRN("background maintenance: %d", rc);
-		}
-		return;
-	}
-	if (res.more) {
-		blob_db_lock();
-		blob_db_maint_kick();
-		blob_db_unlock();
-	}
-}
-
-int blob_db_maint_start(struct k_work_q *queue)
-{
-	blob_db_lock();
-	g_maint_q = queue != NULL ? queue : &k_sys_work_q;
-	if (st.mounted) {
-		blob_db_maint_kick();
-	}
-	blob_db_unlock();
-	return 0;
-}
-
-void blob_db_maint_stop(void)
-{
-	struct k_work_sync sync;
-
-	/* Cleared under the lock, so a run that is already past its step
-	 * cannot resubmit; then wait for that run outside it, since the run
-	 * takes the lock itself. */
-	blob_db_lock();
-	g_maint_q = NULL;
-	blob_db_unlock();
-	(void)k_work_cancel_sync(&g_maint_work, &sync);
-}
-#endif /* CONFIG_BLOB_DB_MAINT_WORK */
-
 /* Public API: each call holds g_lock for its whole duration ---------------- */
 
 int blob_db_mount(void)

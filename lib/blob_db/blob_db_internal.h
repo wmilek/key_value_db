@@ -258,7 +258,7 @@ BUILD_ASSERT(sizeof(struct blob_db_seg_hdr) == 12,
 
 /* The lock every public call holds (recursive k_mutex). For the parts of the
  * library outside blob_db.c that expose API of their own: the inspection
- * calls and the UBI backend's maintenance calls. */
+ * calls, the UBI backend's maintenance calls and the background helper. */
 void blob_db_lock(void);
 void blob_db_unlock(void);
 
