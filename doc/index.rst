@@ -51,6 +51,7 @@ instructions live in the repository ``README.md``.
    proposals/2026-08-09-rootreg-kvdb-impact
    proposals/2026-08-09-implementation-plan
    proposals/2026-08-20-kvhash-second-level
+   proposals/2026-10-09-kvhash-spill
 
 .. toctree::
    :maxdepth: 1

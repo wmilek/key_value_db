@@ -23,6 +23,12 @@ not. Every other table in this file predates them and is unaffected: the
 new phases read only, and sit between phases that were already timed
 separately.
 
+**v1.2.0 adds a value-blob variant (`CONFIG_APP_PERF_KVDB_VALUE_BLOBS`):
+the map holds blob ids and every value is its own blob.** On `native_sim` it
+writes 2.9× fewer bytes per rewrite and does ~12 % more flash reads per get;
+scaled to the DK by blob transactions, a get is ≈1.33× slower. See "On values
+as blob ids"; nothing in it has run on the DK yet.
+
 **`blob_db` now defaults to the UBI backend, and the tables below are
 `flash_area`.** Both are measured — see "On the UBI backend", which is also
 where this app's most interesting result lives: **UBI halves the cost of
@@ -267,6 +273,115 @@ one-minute budget is back to about half spent.
 The native_sim capture is below; the DK capture, when it exists, belongs in
 its place and this section's scalings replaced by it.
 
+## On values as blob ids (`CONFIG_APP_PERF_KVDB_VALUE_BLOBS`)
+
+v1.2.0 adds a variant that stores **every value in its own blob**: the kvhash
+map holds key → u64 blob id, and the value is that blob's payload. This is the
+full indirection `l1_model_container.md` §2 and `l2_containers.md` §4.2 take as
+the ground case (for values; keys stay in the map), which kvhash v1 replaced
+with inline values without, as far as the docs record, measuring it. The
+workload, the verification and the intent protocol are unchanged; only
+`kv_get` / `kv_set` / `kv_delete` / `kv_next` in `src/main.c` differ:
+
+| op | inline (default) | value blobs |
+|---|---|---|
+| get | map get (3 blob reads at depth 2) | map get + value blob read (**4**) |
+| set, key exists | map get + bucket rewrite | map get + **value blob rewrite** (the map is not written) |
+| set, new key | map set | map get (miss) + value blob bind + map set |
+| delete | map delete | map get + map delete + value blob delete |
+
+An insert or delete interrupted between its two writes leaves an unreferenced
+value blob, never a wrong value. Nothing reclaims it; that cost is not modelled
+here.
+
+### No board yet: I/O counters, and what they predict
+
+`native_sim`, same setup as above. Both builds declare the same population, so
+both build the same **depth 2, fanout 16, 256 buckets** map, and the only
+difference is where the value lives. `VERIFY`, `COUNT` and `WALK PASS` at every
+generation (checked through gen 4). Rerun, gen 2 → 3:
+
+| phase | inline: reads / bytes read | value blobs: reads / bytes read | writes (inline → value blobs) | flash-only prediction, DK (inline → value blobs) | |
+|---|--:|--:|--:|--:|--:|
+| `verify`   | 26 102 / 558 063 | 29 530 / 565 231 | — | 1.949 → 2.188 s | ×1.12 |
+| `count`    |  2 406 /  52 631 |  2 213 /  38 027 | — | 0.180 → 0.163 s | ×0.91 |
+| `walk`     | 28 508 / 610 709 | 31 748 / 603 323 | — | 2.129 → 2.351 s | ×1.10 |
+| `modify`   |  7 894 / 157 883 |  7 219 / 140 805 | 196 / 22 420 B → 200 / 7 673 B, +1 erase | 0.892 → 0.737 s | ×0.83 |
+| `reverify` | 26 715 / 565 551 | 29 737 / 567 789 | — | 1.993 → 2.203 s | ×1.11 |
+| `recount`  |  2 602 /  55 016 |  2 216 /  38 080 | — | 0.194 → 0.163 s | ×0.84 |
+| `rewalk`   | 29 356 / 621 364 | 31 994 / 606 632 | — | 2.190 → 2.369 s | ×1.08 |
+| **sum**    | | | | **9.526 → 10.174 s** | **×1.07** |
+
+First run (store creation):
+
+| phase | inline | value blobs | flash-only prediction, DK |
+|---|--:|--:|--:|
+| `populate` | rd 25 248 / wr 1 027 (100 300 B) / er 1 | rd 46 982 / wr 1 800 (104 216 B) / er 4 | 3.342 → 5.355 s, ×1.60 |
+
+What the counters say:
+
+- **Writes shrink 2.9× in bytes, at the same count.** A rewrite of an existing
+  key writes a 24 B value blob instead of repacking its whole kvhash bucket
+  (22 420 B → 7 673 B for 196 rewrites). That is the one thing value blobs
+  buy outright, and the saving grows with the bucket size: the fuller the
+  buckets, the more an inline rewrite costs.
+- **Buckets stop drifting.** `count` grows +196 reads per generation inline
+  (each bucket rewrite appends a slot to its blob_db bucket log) and +3 with
+  value blobs, because `modify` no longer touches the buckets; the rewritten
+  value blobs drift instead, and only for the keys that were rewritten.
+- **The map is a third smaller.** 16 B per entry against 32 B here
+  (`klen`/`vlen` + `k000` + 8 B id, against + 24 B value); `count` reads
+  38 027 B against 52 631 B.
+- **Every get costs one more blob read**, so `verify` and `walk` do ~12 %
+  more flash reads. Bytes read barely move, because the extra read is small
+  and the buckets it scans are smaller.
+- **Creating the store costs 1.6×.** Every new key pays a map lookup that
+  misses before its value blob is bound and its id published: 1 800 writes
+  against 1 027, nearly twice the reads, and 4 erases against 1, as the extra
+  768 blobs fill more of blob_db's buckets.
+
+### What it means on the DK: probably slower, not ×1.07
+
+The flash-only column cannot be the forecast here. It leaves out the cost per
+blob transaction, and on this board that cost is most of the time. The one-level
+to two-level change measured on the DK ("On the two-level `kvhash`") added
+**one blob read per get** and took `verify` from 6 083 to 9 923 µs/op: about
+3.0–3.3 ms per blob read at both depths, against a flash-only prediction of
+≈2.5 ms for the whole three-read get. Value blobs add exactly one more blob read
+per get, so scaling by blob reads (3 → 4) puts **`verify` at ≈13 ms/op on the
+DK, ≈1.33× slower** — a scaling, not a measurement. `modify` makes the same
+number of blob transactions in both layouts (one map get and one write) and
+writes less, so it should hold or improve. Applied to this app's read-heavy
+rerun, the result is roughly **19.7 s → ≈25 s**.
+
+So, for this workload: **value blobs trade read latency for write volume.** They
+are worth it where values are large, rewritten often, or would crowd a kvhash
+bucket (the `-ENOSPC` limit: a value blob takes 8 B of bucket space whatever its
+size). They are not worth it for small values on a read-heavy store, which is
+why `l2_containers.md` §4.2 planned an inline threshold (`KVLIST_INLINE_MAX`,
+64 B) rather than either extreme. The DK capture, when it exists, should
+replace this scaling.
+
+### The same layout, done by kvhash itself
+
+kvhash can now spill values on its own (`doc/proposals/2026-10-09-kvhash-spill.md`).
+Building the inline app with `-DCONFIG_BLOB_CONTAINER_KVHASH_VAL_INLINE_MAX=0`
+puts every value in a blob of its own, the layout of this section, without the
+app's wrappers. Every read and write count matches `VALUE_BLOBS` (the gen 2 → 3
+rerun above, phase for phase, with `modify` ~1.5 % fewer reads), except store
+creation:
+
+| `populate` | inline | `VALUE_BLOBS` (app) | `VAL_INLINE_MAX=0` (kvhash) |
+|---|--:|--:|--:|
+| flash reads | 25 248 | 46 982 | **26 788** |
+| writes | 1 027 | 1 800 | 1 800 |
+| flash-only prediction, DK | 3.342 s | 5.355 s | **3.849 s** |
+
+The app had to look a key up before inserting it to learn whether a value blob
+already existed; kvhash finds that out in the bucket it is already rewriting.
+So the indirection's cost at creation is the extra writes, not extra lookups.
+At the default thresholds (never spill) every counter in this file is unchanged.
+
 ## Raw native_sim capture — rerun (gen 2 -> 3), I/O counters
 
 ```
@@ -294,6 +409,37 @@ bench recount  :    1 ops in      0 ms  ->     0.000 ops/s  (      0 us/op)
 COUNT PASS (gen 3): 770 keys
 bench rewalk   :  771 ops in      0 ms  ->     0.000 ops/s  (      0 us/op)
    io rewalk   : rd  29356 ops/  621364 B   wr     0 ops/       0 B   er    0 ops/       0 B
+WALK PASS (gen 3): 770 entries, each exactly once
+done — store at gen 3; rerun to verify persistence
+```
+
+## Raw native_sim capture — value blobs, rerun (gen 2 -> 3), I/O counters
+
+```
+*** Booting Zephyr OS build bbc6385f0a2c ***
+kvdb perf 1.2.0  (N_KEYS=768  VAL_LEN=16  STRIDE=4  val=24 B  layout=value blobs)
+mount+open   :              0 ms
+map geometry : depth 2, fanout 16, 256 buckets, entry limit 1020 B
+state: rerun, store at gen 2
+bench verify   :  769 ops in      0 ms  ->     0.000 ops/s  (      0 us/op)
+   io verify   : rd  29530 ops/  565231 B   wr     0 ops/       0 B   er    0 ops/       0 B
+VERIFY PASS (gen 2)
+bench count    :    1 ops in      0 ms  ->     0.000 ops/s  (      0 us/op)
+   io count    : rd   2213 ops/   38027 B   wr     0 ops/       0 B   er    0 ops/       0 B
+COUNT PASS (gen 2): 769 keys
+bench walk     :  770 ops in      0 ms  ->     0.000 ops/s  (      0 us/op)
+   io walk     : rd  31748 ops/  603323 B   wr     0 ops/       0 B   er    0 ops/       0 B
+WALK PASS (gen 2): 769 entries, each exactly once
+bench modify   :  196 ops in      0 ms  ->     0.000 ops/s  (      0 us/op)
+   io modify   : rd   7219 ops/  140805 B   wr   200 ops/    7673 B   er    1 ops/    3968 B
+bench reverify :  769 ops in      0 ms  ->     0.000 ops/s  (      0 us/op)
+   io reverify : rd  29737 ops/  567789 B   wr     0 ops/       0 B   er    0 ops/       0 B
+VERIFY PASS (gen 3)
+bench recount  :    1 ops in      0 ms  ->     0.000 ops/s  (      0 us/op)
+   io recount  : rd   2216 ops/   38080 B   wr     0 ops/       0 B   er    0 ops/       0 B
+COUNT PASS (gen 3): 770 keys
+bench rewalk   :  771 ops in      0 ms  ->     0.000 ops/s  (      0 us/op)
+   io rewalk   : rd  31994 ops/  606632 B   wr     0 ops/       0 B   er    0 ops/       0 B
 WALK PASS (gen 3): 770 entries, each exactly once
 done — store at gen 3; rerun to verify persistence
 ```
@@ -442,6 +588,10 @@ west build -p always -b native_sim -d build/kvdb_sim app_perf_kvdb
 python3 app_perf_l0/tools/l0_timing.py predict \
     -m app_perf_l0/models/mx25r64_nrf5340dk_full.json rerun.log
 ```
+
+For the value-blob variant add `-- -DCONFIG_APP_PERF_KVDB_VALUE_BLOBS=y` to
+either build (`twister` runs it as `perf.kvdb.value_blobs`). It opens its own
+store, so it can share a flash image with the inline build.
 
 ## Power-loss field note
 

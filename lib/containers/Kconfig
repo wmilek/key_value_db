@@ -34,6 +34,51 @@ config BLOB_CONTAINER_KVHASH
 	  caller declares in map_config, and is fixed thereafter.
 
 if BLOB_CONTAINER_KVHASH
+
+config BLOB_CONTAINER_KVHASH_KEY_INLINE_MAX
+	int "Longest key stored inside its bucket"
+	default 32767
+	range 0 32767
+	help
+	  A key longer than this is written to a blob of its own, and its
+	  bucket entry keeps only its length, a 32-bit fingerprint and the
+	  blob id (12 B). Lookups compare the fingerprint first and read the
+	  key blob only on a match.
+
+	  A write policy, not a format: every entry records where its key
+	  lives, and readers go by that record alone. Changing this value
+	  changes how new writes are stored; entries written under any
+	  earlier value stay readable, and move to the new placement only
+	  when their key is next set. Applies to maps created as kvhash v3;
+	  v2 maps are never spilled.
+
+	  The default, 32767, never spills. Keys of 12 B or less never gain
+	  from spilling.
+
+config BLOB_CONTAINER_KVHASH_VAL_INLINE_MAX
+	int "Longest value stored inside its bucket"
+	default 32767
+	range 0 32767
+	help
+	  A value longer than this is written to a blob of its own, and its
+	  bucket entry keeps only the blob id (8 B). A get of such a value
+	  costs one more blob read; a set that keeps its length rewrites
+	  only the value blob. A spilled value may exceed one blob_db slot
+	  when BLOB_DB_LARGE_PAYLOADS is enabled.
+
+	  Like BLOB_CONTAINER_KVHASH_KEY_INLINE_MAX, a write policy only:
+	  it can change between builds, or at run time through
+	  kvhash_set_inline_max(), without touching stored data.
+
+	  The default, 32767, never spills.
+
+config BLOB_CONTAINER_KVHASH_TEST_HOOKS
+	bool "Test hooks (fingerprint collisions, power cuts)"
+	help
+	  Exposes kvhash_test_fp_mask, so a test can force key fingerprints
+	  to collide, and kvhash_test_cut_after, so it can cut power between
+	  any two of kvhash's flash writes. Test builds only.
+
 module = BLOB_CONTAINER_KVHASH
 module-str = BLOB_CONTAINER_KVHASH
 source "subsys/logging/Kconfig.template.log_config"

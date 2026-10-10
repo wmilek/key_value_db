@@ -19,8 +19,22 @@ which, so a reader never has to guess:
 directory blob (the root, and at depth 2 each sub-directory):
   [u32 magic] [u16 n] [u8 version] [u8 depth] [u64 child_id]*n
 bucket blob (packed pair list):
-  ( [u16 klen] [u16 vlen] [key bytes] [val bytes] )*
+  ( [u16 klen|KS] [u16 vlen|VS] [key part] [value part] )*
+    key part   KS=0: key bytes      KS=1: [u32 key_fp] [u64 key_id]
+    value part VS=0: value bytes    VS=1: [u64 val_id]
 ```
+
+**Spilling (v3).** A key longer than `CONFIG_BLOB_CONTAINER_KVHASH_KEY_INLINE_MAX`
+or a value longer than `..._VAL_INLINE_MAX` is written to a blob of its own; its
+entry keeps the true length (low 15 bits), a flag (bit 15) and the blob id, plus
+a CRC-32C fingerprint for a key. The thresholds are a write policy only: every
+read goes by the flags, the thresholds are consulted solely when `set` builds a
+new entry, and an entry moves to the current placement only when its key is next
+set. They can change between builds, or at run time with
+`kvhash_set_inline_max()`, without touching stored data. Both default to 32767,
+which never spills. Maps created as v2 are still served, but never spilled, so
+v2 firmware can keep parsing them. Full design:
+`doc/proposals/2026-10-09-kvhash-spill.md`.
 
 At `depth 1` each `child_id` is a bucket. At `depth 2` each is a sub-directory —
 itself a well-formed `depth 1` directory, so one loader serves both levels — and
