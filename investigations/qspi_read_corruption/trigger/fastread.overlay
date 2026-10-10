@@ -1,0 +1,3 @@
+&mx25r64 {
+	readoc = "fastread";
+};

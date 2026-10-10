@@ -1,0 +1,19 @@
+/*
+ * Same partition move as the demo app: run the benchmark against the on-board
+ * MX25R64 QSPI NOR (8 MB, 64 KB sectors) so the numbers reflect real flash.
+ */
+
+/delete-node/ &storage_partition;
+
+&mx25r64 {
+	partitions {
+		compatible = "fixed-partitions";
+		#address-cells = <1>;
+		#size-cells = <1>;
+
+		storage_partition: partition@0 {
+			label = "storage";
+			reg = <0x00000000 0x00800000>;
+		};
+	};
+};
