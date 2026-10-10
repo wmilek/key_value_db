@@ -97,6 +97,16 @@ step leaves a valid (possibly non-empty) log that `open` recovers and a rerun
 of `reset` finishes; it can never brick. This path is the one
 `eventlog_ll_clear_all` drives, so its crash-safety is load-bearing.
 
+**Destroy** follows the same discipline from the other end. Deleting the chain
+first and the root last would leave the same deleted-head brick on a crash, so
+`logring_destroy` deletes the **root first** — the single delete that makes the
+whole log cease to exist — then reclaims the pending-eviction run (read from
+the root before it went) and the live chain best-effort. A crash after the root
+delete orphans those blobs (a bounded leak a store-level GC reclaims), but
+`open` on the gone root returns `-ENOENT`: destroyed, never bricked. If the
+root delete itself fails, the chain is left untouched so the log stays intact
+and destroy is retryable.
+
 ## 6. Open / recovery
 
 `open` loads and type-checks the root, finishes any interrupted eviction
@@ -152,10 +162,12 @@ the caller's own integrity check.
   `blob_db` op, not between logring's op sequence. The unit suite covers
   recovery via unmount/mount (handle rebuild, interrupted-eviction re-run); a
   host harness additionally injects a power loss at every `blob_db`
-  update/delete boundary of `reset` and asserts the log is never bricked (it
-  reopens, drains to `-ENOENT` not `-ESTALE`, still appends and evicts, and a
-  rerun empties it). A logring-level cut hook inside the on-target suite, to
-  assert each §4/§5 step's residue, is still a follow-up.
+  update/delete boundary of `reset` and `destroy` and asserts the log is never
+  bricked (`reset`: reopens, drains to `-ENOENT` not `-ESTALE`, still appends
+  and evicts, and a rerun empties it; `destroy`: reopens either gone
+  (`-ENOENT`) or fully usable, and a rerun finishes it). A logring-level cut
+  hook inside the on-target suite, to assert each §4/§5 step's residue, is
+  still a follow-up.
 - **Waypoint far behind.** If the live set shrinks below one checkpoint
   interval the waypoint could be evicted; `open` then falls back to a walk from
   `head_id`. Rare; handled, not optimized.

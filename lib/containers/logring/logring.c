@@ -367,21 +367,43 @@ int logring_destroy(logring_t *h)
 		return -EINVAL;
 	}
 
-	/* Finish any pending eviction, then delete the live chain, then the
-	 * root. Best-effort on individual deletes. */
+	/* Crash-safe, commit-before-cleanup. Deleting the chain first and the
+	 * root last would, on a power loss, leave a root whose head points at an
+	 * already-deleted entry — a reopen would then brick exactly as a half-done
+	 * reset does. Instead delete the root *first*: that single delete is the
+	 * commit that makes the whole log cease to exist, so no reopen can misread
+	 * it (open sees -ENOENT). The chain and any pending-eviction run are then
+	 * reclaimed best-effort; a crash during cleanup orphans those blobs (a
+	 * bounded leak a store-level GC reclaims later), but never bricks. */
 	struct clog_root r;
+	uint64_t evict_from = 0, evict_to = 0;
 
-	if (root_load(h->root, &r) == 0 && r.evict_from != 0) {
-		run_delete(r.evict_from, r.evict_to);
+	if (root_load(h->root, &r) == 0) {
+		evict_from = r.evict_from;
+		evict_to = r.evict_to;
 	}
 
+	int rc = blob_db_delete(h->root);   /* COMMIT: the log is now gone */
+
+	if (rc < 0 && rc != -ENOENT) {
+		/* Root still present and unremovable: do NOT touch the chain, or a
+		 * reopen would brick. The log stays intact and destroy is retryable. */
+		return rc;
+	}
+
+	/* The root is gone (or was already gone from an interrupted destroy);
+	 * cleanup order is now immaterial. Reclaim the detached eviction run... */
+	if (evict_from != 0) {
+		run_delete(evict_from, evict_to);
+	}
+
+	/* ...and the live chain. */
 	uint64_t cur = h->head_id;
 
 	while (cur != 0 && cur != h->next_free) {
 		uint64_t nxt;
-		int rc = entry_read(cur, &nxt, NULL, 0, NULL);
 
-		if (rc < 0) {
+		if (entry_read(cur, &nxt, NULL, 0, NULL) < 0) {
 			break;
 		}
 		uint64_t del = cur;
@@ -389,7 +411,7 @@ int logring_destroy(logring_t *h)
 		cur = nxt;
 		(void)blob_db_delete(del);
 	}
-	return blob_db_delete(h->root);
+	return 0;
 }
 
 /* ---- append ------------------------------------------------------------ */

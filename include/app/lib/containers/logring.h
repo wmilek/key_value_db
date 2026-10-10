@@ -179,8 +179,15 @@ int logring_open(uint64_t root, logring_t *h);
 /**
  * @brief Delete every entry and the root. The handle is invalid afterwards.
  *
+ * Crash-safe: the root is removed first (the point at which the log ceases to
+ * exist), then the entries are reclaimed. A power loss during reclaim orphans
+ * a bounded set of blobs (recoverable by a store-level GC) but never leaves a
+ * reopenable yet broken log — a reopen after any crash either succeeds on an
+ * intact log or returns `-ENOENT`. Re-running after a partial destroy finishes
+ * it.
+ *
  * @param h  open log handle
- * @retval 0        destroyed
+ * @retval 0        destroyed (or already gone)
  * @retval -EINVAL  @p h is NULL
  * @retval -ENODEV  blob_db not mounted
  * @retval -EIO     flash I/O error
