@@ -1,0 +1,111 @@
+*** Booting Zephyr OS build 4a405846193f ***
+SWEEP control 0x180080:
+SWEEP A off 0x80 blk 0x18 BAD stable=1 got 42 44 42 48 1f 00 00 00 01 00 00 00 ff bb 74 ff want 42 44 42 48 14 00 00 00 01 00 00 00 5b ab 54 7e
+SWEEP   partner blk 0x1f (xor 0x07)
+SWEEP C off 0x80 blk 0x18 ok
+SWEEP A off 0x80 blk 0x10 BAD stable=1 got 42 44 42 48 1f 00 00 00 01 00 00 00 c7 a3 9b f5 want 42 44 42 48 0c 00 00 00 01 00 00 00 c5 81 0a d1
+SWEEP   partner blk 0x17 (xor 0x07)
+SWEEP A off 0x80 blk 0x11 BAD stable=1 got 42 44 42 48 1f 00 00 00 01 00 00 00 5b a3 b1 7d want 42 44 42 48 0d 00 00 00 01 00 00 00 5b 81 a0 1d
+SWEEP   partner blk 0x17 (xor 0x06)
+SWEEP A off 0x80 blk 0x12 BAD stable=1 got 42 44 42 48 1f 00 00 00 01 00 00 00 fa a6 bf f7 want 42 44 42 48 0e 00 00 00 01 00 00 00 b8 86 2f 93
+SWEEP   partner blk 0x17 (xor 0x05)
+SWEEP A off 0x80 blk 0x13 BAD stable=1 got 42 44 42 48 1f 00 00 00 01 00 00 00 66 a6 95 7f want 42 44 42 48 0f 00 00 00 01 00 00 00 26 86 85 5f
+SWEEP   partner blk 0x17 (xor 0x04)
+SWEEP A off 0x80 blk 0x14 BAD stable=1 got 42 44 42 48 13 00 00 00 01 00 00 00 e3 a7 9f fe want 42 44 42 48 10 00 00 00 01 00 00 00 a1 a5 1e fa
+SWEEP   partner blk 0x17 (xor 0x03)
+SWEEP A off 0x80 blk 0x15 BAD stable=1 got 42 44 42 48 13 00 00 00 01 00 00 00 7f a7 b5 76 want 42 44 42 48 11 00 00 00 01 00 00 00 3f a5 b4 36
+SWEEP   partner blk 0x17 (xor 0x02)
+SWEEP A off 0x80 blk 0x16 BAD stable=1 got 42 44 42 48 13 00 00 00 01 00 00 00 de a2 bb fc want 42 44 42 48 12 00 00 00 01 00 00 00 dc a2 3b b8
+SWEEP   partner blk 0x17 (xor 0x01)
+SWEEP A off 0x80 blk 0x18 BAD stable=1 got 42 44 42 48 1f 00 00 00 01 00 00 00 ff bb 74 ff want 42 44 42 48 14 00 00 00 01 00 00 00 5b ab 54 7e
+SWEEP   partner blk 0x1f (xor 0x07)
+SWEEP A off 0x80 blk 0x19 BAD stable=1 got 42 44 42 48 1f 00 00 00 01 00 00 00 f7 bb fe b7 want 42 44 42 48 15 00 00 00 01 00 00 00 c5 ab fe b2
+SWEEP   partner blk 0x1f (xor 0x06)
+SWEEP A off 0x80 blk 0x1a BAD stable=1 got 42 44 42 48 1f 00 00 00 01 00 00 00 f7 bd 75 bf want 42 44 42 48 16 00 00 00 01 00 00 00 26 ac 71 3c
+SWEEP   partner blk 0x1f (xor 0x05)
+SWEEP A off 0x80 blk 0x1b BAD stable=1 got 42 44 42 48 1f 00 00 00 01 00 00 00 ff bd ff f7 want 42 44 42 48 17 00 00 00 01 00 00 00 b8 ac db f0
+SWEEP   partner blk 0x1f (xor 0x04)
+SWEEP A off 0x80 blk 0x1c BAD stable=1 got 42 44 42 48 1b 00 00 00 01 00 00 00 f7 bf ff af want 42 44 42 48 18 00 00 00 01 00 00 00 14 be fb 29
+SWEEP   partner blk 0x1f (xor 0x03)
+SWEEP A off 0x80 blk 0x1d BAD stable=1 got 42 44 42 48 1b 00 00 00 01 00 00 00 ff bf 75 e7 want 42 44 42 48 19 00 00 00 01 00 00 00 8a be 51 e5
+SWEEP   partner blk 0x1f (xor 0x02)
+SWEEP A off 0x80 blk 0x1e BAD stable=1 got 42 44 42 48 1b 00 00 00 01 00 00 00 ff b9 fe ef want 42 44 42 48 1a 00 00 00 01 00 00 00 69 b9 de 6b
+SWEEP   partner blk 0x1f (xor 0x01)
+SWEEP summary burst A off 0x80: 14/128 blocks bad (8 erased)
+SWEEP A off 0x90 blk 0x10 BAD stable=1 got 01 00 88 00 1f 00 00 00 00 00 00 00 41 48 56 4b want 01 00 88 00 0c 00 00 00 00 00 00 00 41 48 56 4b
+SWEEP   partner blk 0x17 (xor 0x07)
+SWEEP A off 0x90 blk 0x11 BAD stable=1 got 01 00 88 00 1f 00 00 00 00 00 00 00 41 48 56 4b want 01 00 88 00 0d 00 00 00 00 00 00 00 41 48 56 4b
+SWEEP   partner blk 0x16 (xor 0x07)
+SWEEP   partner blk 0x17 (xor 0x06)
+SWEEP A off 0x90 blk 0x12 BAD stable=1 got 01 00 88 00 1f 00 00 00 00 00 00 00 41 48 56 4b want 01 00 88 00 0e 00 00 00 00 00 00 00 41 48 56 4b
+SWEEP   partner blk 0x15 (xor 0x07)
+SWEEP   partner blk 0x17 (xor 0x05)
+SWEEP A off 0x90 blk 0x13 BAD stable=1 got 01 00 88 00 1f 00 00 00 00 00 00 00 41 48 56 4b want 01 00 88 00 0f 00 00 00 00 00 00 00 41 48 56 4b
+SWEEP   partner blk 0x14 (xor 0x07)
+SWEEP   partner blk 0x15 (xor 0x06)
+SWEEP   partner blk 0x16 (xor 0x05)
+SWEEP   partner blk 0x17 (xor 0x04)
+SWEEP A off 0x90 blk 0x14 BAD stable=1 got 01 00 88 00 13 00 00 00 00 00 00 00 41 48 56 4b want 01 00 88 00 10 00 00 00 00 00 00 00 41 48 56 4b
+SWEEP   partner blk 0x07 (xor 0x13)
+SWEEP   partner blk 0x17 (xor 0x03)
+SWEEP A off 0x90 blk 0x15 BAD stable=1 got 01 00 88 00 13 00 00 00 00 00 00 00 41 48 56 4b want 01 00 88 00 11 00 00 00 00 00 00 00 41 48 56 4b
+SWEEP   partner blk 0x07 (xor 0x12)
+SWEEP   partner blk 0x16 (xor 0x03)
+SWEEP   partner blk 0x17 (xor 0x02)
+SWEEP A off 0x90 blk 0x16 BAD stable=1 got 01 00 88 00 13 00 00 00 00 00 00 00 41 48 56 4b want 01 00 88 00 12 00 00 00 00 00 00 00 41 48 56 4b
+SWEEP   partner blk 0x07 (xor 0x11)
+SWEEP   partner blk 0x15 (xor 0x03)
+SWEEP   partner blk 0x17 (xor 0x01)
+SWEEP A off 0x90 blk 0x18 BAD stable=1 got 01 00 20 00 1f 00 00 00 00 00 00 00 04 00 18 00 want 01 00 20 00 14 00 00 00 00 00 00 00 04 00 18 00
+SWEEP   partner blk 0x1f (xor 0x07)
+SWEEP   partner blk 0x23 (xor 0x3b)
+SWEEP A off 0x90 blk 0x19 BAD stable=1 got 01 00 20 00 1f 00 00 00 00 00 00 00 04 00 18 00 want 01 00 20 00 15 00 00 00 00 00 00 00 04 00 18 00
+SWEEP   partner blk 0x1e (xor 0x07)
+SWEEP   partner blk 0x1f (xor 0x06)
+SWEEP   partner blk 0x22 (xor 0x3b)
+SWEEP   partner blk 0x23 (xor 0x3a)
+SWEEP A off 0x90 blk 0x1a BAD stable=1 got 01 00 20 00 1f 00 00 00 00 00 00 00 04 00 18 00 want 01 00 20 00 16 00 00 00 00 00 00 00 04 00 18 00
+SWEEP   partner blk 0x1d (xor 0x07)
+SWEEP   partner blk 0x1f (xor 0x05)
+SWEEP   partner blk 0x21 (xor 0x3b)
+SWEEP   partner blk 0x23 (xor 0x39)
+SWEEP A off 0x90 blk 0x1b BAD stable=1 got 01 00 20 00 1f 00 00 00 00 00 00 00 04 00 18 00 want 01 00 20 00 17 00 00 00 00 00 00 00 04 00 18 00
+SWEEP   partner blk 0x1c (xor 0x07)
+SWEEP   partner blk 0x1d (xor 0x06)
+SWEEP   partner blk 0x1e (xor 0x05)
+SWEEP   partner blk 0x1f (xor 0x04)
+SWEEP   partner blk 0x20 (xor 0x3b)
+SWEEP   partner blk 0x21 (xor 0x3a)
+SWEEP   partner blk 0x22 (xor 0x39)
+SWEEP   partner blk 0x23 (xor 0x38)
+SWEEP A off 0x90 blk 0x1c BAD stable=1 got 01 00 20 00 1b 00 00 00 00 00 00 00 04 00 18 00 want 01 00 20 00 18 00 00 00 00 00 00 00 04 00 18 00
+SWEEP   partner blk 0x1f (xor 0x03)
+SWEEP A off 0x90 blk 0x1d BAD stable=1 got 01 00 20 00 1b 00 00 00 00 00 00 00 04 00 18 00 want 01 00 20 00 19 00 00 00 00 00 00 00 04 00 18 00
+SWEEP   partner blk 0x1e (xor 0x03)
+SWEEP   partner blk 0x1f (xor 0x02)
+SWEEP A off 0x90 blk 0x1e BAD stable=1 got 01 00 20 00 1b 00 00 00 00 00 00 00 04 00 18 00 want 01 00 20 00 1a 00 00 00 00 00 00 00 04 00 18 00
+SWEEP   partner blk 0x1d (xor 0x03)
+SWEEP   partner blk 0x1f (xor 0x01)
+SWEEP summary burst A off 0x90: 14/128 blocks bad (8 erased)
+SWEEP A off 0x100 blk 0x18 BAD stable=1 got 7b 7b 7c 7f 7f 7f 80 81 8f 83 84 85 28 09 ff ff want 7a 7b 7c 7d 7e 7f 80 81 82 83 84 85 20 01 ff ff
+SWEEP   partner blk 0x1f (xor 0x07)
+SWEEP A off 0x100 blk 0x19 BAD stable=1 got 7b 75 75 77 77 78 79 7a ff 7c 7d 7e ea 69 ff ff want 73 74 75 76 77 78 79 7a 7b 7c 7d 7e e2 69 ff ff
+SWEEP   partner blk 0x1f (xor 0x06)
+SWEEP A off 0x100 blk 0x1a BAD stable=1 got 6b 33 37 37 01 00 00 00 cf 01 00 00 49 4b 4b 4f want 6b 33 33 34 01 00 00 00 4e 01 00 00 41 42 43 44
+SWEEP   partner blk 0x1f (xor 0x05)
+SWEEP A off 0x100 blk 0x1b BAD stable=1 got 6b 33 37 37 01 00 00 00 cf 01 00 00 48 49 4a 4b want 6b 33 33 35 01 00 00 00 4f 01 00 00 48 49 4a 4b
+SWEEP   partner blk 0x1f (xor 0x04)
+SWEEP A off 0x100 blk 0x1c BAD stable=1 got 6b 31 37 3b 01 00 00 00 8f 00 00 00 ed ef ef eb want 6b 31 33 38 01 00 00 00 8a 00 00 00 e5 e6 e7 e8
+SWEEP   partner blk 0x1f (xor 0x03)
+SWEEP A off 0x100 blk 0x1d BAD stable=1 got 6b 31 37 3b 01 00 00 00 8f 00 00 00 ec ed ee ef want 6b 31 33 39 01 00 00 00 8b 00 00 00 ec ed ee ef
+SWEEP   partner blk 0x1f (xor 0x02)
+SWEEP A off 0x100 blk 0x1e BAD stable=1 got 6b 31 34 33 01 00 00 00 8f 00 00 00 09 0b 0b 0f want 6b 31 34 32 01 00 00 00 8e 00 00 00 01 02 03 04
+SWEEP   partner blk 0x1f (xor 0x01)
+SWEEP summary burst A off 0x100: 7/128 blocks bad (10 erased)
+SWEEP summary burst B off 0x80: 0/128 blocks bad (8 erased)
+SWEEP summary burst B off 0x90: 0/128 blocks bad (8 erased)
+SWEEP summary burst B off 0x100: 0/128 blocks bad (10 erased)
+SWEEP summary burst C off 0x80: 0/128 blocks bad (8 erased)
+SWEEP summary burst C off 0x90: 0/128 blocks bad (8 erased)
+SWEEP summary burst C off 0x100: 0/128 blocks bad (10 erased)
+SWEEP DONE

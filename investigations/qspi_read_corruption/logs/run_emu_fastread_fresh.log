@@ -1,0 +1,50 @@
+*** Booting Zephyr OS build 4a405846193f ***
+kvdb perf 1.1.0  (N_KEYS=768  VAL_LEN=16  STRIDE=4  val=24 B)
+EMU geometry: leb 65408, 121 lebs, +128
+[00:00:03.524,932] <inf> rootreg: virgin store — registry bootstrapped at id 1
+mount+open   :          24479 ms
+map geometry : depth 2, fanout 16, 256 buckets, entry limit 1020 B
+state: empty store -> initial population
+bench prepare  :   99 ops in 110834 ms  ->     0.893 ops/s  (1119535 us/op)
+FADBL 20000 reads, 0 mismatches
+bench populate :  770 ops in   9273 ms  ->    83.036 ops/s  (  12042 us/op)
+FADBL 40000 reads, 0 mismatches
+FADBL 60000 reads, 0 mismatches
+bench verify   :  769 ops in   6904 ms  ->   111.384 ops/s  (   8977 us/op)
+VERIFY PASS (gen 1)
+bench count    :    1 ops in    691 ms  ->     1.447 ops/s  ( 691000 us/op)
+COUNT PASS (gen 1): 770 keys
+FADBL 80000 reads, 0 mismatches
+FADBL 100000 reads, 0 mismatches
+FADBL mismatch #1 (read 112630) off=0x470080 len=16 dst=0x20029808
+  got : 42 44 42 48 7d 00 00 00 01 00 00 00 bf da 7f bb
+  re1 : 42 44 42 48 44 00 00 00 01 00 00 00 9d 58 72 2b
+  re2 : 42 44 42 48 44 00 00 00 01 00 00 00 9d 58 72 2b
+  h-24 off=0x6e013c len=2 dst=0x200297fe head=02 52 40 00 86 00 00 00
+  h-23 off=0x130700 len=12 dst=0x200297d4 head=01 00 88 00 10 00 00 00
+  h-22 off=0x130798 len=12 dst=0x200297d4 head=01 00 88 00 10 00 00 00
+  h-21 off=0x130830 len=12 dst=0x200297d4 head=01 00 88 00 10 00 00 00
+  h-20 off=0x1308c8 len=12 dst=0x200297d4 head=01 00 88 00 10 00 00 00
+  h-19 off=0x130960 len=12 dst=0x200297d4 head=01 00 88 00 10 00 00 00
+  h-18 off=0x1309f8 len=12 dst=0x200297d4 head=01 00 20 00 fc 00 00 00
+  h-17 off=0x130a28 len=12 dst=0x200297d4 head=01 00 88 00 10 00 00 00
+  h-16 off=0x130ac0 len=12 dst=0x200297d4 head=01 00 88 00 10 00 00 00
+  h-15 off=0x130b58 len=12 dst=0x200297d4 head=01 00 40 00 fc 00 00 00
+  h-14 off=0x130ba8 len=12 dst=0x200297d4 head=01 00 60 00 86 00 00 00
+  h-13 off=0x130c18 len=12 dst=0x200297d4 head=01 00 60 00 fc 00 00 00
+  h-12 off=0x130c88 len=12 dst=0x200297d4 head=01 00 80 00 fc 00 00 00
+  h-11 off=0x130d18 len=12 dst=0x200297d4 head=ff ff ff ff ff ff ff ff
+  h-10 off=0x130acc len=136 dst=0x200109a0 head=41 48 56 4b 10 00 02 01
+  h-09 off=0x130b54 len=2 dst=0x2002981e head=81 67 88 00 10 00 00 00
+  h-08 off=0x6e0080 len=16 dst=0x20029808 head=42 44 42 48 6b 00 00 00
+  h-07 off=0x6e0090 len=12 dst=0x200297b4 head=01 00 20 00 6b 00 00 00
+  h-06 off=0x6e00c0 len=12 dst=0x200297b4 head=01 00 20 00 e1 00 00 00
+  h-05 off=0x6e00f0 len=12 dst=0x200297b4 head=01 00 40 00 6b 00 00 00
+  h-04 off=0x6e0140 len=12 dst=0x200297b4 head=01 00 40 00 e1 00 00 00
+  h-03 off=0x6e0190 len=12 dst=0x200297b4 head=01 00 60 00 e1 00 00 00
+  h-02 off=0x6e0200 len=12 dst=0x200297b4 head=ff ff ff ff ff ff ff ff
+  h-01 off=0x6e00fc len=64 dst=0x200109a0 head=04 00 18 00 6b 31 30 33
+[00:02:38.779,296] <err> app_perf_kvdb: walk: next(k427) rc=-2
+bench walk     :  619 ops in   6284 ms  ->    98.504 ops/s  (  10151 us/op)
+[00:02:38.792,755] <err> app_perf_kvdb: walk: 152 keys never returned
+WALK FAIL (gen 1): 618 entries, 2 bad
