@@ -144,6 +144,28 @@ west update
 
 [ubi]: https://github.com/kamil-kielbasa/zephyr-ubi
 
+#### Zephyr patches (required for nRF5340-DK)
+
+Before building for the nRF5340-DK, apply the patches listed in
+[`zephyr/patches.yml`](zephyr/patches.yml). Do it again after every
+`west update`, because the update checks Zephyr out clean:
+
+```shell
+west patch apply
+```
+
+At the moment there is one patch. It makes Zephyr's `nrf_qspi_nor` driver
+honour `mxicy,mx25r-power-mode`, and every nRF5340-DK overlay here sets that
+to `"high-performance"`.
+
+Without the patch, the property is silently ignored. The on-board MX25R6435F
+then stays in its ultra-low-power default, where some dense read sequences
+return corrupted data: the OR of two 64 KB blocks, for one read. The full
+investigation is in [PR #44][pr44]. The patch goes away once the change is in
+Zephyr main.
+
+[pr44]: https://github.com/wmilek/key_value_db/pull/44
+
 ### Build and run
 
 From the workspace top directory:

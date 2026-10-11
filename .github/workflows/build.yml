@@ -97,6 +97,13 @@ jobs:
           west init -l key_value_db
           west update --narrow -o=--depth=1
 
+      # The nRF5340-DK overlays set mxicy,mx25r-power-mode, which upstream
+      # nrf_qspi_nor ignores until the patch in zephyr/patches.yml lands.
+      # Applying it here also catches the day it stops applying to main.
+      - name: Apply Zephyr patches
+        run: |
+          west patch apply
+
       - name: Build app — flash_area backend (ARM)
         run: |
           west build -p always -b nrf5340dk/nrf5340/cpuapp -d build/nrf_flash key_value_db/app -- \
