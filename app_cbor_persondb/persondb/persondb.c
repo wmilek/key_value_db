@@ -488,17 +488,23 @@ int persondb_erase(struct persondb **db, uint32_t n_persons)
 	return persondb_open(db, n_persons);
 }
 
-int persondb_prepare(int *buckets_formatted)
+int persondb_prepare(int *steps)
 {
-	/* How many buckets to ask for is a guess: blob_db reports neither its
-	 * bucket count nor which are already formatted (FINDINGS.md B3/B7).
-	 * Asking for more than exist is harmless — the call caps at the total. */
-	int n = blob_db_prepare((size_t)-1);
+	/* blob_db tracks what is left, so there is no count to guess
+	 * (FINDINGS.md B7): run it until it says there is nothing. */
+	struct blob_db_maint_result res;
+	int done = 0;
+	int rc;
 
-	if (buckets_formatted) {
-		*buckets_formatted = (n < 0) ? 0 : n;
+	do {
+		rc = blob_db_maintain(1, &res);
+		done += (int)res.performed;
+	} while (rc == 0 && res.more);
+
+	if (steps) {
+		*steps = done;
 	}
-	return n < 0 ? n : 0;
+	return rc;
 }
 
 /* -- enrollment --------------------------------------------------------- */

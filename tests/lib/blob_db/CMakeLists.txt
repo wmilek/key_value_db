@@ -10,6 +10,8 @@ project(blob_db_test)
 # is built and linked automatically when CONFIG_BLOB_DB=y. Re-adding lib/
 # here would create a duplicate `blob_db` target, so we only add the test.
 target_sources(app PRIVATE src/main.c)
+# blob_db_maintain(), its work-queue helper and the library lock.
+target_sources(app PRIVATE src/maint.c)
 # The UBI backend's own behaviour: refusing a substrate it cannot read, and the
 # application hooks of <app/lib/blob_db_ubi.h>.
 target_sources_ifdef(CONFIG_BLOB_DB_BACKEND_UBI app PRIVATE src/ubi.c)

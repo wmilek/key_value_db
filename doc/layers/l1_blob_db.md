@@ -235,9 +235,20 @@ parse and verify. Consequently a caller must treat mount failure as a real
 outcome — the pre-v1 behaviour of silently reformatting anything unparseable
 is gone.
 
-**Concurrency contract (v1):** single-threaded — caller serializes. v2 may
-add a `k_mutex`. Corollary used by client recovery: at most one mutation is
-in flight per database.
+**Concurrency contract:** every call holds one library-wide recursive
+`k_mutex` for its whole duration, so calls may come from any thread and run
+one at a time. Corollary used by client recovery, unchanged from v1's
+caller-serialized contract: at most one mutation is in flight per database.
+The lock makes each call atomic, not a sequence of calls: a container
+mutation spanning several calls still serializes itself.
+
+**Maintenance:** `blob_db_maintain(budget, &result)` does up to `budget`
+steps of the erases an implementation can do ahead of time — at most one
+erase each — and reports whether any are left. What a step is belongs to the
+implementation; the contract is that it changes nothing a reader sees, so an
+application may run it whenever it has idle time, until nothing is left, to
+keep those erases out of its real operations. It replaces `blob_db_prepare(n)`,
+which left the caller to guess `n` and was called only by benchmarks.
 
 **Planned extension** (specified, not yet part of the header): pread-style
 partial access, implementable by any allocator — see decision D4 (§5.4).

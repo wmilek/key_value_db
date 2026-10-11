@@ -20,7 +20,7 @@
 #include "blob_db_internal.h"
 #include "blob_db_store.h"
 
-int blob_db_inspect_info_get(struct blob_db_inspect_info *out)
+static int info_get_impl(struct blob_db_inspect_info *out)
 {
 	struct blob_db_core_state st;
 
@@ -53,9 +53,8 @@ int blob_db_inspect_info_get(struct blob_db_inspect_info *out)
 	return 0;
 }
 
-int blob_db_inspect_bucket_get(uint16_t bid,
-			       struct blob_db_inspect_bucket *out,
-			       blob_db_inspect_slot_cb_t cb, void *user)
+static int bucket_get_impl(uint16_t bid, struct blob_db_inspect_bucket *out,
+			   blob_db_inspect_slot_cb_t cb, void *user)
 {
 	struct blob_db_core_state st;
 
@@ -175,4 +174,26 @@ int blob_db_inspect_bucket_get(uint16_t bid,
 	out->free_bytes = capacity - out->live_bytes - out->garbage_bytes -
 			  out->tail_bytes;
 	return 0;
+}
+
+/* Under the blob_db lock: the bucket walk stages the sector in the core's
+ * shared buffer, and both read the mount state. */
+int blob_db_inspect_info_get(struct blob_db_inspect_info *out)
+{
+	blob_db_lock();
+	const int rc = info_get_impl(out);
+
+	blob_db_unlock();
+	return rc;
+}
+
+int blob_db_inspect_bucket_get(uint16_t bid,
+			       struct blob_db_inspect_bucket *out,
+			       blob_db_inspect_slot_cb_t cb, void *user)
+{
+	blob_db_lock();
+	const int rc = bucket_get_impl(bid, out, cb, user);
+
+	blob_db_unlock();
+	return rc;
 }

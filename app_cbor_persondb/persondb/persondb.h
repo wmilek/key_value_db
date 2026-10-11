@@ -143,10 +143,12 @@ int persondb_close(struct persondb *db);
 int persondb_erase(struct persondb **db, uint32_t n_persons);
 
 /**
- * @brief Pre-format flash erase blocks so first-touch erases leave the hot
- *        path (~1.1 s each on the DK — FINDINGS.md B7).
+ * @brief Do the erases blob_db can do ahead of time, so first-touch erases
+ *        leave the hot path (~1.1 s each on the DK — FINDINGS.md B7).
+ *
+ * @param[out] steps blob_db_maintain() steps run, one erase each; may be NULL.
  */
-int persondb_prepare(int *buckets_formatted);
+int persondb_prepare(int *steps);
 
 /* -- enrollment --------------------------------------------------------- */
 

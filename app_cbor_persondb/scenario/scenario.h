@@ -80,9 +80,9 @@ int scenario_fill(struct scenario *s, uint32_t budget,
 
 /** Pre-erase the store's flash blocks so first-touch erases leave the timed
  *  loops — and so their cost shows up as its own line rather than inside the
- *  fill. Reports how many were formatted.
+ *  fill. Reports how many blob_db_maintain() steps that took.
  */
-int scenario_prepare(struct scenario *s, int *buckets_formatted, int64_t *ms);
+int scenario_prepare(struct scenario *s, int *steps, int64_t *ms);
 
 /* -- verification ------------------------------------------------------- */
 

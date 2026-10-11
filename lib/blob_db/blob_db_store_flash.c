@@ -77,6 +77,9 @@ int blob_db_store_open(struct blob_db_store_geom *geom, bool discard)
 	geom->peb_size = peb_size;
 	geom->write_align = write_align;
 	geom->n_pebs = (uint16_t)(fa_size / peb_size);
+	/* A never-written bucket costs its first update a sector erase;
+	 * blob_db_maintain() takes it off that path. */
+	geom->preformat = true;
 	return 0;
 
 err_close:
@@ -126,4 +129,15 @@ int blob_db_store_replace(off_t off, const void *buf, size_t len)
 bool blob_db_store_replace_is_atomic(void)
 {
 	return false;
+}
+
+/* Everything this backend could defer is the core's: formatting fresh
+ * buckets (geom->preformat). */
+int blob_db_store_maintain(uint32_t budget, uint32_t *performed, bool *more)
+{
+	ARG_UNUSED(budget);
+
+	*performed = 0;
+	*more = false;
+	return 0;
 }

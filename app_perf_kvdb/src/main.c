@@ -8,7 +8,7 @@
  * "gen"). Every value in the store is fully predicted by (key index,
  * generation), so a rerun can prove the previous run's content survived:
  *
- *   run 1 (empty store) : blob_db_prepare() the write path, then populate
+ *   run 1 (empty store) : blob_db_maintain() the write path, then populate
  *                         N_KEYS keys, stamp gen = 1 (geometry recorded;
  *                         a build with different N_KEYS/VAL_LEN wipes the
  *                         store and repopulates instead of failing verify)
@@ -166,6 +166,23 @@ static uint32_t last_writer(uint32_t i, uint32_t G)
 		}
 	}
 	return 1;
+}
+
+/* Run blob_db_maintain() until nothing is left; returns the steps taken. */
+static int maintain_all(void)
+{
+	struct blob_db_maint_result res;
+	int steps = 0;
+
+	do {
+		const int rc = blob_db_maintain(1, &res);
+
+		if (rc < 0) {
+			return rc;
+		}
+		steps += (int)res.performed;
+	} while (res.more);
+	return steps;
 }
 
 static void bench_line(const char *what, int ops, int64_t ms)
@@ -609,10 +626,11 @@ static int enumerate(kvdb_t *db, uint32_t G, const char *count_label,
 
 /* First run: fill the empty store and stamp gen = 1. Timed.
  *
- * blob_db_prepare() first pre-formats the blob_db buckets the id allocator
- * will land in, so the timed loop measures the warm write path — without it
- * every first touch of a 64 KB QSPI sector pays a ~1 s erase inside the
- * loop (see app_perf/RESULTS.md). Reported as its own bench line. */
+ * blob_db_maintain() first does the erases blob_db can do ahead — fresh
+ * buckets on flash_area, waiting blocks on UBI — so the timed loop measures
+ * the warm write path; without it every first touch of a 64 KB QSPI sector
+ * pays a ~1 s erase inside the loop (see app_perf/RESULTS.md). Reported as
+ * its own bench line. */
 static int populate(kvdb_t *db)
 {
 	char key[8];
@@ -620,13 +638,13 @@ static int populate(kvdb_t *db)
 	int ops = 0;
 
 	int64_t t = k_uptime_get();
-	int prepared = blob_db_prepare(N_KEYS * 2);
+	int maintained = maintain_all();
 
-	if (prepared < 0) {
-		LOG_ERR("prepare: %d", prepared);
-		return prepared;
+	if (maintained < 0) {
+		LOG_ERR("maintain: %d", maintained);
+		return maintained;
 	}
-	bench_line("prepare", prepared, k_uptime_delta(&t));
+	bench_line("maint", maintained, k_uptime_delta(&t));
 
 	t = k_uptime_get();
 	io_reset();

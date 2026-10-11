@@ -102,10 +102,10 @@ int scenario_erase(struct scenario *s)
 	return rc;
 }
 
-int scenario_prepare(struct scenario *s, int *buckets_formatted, int64_t *ms)
+int scenario_prepare(struct scenario *s, int *steps, int64_t *ms)
 {
 	int64_t t = scenario_now_us();
-	int rc = persondb_prepare(buckets_formatted);
+	int rc = persondb_prepare(steps);
 
 	ARG_UNUSED(s);
 	if (ms) {

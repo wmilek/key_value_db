@@ -28,6 +28,7 @@
 
 #include <stdbool.h>
 #include <stddef.h>
+#include <stdint.h>
 #include <sys/types.h>
 
 /* Geometry reported by the backend at open time. */
@@ -35,6 +36,11 @@ struct blob_db_store_geom {
 	size_t   peb_size;    /* usable bytes per PEB (erase block / LEB) */
 	size_t   write_align; /* minimum write granularity in bytes */
 	uint16_t n_pebs;      /* total addressable PEBs */
+	/* Whether blob_db_maintain() should format never-written buckets ahead
+	 * of use. True where that is what takes the erase off the first write
+	 * (flash_area). A backend that hands out erased blocks of its own (UBI)
+	 * says false: formatting ahead would only use those blocks up early. */
+	bool     preformat;
 };
 
 /*
@@ -79,6 +85,27 @@ int blob_db_store_replace(off_t off, const void *buf, size_t len);
  * compaction replaces a bucket in one call instead of staging the image
  * through the scratch sector. */
 bool blob_db_store_replace_is_atomic(void);
+
+/*
+ * Run up to budget steps of the backend's own deferred work; one step erases
+ * at most one block. *performed is set to the steps run, *more to whether
+ * work is left. The work must not change what blob_db reads back. Called with
+ * the blob_db lock held. A backend with nothing to defer reports 0 and false.
+ */
+int blob_db_store_maintain(uint32_t budget, uint32_t *performed, bool *more);
+
+/*
+ * Tell the background maintenance helper (CONFIG_BLOB_DB_MAINT_WORK) there may
+ * be work: a backend calls it when it has just deferred some, e.g. queued a
+ * block for erase. Called with the blob_db lock held; never blocks.
+ */
+#if defined(CONFIG_BLOB_DB_MAINT_WORK)
+void blob_db_maint_kick(void);
+#else
+static inline void blob_db_maint_kick(void)
+{
+}
+#endif
 
 /* I/O accounting, counted here so it covers both backends and every caller
  * uniformly (CONFIG_BLOB_DB_IOSTATS; compiles to nothing when disabled). */

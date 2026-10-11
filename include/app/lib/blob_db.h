@@ -74,8 +74,14 @@ extern "C" {
  *
  * @section blob_db_concurrency Concurrency
  *
- * v1 is **single-threaded**: the caller must serialize all calls. The
- * library does no locking internally.
+ * Every call takes one library-wide recursive mutex for its whole duration,
+ * so calls may come from any thread and run one at a time. A call made from
+ * inside `blob_db_iterate()`'s callback, on the same thread, does not
+ * deadlock. Not callable from an ISR.
+ *
+ * The lock makes each call atomic, not a sequence of them: a component that
+ * needs several calls to see a consistent store (a container mutation, say)
+ * still serializes those itself.
  *
  * See `doc/layers/l1_blob_db.md` for the on-flash format, algorithms, and crash
  * recovery details.
@@ -418,41 +424,84 @@ int blob_db_format(void);
 int blob_db_erase_all(void);
 
 /**
- * @brief Pre-format the next @p n buckets the allocator will use.
- *
- * `blob_db_update()` on an id whose bucket has never been written to must
- * first erase-and-header that sector — on 64 KB QSPI NOR this dominates the
- * cost of a cold first write (roughly one second per bucket at 8 MHz Quad-SPI
- * on mx25r64). This call amortizes that cost off the hot path: it walks the
- * @p n buckets ahead of the current allocation cursor (`bid = id % n_buckets`
- * for ids `next_id … next_id + n − 1`) and formats any that don't already
- * have a valid header.
- *
- * Idempotent: buckets already prepared (or already holding live data) are
- * skipped. Safe to call repeatedly from an idle context to keep a rolling
- * "N-ahead" ready window; the return value tells the caller how many
- * sectors were actually erased this call, so progress is observable.
- *
- * @p n is capped at the total bucket count — beyond that the loop would
- * revisit buckets already covered on this call. The root bucket
- * (`BLOB_DB_ROOT_ID % n_buckets`) is always skipped: it stays formatted for
- * the lifetime of the mount, and `alloc_id` never returns the root id, so
- * it never appears in the "next N" window anyway.
- *
- * Prepared sectors persist across a remount — the bucket header is on
- * flash, not in RAM. Prior contents of a prepared sector are discarded. On
- * flash_area and on UBI by default the sector is erased; with
- * CONFIG_BLOB_DB_UBI_ATOMIC_REPLACE UBI maps it to a fresh block instead,
- * and the old block's bytes stay readable from raw flash until UBI reclaims
- * it.
- *
- * @param n  desired number of ready-to-write buckets ahead of the cursor
- *
- * @retval >=0     number of buckets actually formatted this call
- * @retval -ENODEV not mounted
- * @retval -EIO    flash I/O error
+ * @brief Outcome of one `blob_db_maintain()` call.
  */
-int blob_db_prepare(size_t n);
+struct blob_db_maint_result {
+	/** Steps run, at most the budget. */
+	uint32_t performed;
+	/** Work may be left. A call that finds none clears it. */
+	bool more;
+};
+
+/**
+ * @brief Do up to @p budget steps of the erases blob_db can do ahead of time.
+ *
+ * Some erases need not happen inside the call that would otherwise pay for
+ * them. This runs them now, so that an application can keep them out of its
+ * real operations by calling it while the system is idle, until
+ * `more` is false. One step erases at most one block; on large-sector NOR
+ * that is up to a second.
+ *
+ * What a step does depends on the storage backend, not on the caller:
+ * - **flash_area:** formats one bucket that has never been written, the ones
+ *   the next allocations land in first, so its first `update` does not pay
+ *   the erase. Once every bucket has been written there is nothing left: the
+ *   erases of compaction cannot be done ahead on raw flash.
+ * - **UBI:** erases one block waiting for reclaim, and once none is left
+ *   moves one block for wear levelling. With
+ *   `CONFIG_BLOB_DB_UBI_ATOMIC_REPLACE` (the default) and
+ *   `CONFIG_BLOB_DB_UBI_RELOCATE_BUDGET=0`, this is every erase blob_db's
+ *   own calls would make, for as long as UBI's free pool lasts
+ *   (`CONFIG_BLOB_DB_UBI_SPARE_LEBS`).
+ *
+ * Nothing it does changes what blob_db reads back. The blob_db lock is held
+ * for the whole call, so other threads' calls wait for at most @p budget
+ * erases; a budget of 1 per call keeps that to one.
+ *
+ * Work appears after mount, format and erase_all, and on UBI after writes.
+ * `CONFIG_BLOB_DB_MAINT_WORK` adds a helper that runs this on a work queue
+ * whenever there is work (`blob_db_maint_start()`).
+ *
+ * @param budget  most steps to run; 0 runs none and only reports `more`
+ * @param result  steps run and whether work is left; may be NULL
+ *
+ * @retval 0       success, including nothing to do
+ * @retval -ENODEV not mounted
+ * @retval -EIO    flash I/O error, or a torn compaction refuses writes
+ * @retval <0      other negative errno from the backend (UBI: -EROFS once
+ *                 the device is read-only)
+ */
+int blob_db_maintain(uint32_t budget, struct blob_db_maint_result *result);
+
+#if defined(CONFIG_BLOB_DB_MAINT_WORK) || defined(__DOXYGEN__)
+struct k_work_q;
+
+/**
+ * @brief Run `blob_db_maintain()` in the background on a work queue.
+ *
+ * Each run of the work item does one step and, while work is left, submits
+ * itself again behind the queue's other items, so they wait at most one erase
+ * each time. blob_db submits it whenever work appears. Stays started across
+ * unmount and mount.
+ *
+ * The queue's thread runs the step, so its stack must hold one; see
+ * `CONFIG_BLOB_DB_MAINT_WORK` for the size. The system work queue's default
+ * may be too small, and any other item on it waits out the erase.
+ *
+ * @param queue  queue to run on; NULL for the system work queue
+ *
+ * @retval 0 success
+ */
+int blob_db_maint_start(struct k_work_q *queue);
+
+/**
+ * @brief Stop the background helper, waiting for a run in progress.
+ *
+ * Must not be called from the queue the helper runs on.
+ */
+void blob_db_maint_stop(void);
+#endif
+
 
 /** @} */ /* end of lib_blob_db */
 
