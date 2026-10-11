@@ -2,6 +2,7 @@
 
 > **DO NOT MERGE.** This directory holds evidence and reproducers for a
 > hardware-level read corruption, not production code.
+> **Root cause found:** the MX25R ultra-low-power mode. See *Root cause and fix* below.
 
 ## Summary
 
@@ -17,6 +18,51 @@ of earlier reads.
 - **It's one-shot:** the next read of the same address is correct.
 - **It isn't one bad unit.** It reproduces on two DKs and on Zephyr main and
   v4.4.0.
+
+### Root cause and fix
+
+**The MX25R6435F runs in its power-on default, *ultra-low-power* mode, and
+that mode causes the corruption.** In this mode, CR2 bit 1, the L/H switch, is
+0. Zephyr's `nrf_qspi_nor` driver ignores the `mxicy,mx25r-power-mode` property
+(only the generic `spi_nor` driver acts on it), so the chip stays in that mode.
+
+Switching the flash to **high-performance mode** removes the corruption
+completely on both boards. Read timing is unchanged, so it's the mode, not
+speed:
+
+| Test | ULP (default) | High-performance |
+|---|---|---|
+| Replay, board 1 / board 2 | fails every pass | **0 bad, 9/9 passes** on both |
+| Relocated-trigger sweep, board 1 / board 2 | 79 / 61 corrupted blocks | **0 / 0** |
+| Original app (`app_perf_kvdb` walk, shifted layout), board 1 / board 2 | WALK FAIL at read 51892 / 79699 | **WALK PASS** (770 entries each exactly once, 0 mismatches) |
+
+Fix: `fix/0001-drivers-flash-nrf_qspi_nor-support-mxicy-mx25r-power.patch`.
+- It is a Zephyr patch, based on `4a405846193f`.
+- It adds support for `mxicy,mx25r-power-mode` to `nrf_qspi_nor`: read SR and
+  CR, and if the L/H bit differs, write SR/CR1/CR2 with WRSR.
+- Enable it per board with `fix/mx25r_hp.overlay`:
+
+```dts
+&mx25r64 {
+	mxicy,mx25r-power-mode = "high-performance";
+};
+```
+
+The trade-off is higher flash active current. The chip keeps the mode across
+an SoC reset, because the flash isn't power-cycled. The driver applies it at
+every init.
+
+The OR of two real blocks fits the internal array selecting two 64 KB blocks
+at once: the previous block select isn't released before the next read is
+sensed. That's plausible for the slower ultra-low-power internal circuits under
+dense back-to-back reads. Bus-level timing is not the cause:
+- Chip-select high time between transactions (`sck-delay`, `IFCONFIG1.SCKDELAY`,
+  Zephyr default 0) made no difference from 62.5 ns up to 8 µs
+  (`experiments/sck_delay/`, `logs/b1_replay_sck*.log`).
+- 8 MHz SCK is within ultra-low-power limits, so this still looks like a
+  Macronix erratum or supply-margin issue worth reporting.
+
+### Background
 
 It was found because PR #40's `app_perf_kvdb` walk phase failed on the UBI
 backend. UBI turned out to be irrelevant. What matters is that UBI puts data
@@ -96,13 +142,12 @@ The plain flash backend reproduces it once given the same layout.
 | Alignment, read size | Neither matters. |
 | Zephyr regression | Main `4a405846193f` and v4.4.0 (with hal_nordic `44fd3d4`) both fail. |
 | One faulty board | Two DKs fail: J-Link SN 960115021 and 1050091053. |
+| CS-high time between QSPI transactions | `sck-delay` 1–128 (62.5 ns–8 µs) changed nothing. |
 
 ### Open questions
-- Is it a Macronix MX25R64 erratum, or the nRF5340 QSPI peripheral's timing,
-  for example chip-select high time between transfers?
-  - To test: scope CS and SCK, raise the flash supply voltage, try a different
-    flash part.
-- Temperature and voltage sensitivity.
+- Does a higher flash supply voltage also avoid it in ultra-low-power mode?
+  Does temperature matter?
+- Does Macronix document this as an erratum?
 
 ## Impact on key_value_db
 
@@ -110,7 +155,8 @@ The plain flash backend reproduces it once given the same layout.
 reports an invalid header (`blob_db_update()` and two other call sites). One
 corrupted read therefore **erases a whole bucket sector**: silent data loss.
 
-Recommended fixes, in separate PRs:
+Even with the driver fix, these are recommended as defence in depth, in
+separate PRs:
 1. Format a bucket only if its header reads as all-0xFF. Otherwise re-read,
    then return `-EIO`.
 2. Re-read on any CRC or magic mismatch before treating data as corrupt. The
@@ -127,6 +173,10 @@ Recommended fixes, in separate PRs:
 | `apps/replay` | Replays the trace with a 0, 20 and 100 µs gap, 3 passes each, and checks every bucket header's CRC. `-DEXTRA_CFLAGS=-DREPLAY_MINIMIZE` builds the delta-debugging minimizer instead. |
 | `apps/sweep_blocks` | Runs the trigger, then reads each of the 128 blocks at +0x80, +0x90 and +0x100 and identifies the partner block. The variants are: A = the real tail; B = a synthetic burst; C = the tail with a 100 µs gap. **Variant B is flawed:** its target pre-read resets the state, so its "0 bad" proves nothing. |
 | `apps/sweep_relocate` | Shifts the trigger by k blocks to map affected regions. |
+| `apps/replay_power_mode` | The replay, but it first reads SR/CR and sets the MX25R L/H mode from the app (`-DHP_MODE=1` = high-performance), then restores ULP. It calls nrfx directly, wrapped in the anomaly-159 clock setup; otherwise nrfx returns `-EPERM`. |
+| `apps/sweep_relocate_power_mode` | The relocation sweep in high-performance mode. |
+| `fix/` | The Zephyr driver patch and the overlay that enables it. |
+| `experiments/sck_delay/` | `sck-delay` overlays for the CS-high-time experiment. |
 | `scripts/dkrun.sh` | Captures the console, flashes the board and waits for a regex. Select the board with `SN=… PORT=…`. |
 | `logs/` | Key logs. `b1_`/`b2_` = board 1 or 2; `run_` = board 1. |
 
@@ -160,3 +210,7 @@ Environment:
 - Zephyr SDK 1.0.1 in `ghcr.io/zephyrproject-rtos/ci:latest`.
 - Zephyr main `4a405846193f` (4.4.99) and v4.4.0.
 - Board DT: `readoc = "read4io"`, SCK 8 MHz.
+- The fix verification (`logs/b*_drv_*`) used `CONFIG_BLOB_DB_BACKEND_FLASH_AREA=y`
+  and `CONFIG_LOG_MODE_IMMEDIATE=y`, so the `.config` matched the original
+  failing build. The control build (`drv_app_noov`, patched driver with no
+  overlay) still fails at the original read.

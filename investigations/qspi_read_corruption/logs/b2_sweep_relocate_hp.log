@@ -1,0 +1,18 @@
+*** Booting Zephyr OS build 4a405846193f ***
+REGS before rc=0,0 SR=40 CR1=00 CR2=00 -> ultra-low-power mode
+REGS write 40 00 02 rc=0
+REGS after rc=0,0 SR=40 CR1=00 CR2=02 -> high-performance mode
+S5 shift +0x00: targets 0x10-0x1e  0/14 [-------.-------]
+S5 shift +0x10: targets 0x20-0x2e  0/14 [-------.-------]
+S5 shift +0x20: targets 0x30-0x3e  0/14 [-------.-------]
+S5 shift +0x30: targets 0x40-0x4e  0/14 [-------.-------]
+S5 shift +0x40: targets 0x50-0x5e  0/14 [-------.-------]
+S5 shift +0x50: targets 0x60-0x6e  0/14 [-------.-------]
+S5 shift +0x60: targets 0x70-0x7e  0/9  [-------.--.....]
+S5 shift +0x70: targets 0x00-0x0e  0/12 [.--.---.-------]
+S5 shift +0x08: targets 0x18-0x26  0/14 [-------.-------]
+S5 shift +0x01: targets 0x11-0x1f  0/14 [-------.-------]
+REGS before rc=0,0 SR=40 CR1=00 CR2=02 -> high-performance mode
+REGS write 40 00 00 rc=0
+REGS after rc=0,0 SR=40 CR1=00 CR2=00 -> ultra-low-power mode
+S5 DONE

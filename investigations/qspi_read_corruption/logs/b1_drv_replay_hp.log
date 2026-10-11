@@ -1,0 +1,12 @@
+*** Booting Zephyr OS build 4a405846193f ***
+REPLAY 43300 entries
+REPLAY pass 0 delay 0 us: 0 bad, 2907 ms
+REPLAY pass 0 delay 20 us: 0 bad, 3796 ms
+REPLAY pass 0 delay 100 us: 0 bad, 7289 ms
+REPLAY pass 1 delay 0 us: 0 bad, 2907 ms
+REPLAY pass 1 delay 20 us: 0 bad, 3796 ms
+REPLAY pass 1 delay 100 us: 0 bad, 7290 ms
+REPLAY pass 2 delay 0 us: 0 bad, 2907 ms
+REPLAY pass 2 delay 20 us: 0 bad, 3779 ms
+REPLAY pass 2 delay 100 us: 0 bad, 7269 ms
+REPLAY DONE
