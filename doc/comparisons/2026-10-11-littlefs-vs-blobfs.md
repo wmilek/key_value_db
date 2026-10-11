@@ -57,6 +57,7 @@ whichever file system its variant fragment enables:
 | `blobfs_ubi` | `kvdb_ubi` + blobfs + VFS driver |
 | `blobfs_ubi_ar` | `blobfs_ubi` + `BLOB_DB_UBI_ATOMIC_REPLACE` (compaction = 1 erase, not 5) |
 | `blobfs_fa` | `blobfs_ubi` on the raw partition (no UBI, no PSA Crypto) |
+| `blobfs_ubi_lp` | `blobfs_ubi` + `BLOB_DB_LARGE_PAYLOADS` (§2.1) |
 | `lfs_kvdb_ubi` | `kvdb_ubi` for key/value + littlefs on a second partition for files |
 
 **Geometry.** The DK's 8 MB MX25R64 is split into two 4 MB partitions, one per
@@ -125,6 +126,30 @@ The blob stack's RAM is fixed by the flash, not by the workload.
 block. On an MCU with less RAM than the nRF5340's 512 KB, that difference
 alone decides the question.
 
+### 2.1 Large payloads
+
+Every variant above runs with `CONFIG_BLOB_DB_LARGE_PAYLOADS` **off**, its
+default. Turning it on does not give blobfs large files. blobfs stores a file
+as one inline payload and caps it at `CONFIG_BLOB_DB_MAX_PAYLOAD_LEN`
+(`BLOBFS_FILE_MAX`); it never creates a segmented object. What the option
+does change is that payload default, from 256 B to 2016 B, so the blobfs
+file cap rises to 2016 B. The 4 KB `big_file` still fails with `-ENOSPC`.
+
+| | ROM | RAM |
+|---|--:|--:|
+| `blobfs_ubi` | 93.4 KiB | 168.4 KiB |
+| `blobfs_ubi_lp` | 97.4 KiB (+4.1) | 175.8 KiB (+7.4) |
+
+The extra RAM is kvhash's two payload-sized buffers (FINDINGS K7) and the
+segment tables (`MAX_SEGMENTS` 128 × 16 B). The extra ROM is the segmentation
+code, which blobfs never calls but kvdb or other blob_db users can. The
+option also bumps the on-flash format major. On the same 128 B workload,
+every phase's flash counts match `blobfs_ubi` to within a few reads, so the
+§3 timings hold. Raising `MAX_PAYLOAD_LEN` directly lifts the file cap the
+same way without the segmentation code. Files up to `MAX_OBJECT_LEN` would
+need blobfs to create its bodies as segmented objects, which is not
+implemented.
+
 ## 3. Flash cost (predicted DK flash time)
 
 ### 3.1 Steady state — what a device spends its life doing
@@ -170,7 +195,7 @@ payload written: 4.19 MB.
 | `read` 33 files after churn (run 2) | 1.17 s | 1.21 s | 0.35 s | |
 | `dir` (mkdir, 8 files, rename, 4 unlinks) | 1.4 s | 1.8 s | 9.1 s | 8 first-touch bucket erases |
 | `list` 34 entries | 1.6 s | 2.3 s | 0.09 s | |
-| `big_file` 4 KB | 1.2 s | 1.2 s | **`-ENOSPC`** | over the 256 B body cap |
+| `big_file` 4 KB | 1.2 s | 1.2 s | **`-ENOSPC`** | over the 256 B body cap (2016 B with large payloads, §2.1) |
 
 blob_db's first touch of a bucket costs a 64 KB erase, about 1.1 s. That
 happens once per bucket over the life of a store, and `blob_db_prepare()` can
@@ -197,7 +222,7 @@ spent at boot anyway, for kvdb. The marginal cost of mounting blobfs is 2 ms.
 
 | | littlefs | blobfs (v1) |
 |---|---|---|
-| Largest file | 2 GiB | one blob payload: `MAX_PAYLOAD_LEN`, default 256 B, at most ~32 KB on 64 KB blocks / ~2 KB on 4 KB blocks. Raising it also raises kvhash's RAM (2 × payload, FINDINGS K7). Segmented objects are not wired into blobfs yet |
+| Largest file | 2 GiB | one blob payload: `MAX_PAYLOAD_LEN`, default 256 B, at most ~32 KB on 64 KB blocks / ~2 KB on 4 KB blocks. Raising it also raises kvhash's RAM (2 × payload, FINDINGS K7). `BLOB_DB_LARGE_PAYLOADS` only raises the default to 2016 B: segmented objects are not wired into blobfs yet (§2.1) |
 | Write durability | at `fs_sync` / `fs_close` (copy-on-write; an open file is a draft) | **every `fs_write` is crash-atomic and durable when it returns**; `sync` is a no-op |
 | Write cost | proportional to bytes written (CTZ skip-list, inline when small) | proportional to **file size**: each write rewrites the whole body |
 | Name length | 255 | `BLOBFS_MAX_NAME_LEN`, default 12, up to 255 |

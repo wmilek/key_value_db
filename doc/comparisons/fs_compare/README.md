@@ -21,6 +21,7 @@ its image size.
 | `blobfs_ubi` | `kvdb_ubi` + blobfs + its VFS driver |
 | `blobfs_ubi_ar` | `blobfs_ubi` with `CONFIG_BLOB_DB_UBI_ATOMIC_REPLACE=y` |
 | `blobfs_fa` | `blobfs_ubi` on the raw partition instead of UBI |
+| `blobfs_ubi_lp` | `blobfs_ubi` with `CONFIG_BLOB_DB_LARGE_PAYLOADS=y` |
 | `lfs_kvdb_ubi` | `kvdb_ubi` for key/value + littlefs on a second partition for files |
 
 Both board files split the DK's 8 MB MX25R64 into two 4 MB partitions,
