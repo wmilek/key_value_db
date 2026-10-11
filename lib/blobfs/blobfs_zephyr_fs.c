@@ -528,6 +528,13 @@ static int blobfs_fs_readdir(struct fs_dir_t *dirp, struct fs_dirent *entry)
 			dh->done = true;
 			rc = 0;
 		} else if (rc != 0) {
+			/* A broken entry comes back named: report it, but move
+			 * the cursor past it, so the next readdir goes on to
+			 * the rest of the directory instead of stalling here.
+			 */
+			if (rc == -EIO && entry->name[0] != '\0') {
+				strcpy(dh->last, entry->name);
+			}
 			goto out;
 		}
 	}

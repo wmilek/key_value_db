@@ -175,13 +175,20 @@ free — handles follow renames and fail cleanly after unlink.
 power loss by a **rename intent** recorded in the filesystem meta blob before
 the first one: mount finds a half-done rename and rolls it forward (intent +
 new name visible) or back (intent only), so no caller ever observes two names
-bound to one body. An occupied destination is refused rather than silently
-replaced. The intent names the directory each end lives in (meta version 2);
-the two are always equal today, and are what will let a cross-directory
-rename reuse the same recovery. Mount still reads a version 1 meta, from
-before directories, as an intent in the root; firmware that predates
-directories refuses a version 2 meta, and reports a directory's dirent as
-corrupt (`-EIO`), rather than misreading either.
+bound to one body after a power cut. A rename whose last step fails with a
+flash error in a running session leaves the same intent behind; the next
+`unlink` or `rename` runs mount's recovery first, so neither name can be
+unlinked from under the other and the intent is never overwritten. An
+occupied destination is refused rather than silently replaced.
+
+The intent names the directory each end lives in (meta version 2); the two
+are always equal today, and are what will let a cross-directory rename reuse
+the same recovery. Mount still reads a version 1 meta, from before
+directories, as an intent in the root. The first `mkdir` on such a store
+rewrites the meta as version 2 before creating the directory, so firmware
+that predates directories refuses the store at mount instead of reporting
+each directory as corrupt; a store that never makes a directory stays
+version 1 and can still go back to that firmware.
 
 **Listing** is `map_ops.next` (§3) passed straight through:
 `blobfs_opendir` resolves a path to the directory's id, and `blobfs_next_id`

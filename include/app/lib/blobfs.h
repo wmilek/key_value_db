@@ -43,7 +43,11 @@ extern "C" {
  * Rename is atomic against power loss: an intent recorded in the filesystem
  * metadata before the directory is touched lets @ref blobfs_mount roll a
  * half-done rename forward or back, so no caller ever observes two names
- * bound to one body.
+ * bound to one body after a power cut. A rename that fails part way
+ * without one (a flash error on its last step) reports the error and may
+ * leave both names readable for the moment; the next @ref blobfs_unlink or
+ * @ref blobfs_rename finishes it first, exactly as mount would, so neither
+ * name can be unlinked from under the other.
  *
  * @section blobfs_v1 v1 scope
  *
@@ -324,7 +328,11 @@ int blobfs_opendir(const char *path, uint64_t *dir_id);
  * @retval -EINVAL       @p after or @p name is NULL
  * @retval -ENAMETOOLONG @p after is longer than @ref BLOBFS_NAME_MAX
  * @retval -ENODEV       not mounted
- * @retval -EIO          flash error or a corrupt directory entry
+ * @retval -EIO          flash error, or a broken entry (a corrupt dirent,
+ *                       or a file whose body is missing). For a broken
+ *                       entry @p name holds its name, so the caller can
+ *                       pass it back as the cursor and step past it; on
+ *                       every other error @p name is empty.
  */
 int blobfs_next_id(uint64_t dir_id, const char *after,
 		   char name[BLOBFS_NAME_MAX + 1], struct blobfs_stat *st);

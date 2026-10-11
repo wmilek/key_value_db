@@ -26,8 +26,11 @@ directories (and refusing non-empty ones, without leaking blobs), listing
 follow a renamed directory), renaming a directory with its contents, and
 `-EXDEV` across directories — plus the glue's own edges: `statvfs` reporting
 `-ENOTSUP`, the one-payload file size cap, mid-rename crash recovery in the
-root and in a subdirectory, mounting a store whose meta predates
-directories, and the single-mount limit.
+root and in a subdirectory, a rename that fails part way in a running
+session (via kvhash's write-cut test hook) being finished before the next
+unlink or rename, mounting a store whose meta predates directories and its
+upgrade at the first `mkdir`, removing a directory whose Map is already gone,
+a listing stepping past a broken entry, and the single-mount limit.
 
 ```shell
 west twister -T key_value_db/tests/lib/blobfs -p native_sim -v --inline-logs

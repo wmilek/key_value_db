@@ -60,6 +60,12 @@ BUILD_ASSERT(sizeof(struct blobfs_dirent) == 16,
 
 static struct {
 	bool     mounted;
+	/* The meta on flash is still version 1 (see blobfs_mkdir). */
+	bool     meta_v1;
+	/* A rename intent may be on flash: a rename failed part way this
+	 * session, so two names may share one entry (see intent_settle).
+	 */
+	bool     intent_pending;
 	uint64_t meta_id;
 	uint64_t dir_root;
 } st;
@@ -133,6 +139,21 @@ static int check_name(const char *name, size_t len)
 	return 0;
 }
 
+/* Validate a dirent of @p got bytes read for @p name: -EIO if it is not
+ * one blobfs wrote. The one place that decides what a dirent may be.
+ */
+static int dirent_check(const struct blobfs_dirent *de, size_t got,
+			const char *name, size_t nlen)
+{
+	if (got != sizeof(*de) ||
+	    (de->type != BLOBFS_TYPE_FILE && de->type != BLOBFS_TYPE_DIR) ||
+	    de->version != BLOBFS_DIRENT_VERSION) {
+		LOG_ERR("corrupt dirent for '%.*s'", (int)nlen, name);
+		return -EIO;
+	}
+	return 0;
+}
+
 /* Fetch and validate the dirent for a name in directory @p dir. */
 static int dirent_get(uint64_t dir, const char *name, size_t nlen,
 		      struct blobfs_dirent *de)
@@ -143,13 +164,7 @@ static int dirent_get(uint64_t dir, const char *name, size_t nlen,
 	if (rc != 0) {
 		return rc;
 	}
-	if (got != sizeof(*de) ||
-	    (de->type != BLOBFS_TYPE_FILE && de->type != BLOBFS_TYPE_DIR) ||
-	    de->version != BLOBFS_DIRENT_VERSION) {
-		LOG_ERR("corrupt dirent for '%.*s'", (int)nlen, name);
-		return -EIO;
-	}
-	return 0;
+	return dirent_check(de, got, name, nlen);
 }
 
 /* Walk @p path to the directory holding its last component, one Map lookup
@@ -231,10 +246,15 @@ static int resolve(const char *path, struct where *w, struct blobfs_dirent *de)
 	return 0;
 }
 
-/* Commit the meta blob — one atomic blob_db_update. */
+/* Commit the meta blob — one atomic blob_db_update. Always version 2. */
 static int meta_write(const struct blobfs_meta *meta)
 {
-	return blob_db_update(st.meta_id, meta, sizeof(*meta));
+	int rc = blob_db_update(st.meta_id, meta, sizeof(*meta));
+
+	if (rc == 0) {
+		st.meta_v1 = false;
+	}
+	return rc;
 }
 
 static void intent_clear(struct blobfs_meta *meta)
@@ -292,16 +312,17 @@ static int rename_recover(struct blobfs_meta *meta)
 		} else if (rc != 0 && rc != -ENOENT) {
 			return rc;
 		}
-		LOG_INF("recovered rename '%s' -> '%s' (rolled forward)",
-			meta->from, meta->to);
+		LOG_INF("recovered rename '%.*s' -> '%.*s' (rolled forward)",
+			meta->from_len, meta->from, meta->to_len, meta->to);
 	} else if (rc == -ENOENT) {
-		LOG_INF("recovered rename '%s' -> '%s' (rolled back)",
-			meta->from, meta->to);
+		LOG_INF("recovered rename '%.*s' -> '%.*s' (rolled back)",
+			meta->from_len, meta->from, meta->to_len, meta->to);
 	} else if (rc != 0) {
 		return rc;
 	} else {
-		LOG_ERR("rename intent found '%s' bound to another body; "
-			"clearing intent, keeping both names", meta->to);
+		LOG_ERR("rename intent found '%.*s' bound to another body; "
+			"clearing intent, keeping both names",
+			meta->to_len, meta->to);
 	}
 
 	intent_clear(meta);
@@ -313,7 +334,8 @@ static int rename_recover(struct blobfs_meta *meta)
  * directory fields: there was only the root, so both ends live there.
  * Nothing is written here; the next meta write stores version 2.
  */
-static int meta_read(uint64_t meta_id, struct blobfs_meta *meta)
+static int meta_read(uint64_t meta_id, struct blobfs_meta *meta,
+		     bool *was_v1)
 {
 	union {
 		struct blobfs_meta    v2;
@@ -332,6 +354,7 @@ static int meta_read(uint64_t meta_id, struct blobfs_meta *meta)
 	if (got == sizeof(buf.v2) && buf.v2.magic == BLOBFS_MAGIC &&
 	    buf.v2.version == BLOBFS_META_VERSION) {
 		*meta = buf.v2;
+		*was_v1 = false;
 		return 0;
 	}
 	if (got == sizeof(buf.v1) && buf.v1.magic == BLOBFS_MAGIC &&
@@ -349,12 +372,59 @@ static int meta_read(uint64_t meta_id, struct blobfs_meta *meta)
 		};
 		memcpy(meta->from, buf.v1.from, sizeof(meta->from));
 		memcpy(meta->to, buf.v1.to, sizeof(meta->to));
+		*was_v1 = true;
 		return 0;
 	}
 
 	LOG_ERR("bad blobfs metadata (magic %08x version %u len %zu)",
 		buf.v2.magic, buf.v2.version, got);
 	return -EIO;
+}
+
+/* Rewrite a version 1 meta as version 2, before the first directory is
+ * made. Firmware older than directories mounts a version 1 meta and would
+ * then report every directory as corrupt; a version 2 meta it refuses at
+ * mount instead. A store that never makes a directory stays version 1, so
+ * it can still go back to that firmware.
+ */
+static int meta_upgrade(void)
+{
+	if (!st.meta_v1) {
+		return 0;
+	}
+
+	struct blobfs_meta meta;
+	bool was_v1;
+	int rc = meta_read(st.meta_id, &meta, &was_v1);
+
+	return (rc != 0) ? rc : meta_write(&meta);
+}
+
+/* Finish a rename that failed part way earlier in this session. A rename
+ * whose last steps fail leaves its intent on flash, and possibly two names
+ * on one entry, for mount to resolve. Until then neither name may be
+ * unlinked (that would free what the other still points at), nor may
+ * another rename overwrite the intent. So each mutation that could do
+ * either first runs the recovery mount would, and refuses to go on if it
+ * still cannot.
+ */
+static int intent_settle(void)
+{
+	if (!st.intent_pending) {
+		return 0;
+	}
+
+	struct blobfs_meta meta;
+	bool was_v1;
+	int rc = meta_read(st.meta_id, &meta, &was_v1);
+
+	if (rc == 0 && meta.rename_in_flight) {
+		rc = rename_recover(&meta);
+	}
+	if (rc == 0) {
+		st.intent_pending = false;
+	}
+	return rc;
 }
 
 int blobfs_mount(void)
@@ -371,8 +441,9 @@ int blobfs_mount(void)
 	}
 
 	struct blobfs_meta meta;
+	bool was_v1 = false;
 
-	rc = meta_read(meta_id, &meta);
+	rc = meta_read(meta_id, &meta, &was_v1);
 	if (rc == -ENOENT) {
 		/* Virgin filesystem: build an empty root directory and commit
 		 * it.
@@ -410,6 +481,8 @@ int blobfs_mount(void)
 
 	st.meta_id = meta_id;
 	st.dir_root = meta.dir_root;
+	st.meta_v1 = was_v1;
+	st.intent_pending = false;
 
 	if (meta.rename_in_flight) {
 		rc = rename_recover(&meta);
@@ -427,6 +500,8 @@ int blobfs_mount(void)
 int blobfs_unmount(void)
 {
 	st.mounted = false;
+	st.meta_v1 = false;
+	st.intent_pending = false;
 	st.meta_id = 0;
 	st.dir_root = 0;
 	return 0;
@@ -498,6 +573,11 @@ int blobfs_mkdir(const char *path)
 	struct where w = { 0 };
 	int rc = walk_to_free_name(path, &w);
 
+	if (rc != 0) {
+		return rc;
+	}
+
+	rc = meta_upgrade();
 	if (rc != 0) {
 		return rc;
 	}
@@ -714,7 +794,10 @@ static int dir_is_empty(uint64_t dir)
 	int rc = dir_ops()->next(dir, NULL, 0, NULL, 0, &klen,
 				 NULL, 0, NULL);
 
-	if (rc == -ENODATA) {
+	/* -ENOENT: the Map is gone (a destroy began). Nothing is left to
+	 * lose, so the name pointing at it may go.
+	 */
+	if (rc == -ENODATA || rc == -ENOENT) {
 		return 1;
 	}
 	if (rc == 0 || rc == -ENOMEM) {
@@ -727,7 +810,13 @@ int blobfs_unlink(const char *path)
 {
 	struct where w = { 0 };
 	struct blobfs_dirent de;
-	int rc = resolve(path, &w, &de);
+	int rc = intent_settle();
+
+	if (rc != 0) {
+		return rc;
+	}
+
+	rc = resolve(path, &w, &de);
 
 	if (rc == -EISDIR && w.nlen == 0) {
 		return -EBUSY; /* the root directory */
@@ -749,9 +838,9 @@ int blobfs_unlink(const char *path)
 	/* Drop the name first — that single Map mutation is what makes the
 	 * entry disappear atomically. The body (or directory Map) is then
 	 * unreachable, so failing to release it costs garbage, never a
-	 * dangling name. (Aliased bodies cannot reach this point: the rename
-	 * intent keeps a half-renamed pair invisible until mount has resolved
-	 * it.)
+	 * dangling name. (Aliased bodies cannot reach this point: a
+	 * half-done rename is resolved, at mount or by intent_settle above,
+	 * before anything can be unlinked.)
 	 */
 	rc = dir_ops()->del(w.dir, w.name, w.nlen);
 	if (rc != 0) {
@@ -763,7 +852,7 @@ int blobfs_unlink(const char *path)
 	} else {
 		rc = blob_db_delete(de.body_id);
 	}
-	if (rc != 0) {
+	if (rc != 0 && rc != -ENOENT) { /* -ENOENT: already gone */
 		LOG_WRN("%s %llu orphaned: %d",
 			(de.type == BLOBFS_TYPE_DIR) ? "directory" : "body",
 			(unsigned long long)de.body_id, rc);
@@ -775,7 +864,13 @@ int blobfs_rename(const char *from, const char *to)
 {
 	struct where wf = { 0 }, wt = { 0 };
 	struct blobfs_dirent de, existing;
-	int rc = resolve(from, &wf, &de);
+	int rc = intent_settle();
+
+	if (rc != 0) {
+		return rc;
+	}
+
+	rc = resolve(from, &wf, &de);
 
 	if (rc == -EISDIR && wf.nlen == 0) {
 		return -EBUSY; /* the root directory */
@@ -830,29 +925,37 @@ int blobfs_rename(const char *from, const char *to)
 
 	rc = meta_write(&meta);
 	if (rc != 0) {
-		return rc;
+		return rc; /* atomic: no intent was written */
 	}
+	st.intent_pending = true;
 
 	rc = dir_ops()->set(wt.dir, wt.name, wt.nlen, &de, sizeof(de));
 	if (rc != 0) {
 		/* Nothing became visible; withdraw the intent. If even that
-		 * fails, mount will roll the intent back for us.
+		 * fails, intent_settle (or mount) rolls the intent back.
 		 */
 		intent_clear(&meta);
-		(void)meta_write(&meta);
+		if (meta_write(&meta) == 0) {
+			st.intent_pending = false;
+		}
 		return rc;
 	}
 
 	rc = dir_ops()->del(wf.dir, wf.name, wf.nlen);
 	if (rc != 0) {
 		/* Both names exist but the intent still stands: the next
-		 * mount finishes the rename. Report the failure regardless.
+		 * unlink or rename (intent_settle), or the next mount,
+		 * finishes the rename. Report the failure regardless.
 		 */
 		return rc;
 	}
 
 	intent_clear(&meta);
-	return meta_write(&meta);
+	rc = meta_write(&meta);
+	if (rc == 0) {
+		st.intent_pending = false;
+	}
+	return rc;
 }
 
 int blobfs_opendir(const char *path, uint64_t *dir_id)
@@ -887,6 +990,7 @@ int blobfs_next_id(uint64_t dir_id, const char *after,
 	if (after == NULL || name == NULL) {
 		return -EINVAL;
 	}
+	name[0] = '\0';
 	if (!st.mounted) {
 		return -ENODEV;
 	}
@@ -915,20 +1019,19 @@ int blobfs_next_id(uint64_t dir_id, const char *after,
 		/* -ENOENT: the directory was removed. */
 		return rc;
 	}
-	if (got != sizeof(de) ||
-	    (de.type != BLOBFS_TYPE_FILE && de.type != BLOBFS_TYPE_DIR) ||
-	    de.version != BLOBFS_DIRENT_VERSION) {
-		LOG_ERR("corrupt dirent for '%.*s'", (int)nlen, name);
-		return -EIO;
-	}
+	/* From here on the entry has a name, even when it proves broken:
+	 * returned with -EIO, it lets the caller step past the entry instead
+	 * of stalling on it.
+	 */
 	name[nlen] = '\0';
 
-	if (stat == NULL) {
-		return 0;
+	rc = dirent_check(&de, got, name, nlen);
+	if (rc != 0 || stat == NULL) {
+		return rc;
 	}
 
 	/* A name is dropped before its body is deleted, so a listed file
-	 * always has a body.
+	 * always has a body: a missing one is damage.
 	 */
 	rc = stat_of(&de, stat);
 	if (rc == -ENOENT) {
