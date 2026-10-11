@@ -1,0 +1,325 @@
+diff --git a/lib/blob_db/blob_db_store_flash.c b/lib/blob_db/blob_db_store_flash.c
+index a4d21ec..f056f7a 100644
+--- a/lib/blob_db/blob_db_store_flash.c
++++ b/lib/blob_db/blob_db_store_flash.c
+@@ -8,6 +8,7 @@
+  */
+ 
+ #include <errno.h>
++#include <string.h>
+ 
+ #include <zephyr/kernel.h>
+ #include <zephyr/logging/log.h>
+@@ -22,6 +23,90 @@ LOG_MODULE_REGISTER(blob_db_store, CONFIG_BLOB_DB_LOG_LEVEL);
+ static const struct flash_area *g_fa;
+ static size_t g_peb_size;
+ 
++/* EXPERIMENT: mimic UBI's geometry - data starts 128 B into each sector,
++ * logical block n lives in sector n, 121 logical blocks. */
++#define EMU_HDR 128
++#ifndef EMU_MODE
++#define EMU_MODE 0
++#endif
++#ifndef EMU_SHIFT
++#define EMU_SHIFT 0
++#endif
++#ifndef EMU_N
++#define EMU_N 79699
++#endif
++static size_t g_sec_size;
++
++static void ring_put(unsigned int type, off_t off, size_t len);
++
++static int tr_read(const struct flash_area *fa, off_t off, void *dst, size_t len)
++{
++	int rc = flash_area_read(fa, off, dst, len);
++
++	ring_put(0, off, len);
++	if (EMU_MODE == 10) {
++		printk("R%lx %zx\n", (long)off, len);
++	}
++	return rc;
++}
++
++#define RING_N 50000
++static uint8_t ring[RING_N][4];
++static uint32_t ring_cnt;
++static uint16_t lens[255];
++static uint8_t nlens;
++
++/* type: 0 read, 1 write, 2 erase */
++static void ring_put(unsigned int type, off_t off, size_t len)
++{
++	uint8_t li = 0xff;
++
++	if (EMU_MODE != 11) {
++		return;
++	}
++	for (uint8_t i = 0; i < nlens; i++) {
++		if (lens[i] == len) {
++			li = i;
++			break;
++		}
++	}
++	if (li == 0xff && nlens < ARRAY_SIZE(lens)) {
++		lens[nlens] = (uint16_t)len;
++		li = nlens++;
++	}
++	uint8_t *e = ring[ring_cnt % RING_N];
++
++	e[0] = (uint8_t)(((size_t)off >> 16) | (type << 6));
++	e[1] = (uint8_t)(off & 0xff);
++	e[2] = (uint8_t)((off >> 8) & 0xff);
++	e[3] = li;
++	ring_cnt++;
++}
++
++static void ring_dump(void)
++{
++	if (EMU_MODE != 11) {
++		return;
++	}
++	uint32_t first = ring_cnt > RING_N ? ring_cnt - RING_N : 0;
++
++	printk("RINGDUMP total=%u first=%u\n", ring_cnt, first);
++	for (uint32_t i = first; i < ring_cnt; i++) {
++		const uint8_t *e = ring[i % RING_N];
++		const uint32_t a = ((uint32_t)(e[0] & 0x3f) << 16) | ((uint32_t)e[2] << 8) | e[1];
++
++		printk("%c%x %x\n", "RWE?"[e[0] >> 6], a, e[3] == 0xff ? 0 : lens[e[3]]);
++	}
++	printk("RINGEND\n");
++}
++
++static off_t emu(off_t off)
++{
++	const size_t leb = g_sec_size - EMU_HDR;
++
++	return (off_t)(((size_t)off / leb + EMU_SHIFT) * g_sec_size + EMU_HDR + (size_t)off % leb);
++}
++
+ int blob_db_store_open(struct blob_db_store_geom *geom, bool discard)
+ {
+ 	/* No metadata below blob_db's own: nothing to replace. */
+@@ -73,10 +158,63 @@ int blob_db_store_open(struct blob_db_store_geom *geom, bool discard)
+ 		goto err_close;
+ 	}
+ 
+-	g_peb_size = peb_size;
+-	geom->peb_size = peb_size;
++	g_sec_size = peb_size;
++	if (EMU_MODE == 7) {
++		static const struct { uint32_t a; uint16_t l; } pre[] = {
++			{0x400080, 16}, {0x400080, 16}, {0x400090, 12}, {0x400000, 128},
++			{0x400100, 64}, {0x40fff0, 16},
++		};
++		uint8_t sm[16] __aligned(4);
++		static uint8_t big[128] __aligned(4);
++
++		for (unsigned int i = 0; i < ARRAY_SIZE(pre); i++) {
++			(void)tr_read(g_fa, pre[i].a, pre[i].l > 16 ? big : sm, pre[i].l);
++			(void)tr_read(g_fa, 0x470080, sm, 16);
++			printk("EMU7 boot after 0x%x/%u: byte4=%02x\n", pre[i].a, pre[i].l, sm[4]);
++		}
++	}
++	if (EMU_MODE == 6) {
++		static const struct { uint32_t off; uint16_t len; } rp[] = {
++			{0x130700, 12}, {0x130798, 12}, {0x130830, 12}, {0x1308c8, 12},
++			{0x130960, 12}, {0x1309f8, 12}, {0x130a28, 12}, {0x130ac0, 12},
++			{0x130b58, 12}, {0x130ba8, 12}, {0x130c18, 12}, {0x130c88, 12},
++			{0x130d18, 12}, {0x130acc, 136}, {0x130b54, 2}, {0x6e0080, 16},
++			{0x6e0090, 12}, {0x6e00c0, 12}, {0x6e00f0, 12}, {0x6e0140, 12},
++			{0x6e0190, 12}, {0x6e0200, 12}, {0x6e00fc, 64}, {0x6e013c, 2},
++		};
++		static const unsigned int starts[] = { 0, 15, 22, 23, 24, 0 };
++		static uint8_t big[136] __aligned(4);
++		uint8_t sm[16] __aligned(4);
++
++		for (unsigned int v = 0; v < ARRAY_SIZE(starts); v++) {
++			for (unsigned int i = starts[v]; i < ARRAY_SIZE(rp); i++) {
++				uint8_t *d = rp[i].len > 16 ? big : sm;
++
++				(void)tr_read(g_fa, rp[i].off, d + (rp[i].len == 2 ? 2 : 0),
++						      rp[i].len);
++			}
++			(void)tr_read(g_fa, 0x470080, sm, 16);
++			printk("EMU6 replay from %u: byte4=%02x crc=%02x%02x%02x%02x\n", starts[v],
++			       sm[4], sm[12], sm[13], sm[14], sm[15]);
++		}
++	}
++	if (EMU_MODE == 5) {
++		static const off_t probe[] = { 0x470080, 0x370080, 0x470080, 0x370080 };
++
++		for (unsigned int i = 0; i < ARRAY_SIZE(probe); i++) {
++			uint8_t pb[16] __aligned(4);
++
++			(void)tr_read(g_fa, probe[i], pb, sizeof(pb));
++			printk("EMU5 boot probe 0x%lx: %02x %02x %02x %02x %02x .. %02x %02x %02x %02x\n",
++			       (long)probe[i], pb[0], pb[1], pb[2], pb[3], pb[4], pb[12], pb[13],
++			       pb[14], pb[15]);
++		}
++	}
++	g_peb_size = peb_size - EMU_HDR;
++	geom->peb_size = g_peb_size;
+ 	geom->write_align = write_align;
+-	geom->n_pebs = (uint16_t)(fa_size / peb_size);
++	geom->n_pebs = 121;
++	printk("EMU geometry: leb %zu, %u lebs, +%d\n", g_peb_size, geom->n_pebs, EMU_HDR);
+ 	return 0;
+ 
+ err_close:
+@@ -93,22 +231,151 @@ void blob_db_store_close(void)
+ 	}
+ }
+ 
++struct emu_rec {
++	uint32_t off;
++	uint16_t len;
++	uint32_t dst;
++	uint8_t head[8];
++};
++static struct emu_rec hist[24];
++static unsigned int nrd, nbad;
++
+ int blob_db_store_read(off_t off, void *buf, size_t len)
+ {
+ 	BLOB_DB_IO_NOTE(BLOB_DB_IO_READ, len);
+-	return flash_area_read(g_fa, off, buf, len);
++	off = emu(off);
++
++	/* EXPERIMENT variants, chosen with EMU_MODE at build time. */
++	static uint8_t bnc[1024] __aligned(4);
++	const unsigned int me = nrd + 1;
++	const bool odd = (len % 4) != 0 || ((uintptr_t)buf % 4) != 0;
++	int rc;
++
++	if (EMU_MODE == 7 && ((off >= 0x400000 && off < 0x410000) ||
++			      (off <= 0x470080 && off + (off_t)len > 0x470084))) {
++		printk("EMU7 %u 0x%lx/%zu t=%u\n", me, (long)off, len, k_uptime_get_32());
++	}
++	if (EMU_MODE == 5 && off <= 0x470080 && off + (off_t)len > 0x470084) {
++		static uint8_t p5[16] __aligned(4);
++
++		(void)tr_read(g_fa, 0x470080, p5, sizeof(p5));
++		printk("EMU5 read %u off=0x%lx len=%zu t=%u: byte4=%02x\n", me, (long)off, len,
++		       k_uptime_get_32(), p5[4]);
++	}
++	if ((EMU_MODE == 8 || EMU_MODE == 9) && me == EMU_N) {
++		static const uint32_t a8[] = { 0x480080, 0x470080, 0x480080 };
++		static const uint32_t a9[] = { 0x470080, 0x480080, 0x470080 };
++		static uint8_t x[32] __aligned(4);
++
++		for (unsigned int i = 0; i < 3; i++) {
++			const uint32_t a = EMU_MODE == 8 ? a8[i] : a9[i];
++
++			(void)tr_read(g_fa, a, x, sizeof(x));
++			printk("EMU%d probe %u 0x%06x:", EMU_MODE, i, a);
++			for (size_t j = 0; j < sizeof(x); j++) {
++				printk(" %02x", x[j]);
++			}
++			printk("\n");
++		}
++	}
++	if (EMU_MODE == 1 && me == EMU_N) {
++		printk("EMU1 busy wait before read %u\n", me);
++		k_busy_wait(2000);
++	}
++	if (EMU_MODE == 2 && me == EMU_N) {
++		static uint8_t pre[16] __aligned(4);
++
++		(void)tr_read(g_fa, off, pre, sizeof(pre));
++		printk("EMU2 pre-read %u:", me);
++		for (size_t i = 0; i < sizeof(pre); i++) {
++			printk(" %02x", pre[i]);
++		}
++		printk("\n");
++	}
++	if (((EMU_MODE == 3) || (EMU_MODE == 4 && me == EMU_N - 1)) && odd &&
++	    len <= sizeof(bnc) - 4) {
++		rc = tr_read(g_fa, off & ~3, bnc, ROUND_UP(len + (off & 3), 4));
++		memcpy(buf, bnc + (off & 3), len);
++		if (EMU_MODE == 4) {
++			printk("EMU4 padded read %u off=0x%lx len=%zu\n", me, (long)off, len);
++		}
++	} else {
++		rc = tr_read(g_fa, off, buf, len);
++	}
++
++	/* EXPERIMENT: re-read and compare every read. */
++	static uint8_t chk[256] __aligned(4);
++	static uint8_t chk2[256] __aligned(4);
++	size_t cl = len < sizeof(chk) ? len : sizeof(chk);
++	const uint8_t *b = buf;
++
++	nrd++;
++	if (rc == 0 && tr_read(g_fa, off, chk, cl) == 0 &&
++	    memcmp(chk, b, cl) != 0) {
++		(void)tr_read(g_fa, off, chk2, cl);
++		nbad++;
++		printk("FADBL mismatch #%u (read %u) off=0x%lx len=%zu dst=%p\n",
++		       nbad, nrd, (long)off, len, buf);
++		size_t sl = cl < 32 ? cl : 32;
++
++		printk("  got :");
++		for (size_t i = 0; i < sl; i++) {
++			printk(" %02x", b[i]);
++		}
++		printk("\n  re1 :");
++		for (size_t i = 0; i < sl; i++) {
++			printk(" %02x", chk[i]);
++		}
++		printk("\n  re2 :");
++		for (size_t i = 0; i < sl; i++) {
++			printk(" %02x", chk2[i]);
++		}
++		printk("\n");
++		if (nbad == 1) {
++			ring_dump();
++		}
++		for (unsigned int k = 0; k < ARRAY_SIZE(hist); k++) {
++			const struct emu_rec *h = &hist[(nrd - 1 + k) % ARRAY_SIZE(hist)];
++
++			printk("  h-%02u off=0x%06x len=%u dst=0x%08x head=%02x %02x %02x %02x %02x %02x %02x %02x\n",
++			       ARRAY_SIZE(hist) - k, h->off, h->len, h->dst, h->head[0], h->head[1],
++			       h->head[2], h->head[3], h->head[4], h->head[5], h->head[6], h->head[7]);
++		}
++	}
++	struct emu_rec *r = &hist[nrd % ARRAY_SIZE(hist)];
++
++	r->off = (uint32_t)off;
++	r->len = (uint16_t)len;
++	r->dst = (uint32_t)(uintptr_t)buf;
++	memcpy(r->head, b, len < 8 ? len : 8);
++	if ((nrd % 20000) == 0) {
++		printk("FADBL %u reads, %u mismatches\n", nrd, nbad);
++	}
++	return rc;
+ }
+ 
+ int blob_db_store_write(off_t off, const void *buf, size_t len)
+ {
+ 	BLOB_DB_IO_NOTE(BLOB_DB_IO_WRITE, len);
+-	return flash_area_write(g_fa, off, buf, len);
++	ring_put(1, emu(off), len);
++	if (EMU_MODE == 10) {
++		printk("W%lx %zx\n", (long)emu(off), len);
++	}
++	return flash_area_write(g_fa, emu(off), buf, len);
+ }
+ 
+ int blob_db_store_erase(off_t off, size_t len)
+ {
+ 	BLOB_DB_IO_NOTE(BLOB_DB_IO_ERASE, len);
+-	return flash_area_erase(g_fa, off, len);
++	/* Callers erase whole logical blocks: erase the sectors under them. */
++	const size_t first = (size_t)off / g_peb_size;
++	const size_t n = (len + g_peb_size - 1) / g_peb_size;
++
++	ring_put(2, (off_t)((first + EMU_SHIFT) * g_sec_size), n * g_sec_size);
++	if (EMU_MODE == 10) {
++		printk("E%lx %zx\n", (long)((first + EMU_SHIFT) * g_sec_size), n * g_sec_size);
++	}
++	return flash_area_erase(g_fa, (off_t)((first + EMU_SHIFT) * g_sec_size), n * g_sec_size);
+ }
+ 
+ int blob_db_store_replace(off_t off, const void *buf, size_t len)

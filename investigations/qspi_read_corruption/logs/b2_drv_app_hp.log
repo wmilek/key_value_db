@@ -1,0 +1,18 @@
+*** Booting Zephyr OS build 4a405846193f ***
+kvdb perf 1.1.0  (N_KEYS=768  VAL_LEN=16  STRIDE=4  val=24 B)
+EMU geometry: leb 65408, 121 lebs, +128
+mount+open   :            295 ms
+map geometry : depth 2, fanout 16, 256 buckets, entry limit 1020 B
+state: rerun, store at gen 1
+FADBL 20000 reads, 0 mismatches
+FADBL 40000 reads, 0 mismatches
+bench verify   :  769 ops in   5295 ms  ->   145.231 ops/s  (   6885 us/op)
+VERIFY PASS (gen 1)
+bench count    :    1 ops in    530 ms  ->     1.886 ops/s  ( 530000 us/op)
+COUNT PASS (gen 1): 770 keys
+FADBL 60000 reads, 0 mismatches
+FADBL 80000 reads, 0 mismatches
+bench walk     :  771 ops in   5822 ms  ->   132.428 ops/s  (   7551 us/op)
+WALK PASS (gen 1): 770 entries, each exactly once
+FADBL 100000 reads, 0 mismatches
+bench modify   :  196 ops in   1840 ms  ->   106.521 ops/s  (   9387 us/op)

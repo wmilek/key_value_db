@@ -1,0 +1,15 @@
+*** Booting Zephyr OS build 4a405846193f ***
+REPLAY 43300 entries
+REPLAY bad header #1 at entry 43297/43300 a=0x180080: 42 44 42 48 1f 00 00 00 01 00 00 00 ff bb 74 ff
+REPLAY pass 0 delay 0 us: 1 bad, 2873 ms
+REPLAY pass 0 delay 20 us: 0 bad, 3743 ms
+REPLAY pass 0 delay 100 us: 0 bad, 7182 ms
+REPLAY bad header #1 at entry 43297/43300 a=0x180080: 42 44 42 48 1f 00 00 00 01 00 00 00 ff bb 74 ff
+REPLAY pass 1 delay 0 us: 1 bad, 2872 ms
+REPLAY pass 1 delay 20 us: 0 bad, 3742 ms
+REPLAY pass 1 delay 100 us: 0 bad, 7183 ms
+REPLAY bad header #1 at entry 43297/43300 a=0x180080: 42 44 42 48 1f 00 00 00 01 00 00 00 ff bb 74 ff
+REPLAY pass 2 delay 0 us: 1 bad, 2873 ms
+REPLAY pass 2 delay 20 us: 0 bad, 3730 ms
+REPLAY pass 2 delay 100 us: 0 bad, 7164 ms
+REPLAY DONE
