@@ -16,13 +16,18 @@ pointed at a blobfs mount at `/blob`:
 These are the same bodies FAT and littlefs answer to, so passing them is what
 makes "blobfs behaves like a Zephyr filesystem" a result rather than a claim.
 
-`test_fs_dirops.c` is deliberately **not** compiled in: it builds its tree
-with `mkdir`, and v1 is a flat namespace, so `mkdir` is unimplemented. The
-local tests in `src/main.c` assert that `mkdir` and `statvfs` report
-`-ENOTSUP` through the VFS instead of failing in some other way, and cover the
-glue's own edges: listing the directory (including deleting while listing and
-listing across a remount), the flat namespace, the one-payload file size cap,
-rename, and the single-mount limit.
+`test_fs_dirops.c` is deliberately **not** compiled in yet: it calls
+`fs_statvfs`, which blob_db cannot answer, and it expects `rename` to move
+entries between directories and to replace an existing file, neither of which
+blobfs does. The local tests in `src/main.c` cover the same ground for what
+blobfs does support — nested `mkdir`, path walking, removing empty
+directories (and refusing non-empty ones, without leaking blobs), listing
+(including deleting while listing, listing across a remount, and handles that
+follow a renamed directory), renaming a directory with its contents, and
+`-EXDEV` across directories — plus the glue's own edges: `statvfs` reporting
+`-ENOTSUP`, the one-payload file size cap, mid-rename crash recovery in the
+root and in a subdirectory, mounting a store whose meta predates
+directories, and the single-mount limit.
 
 ```shell
 west twister -T key_value_db/tests/lib/blobfs -p native_sim -v --inline-logs

@@ -7,12 +7,12 @@ config BLOBDB_BLOBFS
 	select BLOB_ROOTREG
 	select BLOB_CONTAINER_KVHASH
 	help
-	  blobfs — file interface over a Map container: the directory maps a
-	  name to a dirent, and each file body is its own blob (its payload
-	  length is the file size). v1 is a flat namespace — one directory,
-	  listed through the Map shape's next op, and no subdirectories — and a
-	  file body is one blob payload, so CONFIG_BLOB_DB_MAX_PAYLOAD_LEN caps
-	  file size. See doc/layers/l3_interfaces.md.
+	  blobfs — file interface over Map containers: every directory is a Map
+	  from a name to a dirent, which points at either a file body (its own
+	  blob, whose payload length is the file size) or a subdirectory's Map.
+	  Rename stays within one directory, and a file body is one blob
+	  payload, so CONFIG_BLOB_DB_MAX_PAYLOAD_LEN caps file size. See
+	  doc/layers/l3_interfaces.md.
 
 if BLOBDB_BLOBFS
 
@@ -21,7 +21,8 @@ config BLOBFS_MAX_NAME_LEN
 	default 12
 	range 1 255
 	help
-	  Longest file name blobfs accepts, excluding the NUL. The default
+	  Longest name of one path component (a file or directory name)
+	  blobfs accepts, excluding the NUL. The default
 	  matches the VFS name field Zephyr uses when no in-tree file system is
 	  enabled; raising it past that requires raising
 	  CONFIG_FILE_SYSTEM_MAX_FILE_NAME too, which the interop shim asserts

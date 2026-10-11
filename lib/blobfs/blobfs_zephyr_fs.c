@@ -16,8 +16,9 @@
  *   every op serializes on one mutex — the same discipline littlefs's and
  *   FAT's drivers apply.
  * - The access-mode checks that go with a handle (read/write/truncate).
- * - A directory handle: only the last name readdir returned. blobfs lists
- *   by name cursor, so that is the whole of a listing's state.
+ * - A directory handle: the directory's id and the last name readdir
+ *   returned. blobfs lists by name cursor, so that is the whole of a
+ *   listing's state.
  *
  * Ops blobfs v1 cannot honor are left NULL — the VFS core NULL-checks every
  * op and reports -ENOTSUP itself, so there is nothing to stub here.
@@ -63,7 +64,10 @@ static struct blobfs_fh fh_pool[CONFIG_BLOBFS_FS_MAX_OPEN_FILES];
 
 /** A directory handle: the cursor of a listing in progress.
  *
- * `last` is the name readdir returned last ("" before the first); `done`
+ * Like a file handle it binds to the directory's identity (its Map root),
+ * not its path, so it follows a rename and reports -ENOENT once the
+ * directory is removed. `last` is the name readdir returned last ("" before
+ * the first); `done`
  * marks a listing that has reported its end, so later readdirs keep
  * reporting it. `dead` is as for file handles.
  */
@@ -71,6 +75,7 @@ struct blobfs_dh {
 	bool used;
 	bool dead;
 	bool done;
+	uint64_t dir_id;
 	char last[BLOBFS_NAME_MAX + 1];
 };
 
@@ -145,10 +150,31 @@ static const char *strip_mnt(const struct fs_mount_t *mp, const char *path)
 	return (*path != '\0') ? path : "/";
 }
 
-/* The bare name, for filling fs_dirent::name. */
-static const char *bare_name(const char *path)
+/* Copy the last component of @p path into fs_dirent::name. */
+static void last_name(char dst[MAX_FILE_NAME + 1], const char *path)
 {
-	return (path[0] == '/') ? path + 1 : path;
+	size_t end = strlen(path);
+
+	while (end > 0 && path[end - 1] == '/') {
+		end--;
+	}
+
+	size_t start = end;
+
+	while (start > 0 && path[start - 1] != '/') {
+		start--;
+	}
+
+	size_t n = MIN(end - start, (size_t)MAX_FILE_NAME);
+
+	memcpy(dst, path + start, n);
+	dst[n] = '\0';
+}
+
+static enum fs_dir_entry_type vfs_type(enum blobfs_entry_type type)
+{
+	return (type == BLOBFS_ENTRY_DIR) ? FS_DIR_ENTRY_DIR
+					  : FS_DIR_ENTRY_FILE;
 }
 
 static int blobfs_fs_open(struct fs_file_t *filp, const char *fs_path,
@@ -409,12 +435,21 @@ static int blobfs_fs_stat(struct fs_mount_t *mountp, const char *path,
 
 	rc = blobfs_stat(name, &stat);
 	if (rc == 0) {
-		entry->type = FS_DIR_ENTRY_FILE;
+		entry->type = vfs_type(stat.type);
 		entry->size = stat.size;
-		strncpy(entry->name, bare_name(name), sizeof(entry->name) - 1);
-		entry->name[sizeof(entry->name) - 1] = '\0';
+		last_name(entry->name, name);
 	}
 
+	unlock();
+	return rc;
+}
+
+static int blobfs_fs_mkdir(struct fs_mount_t *mountp, const char *name)
+{
+	int rc;
+
+	lock();
+	rc = blobfs_mkdir(strip_mnt(mountp, name));
 	unlock();
 	return rc;
 }
@@ -459,7 +494,7 @@ static int blobfs_fs_opendir(struct fs_dir_t *dirp, const char *fs_path)
 		goto out;
 	}
 
-	rc = blobfs_opendir(strip_mnt(dirp->mp, fs_path));
+	rc = blobfs_opendir(strip_mnt(dirp->mp, fs_path), &dh->dir_id);
 	if (rc != 0) {
 		dh_free(dh);
 		goto out;
@@ -488,7 +523,7 @@ static int blobfs_fs_readdir(struct fs_dir_t *dirp, struct fs_dirent *entry)
 	struct blobfs_stat stat;
 
 	if (!dh->done) {
-		rc = blobfs_next(dh->last, entry->name, &stat);
+		rc = blobfs_next_id(dh->dir_id, dh->last, entry->name, &stat);
 		if (rc == -ENODATA) {
 			dh->done = true;
 			rc = 0;
@@ -503,7 +538,7 @@ static int blobfs_fs_readdir(struct fs_dir_t *dirp, struct fs_dirent *entry)
 		goto out;
 	}
 
-	entry->type = FS_DIR_ENTRY_FILE;
+	entry->type = vfs_type(stat.type);
 	entry->size = stat.size;
 	strcpy(dh->last, entry->name);
 
@@ -599,8 +634,8 @@ static int blobfs_fs_unmount(struct fs_mount_t *mountp)
 	return 0;
 }
 
-/* mkdir and statvfs stay NULL: the VFS core turns a NULL op into -ENOTSUP,
- * which is exactly what v1 owes those callers.
+/* statvfs stays NULL: the VFS core turns a NULL op into -ENOTSUP, which is
+ * exactly what v1 owes its callers.
  */
 static const struct fs_file_system_t blobfs_fs = {
 	.open = blobfs_fs_open,
@@ -613,6 +648,7 @@ static const struct fs_file_system_t blobfs_fs = {
 	.close = blobfs_fs_close,
 	.mount = blobfs_fs_mount,
 	.unmount = blobfs_fs_unmount,
+	.mkdir = blobfs_fs_mkdir,
 	.unlink = blobfs_fs_unlink,
 	.rename = blobfs_fs_rename,
 	.stat = blobfs_fs_stat,

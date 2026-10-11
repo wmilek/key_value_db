@@ -18,13 +18,14 @@ extern "C" {
  * @ingroup lib
  * @{
  *
- * @brief File access over a Map container: name -> dirent -> body blob.
+ * @brief File access over Map containers: name -> dirent -> body blob.
  *
- * blobfs stores a directory as a Map container instance (`name -> dirent`)
- * and each file body as its own blob: the dirent records the body's stable
- * i-node id, and the body's payload length *is* the file size. Reads and
- * writes go straight to blob_db's pread/pwrite calls, so every mutation is
- * one crash-atomic L1 operation.
+ * blobfs stores each directory as a Map container instance
+ * (`name -> dirent`) and each file body as its own blob: a file's dirent
+ * records the body's stable i-node id, and the body's payload length *is*
+ * the file size. Reads and writes go straight to blob_db's pread/pwrite
+ * calls, so every mutation is one crash-atomic L1 operation. A
+ * subdirectory's dirent records that directory's Map root instead.
  *
  * @section blobfs_identity Names and identity
  *
@@ -46,13 +47,20 @@ extern "C" {
  *
  * @section blobfs_v1 v1 scope
  *
- * The namespace is **flat**: one directory, holding files, which
- * @ref blobfs_next lists. `mkdir` is not provided; nesting is future work.
- * Paths are therefore a single name, with or without a leading
- * slash (`"cfg"` and `"/cfg"` name the same file); an embedded `/` reports
- * -ENOENT because no such directory can exist, and `"."`/`".."` are
- * refused (-EINVAL) so every stored name stays addressable through
- * path-normalizing clients.
+ * The namespace is a **tree**: @ref blobfs_mkdir makes directories,
+ * @ref blobfs_next_id lists them, and @ref blobfs_unlink removes empty
+ * ones. A path is a series of names separated by `/`, with or without a
+ * leading slash (`"cfg/net"` and `"/cfg/net"` name the same file), and
+ * repeated slashes collapse. Each component is capped at
+ * @ref BLOBFS_NAME_MAX, and resolving a path costs one Map lookup per
+ * directory on the way; there is no cap on depth or total length. A
+ * missing directory on the way reports -ENOENT and a file on the way
+ * -ENOTDIR. `"."`/`".."` are refused (-EINVAL) so every stored name stays
+ * addressable through path-normalizing clients. A trailing `/` asks for a
+ * directory: on a file it reports -ENOTDIR.
+ *
+ * Rename moves an entry **within one directory** only; across directories
+ * it reports -EXDEV.
  *
  * A file body is a single inline blob payload, so
  * `CONFIG_BLOB_DB_MAX_PAYLOAD_LEN` caps file size; a write past that cap
@@ -69,15 +77,22 @@ extern "C" {
  * See doc/layers/l3_interfaces.md for the full design.
  */
 
-/** Longest file name, in bytes (excluding the NUL). */
+/** Longest name of one path component, in bytes (excluding the NUL). */
 #define BLOBFS_NAME_MAX CONFIG_BLOBFS_MAX_NAME_LEN
 
 /** Largest file body, in bytes: one blob payload (see @ref blobfs_v1). */
 #define BLOBFS_FILE_MAX CONFIG_BLOB_DB_MAX_PAYLOAD_LEN
 
-/** What @ref blobfs_stat reports about a file. */
+/** What a directory entry is. */
+enum blobfs_entry_type {
+	BLOBFS_ENTRY_FILE, /**< a file */
+	BLOBFS_ENTRY_DIR,  /**< a directory */
+};
+
+/** What @ref blobfs_stat reports about an entry. */
 struct blobfs_stat {
-	size_t size; /**< file size in bytes */
+	enum blobfs_entry_type type;
+	size_t size; /**< file size in bytes; 0 for a directory */
 };
 
 /**
@@ -113,11 +128,12 @@ int blobfs_unmount(void);
  * @brief Create an empty file.
  *
  * @retval 0             created
- * @retval -EEXIST       the name is already taken
- * @retval -EISDIR       @p path names the root directory
- * @retval -EINVAL       @p path is "." or ".."
- * @retval -ENAMETOOLONG name longer than @ref BLOBFS_NAME_MAX
- * @retval -ENOENT       @p path contains a directory component (v1 is flat)
+ * @retval -EEXIST       the name is already taken (by a file or directory)
+ * @retval -EISDIR       @p path names the root directory, or ends in '/'
+ * @retval -EINVAL       a component is "." or ".."
+ * @retval -ENAMETOOLONG a component longer than @ref BLOBFS_NAME_MAX
+ * @retval -ENOENT       a directory on the way does not exist
+ * @retval -ENOTDIR      a component on the way is a file
  * @retval -ENODEV       not mounted
  * @retval -ENOSPC       store full
  * @retval -EIO          flash error
@@ -125,11 +141,32 @@ int blobfs_unmount(void);
 int blobfs_create(const char *path);
 
 /**
+ * @brief Create an empty directory.
+ *
+ * The new directory is its own Map, built before its name is published: a
+ * crash in between leaves an unreachable empty Map, never a dangling name.
+ *
+ * @retval 0             created
+ * @retval -EEXIST       the name is already taken (by a file or directory),
+ *                       or @p path names the root directory
+ * @retval -EINVAL       a component is "." or ".."
+ * @retval -ENAMETOOLONG a component longer than @ref BLOBFS_NAME_MAX
+ * @retval -ENOENT       a directory on the way does not exist
+ * @retval -ENOTDIR      a component on the way is a file
+ * @retval -ENODEV       not mounted
+ * @retval -ENOSPC       store full
+ * @retval -EIO          flash error
+ */
+int blobfs_mkdir(const char *path);
+
+/**
  * @brief Resolve a name to the file's body id — its durable identity.
  *
- * @retval 0       found; *body_id filled
- * @retval -ENOENT no such file
- * @retval -EINVAL bad arguments
+ * @retval 0        found; *body_id filled
+ * @retval -ENOENT  no such file
+ * @retval -EISDIR  @p path names a directory
+ * @retval -ENOTDIR a component on the way is a file
+ * @retval -EINVAL  bad arguments
  */
 int blobfs_lookup(const char *path, uint64_t *body_id);
 
@@ -183,11 +220,13 @@ int blobfs_write_id(uint64_t body_id, size_t off, const void *buf, size_t len);
 int blobfs_truncate_id(uint64_t body_id, size_t size);
 
 /**
- * @brief Report a file's size. Path form of @ref blobfs_size_id.
+ * @brief Report whether @p path is a file or a directory, and a file's
+ *        size. The root directory is a directory.
  *
- * @retval 0       found; @p st filled
- * @retval -ENOENT no such file
- * @retval -EINVAL st is NULL
+ * @retval 0        found; @p st filled
+ * @retval -ENOENT  no such entry
+ * @retval -ENOTDIR a component on the way is a file
+ * @retval -EINVAL  st is NULL
  */
 int blobfs_stat(const char *path, struct blobfs_stat *st);
 
@@ -202,54 +241,62 @@ int blobfs_write(const char *path, size_t off, const void *buf, size_t len);
 int blobfs_truncate(const char *path, size_t size);
 
 /**
- * @brief Remove a file.
+ * @brief Remove a file or an empty directory.
  *
- * The name is dropped from the directory first (one atomic Map mutation),
- * then the body blob is deleted. A crash between the two leaves an
- * unreachable body — garbage a later compaction reclaims — never a dangling
- * name. Outstanding body ids for the file report -ENOENT from then on.
+ * The name is dropped from its directory first (one atomic Map mutation),
+ * then the body blob is deleted, or the directory's Map destroyed. A crash
+ * between the two leaves an unreachable body or Map — garbage, never a
+ * dangling name. Outstanding body ids for a file report -ENOENT from then
+ * on, and so do directory ids for a directory (@ref blobfs_next_id).
  *
- * @retval 0       removed
- * @retval -ENOENT no such file
- * @retval -EIO    flash error
+ * @retval 0          removed
+ * @retval -ENOENT    no such entry
+ * @retval -ENOTEMPTY @p path is a directory that still holds entries
+ * @retval -EBUSY     @p path names the root directory
+ * @retval -EIO       flash error
  */
 int blobfs_unlink(const char *path);
 
 /**
- * @brief Rename a file within the (single) directory.
+ * @brief Rename a file or directory within its directory.
  *
  * Atomic against power loss via the recorded intent (see @ref
  * blobfs_identity): after a crash at any point, mount resolves the rename
- * so that exactly one of the two names exists. The file keeps its body id,
- * so ids resolved before the rename remain valid. Refuses to overwrite an
- * existing destination.
+ * so that exactly one of the two names exists. The entry keeps its id —
+ * a file its body id, a directory its Map root, and with it everything
+ * inside — so ids resolved before the rename remain valid. Refuses to
+ * overwrite an existing destination.
  *
  * @retval 0       renamed
- * @retval -ENOENT @p from does not exist
+ * @retval -ENOENT @p from does not exist, or neither does @p to's directory
  * @retval -EEXIST @p to already exists
+ * @retval -EXDEV  @p from and @p to are in different directories
+ * @retval -EBUSY  either path names the root directory
  * @retval -EIO    flash error
  */
 int blobfs_rename(const char *from, const char *to);
 
 /**
- * @brief Check that @p path names a directory that can be listed.
+ * @brief Resolve a directory path to the directory's id, for listing it.
  *
- * v1 has exactly one directory, the root, so this accepts `""` and `"/"`
- * and nothing else. It keeps no state: a listing is a series of
- * @ref blobfs_next calls, and nothing has to be closed afterwards.
+ * `""` and `"/"` name the root directory. Nothing is opened and nothing
+ * has to be closed: a listing is a series of @ref blobfs_next_id calls on
+ * the id. Like a body id, the directory id is the directory's identity: it
+ * follows the directory through a rename and reports -ENOENT once the
+ * directory is removed.
  *
- * @retval 0        @p path is the root directory
- * @retval -ENOTDIR @p path names a file
- * @retval -ENOENT  no such directory (any other name, or a nested path)
- * @retval -EINVAL  @p path is NULL, "." or ".."
- * @retval -ENAMETOOLONG name longer than @ref BLOBFS_NAME_MAX
+ * @retval 0        *dir_id filled
+ * @retval -ENOTDIR @p path names a file, or a component on the way is one
+ * @retval -ENOENT  no such directory
+ * @retval -EINVAL  @p path or @p dir_id is NULL, or a component is "."/".."
+ * @retval -ENAMETOOLONG a component longer than @ref BLOBFS_NAME_MAX
  * @retval -ENODEV  not mounted
  * @retval -EIO     flash error
  */
-int blobfs_opendir(const char *path);
+int blobfs_opendir(const char *path, uint64_t *dir_id);
 
 /**
- * @brief Return the file that follows @p after in the directory.
+ * @brief Return the entry that follows @p after in directory @p dir_id.
  *
  * Listing is stateless: the name is the cursor. Start with @p after empty
  * (`""`) and pass back each name returned until the call reports -ENODATA.
@@ -258,26 +305,29 @@ int blobfs_opendir(const char *path);
  *
  * The order is the directory Map's own (see @ref map_ops `next`): not
  * sorted and not creation order, but fixed by the names alone. Every file
- * present for the whole listing is returned exactly once. Files may be
+ * present for the whole listing is returned exactly once. Entries may be
  * created, written, renamed and unlinked between calls, including the one
- * just returned; a file created, unlinked or renamed during the listing
- * may or may not appear, depending on where its name falls. @p after need
- * not exist any more.
+ * just returned; one created, unlinked or renamed during the listing may
+ * or may not appear, depending on where its name falls. @p after need not
+ * exist any more. Entries are listed by name only: a subdirectory is
+ * returned as one entry, never descended into.
  *
+ * @param dir_id the directory, from @ref blobfs_opendir
  * @param after  cursor: the previous name returned, or "" to start
- * @param name   receives the next file's name, NUL-terminated
- * @param st     receives that file's size (may be NULL)
+ * @param name   receives the next entry's name, NUL-terminated
+ * @param st     receives that entry's type and size (may be NULL)
  *
- * @retval 0             next file returned
- * @retval -ENODATA      no file follows @p after (an empty directory
+ * @retval 0             next entry returned
+ * @retval -ENODATA      no entry follows @p after (an empty directory
  *                       answers this to the first call)
+ * @retval -ENOENT       the directory has been removed
  * @retval -EINVAL       @p after or @p name is NULL
  * @retval -ENAMETOOLONG @p after is longer than @ref BLOBFS_NAME_MAX
  * @retval -ENODEV       not mounted
  * @retval -EIO          flash error or a corrupt directory entry
  */
-int blobfs_next(const char *after, char name[BLOBFS_NAME_MAX + 1],
-		struct blobfs_stat *st);
+int blobfs_next_id(uint64_t dir_id, const char *after,
+		   char name[BLOBFS_NAME_MAX + 1], struct blobfs_stat *st);
 
 /** @} */
 

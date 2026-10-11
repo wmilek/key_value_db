@@ -43,22 +43,26 @@ extern "C" {
  * Everything a file needs: `fs_open` (with `FS_O_CREATE`, `FS_O_APPEND`,
  * `FS_O_TRUNC` and the access modes), `fs_read`, `fs_write`, `fs_seek`,
  * `fs_tell`, `fs_truncate`, `fs_sync`, `fs_close`, `fs_stat`, `fs_unlink`
- * and `fs_rename`, plus `fs_opendir`/`fs_readdir`/`fs_closedir` on the
- * mount point, which is the one directory v1 has.
+ * and `fs_rename`; and for directories `fs_mkdir`,
+ * `fs_opendir`/`fs_readdir`/`fs_closedir`, `fs_stat` (reporting
+ * `FS_DIR_ENTRY_DIR`) and `fs_unlink` of an empty directory (-ENOTEMPTY
+ * otherwise). `fs_rename` stays within one directory: across directories it
+ * reports -EXDEV.
  *
- * Not supported, and left NULL so the VFS reports -ENOTSUP: `fs_mkdir`
- * (v1 is a flat namespace) and `fs_statvfs` (blob_db exposes no free-space
- * accounting). `fs_sync` is a no-op that succeeds: every write is already
- * durable when it returns.
+ * Not supported, and left NULL so the VFS reports -ENOTSUP: `fs_statvfs`
+ * (blob_db exposes no free-space accounting). `fs_sync` is a no-op that
+ * succeeds: every write is already durable when it returns.
  *
  * @section blobfs_fs_readdir Listing
  *
- * `fs_readdir` returns files in the directory Map's order — not sorted,
- * not creation order (see @ref blobfs_next) — and never "." or "..".
- * Files may be created, unlinked and renamed while a listing is open:
- * every file present for the whole listing is returned exactly once, so
- * deleting each file as it is listed empties the directory. `fs_opendir`
- * on a file reports -ENOTDIR, on any other path -ENOENT. With blobfs
+ * `fs_readdir` returns entries in the directory Map's order — not sorted,
+ * not creation order (see @ref blobfs_next_id) — and never "." or "..".
+ * Entries may be created, unlinked and renamed while a listing is open:
+ * every entry present for the whole listing is returned exactly once, so
+ * deleting each one as it is listed empties the directory. `fs_opendir`
+ * on a file reports -ENOTDIR, on a missing path -ENOENT. A listing binds
+ * to the directory, not its path, like a file handle: it follows a rename
+ * and reports -ENOENT once the directory is removed. With blobfs
  * mounted at "/", `fs_opendir("/")` lists the VFS mount points instead:
  * the VFS core answers it without calling the driver.
  *
@@ -79,7 +83,8 @@ extern "C" {
  * @section blobfs_fs_limits Limits
  *
  * One mount point at a time; a second `fs_mount()` of this type reports
- * -EBUSY. File names are capped at @ref BLOBFS_NAME_MAX and file bodies at
+ * -EBUSY. Each path component is capped at @ref BLOBFS_NAME_MAX and file
+ * bodies at
  * @ref BLOBFS_FILE_MAX (one blob payload) — a write past that reports
  * -ENOSPC. Up to `CONFIG_BLOBFS_FS_MAX_OPEN_FILES` files and
  * `CONFIG_BLOBFS_FS_MAX_OPEN_DIRS` listings may be open at once; beyond
