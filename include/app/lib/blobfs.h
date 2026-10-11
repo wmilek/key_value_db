@@ -46,10 +46,9 @@ extern "C" {
  *
  * @section blobfs_v1 v1 scope
  *
- * The namespace is **flat**: one directory, holding files. `mkdir` and
- * directory iteration are not provided — the Map shape's enumeration op
- * (@ref map_ops `next`) is not wired into blobfs yet, and nesting waits on
- * it. Paths are therefore a single name, with or without a leading
+ * The namespace is **flat**: one directory, holding files, which
+ * @ref blobfs_next lists. `mkdir` is not provided; nesting is future work.
+ * Paths are therefore a single name, with or without a leading
  * slash (`"cfg"` and `"/cfg"` name the same file); an embedded `/` reports
  * -ENOENT because no such directory can exist, and `"."`/`".."` are
  * refused (-EINVAL) so every stored name stays addressable through
@@ -231,6 +230,54 @@ int blobfs_unlink(const char *path);
  * @retval -EIO    flash error
  */
 int blobfs_rename(const char *from, const char *to);
+
+/**
+ * @brief Check that @p path names a directory that can be listed.
+ *
+ * v1 has exactly one directory, the root, so this accepts `""` and `"/"`
+ * and nothing else. It keeps no state: a listing is a series of
+ * @ref blobfs_next calls, and nothing has to be closed afterwards.
+ *
+ * @retval 0        @p path is the root directory
+ * @retval -ENOTDIR @p path names a file
+ * @retval -ENOENT  no such directory (any other name, or a nested path)
+ * @retval -EINVAL  @p path is NULL, "." or ".."
+ * @retval -ENAMETOOLONG name longer than @ref BLOBFS_NAME_MAX
+ * @retval -ENODEV  not mounted
+ * @retval -EIO     flash error
+ */
+int blobfs_opendir(const char *path);
+
+/**
+ * @brief Return the file that follows @p after in the directory.
+ *
+ * Listing is stateless: the name is the cursor. Start with @p after empty
+ * (`""`) and pass back each name returned until the call reports -ENODATA.
+ * A listing holds nothing open, so it may be resumed from a saved name at
+ * any time, after a reboot included.
+ *
+ * The order is the directory Map's own (see @ref map_ops `next`): not
+ * sorted and not creation order, but fixed by the names alone. Every file
+ * present for the whole listing is returned exactly once. Files may be
+ * created, written, renamed and unlinked between calls, including the one
+ * just returned; a file created, unlinked or renamed during the listing
+ * may or may not appear, depending on where its name falls. @p after need
+ * not exist any more.
+ *
+ * @param after  cursor: the previous name returned, or "" to start
+ * @param name   receives the next file's name, NUL-terminated
+ * @param st     receives that file's size (may be NULL)
+ *
+ * @retval 0             next file returned
+ * @retval -ENODATA      no file follows @p after (an empty directory
+ *                       answers this to the first call)
+ * @retval -EINVAL       @p after or @p name is NULL
+ * @retval -ENAMETOOLONG @p after is longer than @ref BLOBFS_NAME_MAX
+ * @retval -ENODEV       not mounted
+ * @retval -EIO          flash error or a corrupt directory entry
+ */
+int blobfs_next(const char *after, char name[BLOBFS_NAME_MAX + 1],
+		struct blobfs_stat *st);
 
 /** @} */
 

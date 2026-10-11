@@ -146,8 +146,9 @@ restrict `rename` to within one directory (`-ENOTSUP` otherwise).
 ### 4.1 What v1 ships
 
 The shipped module is the **flat** slice of the above: one directory, holding
-files, with the handle-free calls that need no iteration — `create`, `stat`,
-`read`, `write`, `truncate`, `unlink`, `rename`, plus `mount`/`unmount`.
+files, with the handle-free calls — `create`, `stat`, `read`, `write`,
+`truncate`, `unlink`, `rename`, the listing pair `opendir`/`next`, plus
+`mount`/`unmount`.
 `name -> dirent { type, body id }` is the Map value; the **file body is its
 own blob**, so its payload length *is* the file size and reads/writes go
 straight to `blob_db_read()`/`blob_db_write()` — pread/pwrite at L1, each
@@ -167,12 +168,22 @@ new name visible) or back (intent only), so no caller ever observes two names
 bound to one body. An occupied destination is refused rather than silently
 replaced.
 
+**Listing** is `map_ops.next` (§3) passed straight through: `blobfs_next`
+takes the previous name as its cursor and returns the following file with
+its size, so blobfs keeps no listing state and adds no format. The order is
+the directory Map's (hash order for kvhash, not sorted); every file present
+for the whole listing is returned exactly once, and files may be created,
+renamed and unlinked mid-listing. This replaces the callback-style
+`blobfs_readdir` sketched above: a cursor call is what the VFS's
+`readdir` needs, and a callback form is a three-line loop over it.
+`blobfs_opendir` only checks the path names the root, since v1 has exactly
+one directory.
+
 Two gaps are structural rather than unfinished work, and both report
 `-ENOTSUP` rather than pretending:
 
-- **`mkdir` / `readdir`** need enumeration of a directory Map. The shape now
-  has it (`map_ops.next`, §3), but blobfs does not wire it yet — the same gap
-  as `kvdb_foreach`. Nested directories follow it.
+- **`mkdir`**: nested directories are Map roots referenced from their parent
+  (§4); the dirent `type` field is reserved for them.
 - **File size** is capped by one inline blob payload
   (`CONFIG_BLOB_DB_MAX_PAYLOAD_LEN`); blob_db's segmented objects are what
   lift it.
@@ -188,7 +199,9 @@ the VFS expects and blobfs lacks: file handles (bound to the body id, per
 the identity rule above), the access-mode checks that go with them, and a
 mutex serializing every op — `fs_*` callers are legitimately concurrent (the
 shell, MCUmgr's fs_mgmt workqueue) while the stack below is single-threaded
-by contract. Ops v1 cannot honor are left NULL — the VFS core turns a NULL
+by contract. Its directory handle is just the listing's cursor (the last
+name returned), from a pool of `CONFIG_BLOBFS_FS_MAX_OPEN_DIRS`. Ops v1
+cannot honor (`mkdir`, `statvfs`) are left NULL — the VFS core turns a NULL
 op into `-ENOTSUP` by itself, so the shim stubs nothing. `sync` succeeds as
 a no-op: a write is durable before it returns. Unmount orphans any handle
 still open (it keeps its slot and reports `-EBADF` until closed) rather than
@@ -221,6 +234,7 @@ config BLOBFS_MAX_NAME_LEN         int "Max file name length"      default 12
 config BLOBFS_FS_INTEROP           bool "Register as Zephyr fs backend"  depends on FILE_SYSTEM
 config BLOBFS_FS_TYPE_OFFSET       int "Offset from FS_TYPE_EXTERNAL_BASE"  default 0
 config BLOBFS_FS_MAX_OPEN_FILES    int "Concurrently open files"   default 4
+config BLOBFS_FS_MAX_OPEN_DIRS     int "Concurrently open listings" default 2
 # Planned, with the containers they wait on:
 choice BLOBFS_DIR_BACKEND          prompt "directory container"    depends on BLOBDB_BLOBFS
   config BLOBFS_DIR_KVHASH         select CONTAINER_KVHASH

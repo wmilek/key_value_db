@@ -16,12 +16,13 @@ pointed at a blobfs mount at `/blob`:
 These are the same bodies FAT and littlefs answer to, so passing them is what
 makes "blobfs behaves like a Zephyr filesystem" a result rather than a claim.
 
-`test_fs_dirops.c` is deliberately **not** compiled in: v1 is a flat namespace
-and `map_ops` has no iterate op, so `mkdir`/`readdir` are unimplemented. The
-local tests in `src/main.c` assert that those paths report `-ENOTSUP` through
-the VFS instead of failing in some other way, and cover the glue's own edges:
-the flat namespace, the one-payload file size cap, rename, and the
-single-mount limit.
+`test_fs_dirops.c` is deliberately **not** compiled in: it builds its tree
+with `mkdir`, and v1 is a flat namespace, so `mkdir` is unimplemented. The
+local tests in `src/main.c` assert that `mkdir` and `statvfs` report
+`-ENOTSUP` through the VFS instead of failing in some other way, and cover the
+glue's own edges: listing the directory (including deleting while listing and
+listing across a remount), the flat namespace, the one-payload file size cap,
+rename, and the single-mount limit.
 
 ```shell
 west twister -T key_value_db/tests/lib/blobfs -p native_sim -v --inline-logs

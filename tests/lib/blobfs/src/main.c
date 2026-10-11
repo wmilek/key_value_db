@@ -10,7 +10,7 @@
  * blobfs behaves like a Zephyr file system. The suites below that cover
  * what the conformance bodies never cross: handle lifetime against rename
  * and unlink, access-mode enforcement, failure atomicity at the API edge,
- * mid-rename crash recovery, and the v1 boundaries.
+ * mid-rename crash recovery, directory listing, and the v1 boundaries.
  */
 
 #include <errno.h>
@@ -110,20 +110,245 @@ ZTEST(blobfs, test_zephyr_fs_open_flags)
 	zassert_ok(fs_unmount(&blobfs_mnt));
 }
 
-/* What v1 does not carry is reported, not faked: directories and free-space
- * accounting come back -ENOTSUP through the VFS.
+/* What v1 does not carry is reported, not faked: subdirectories and
+ * free-space accounting come back -ENOTSUP through the VFS.
  */
 ZTEST(blobfs, test_unsupported_ops_report_enotsup)
 {
-	struct fs_dir_t dir;
 	struct fs_statvfs vfs;
 
 	zassert_ok(fs_mount(&blobfs_mnt));
 
-	fs_dir_t_init(&dir);
 	zassert_equal(fs_mkdir(MNT_POINT "/sub"), -ENOTSUP);
-	zassert_equal(fs_opendir(&dir, MNT_POINT), -ENOTSUP);
 	zassert_equal(fs_statvfs(MNT_POINT, &vfs), -ENOTSUP);
+
+	zassert_ok(fs_unmount(&blobfs_mnt));
+}
+
+#define LIST_FILES 20
+
+/* Names "f00".."f19", each holding its index's worth of bytes. */
+static void make_numbered_files(void)
+{
+	static const uint8_t fill[LIST_FILES];
+	char path[32];
+
+	for (size_t i = 0; i < LIST_FILES; i++) {
+		snprintf(path, sizeof(path), MNT_POINT "/f%02zu", i);
+		make_file(path, fill, i);
+	}
+}
+
+/* Index of a "fNN" name, or -1. */
+static int numbered_index(const char *name)
+{
+	unsigned int i;
+	char tail;
+
+	if (sscanf(name, "f%2u%c", &i, &tail) != 1 || i >= LIST_FILES ||
+	    strlen(name) != 3) {
+		return -1;
+	}
+	return (int)i;
+}
+
+/* Every file is listed exactly once, as a file, with its size, and the end
+ * of the listing stays the end.
+ */
+ZTEST(blobfs, test_readdir_lists_every_file_once)
+{
+	struct fs_dir_t dir;
+	struct fs_dirent entry;
+	int seen[LIST_FILES] = { 0 };
+
+	zassert_ok(fs_mount(&blobfs_mnt));
+	make_numbered_files();
+
+	fs_dir_t_init(&dir);
+	zassert_ok(fs_opendir(&dir, MNT_POINT));
+	for (;;) {
+		zassert_ok(fs_readdir(&dir, &entry));
+		if (entry.name[0] == '\0') {
+			break;
+		}
+
+		int i = numbered_index(entry.name);
+
+		zassert_true(i >= 0, "unexpected name '%s'", entry.name);
+		zassert_equal(entry.type, FS_DIR_ENTRY_FILE);
+		zassert_equal(entry.size, (size_t)i, "size of '%s'", entry.name);
+		seen[i]++;
+	}
+
+	/* Past the end, readdir keeps reporting the end. */
+	zassert_ok(fs_readdir(&dir, &entry));
+	zassert_equal(entry.name[0], '\0');
+	zassert_ok(fs_closedir(&dir));
+
+	for (size_t i = 0; i < LIST_FILES; i++) {
+		zassert_equal(seen[i], 1, "f%02zu listed %d times", i, seen[i]);
+	}
+
+	zassert_ok(fs_unmount(&blobfs_mnt));
+}
+
+ZTEST(blobfs, test_readdir_empty_directory)
+{
+	struct fs_dir_t dir;
+	struct fs_dirent entry;
+
+	zassert_ok(fs_mount(&blobfs_mnt));
+
+	fs_dir_t_init(&dir);
+	zassert_ok(fs_opendir(&dir, MNT_POINT));
+	zassert_ok(fs_readdir(&dir, &entry));
+	zassert_equal(entry.name[0], '\0', "empty directory listed '%s'",
+		      entry.name);
+	zassert_ok(fs_closedir(&dir));
+
+	zassert_ok(fs_unmount(&blobfs_mnt));
+}
+
+/* Unlinking each file as it is listed — what `rm *` does — must not skip
+ * any: the listing's cursor need not exist any more.
+ */
+ZTEST(blobfs, test_readdir_unlink_while_listing)
+{
+	struct fs_dir_t dir;
+	struct fs_dirent entry;
+	char path[32];
+	int removed = 0;
+
+	zassert_ok(fs_mount(&blobfs_mnt));
+	make_numbered_files();
+
+	fs_dir_t_init(&dir);
+	zassert_ok(fs_opendir(&dir, MNT_POINT));
+	for (;;) {
+		zassert_ok(fs_readdir(&dir, &entry));
+		if (entry.name[0] == '\0') {
+			break;
+		}
+		snprintf(path, sizeof(path), MNT_POINT "/%s", entry.name);
+		zassert_ok(fs_unlink(path), "unlink '%s'", path);
+		removed++;
+	}
+	zassert_ok(fs_closedir(&dir));
+	zassert_equal(removed, LIST_FILES);
+
+	/* Nothing is left. */
+	fs_dir_t_init(&dir);
+	zassert_ok(fs_opendir(&dir, MNT_POINT));
+	zassert_ok(fs_readdir(&dir, &entry));
+	zassert_equal(entry.name[0], '\0', "'%s' survived", entry.name);
+	zassert_ok(fs_closedir(&dir));
+
+	zassert_ok(fs_unmount(&blobfs_mnt));
+}
+
+/* The name is the whole cursor: a listing stopped half way resumes from the
+ * saved name after a remount, and the two halves together are every file
+ * exactly once.
+ */
+ZTEST(blobfs, test_next_resumes_across_remount)
+{
+	char name[BLOBFS_NAME_MAX + 1];
+	char cursor[BLOBFS_NAME_MAX + 1] = "";
+	int seen[LIST_FILES] = { 0 };
+	int rc;
+
+	zassert_ok(fs_mount(&blobfs_mnt));
+	make_numbered_files();
+
+	for (int n = 0; n < LIST_FILES / 2; n++) {
+		zassert_ok(blobfs_next(cursor, name, NULL));
+		seen[numbered_index(name)]++;
+		strcpy(cursor, name);
+	}
+
+	zassert_ok(fs_unmount(&blobfs_mnt));
+	zassert_equal(blobfs_next(cursor, name, NULL), -ENODEV);
+	zassert_ok(fs_mount(&blobfs_mnt));
+
+	while ((rc = blobfs_next(cursor, name, NULL)) == 0) {
+		int i = numbered_index(name);
+
+		zassert_true(i >= 0, "unexpected name '%s'", name);
+		seen[i]++;
+		strcpy(cursor, name);
+	}
+	zassert_equal(rc, -ENODATA);
+
+	for (size_t i = 0; i < LIST_FILES; i++) {
+		zassert_equal(seen[i], 1, "f%02zu listed %d times", i, seen[i]);
+	}
+
+	zassert_equal(blobfs_next("a_name_that_is_far_too_long", name, NULL),
+		      -ENAMETOOLONG);
+	zassert_equal(blobfs_next(NULL, name, NULL), -EINVAL);
+
+	zassert_ok(fs_unmount(&blobfs_mnt));
+}
+
+/* Only the mount point is a directory. */
+ZTEST(blobfs, test_opendir_paths)
+{
+	struct fs_dir_t dir;
+
+	zassert_ok(fs_mount(&blobfs_mnt));
+	make_file(MNT_POINT "/plain", NULL, 0);
+
+	fs_dir_t_init(&dir);
+	zassert_ok(fs_opendir(&dir, MNT_POINT "/"));
+	zassert_ok(fs_closedir(&dir));
+
+	fs_dir_t_init(&dir);
+	zassert_equal(fs_opendir(&dir, MNT_POINT "/plain"), -ENOTDIR);
+	fs_dir_t_init(&dir);
+	zassert_equal(fs_opendir(&dir, MNT_POINT "/nope"), -ENOENT);
+	fs_dir_t_init(&dir);
+	zassert_equal(fs_opendir(&dir, MNT_POINT "/nope/deeper"), -ENOENT);
+
+	zassert_ok(fs_unmount(&blobfs_mnt));
+}
+
+/* The directory handle pool is bounded, and unmount orphans open listings
+ * rather than recycling their slots.
+ */
+ZTEST(blobfs, test_dir_handles_bounded_and_orphaned)
+{
+	struct fs_dir_t dirs[CONFIG_BLOBFS_FS_MAX_OPEN_DIRS];
+	struct fs_dir_t extra;
+	struct fs_dirent entry;
+
+	zassert_ok(fs_mount(&blobfs_mnt));
+	make_file(MNT_POINT "/one", NULL, 0);
+
+	for (size_t i = 0; i < ARRAY_SIZE(dirs); i++) {
+		fs_dir_t_init(&dirs[i]);
+		zassert_ok(fs_opendir(&dirs[i], MNT_POINT));
+	}
+	fs_dir_t_init(&extra);
+	zassert_equal(fs_opendir(&extra, MNT_POINT), -EMFILE);
+
+	zassert_ok(fs_unmount(&blobfs_mnt));
+	zassert_ok(fs_mount(&blobfs_mnt));
+
+	/* Orphaned by the unmount: reports -EBADF, still holds its slot. */
+	zassert_equal(fs_readdir(&dirs[0], &entry), -EBADF);
+	fs_dir_t_init(&extra);
+	zassert_equal(fs_opendir(&extra, MNT_POINT), -EMFILE);
+
+	for (size_t i = 0; i < ARRAY_SIZE(dirs); i++) {
+		zassert_ok(fs_closedir(&dirs[i]));
+	}
+
+	/* Closing released the slots. */
+	fs_dir_t_init(&extra);
+	zassert_ok(fs_opendir(&extra, MNT_POINT));
+	zassert_ok(fs_readdir(&extra, &entry));
+	zassert_str_equal(entry.name, "one");
+	zassert_ok(fs_closedir(&extra));
 
 	zassert_ok(fs_unmount(&blobfs_mnt));
 }

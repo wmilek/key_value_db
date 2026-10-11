@@ -25,8 +25,11 @@
  * a half-done rename and rolls it forward or back before anything else can
  * observe it. No API caller ever sees two names on one body.
  *
- * v1 is a flat namespace (no directories, no iteration) and file bodies are
- * a single inline blob payload — see include/app/lib/blobfs.h.
+ * Listing the directory is the Map's own enumeration (map_ops.next): the
+ * name is the cursor, so a listing holds no state here.
+ *
+ * v1 is a flat namespace (no subdirectories) and file bodies are a single
+ * inline blob payload — see include/app/lib/blobfs.h.
  */
 
 #include <errno.h>
@@ -594,4 +597,85 @@ int blobfs_rename(const char *from, const char *to)
 	memset(meta.from, 0, sizeof(meta.from));
 	memset(meta.to, 0, sizeof(meta.to));
 	return meta_write(&meta);
+}
+
+int blobfs_opendir(const char *path)
+{
+	const char *name;
+	size_t nlen;
+	struct blobfs_dirent de;
+
+	if (!st.mounted) {
+		return -ENODEV;
+	}
+
+	/* path_name reports the root as -EISDIR: here that is the answer. */
+	int rc = path_name(path, &name, &nlen);
+
+	if (rc == -EISDIR) {
+		return 0;
+	}
+	if (rc != 0) {
+		return rc;
+	}
+
+	rc = dirent_get(name, nlen, &de);
+	return (rc == 0) ? -ENOTDIR : rc;
+}
+
+int blobfs_next(const char *after, char name[BLOBFS_NAME_MAX + 1],
+		struct blobfs_stat *stat)
+{
+	if (after == NULL || name == NULL) {
+		return -EINVAL;
+	}
+	if (!st.mounted) {
+		return -ENODEV;
+	}
+
+	size_t alen = strlen(after);
+
+	if (alen > BLOBFS_NAME_MAX) {
+		return -ENAMETOOLONG;
+	}
+
+	struct blobfs_dirent de;
+	size_t nlen = 0;
+	size_t got = 0;
+	int rc = dir_ops()->next(st.dir_root, after, alen,
+				 name, BLOBFS_NAME_MAX, &nlen,
+				 &de, sizeof(de), &got);
+
+	if (rc == -ENOMEM || rc == -ENOENT) {
+		/* Every name was checked against BLOBFS_NAME_MAX when it was
+		 * stored, and the directory exists while mounted: either
+		 * answer means the directory is not what blobfs wrote.
+		 */
+		LOG_ERR("directory walk after '%s': %d", after, rc);
+		return -EIO;
+	}
+	if (rc != 0) {
+		return rc;
+	}
+	if (got != sizeof(de) || de.type != BLOBFS_TYPE_FILE ||
+	    de.version != BLOBFS_DIRENT_VERSION) {
+		LOG_ERR("corrupt dirent for '%.*s'", (int)nlen, name);
+		return -EIO;
+	}
+	name[nlen] = '\0';
+
+	if (stat == NULL) {
+		return 0;
+	}
+
+	/* A name is dropped before its body is deleted, so a listed name
+	 * always has a body.
+	 */
+	rc = blob_db_size(de.body_id, &stat->size);
+	if (rc == -ENOENT) {
+		LOG_ERR("'%s' names a missing body %llu", name,
+			(unsigned long long)de.body_id);
+		return -EIO;
+	}
+	return rc;
 }

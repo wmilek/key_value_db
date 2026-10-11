@@ -9,8 +9,8 @@ config BLOBDB_BLOBFS
 	help
 	  blobfs — file interface over a Map container: the directory maps a
 	  name to a dirent, and each file body is its own blob (its payload
-	  length is the file size). v1 is a flat namespace — no directories and
-	  no iteration, which waits on an iterate op in the Map shape — and a
+	  length is the file size). v1 is a flat namespace — one directory,
+	  listed through the Map shape's next op, and no subdirectories — and a
 	  file body is one blob payload, so CONFIG_BLOB_DB_MAX_PAYLOAD_LEN caps
 	  file size. See doc/layers/l3_interfaces.md.
 
@@ -54,6 +54,15 @@ config BLOBFS_FS_MAX_OPEN_FILES
 	help
 	  Size of the handle pool the interop shim keeps (a name and a file
 	  position each). fs_open() reports -EMFILE once they are all in use.
+
+config BLOBFS_FS_MAX_OPEN_DIRS
+	int "Number of directory listings that may be open at once"
+	default 2
+	range 1 32
+	help
+	  Size of the directory handle pool the interop shim keeps (one file
+	  name each: the listing's cursor). fs_opendir() reports -EMFILE once
+	  they are all in use.
 
 endif # BLOBFS_FS_INTEROP
 

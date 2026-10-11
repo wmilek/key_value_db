@@ -112,9 +112,9 @@ fs_open(&file, "/blob/wifi.ssid", FS_O_CREATE | FS_O_RDWR);
 
 Its test suite runs Zephyr's own filesystem conformance bodies
 (`tests/subsys/fs/common`) unmodified against a blobfs mount. v1 is a flat
-namespace with one-blob file bodies: `mkdir`/`readdir` report `-ENOTSUP`
-(directory iteration needs an `iterate` op the Map shape does not define yet)
-and `CONFIG_BLOB_DB_MAX_PAYLOAD_LEN` caps file size until chunked bodies land.
+namespace with one-blob file bodies: `readdir` lists the one directory
+(through the Map shape's `next`), `mkdir` reports `-ENOTSUP`, and
+`CONFIG_BLOB_DB_MAX_PAYLOAD_LEN` caps file size until chunked bodies land.
 
 `tests/lib/blob_db_contract` is the acceptance suite for the *model container*
 of `doc/layers/l1_model_container.md`: a reference key/value structure built
