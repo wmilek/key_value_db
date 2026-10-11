@@ -140,19 +140,30 @@ without changing these semantics. The Zephyr `fs_file_system_t` interop shim
 
 `rename` within a directory is a single Map mutation (atomic, P7).
 Cross-directory rename crash-semantics are **deferred to the blobfs
-implementation design** (`doc/impl/`, when written); until specified, v1 may
-restrict `rename` to within one directory (`-ENOTSUP` otherwise).
+implementation design** (`doc/impl/`, when written); until specified, v1
+restricts `rename` to within one directory (`-EXDEV` otherwise).
 
 ### 4.1 What v1 ships
 
-The shipped module is the **flat** slice of the above: one directory, holding
-files, with the handle-free calls that need no iteration — `create`, `stat`,
-`read`, `write`, `truncate`, `unlink`, `rename`, plus `mount`/`unmount`.
-`name -> dirent { type, body id }` is the Map value; the **file body is its
-own blob**, so its payload length *is* the file size and reads/writes go
+The shipped module is the above minus cross-directory rename and chunked
+bodies: a tree of directories holding files, with the handle-free calls —
+`create`, `mkdir`, `stat`, `read`, `write`, `truncate`, `unlink`, `rename`,
+the listing pair `opendir`/`next_id`, plus `mount`/`unmount`.
+`name -> dirent { type, id }` is the Map value. A file's id is its **body,
+its own blob**, so its payload length *is* the file size and reads/writes go
 straight to `blob_db_read()`/`blob_db_write()` — pread/pwrite at L1, each
 write one crash-atomic operation, no file data staged in RAM at L3, and no
-new on-flash format.
+new on-flash format. A directory's id is its own Map root.
+
+**Paths** are walked one Map lookup per directory on the way, with nothing
+copied: components are compared in place in the caller's string, so there
+is no total-length cap (`BLOBFS_MAX_PATH_LEN` is not needed), only the
+per-component `BLOBFS_NAME_MAX`. `mkdir` builds the child Map before
+publishing its name, so a crash in between costs an unreachable empty Map
+(one blob for kvhash) and never a dangling name — the same order `create`
+uses for a body. `unlink` removes only an empty directory (one `next` step
+from the start answers that without reading the rest), drops the name, then
+`destroy`s the Map.
 
 The **body id is a file's durable identity**: `blobfs_lookup` resolves a name
 to it, and the `_id` calls operate on it directly. Rename re-points names and
@@ -164,20 +175,43 @@ free — handles follow renames and fail cleanly after unlink.
 power loss by a **rename intent** recorded in the filesystem meta blob before
 the first one: mount finds a half-done rename and rolls it forward (intent +
 new name visible) or back (intent only), so no caller ever observes two names
-bound to one body. An occupied destination is refused rather than silently
-replaced.
+bound to one body after a power cut. A rename whose last step fails with a
+flash error in a running session leaves the same intent behind; the next
+`unlink` or `rename` runs mount's recovery first, so neither name can be
+unlinked from under the other and the intent is never overwritten. An
+occupied destination is refused rather than silently replaced.
 
-Two gaps are structural rather than unfinished work, and both report
-`-ENOTSUP` rather than pretending:
+The intent names the directory each end lives in (meta version 2); the two
+are always equal today, and are what will let a cross-directory rename reuse
+the same recovery. Mount still reads a version 1 meta, from before
+directories, as an intent in the root. The first `mkdir` on such a store
+rewrites the meta as version 2 before creating the directory, so firmware
+that predates directories refuses the store at mount instead of reporting
+each directory as corrupt; a store that never makes a directory stays
+version 1 and can still go back to that firmware.
 
-- **`mkdir` / `readdir`** need enumeration of a directory Map. The shape now
-  has it (`map_ops.next`, §3), but blobfs does not wire it yet — the same gap
-  as `kvdb_foreach`. Nested directories follow it.
+**Listing** is `map_ops.next` (§3) passed straight through:
+`blobfs_opendir` resolves a path to the directory's id, and `blobfs_next_id`
+takes the previous name as its cursor and returns the following entry with
+its type and size, so blobfs keeps no listing state and adds no format. The
+order is the directory Map's (hash order for kvhash, not sorted); every
+entry present for the whole listing is returned exactly once, and entries
+may be created, renamed and unlinked mid-listing. Like a body id, the
+directory id follows a rename and reports `-ENOENT` once the directory is
+removed. This replaces the callback-style `blobfs_readdir` sketched above:
+a cursor call is what the VFS's `readdir` needs, and a callback form is a
+three-line loop over it.
+
+Two gaps remain:
+
+- **Cross-directory rename** reports `-EXDEV`. The intent format already
+  carries both directories; what is left is the recovery for two different
+  directories, and refusing to move a directory into its own subtree.
 - **File size** is capped by one inline blob payload
   (`CONFIG_BLOB_DB_MAX_PAYLOAD_LEN`); blob_db's segmented objects are what
   lift it.
 
-The directory Map is created with a `map_config` declaring
+Every directory Map is created with a `map_config` declaring
 `max_entry_bytes = BLOBFS_NAME_MAX + sizeof(dirent)`, so a name limit the
 directory's record geometry cannot hold fails at mount, deterministically,
 instead of at the first unlucky `create`.
@@ -188,8 +222,11 @@ the VFS expects and blobfs lacks: file handles (bound to the body id, per
 the identity rule above), the access-mode checks that go with them, and a
 mutex serializing every op — `fs_*` callers are legitimately concurrent (the
 shell, MCUmgr's fs_mgmt workqueue) while the stack below is single-threaded
-by contract. Ops v1 cannot honor are left NULL — the VFS core turns a NULL
-op into `-ENOTSUP` by itself, so the shim stubs nothing. `sync` succeeds as
+by contract. Its directory handle is the directory's id and the listing's
+cursor (the last name returned), from a pool of
+`CONFIG_BLOBFS_FS_MAX_OPEN_DIRS`. The op v1 cannot honor (`statvfs`) is left
+NULL — the VFS core turns a NULL op into `-ENOTSUP` by itself, so the shim
+stubs nothing. `sync` succeeds as
 a no-op: a write is durable before it returns. Unmount orphans any handle
 still open (it keeps its slot and reports `-EBADF` until closed) rather than
 recycling slots under live references.
@@ -221,13 +258,13 @@ config BLOBFS_MAX_NAME_LEN         int "Max file name length"      default 12
 config BLOBFS_FS_INTEROP           bool "Register as Zephyr fs backend"  depends on FILE_SYSTEM
 config BLOBFS_FS_TYPE_OFFSET       int "Offset from FS_TYPE_EXTERNAL_BASE"  default 0
 config BLOBFS_FS_MAX_OPEN_FILES    int "Concurrently open files"   default 4
+config BLOBFS_FS_MAX_OPEN_DIRS     int "Concurrently open listings" default 2
 # Planned, with the containers they wait on:
 choice BLOBFS_DIR_BACKEND          prompt "directory container"    depends on BLOBDB_BLOBFS
   config BLOBFS_DIR_KVHASH         select CONTAINER_KVHASH
   config BLOBFS_DIR_KVTREE         select CONTAINER_KVTREE         # sorted readdir
 endchoice
 config BLOBFS_FILE_CHUNKED         bool "Chunked file bodies"      select CONTAINER_SEQ
-config BLOBFS_MAX_PATH_LEN         int "Max path length"           default 128
 
 config SETTINGS_KVDB               bool "Zephyr settings backend over kvdb"  depends on KVDB && SETTINGS
 ```
@@ -256,11 +293,12 @@ tests/lib/blobfs/ ztest
   mount — `test_fs_basic` (create/write/stat, seek, truncate, unlink, sync,
   remount persistence) and `test_fs_open_flags` (the whole `FS_O_*` matrix) —
   answering the same suite FAT and littlefs do, and needing none of the
-  per-filesystem bypass defines littlefs sets. Local tests cover the v1
-  boundaries: `-ENOTSUP` for directories and `statvfs`, the flat namespace,
-  the body size cap, rename, single-mount. Path walking, deep nesting and
-  readdir join when directories do; chunk-boundary read/write joins with
-  `seq`.
+  per-filesystem bypass defines littlefs sets. `test_fs_dirops` joins once
+  `statvfs` and cross-directory rename exist (it needs both, and expects
+  rename to replace a file). Local tests cover directories — nesting, path
+  walking, removal, listing, renaming one with its contents, `-EXDEV` — and
+  the v1 boundaries: `-ENOTSUP` for `statvfs`, the body size cap, rename
+  recovery, single-mount. Chunk-boundary read/write joins with `seq`.
 - **Cross-interface**: enable `kvdb` + `blobfs` together; verify id = 1 root
   directory dispatch (§2) and mutual isolation.
 - **Persistence & crash**: remount and torn-write cases at this level are smoke

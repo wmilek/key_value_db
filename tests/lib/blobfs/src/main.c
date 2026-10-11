@@ -10,7 +10,7 @@
  * blobfs behaves like a Zephyr file system. The suites below that cover
  * what the conformance bodies never cross: handle lifetime against rename
  * and unlink, access-mode enforcement, failure atomicity at the API edge,
- * mid-rename crash recovery, and the v1 boundaries.
+ * mid-rename crash recovery, directory listing, and the v1 boundaries.
  */
 
 #include <errno.h>
@@ -24,6 +24,8 @@
 #include <app/lib/blobfs.h>
 #include <app/lib/blobfs_fs.h>
 #include <app/lib/rootreg.h>
+
+#include <app/lib/containers/kvhash.h> /* forging a half-done rename */
 
 #include "blobfs_internal.h" /* forged crash states for recovery tests */
 
@@ -110,20 +112,247 @@ ZTEST(blobfs, test_zephyr_fs_open_flags)
 	zassert_ok(fs_unmount(&blobfs_mnt));
 }
 
-/* What v1 does not carry is reported, not faked: directories and free-space
- * accounting come back -ENOTSUP through the VFS.
+/* What v1 does not carry is reported, not faked: free-space accounting
+ * comes back -ENOTSUP through the VFS.
  */
 ZTEST(blobfs, test_unsupported_ops_report_enotsup)
 {
-	struct fs_dir_t dir;
 	struct fs_statvfs vfs;
 
 	zassert_ok(fs_mount(&blobfs_mnt));
 
-	fs_dir_t_init(&dir);
-	zassert_equal(fs_mkdir(MNT_POINT "/sub"), -ENOTSUP);
-	zassert_equal(fs_opendir(&dir, MNT_POINT), -ENOTSUP);
 	zassert_equal(fs_statvfs(MNT_POINT, &vfs), -ENOTSUP);
+
+	zassert_ok(fs_unmount(&blobfs_mnt));
+}
+
+#define LIST_FILES 20
+
+/* Names "f00".."f19", each holding its index's worth of bytes. */
+static void make_numbered_files(void)
+{
+	static const uint8_t fill[LIST_FILES];
+	char path[32];
+
+	for (size_t i = 0; i < LIST_FILES; i++) {
+		snprintf(path, sizeof(path), MNT_POINT "/f%02zu", i);
+		make_file(path, fill, i);
+	}
+}
+
+/* Index of a "fNN" name, or -1. */
+static int numbered_index(const char *name)
+{
+	unsigned int i;
+	char tail;
+
+	if (sscanf(name, "f%2u%c", &i, &tail) != 1 || i >= LIST_FILES ||
+	    strlen(name) != 3) {
+		return -1;
+	}
+	return (int)i;
+}
+
+/* Every file is listed exactly once, as a file, with its size, and the end
+ * of the listing stays the end.
+ */
+ZTEST(blobfs, test_readdir_lists_every_file_once)
+{
+	struct fs_dir_t dir;
+	struct fs_dirent entry;
+	int seen[LIST_FILES] = { 0 };
+
+	zassert_ok(fs_mount(&blobfs_mnt));
+	make_numbered_files();
+
+	fs_dir_t_init(&dir);
+	zassert_ok(fs_opendir(&dir, MNT_POINT));
+	for (;;) {
+		zassert_ok(fs_readdir(&dir, &entry));
+		if (entry.name[0] == '\0') {
+			break;
+		}
+
+		int i = numbered_index(entry.name);
+
+		zassert_true(i >= 0, "unexpected name '%s'", entry.name);
+		zassert_equal(entry.type, FS_DIR_ENTRY_FILE);
+		zassert_equal(entry.size, (size_t)i, "size of '%s'", entry.name);
+		seen[i]++;
+	}
+
+	/* Past the end, readdir keeps reporting the end. */
+	zassert_ok(fs_readdir(&dir, &entry));
+	zassert_equal(entry.name[0], '\0');
+	zassert_ok(fs_closedir(&dir));
+
+	for (size_t i = 0; i < LIST_FILES; i++) {
+		zassert_equal(seen[i], 1, "f%02zu listed %d times", i, seen[i]);
+	}
+
+	zassert_ok(fs_unmount(&blobfs_mnt));
+}
+
+ZTEST(blobfs, test_readdir_empty_directory)
+{
+	struct fs_dir_t dir;
+	struct fs_dirent entry;
+
+	zassert_ok(fs_mount(&blobfs_mnt));
+
+	fs_dir_t_init(&dir);
+	zassert_ok(fs_opendir(&dir, MNT_POINT));
+	zassert_ok(fs_readdir(&dir, &entry));
+	zassert_equal(entry.name[0], '\0', "empty directory listed '%s'",
+		      entry.name);
+	zassert_ok(fs_closedir(&dir));
+
+	zassert_ok(fs_unmount(&blobfs_mnt));
+}
+
+/* Unlinking each file as it is listed — what `rm *` does — must not skip
+ * any: the listing's cursor need not exist any more.
+ */
+ZTEST(blobfs, test_readdir_unlink_while_listing)
+{
+	struct fs_dir_t dir;
+	struct fs_dirent entry;
+	char path[32];
+	int removed = 0;
+
+	zassert_ok(fs_mount(&blobfs_mnt));
+	make_numbered_files();
+
+	fs_dir_t_init(&dir);
+	zassert_ok(fs_opendir(&dir, MNT_POINT));
+	for (;;) {
+		zassert_ok(fs_readdir(&dir, &entry));
+		if (entry.name[0] == '\0') {
+			break;
+		}
+		snprintf(path, sizeof(path), MNT_POINT "/%s", entry.name);
+		zassert_ok(fs_unlink(path), "unlink '%s'", path);
+		removed++;
+	}
+	zassert_ok(fs_closedir(&dir));
+	zassert_equal(removed, LIST_FILES);
+
+	/* Nothing is left. */
+	fs_dir_t_init(&dir);
+	zassert_ok(fs_opendir(&dir, MNT_POINT));
+	zassert_ok(fs_readdir(&dir, &entry));
+	zassert_equal(entry.name[0], '\0', "'%s' survived", entry.name);
+	zassert_ok(fs_closedir(&dir));
+
+	zassert_ok(fs_unmount(&blobfs_mnt));
+}
+
+/* The name is the whole cursor: a listing stopped half way resumes from the
+ * saved name after a remount, and the two halves together are every file
+ * exactly once.
+ */
+ZTEST(blobfs, test_next_resumes_across_remount)
+{
+	char name[BLOBFS_NAME_MAX + 1];
+	char cursor[BLOBFS_NAME_MAX + 1] = "";
+	int seen[LIST_FILES] = { 0 };
+	uint64_t root = 0;
+	int rc;
+
+	zassert_ok(fs_mount(&blobfs_mnt));
+	make_numbered_files();
+	zassert_ok(blobfs_opendir("/", &root));
+
+	for (int n = 0; n < LIST_FILES / 2; n++) {
+		zassert_ok(blobfs_next_id(root, cursor, name, NULL));
+		seen[numbered_index(name)]++;
+		strcpy(cursor, name);
+	}
+
+	zassert_ok(fs_unmount(&blobfs_mnt));
+	zassert_equal(blobfs_next_id(root, cursor, name, NULL), -ENODEV);
+	zassert_ok(fs_mount(&blobfs_mnt));
+
+	while ((rc = blobfs_next_id(root, cursor, name, NULL)) == 0) {
+		int i = numbered_index(name);
+
+		zassert_true(i >= 0, "unexpected name '%s'", name);
+		seen[i]++;
+		strcpy(cursor, name);
+	}
+	zassert_equal(rc, -ENODATA);
+
+	for (size_t i = 0; i < LIST_FILES; i++) {
+		zassert_equal(seen[i], 1, "f%02zu listed %d times", i, seen[i]);
+	}
+
+	zassert_equal(blobfs_next_id(root, "a_name_that_is_far_too_long", name,
+				     NULL),
+		      -ENAMETOOLONG);
+	zassert_equal(blobfs_next_id(root, NULL, name, NULL), -EINVAL);
+
+	zassert_ok(fs_unmount(&blobfs_mnt));
+}
+
+/* A file is not a directory, and a missing path is neither. */
+ZTEST(blobfs, test_opendir_paths)
+{
+	struct fs_dir_t dir;
+
+	zassert_ok(fs_mount(&blobfs_mnt));
+	make_file(MNT_POINT "/plain", NULL, 0);
+
+	fs_dir_t_init(&dir);
+	zassert_ok(fs_opendir(&dir, MNT_POINT "/"));
+	zassert_ok(fs_closedir(&dir));
+
+	fs_dir_t_init(&dir);
+	zassert_equal(fs_opendir(&dir, MNT_POINT "/plain"), -ENOTDIR);
+	fs_dir_t_init(&dir);
+	zassert_equal(fs_opendir(&dir, MNT_POINT "/nope"), -ENOENT);
+	fs_dir_t_init(&dir);
+	zassert_equal(fs_opendir(&dir, MNT_POINT "/nope/deeper"), -ENOENT);
+
+	zassert_ok(fs_unmount(&blobfs_mnt));
+}
+
+/* The directory handle pool is bounded, and unmount orphans open listings
+ * rather than recycling their slots.
+ */
+ZTEST(blobfs, test_dir_handles_bounded_and_orphaned)
+{
+	struct fs_dir_t dirs[CONFIG_BLOBFS_FS_MAX_OPEN_DIRS];
+	struct fs_dir_t extra;
+	struct fs_dirent entry;
+
+	zassert_ok(fs_mount(&blobfs_mnt));
+	make_file(MNT_POINT "/one", NULL, 0);
+
+	for (size_t i = 0; i < ARRAY_SIZE(dirs); i++) {
+		fs_dir_t_init(&dirs[i]);
+		zassert_ok(fs_opendir(&dirs[i], MNT_POINT));
+	}
+	fs_dir_t_init(&extra);
+	zassert_equal(fs_opendir(&extra, MNT_POINT), -EMFILE);
+
+	zassert_ok(fs_unmount(&blobfs_mnt));
+	zassert_ok(fs_mount(&blobfs_mnt));
+
+	/* Orphaned by the unmount: reports -EBADF, still holds its slot. */
+	zassert_equal(fs_readdir(&dirs[0], &entry), -EBADF);
+	fs_dir_t_init(&extra);
+	zassert_equal(fs_opendir(&extra, MNT_POINT), -EMFILE);
+
+	for (size_t i = 0; i < ARRAY_SIZE(dirs); i++) {
+		zassert_ok(fs_closedir(&dirs[i]));
+	}
+
+	/* Closing released the slots. */
+	fs_dir_t_init(&extra);
+	zassert_ok(fs_opendir(&extra, MNT_POINT));
+	zassert_ok(fs_readdir(&extra, &entry));
+	zassert_str_equal(entry.name, "one");
+	zassert_ok(fs_closedir(&extra));
 
 	zassert_ok(fs_unmount(&blobfs_mnt));
 }
@@ -414,8 +643,8 @@ ZTEST(blobfs, test_mount_at_root)
  * this is deliberately white-box: it is the only way to reach these states
  * without cutting power.
  */
-static void forge_rename_intent(const char *from, const char *to,
-				uint64_t body_id)
+static void forge_rename_intent_in(uint64_t dir, const char *from,
+				   const char *to, uint64_t body_id)
 {
 	uint64_t meta_id = 0;
 	struct blobfs_meta meta;
@@ -426,6 +655,8 @@ static void forge_rename_intent(const char *from, const char *to,
 	zassert_equal(got, sizeof(meta));
 
 	meta.rename_in_flight = 1;
+	meta.from_dir = dir;
+	meta.to_dir = dir;
 	meta.from_len = (uint8_t)strlen(from);
 	meta.to_len = (uint8_t)strlen(to);
 	meta.rename_body = body_id;
@@ -435,6 +666,19 @@ static void forge_rename_intent(const char *from, const char *to,
 	memcpy(meta.to, to, strlen(to));
 
 	zassert_ok(blob_db_update(meta_id, &meta, sizeof(meta)));
+}
+
+/* The same, in the root directory. Read through blobfs while mounted. */
+static void forge_rename_intent(const char *from, const char *to,
+				uint64_t body_id)
+{
+	uint64_t meta_id = 0;
+	struct blobfs_meta meta;
+	size_t got = 0;
+
+	zassert_ok(rootreg_get(ROOTREG_KEY(BLOBFS_MAGIC, 0), &meta_id));
+	zassert_ok(blob_db_get(meta_id, &meta, sizeof(meta), &got));
+	forge_rename_intent_in(meta.dir_root, from, to, body_id);
 }
 
 static void check_intent_cleared(void)
@@ -488,6 +732,571 @@ ZTEST(blobfs, test_rename_intent_recovery)
 	zassert_ok(fs_stat(MNT_POINT "/moved", &stat));
 	zassert_equal(stat.size, sizeof(payload));
 	zassert_equal(fs_stat(MNT_POINT "/keep", &stat), -ENOENT);
+
+	zassert_ok(fs_unmount(&blobfs_mnt));
+}
+
+/* Directories nest, hold files, and survive a remount; files and
+ * directories share one namespace per directory.
+ */
+ZTEST(blobfs, test_mkdir_nested)
+{
+	static const char payload[] = "deep";
+	struct fs_file_t file;
+	struct fs_dirent stat;
+	char buf[sizeof(payload)];
+
+	zassert_ok(fs_mount(&blobfs_mnt));
+
+	zassert_ok(fs_mkdir(MNT_POINT "/d"));
+	zassert_ok(fs_mkdir(MNT_POINT "/d/e"));
+	make_file(MNT_POINT "/d/e/f", payload, sizeof(payload));
+
+	zassert_ok(fs_unmount(&blobfs_mnt));
+	zassert_ok(fs_mount(&blobfs_mnt));
+
+	zassert_ok(fs_stat(MNT_POINT "/d", &stat));
+	zassert_equal(stat.type, FS_DIR_ENTRY_DIR);
+	zassert_str_equal(stat.name, "d");
+	zassert_ok(fs_stat(MNT_POINT "/d/e/f", &stat));
+	zassert_equal(stat.type, FS_DIR_ENTRY_FILE);
+	zassert_equal(stat.size, sizeof(payload));
+	zassert_str_equal(stat.name, "f", "stat named '%s'", stat.name);
+
+	fs_file_t_init(&file);
+	zassert_ok(fs_open(&file, MNT_POINT "/d/e/f", FS_O_READ));
+	zassert_equal(fs_read(&file, buf, sizeof(buf)), sizeof(buf));
+	zassert_mem_equal(buf, payload, sizeof(payload));
+	zassert_ok(fs_close(&file));
+
+	/* Repeated slashes collapse; the leading one is optional. */
+	zassert_ok(fs_stat(MNT_POINT "/d//e///f", &stat));
+	zassert_equal(stat.size, sizeof(payload));
+
+	/* A directory is not a file... */
+	fs_file_t_init(&file);
+	zassert_equal(fs_open(&file, MNT_POINT "/d", FS_O_READ), -EISDIR);
+	zassert_equal(fs_open(&file, MNT_POINT "/d", FS_O_CREATE | FS_O_RDWR),
+		      -EISDIR);
+
+	/* ...and one name is one entry, whichever kind. */
+	zassert_equal(fs_mkdir(MNT_POINT "/d"), -EEXIST);
+	zassert_equal(fs_mkdir(MNT_POINT "/d/e/f"), -EEXIST);
+
+	/* What lies on the way must exist, and be a directory. */
+	zassert_equal(fs_mkdir(MNT_POINT "/nope/x"), -ENOENT);
+	zassert_equal(fs_mkdir(MNT_POINT "/d/e/f/x"), -ENOTDIR);
+	zassert_equal(fs_open(&file, MNT_POINT "/d/e/f/x",
+			      FS_O_CREATE | FS_O_RDWR),
+		      -ENOTDIR);
+	zassert_equal(fs_stat(MNT_POINT "/d/e/f/x", &stat), -ENOTDIR);
+
+	/* Every component obeys the name rules. */
+	zassert_equal(fs_mkdir(MNT_POINT "/d/.."), -EINVAL);
+	zassert_equal(fs_mkdir(MNT_POINT "/d/a_name_that_is_far_too_long"),
+		      -ENAMETOOLONG);
+
+	zassert_ok(fs_unmount(&blobfs_mnt));
+}
+
+/* A trailing '/' asks for a directory. */
+ZTEST(blobfs, test_trailing_slash)
+{
+	struct blobfs_stat st;
+
+	zassert_ok(fs_mount(&blobfs_mnt));
+
+	zassert_ok(blobfs_mkdir("dir/"));
+	zassert_ok(blobfs_stat("dir/", &st));
+	zassert_equal(st.type, BLOBFS_ENTRY_DIR);
+
+	zassert_ok(blobfs_create("plain"));
+	zassert_equal(blobfs_stat("plain/", &st), -ENOTDIR);
+	zassert_equal(blobfs_create("other/"), -EISDIR);
+	zassert_equal(blobfs_rename("plain", "moved/"), -ENOTDIR);
+
+	zassert_ok(fs_unmount(&blobfs_mnt));
+}
+
+/* blob_db's live blob count, for leak checks. */
+static int count_cb(uint64_t id, const void *payload, size_t len, void *user)
+{
+	ARG_UNUSED(id);
+	ARG_UNUSED(payload);
+	ARG_UNUSED(len);
+	(*(size_t *)user)++;
+	return 0;
+}
+
+static size_t live_blobs(void)
+{
+	size_t n = 0;
+
+	zassert_ok(blob_db_iterate(count_cb, &n));
+	return n;
+}
+
+/* Only an empty directory can be removed, the root never, and removing one
+ * releases everything mkdir allocated.
+ */
+ZTEST(blobfs, test_remove_directory)
+{
+	struct fs_dirent stat;
+
+	zassert_ok(fs_mount(&blobfs_mnt));
+
+	/* kvhash keeps a bucket once allocated, even when it empties, so let
+	 * the root's bucket for "d" exist before counting: what is left to
+	 * leak is then only what mkdir and the file allocated.
+	 */
+	zassert_ok(fs_mkdir(MNT_POINT "/d"));
+	zassert_ok(fs_unlink(MNT_POINT "/d"));
+
+	size_t before = live_blobs();
+
+	zassert_ok(fs_mkdir(MNT_POINT "/d"));
+	make_file(MNT_POINT "/d/f", "x", 1);
+
+	zassert_equal(fs_unlink(MNT_POINT "/d"), -ENOTEMPTY);
+	zassert_ok(fs_stat(MNT_POINT "/d/f", &stat), "refused unlink removed");
+
+	zassert_ok(fs_unlink(MNT_POINT "/d/f"));
+	zassert_ok(fs_unlink(MNT_POINT "/d"));
+	zassert_equal(fs_stat(MNT_POINT "/d", &stat), -ENOENT);
+	zassert_equal(live_blobs(), before, "removing a directory leaked");
+
+	/* The name is free again, for either kind. */
+	make_file(MNT_POINT "/d", NULL, 0);
+	zassert_ok(fs_unlink(MNT_POINT "/d"));
+
+	zassert_equal(blobfs_unlink("/"), -EBUSY);
+
+	zassert_ok(fs_unmount(&blobfs_mnt));
+}
+
+/* Listing a subdirectory lists its own entries, each with its kind, and a
+ * subdirectory appears in its parent's listing as one entry.
+ */
+ZTEST(blobfs, test_readdir_subdirectory)
+{
+	struct fs_dir_t dir;
+	struct fs_dirent entry;
+	int files = 0, dirs = 0;
+
+	zassert_ok(fs_mount(&blobfs_mnt));
+
+	zassert_ok(fs_mkdir(MNT_POINT "/d"));
+	zassert_ok(fs_mkdir(MNT_POINT "/d/sub"));
+	make_file(MNT_POINT "/d/a", "12", 2);
+	make_file(MNT_POINT "/d/sub/hidden", NULL, 0);
+	make_file(MNT_POINT "/top", NULL, 0);
+
+	fs_dir_t_init(&dir);
+	zassert_ok(fs_opendir(&dir, MNT_POINT "/d"));
+	for (;;) {
+		zassert_ok(fs_readdir(&dir, &entry));
+		if (entry.name[0] == '\0') {
+			break;
+		}
+		if (strcmp(entry.name, "a") == 0) {
+			zassert_equal(entry.type, FS_DIR_ENTRY_FILE);
+			zassert_equal(entry.size, 2);
+			files++;
+		} else if (strcmp(entry.name, "sub") == 0) {
+			zassert_equal(entry.type, FS_DIR_ENTRY_DIR);
+			zassert_equal(entry.size, 0);
+			dirs++;
+		} else {
+			zassert_unreachable("'%s' listed in /d", entry.name);
+		}
+	}
+	zassert_ok(fs_closedir(&dir));
+	zassert_equal(files, 1);
+	zassert_equal(dirs, 1);
+
+	/* The root lists "d" and "top" only. */
+	int n = 0;
+
+	fs_dir_t_init(&dir);
+	zassert_ok(fs_opendir(&dir, MNT_POINT));
+	for (;;) {
+		zassert_ok(fs_readdir(&dir, &entry));
+		if (entry.name[0] == '\0') {
+			break;
+		}
+		zassert_true(strcmp(entry.name, "d") == 0 ||
+			     strcmp(entry.name, "top") == 0,
+			     "'%s' listed in /", entry.name);
+		n++;
+	}
+	zassert_ok(fs_closedir(&dir));
+	zassert_equal(n, 2);
+
+	zassert_ok(fs_unmount(&blobfs_mnt));
+}
+
+/* A directory renames like a file, taking its contents along; open handles
+ * inside it follow. Rename stays within one directory.
+ */
+ZTEST(blobfs, test_rename_directory)
+{
+	struct fs_file_t file;
+	struct fs_dirent stat;
+	char buf[4];
+
+	zassert_ok(fs_mount(&blobfs_mnt));
+
+	zassert_ok(fs_mkdir(MNT_POINT "/d"));
+	zassert_ok(fs_mkdir(MNT_POINT "/d/sub"));
+	make_file(MNT_POINT "/d/sub/f", "ab", 2);
+	make_file(MNT_POINT "/g", NULL, 0);
+
+	fs_file_t_init(&file);
+	zassert_ok(fs_open(&file, MNT_POINT "/d/sub/f", FS_O_RDWR));
+
+	zassert_ok(fs_rename(MNT_POINT "/d", MNT_POINT "/e"));
+	zassert_equal(fs_stat(MNT_POINT "/d", &stat), -ENOENT);
+	zassert_ok(fs_stat(MNT_POINT "/e/sub/f", &stat));
+	zassert_equal(stat.size, 2);
+
+	/* The handle opened under the old path still reaches the file. */
+	zassert_ok(fs_seek(&file, 0, FS_SEEK_END));
+	zassert_equal(fs_write(&file, "cd", 2), 2);
+	zassert_ok(fs_close(&file));
+
+	fs_file_t_init(&file);
+	zassert_ok(fs_open(&file, MNT_POINT "/e/sub/f", FS_O_READ));
+	zassert_equal(fs_read(&file, buf, sizeof(buf)), 4);
+	zassert_mem_equal(buf, "abcd", 4);
+	zassert_ok(fs_close(&file));
+
+	/* Renames inside a subdirectory work... */
+	zassert_ok(fs_rename(MNT_POINT "/e/sub/f", MNT_POINT "/e/sub/h"));
+	zassert_ok(fs_stat(MNT_POINT "/e/sub/h", &stat));
+
+	/* ...across directories they are refused, nothing moved. */
+	zassert_equal(fs_rename(MNT_POINT "/g", MNT_POINT "/e/g"), -EXDEV);
+	zassert_equal(fs_rename(MNT_POINT "/e/sub/h", MNT_POINT "/h"), -EXDEV);
+	zassert_equal(fs_rename(MNT_POINT "/e", MNT_POINT "/e/sub/e"), -EXDEV);
+	zassert_ok(fs_stat(MNT_POINT "/g", &stat));
+	zassert_ok(fs_stat(MNT_POINT "/e/sub/h", &stat));
+
+	/* An occupied destination is refused, file or directory. */
+	zassert_equal(fs_rename(MNT_POINT "/g", MNT_POINT "/e"), -EEXIST);
+	zassert_equal(fs_rename(MNT_POINT "/e", MNT_POINT "/g"), -EEXIST);
+
+	zassert_ok(fs_unmount(&blobfs_mnt));
+}
+
+/* A directory handle binds to the directory: it follows a rename, and once
+ * the directory is gone it reports -ENOENT rather than listing anything.
+ */
+ZTEST(blobfs, test_dir_handle_follows_directory)
+{
+	struct fs_dir_t dir;
+	struct fs_dirent entry;
+
+	zassert_ok(fs_mount(&blobfs_mnt));
+
+	zassert_ok(fs_mkdir(MNT_POINT "/d"));
+	make_file(MNT_POINT "/d/a", NULL, 0);
+
+	fs_dir_t_init(&dir);
+	zassert_ok(fs_opendir(&dir, MNT_POINT "/d"));
+	zassert_ok(fs_rename(MNT_POINT "/d", MNT_POINT "/moved"));
+	zassert_ok(fs_readdir(&dir, &entry));
+	zassert_str_equal(entry.name, "a");
+	zassert_ok(fs_closedir(&dir));
+
+	fs_dir_t_init(&dir);
+	zassert_ok(fs_opendir(&dir, MNT_POINT "/moved"));
+	zassert_ok(fs_unlink(MNT_POINT "/moved/a"));
+	zassert_ok(fs_unlink(MNT_POINT "/moved"));
+	zassert_equal(fs_readdir(&dir, &entry), -ENOENT);
+	zassert_ok(fs_closedir(&dir));
+
+	zassert_ok(fs_unmount(&blobfs_mnt));
+}
+
+/* A half-done rename inside a subdirectory is resolved in that directory. */
+ZTEST(blobfs, test_rename_intent_recovery_in_subdirectory)
+{
+	struct fs_dirent stat;
+	uint64_t body_id = 0;
+	uint64_t sub = 0;
+
+	zassert_ok(fs_mount(&blobfs_mnt));
+	zassert_ok(fs_mkdir(MNT_POINT "/sub"));
+	make_file(MNT_POINT "/sub/keep", "k", 1);
+	make_file(MNT_POINT "/keep", NULL, 0); /* same name, other directory */
+	zassert_ok(blobfs_lookup("sub/keep", &body_id));
+	zassert_ok(blobfs_opendir("sub", &sub));
+	zassert_ok(fs_unmount(&blobfs_mnt));
+
+	/* Crash after binding the new name, before dropping the old: both
+	 * names exist in /sub. Mount must roll forward there, and leave the
+	 * root's "keep" alone.
+	 */
+	struct blobfs_dirent de = {
+		.type = BLOBFS_TYPE_FILE,
+		.version = BLOBFS_DIRENT_VERSION,
+		.body_id = body_id,
+	};
+
+	zassert_ok(kvhash_map_ops.set(sub, "dest", 4, &de, sizeof(de)));
+	forge_rename_intent_in(sub, "keep", "dest", body_id);
+
+	zassert_ok(fs_mount(&blobfs_mnt));
+	check_intent_cleared();
+	zassert_equal(fs_stat(MNT_POINT "/sub/keep", &stat), -ENOENT);
+	zassert_ok(fs_stat(MNT_POINT "/sub/dest", &stat));
+	zassert_equal(stat.size, 1);
+	zassert_ok(fs_stat(MNT_POINT "/keep", &stat), "wrong directory");
+
+	zassert_ok(fs_unmount(&blobfs_mnt));
+}
+
+/* A store written before directories existed carries a version 1 meta.
+ * Mount reads it, a pending intent in it included, and the next meta write
+ * stores version 2.
+ */
+ZTEST(blobfs, test_meta_v1_still_mounts)
+{
+	struct fs_dirent stat;
+	uint64_t body_id = 0;
+	uint64_t meta_id = 0;
+	struct blobfs_meta meta;
+	size_t got = 0;
+
+	zassert_ok(fs_mount(&blobfs_mnt));
+	make_file(MNT_POINT "/old", "v1", 2);
+	zassert_ok(blobfs_lookup("old", &body_id));
+	zassert_ok(fs_unmount(&blobfs_mnt));
+
+	zassert_ok(rootreg_get(ROOTREG_KEY(BLOBFS_MAGIC, 0), &meta_id));
+	zassert_ok(blob_db_get(meta_id, &meta, sizeof(meta), &got));
+
+	/* Rewrite it as version 1, mid-rename: intent committed, directory
+	 * untouched.
+	 */
+	struct blobfs_meta_v1 v1 = {
+		.magic = BLOBFS_MAGIC,
+		.version = BLOBFS_META_VERSION_1,
+		.rename_in_flight = 1,
+		.from_len = 3,
+		.to_len = 3,
+		.dir_root = meta.dir_root,
+		.rename_body = body_id,
+	};
+	memcpy(v1.from, "old", 3);
+	memcpy(v1.to, "new", 3);
+	zassert_ok(blob_db_update(meta_id, &v1, sizeof(v1)));
+
+	zassert_ok(fs_mount(&blobfs_mnt));
+
+	/* Rolled back, in the root directory, and stored as version 2. */
+	zassert_ok(fs_stat(MNT_POINT "/old", &stat));
+	zassert_equal(stat.size, 2);
+	zassert_equal(fs_stat(MNT_POINT "/new", &stat), -ENOENT);
+	zassert_ok(blob_db_get(meta_id, &meta, sizeof(meta), &got));
+	zassert_equal(got, sizeof(meta));
+	zassert_equal(meta.version, BLOBFS_META_VERSION);
+	zassert_equal(meta.rename_in_flight, 0);
+
+	zassert_ok(fs_unmount(&blobfs_mnt));
+}
+
+/* Rewrite the meta as version 1 (no intent), as blobfs before directories
+ * left it.
+ */
+static uint64_t forge_v1_meta(void)
+{
+	uint64_t meta_id = 0;
+	struct blobfs_meta meta;
+	size_t got = 0;
+
+	zassert_ok(rootreg_get(ROOTREG_KEY(BLOBFS_MAGIC, 0), &meta_id));
+	zassert_ok(blob_db_get(meta_id, &meta, sizeof(meta), &got));
+
+	struct blobfs_meta_v1 v1 = {
+		.magic = BLOBFS_MAGIC,
+		.version = BLOBFS_META_VERSION_1,
+		.dir_root = meta.dir_root,
+	};
+
+	zassert_ok(blob_db_update(meta_id, &v1, sizeof(v1)));
+	return meta_id;
+}
+
+/* A version 1 store stays version 1 while it is used flat — so it can
+ * still go back to firmware from before directories — and the first mkdir
+ * makes it version 2, which that firmware refuses at mount instead of
+ * reporting the directory as corrupt.
+ */
+ZTEST(blobfs, test_mkdir_upgrades_v1_meta)
+{
+	size_t size = 0;
+
+	zassert_ok(fs_mount(&blobfs_mnt));
+	zassert_ok(fs_unmount(&blobfs_mnt));
+
+	uint64_t meta_id = forge_v1_meta();
+
+	zassert_ok(fs_mount(&blobfs_mnt));
+	make_file(MNT_POINT "/flat", "1", 1);
+	zassert_ok(blob_db_size(meta_id, &size));
+	zassert_equal(size, sizeof(struct blobfs_meta_v1),
+		      "flat use rewrote the version 1 meta");
+
+	zassert_ok(fs_mkdir(MNT_POINT "/d"));
+	zassert_ok(blob_db_size(meta_id, &size));
+	zassert_equal(size, sizeof(struct blobfs_meta),
+		      "mkdir left a version 1 meta");
+
+	zassert_ok(fs_unmount(&blobfs_mnt));
+	zassert_ok(fs_mount(&blobfs_mnt));
+	struct fs_dirent stat;
+
+	zassert_ok(fs_stat(MNT_POINT "/d", &stat));
+	zassert_equal(stat.type, FS_DIR_ENTRY_DIR);
+	zassert_ok(fs_unmount(&blobfs_mnt));
+}
+
+/* Make a rename from "a" to "b" fail on its last step (dropping "a"), so
+ * both names are left bound to one file with the intent on flash.
+ */
+static void fail_rename_last_step(void)
+{
+	struct fs_dirent stat;
+
+	make_file(MNT_POINT "/a", "x", 1);
+	/* Let b's bucket exist, so binding "b" is exactly one kvhash write. */
+	make_file(MNT_POINT "/b", NULL, 0);
+	zassert_ok(fs_unlink(MNT_POINT "/b"));
+
+	kvhash_test_cut_after = 1; /* bind "b", then fail dropping "a" */
+	zassert_not_equal(fs_rename(MNT_POINT "/a", MNT_POINT "/b"), 0);
+	kvhash_test_cut_after = -1;
+	kvhash_test_cut_fired = false;
+
+	zassert_ok(fs_stat(MNT_POINT "/a", &stat), "setup: 'a' gone");
+	zassert_ok(fs_stat(MNT_POINT "/b", &stat), "setup: 'b' not bound");
+}
+
+/* Unlinking one of two names a failed rename left must not free the file
+ * the other still names: the half-done rename is finished first.
+ */
+ZTEST(blobfs, test_rename_failure_settled_before_unlink)
+{
+	struct fs_dirent stat;
+	struct fs_dir_t dir;
+	struct fs_dirent entry;
+
+	zassert_ok(fs_mount(&blobfs_mnt));
+	fail_rename_last_step();
+
+	zassert_ok(fs_unlink(MNT_POINT "/b"));
+	/* The name itself must be gone: a name left on a deleted body also
+	 * stats as -ENOENT, but still resolves.
+	 */
+	uint64_t id = 0;
+
+	zassert_equal(blobfs_lookup("a", &id), -ENOENT,
+		      "'a' left naming a deleted body");
+	zassert_equal(fs_stat(MNT_POINT "/b", &stat), -ENOENT);
+	check_intent_cleared();
+
+	/* Nothing broken is left to list. */
+	fs_dir_t_init(&dir);
+	zassert_ok(fs_opendir(&dir, MNT_POINT));
+	zassert_ok(fs_readdir(&dir, &entry));
+	zassert_equal(entry.name[0], '\0', "'%s' left behind", entry.name);
+	zassert_ok(fs_closedir(&dir));
+
+	zassert_ok(fs_unmount(&blobfs_mnt));
+}
+
+/* A later rename must not overwrite the intent a failed one left, which
+ * would leave the two names for good.
+ */
+ZTEST(blobfs, test_rename_failure_settled_before_rename)
+{
+	struct fs_dirent stat;
+
+	zassert_ok(fs_mount(&blobfs_mnt));
+	fail_rename_last_step();
+
+	zassert_ok(fs_rename(MNT_POINT "/b", MNT_POINT "/c"));
+	zassert_equal(fs_stat(MNT_POINT "/a", &stat), -ENOENT,
+		      "the failed rename was never finished");
+	zassert_equal(fs_stat(MNT_POINT "/b", &stat), -ENOENT);
+	zassert_ok(fs_stat(MNT_POINT "/c", &stat));
+	zassert_equal(stat.size, 1);
+	check_intent_cleared();
+
+	/* And the next mount has nothing left to repair. */
+	zassert_ok(fs_unmount(&blobfs_mnt));
+	zassert_ok(fs_mount(&blobfs_mnt));
+	zassert_equal(fs_stat(MNT_POINT "/a", &stat), -ENOENT);
+	zassert_ok(fs_stat(MNT_POINT "/c", &stat));
+	zassert_ok(fs_unmount(&blobfs_mnt));
+}
+
+/* A directory name whose Map is already gone can still be removed. */
+ZTEST(blobfs, test_unlink_directory_whose_map_is_gone)
+{
+	struct fs_dirent stat;
+	uint64_t dir_id = 0;
+
+	zassert_ok(fs_mount(&blobfs_mnt));
+	zassert_ok(fs_mkdir(MNT_POINT "/d"));
+	zassert_ok(blobfs_opendir("d", &dir_id));
+	zassert_ok(kvhash_map_ops.destroy(dir_id));
+
+	zassert_ok(fs_stat(MNT_POINT "/d", &stat));
+	zassert_ok(fs_unlink(MNT_POINT "/d"));
+	zassert_equal(fs_stat(MNT_POINT "/d", &stat), -ENOENT);
+
+	zassert_ok(fs_unmount(&blobfs_mnt));
+}
+
+/* A broken entry is reported once, and the listing goes on past it. */
+ZTEST(blobfs, test_readdir_steps_past_broken_entry)
+{
+	struct fs_dir_t dir;
+	struct fs_dirent entry;
+	uint64_t body_id = 0;
+	int listed = 0, errors = 0;
+
+	zassert_ok(fs_mount(&blobfs_mnt));
+	make_file(MNT_POINT "/f0", NULL, 0);
+	make_file(MNT_POINT "/f1", NULL, 0);
+	make_file(MNT_POINT "/f2", NULL, 0);
+	zassert_ok(blobfs_lookup("f1", &body_id));
+	zassert_ok(blob_db_delete(body_id)); /* f1 now names nothing */
+
+	fs_dir_t_init(&dir);
+	zassert_ok(fs_opendir(&dir, MNT_POINT));
+	for (int guard = 0; guard < 10; guard++) {
+		int rc = fs_readdir(&dir, &entry);
+
+		if (rc == -EIO) {
+			errors++;
+			continue;
+		}
+		zassert_ok(rc);
+		if (entry.name[0] == '\0') {
+			break;
+		}
+		zassert_not_equal(strcmp(entry.name, "f1"), 0);
+		listed++;
+	}
+	zassert_ok(fs_closedir(&dir));
+	zassert_equal(listed, 2, "listing stalled or skipped (%d)", listed);
+	zassert_equal(errors, 1);
+
+	/* The broken name can be removed. */
+	zassert_ok(fs_unlink(MNT_POINT "/f1"));
 
 	zassert_ok(fs_unmount(&blobfs_mnt));
 }

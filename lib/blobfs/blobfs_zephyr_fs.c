@@ -16,6 +16,9 @@
  *   every op serializes on one mutex — the same discipline littlefs's and
  *   FAT's drivers apply.
  * - The access-mode checks that go with a handle (read/write/truncate).
+ * - A directory handle: the directory's id and the last name readdir
+ *   returned. blobfs lists by name cursor, so that is the whole of a
+ *   listing's state.
  *
  * Ops blobfs v1 cannot honor are left NULL — the VFS core NULL-checks every
  * op and reports -ENOTSUP itself, so there is nothing to stub here.
@@ -58,6 +61,25 @@ struct blobfs_fh {
 };
 
 static struct blobfs_fh fh_pool[CONFIG_BLOBFS_FS_MAX_OPEN_FILES];
+
+/** A directory handle: the cursor of a listing in progress.
+ *
+ * Like a file handle it binds to the directory's identity (its Map root),
+ * not its path, so it follows a rename and reports -ENOENT once the
+ * directory is removed. `last` is the name readdir returned last ("" before
+ * the first); `done`
+ * marks a listing that has reported its end, so later readdirs keep
+ * reporting it. `dead` is as for file handles.
+ */
+struct blobfs_dh {
+	bool used;
+	bool dead;
+	bool done;
+	uint64_t dir_id;
+	char last[BLOBFS_NAME_MAX + 1];
+};
+
+static struct blobfs_dh dh_pool[CONFIG_BLOBFS_FS_MAX_OPEN_DIRS];
 
 /* v1 supports a single mounted instance (blobfs itself is a singleton). */
 static bool fs_mounted;
@@ -102,6 +124,22 @@ static struct blobfs_fh *fh_of(struct fs_file_t *filp)
 	return fh;
 }
 
+static struct blobfs_dh *dh_alloc(void)
+{
+	for (size_t i = 0; i < ARRAY_SIZE(dh_pool); i++) {
+		if (!dh_pool[i].used) {
+			dh_pool[i] = (struct blobfs_dh){ .used = true };
+			return &dh_pool[i];
+		}
+	}
+	return NULL;
+}
+
+static void dh_free(struct blobfs_dh *dh)
+{
+	*dh = (struct blobfs_dh){ 0 };
+}
+
 /* Path as blobfs sees it: the mount point prefix belongs to the VFS. The
  * result may or may not carry a leading '/' (it does not when the mount
  * point is "/" itself); blobfs accepts both spellings.
@@ -112,10 +150,31 @@ static const char *strip_mnt(const struct fs_mount_t *mp, const char *path)
 	return (*path != '\0') ? path : "/";
 }
 
-/* The bare name, for filling fs_dirent::name. */
-static const char *bare_name(const char *path)
+/* Copy the last component of @p path into fs_dirent::name. */
+static void last_name(char dst[MAX_FILE_NAME + 1], const char *path)
 {
-	return (path[0] == '/') ? path + 1 : path;
+	size_t end = strlen(path);
+
+	while (end > 0 && path[end - 1] == '/') {
+		end--;
+	}
+
+	size_t start = end;
+
+	while (start > 0 && path[start - 1] != '/') {
+		start--;
+	}
+
+	size_t n = MIN(end - start, (size_t)MAX_FILE_NAME);
+
+	memcpy(dst, path + start, n);
+	dst[n] = '\0';
+}
+
+static enum fs_dir_entry_type vfs_type(enum blobfs_entry_type type)
+{
+	return (type == BLOBFS_ENTRY_DIR) ? FS_DIR_ENTRY_DIR
+					  : FS_DIR_ENTRY_FILE;
 }
 
 static int blobfs_fs_open(struct fs_file_t *filp, const char *fs_path,
@@ -376,12 +435,21 @@ static int blobfs_fs_stat(struct fs_mount_t *mountp, const char *path,
 
 	rc = blobfs_stat(name, &stat);
 	if (rc == 0) {
-		entry->type = FS_DIR_ENTRY_FILE;
+		entry->type = vfs_type(stat.type);
 		entry->size = stat.size;
-		strncpy(entry->name, bare_name(name), sizeof(entry->name) - 1);
-		entry->name[sizeof(entry->name) - 1] = '\0';
+		last_name(entry->name, name);
 	}
 
+	unlock();
+	return rc;
+}
+
+static int blobfs_fs_mkdir(struct fs_mount_t *mountp, const char *name)
+{
+	int rc;
+
+	lock();
+	rc = blobfs_mkdir(strip_mnt(mountp, name));
 	unlock();
 	return rc;
 }
@@ -406,6 +474,99 @@ static int blobfs_fs_rename(struct fs_mount_t *mountp, const char *from,
 	rc = blobfs_rename(strip_mnt(mountp, from), strip_mnt(mountp, to));
 	unlock();
 	return rc;
+}
+
+static int blobfs_fs_opendir(struct fs_dir_t *dirp, const char *fs_path)
+{
+	int rc;
+
+	/* fs_opendir("/") lists the VFS mount points and never reaches here,
+	 * so a mount at "/" is listed as the VFS root, not by blobfs.
+	 */
+	lock();
+
+	struct blobfs_dh *dh = dh_alloc();
+
+	if (dh == NULL) {
+		LOG_ERR("opendir: all %zu directory handles in use",
+			ARRAY_SIZE(dh_pool));
+		rc = -EMFILE;
+		goto out;
+	}
+
+	rc = blobfs_opendir(strip_mnt(dirp->mp, fs_path), &dh->dir_id);
+	if (rc != 0) {
+		dh_free(dh);
+		goto out;
+	}
+
+	dirp->dirp = dh;
+
+out:
+	unlock();
+	return rc;
+}
+
+static int blobfs_fs_readdir(struct fs_dir_t *dirp, struct fs_dirent *entry)
+{
+	int rc = 0;
+
+	lock();
+
+	struct blobfs_dh *dh = dirp->dirp;
+
+	if (dh == NULL || !dh->used || dh->dead) {
+		rc = -EBADF;
+		goto out;
+	}
+
+	struct blobfs_stat stat;
+
+	if (!dh->done) {
+		rc = blobfs_next_id(dh->dir_id, dh->last, entry->name, &stat);
+		if (rc == -ENODATA) {
+			dh->done = true;
+			rc = 0;
+		} else if (rc != 0) {
+			/* A broken entry comes back named: report it, but move
+			 * the cursor past it, so the next readdir goes on to
+			 * the rest of the directory instead of stalling here.
+			 */
+			if (rc == -EIO && entry->name[0] != '\0') {
+				strcpy(dh->last, entry->name);
+			}
+			goto out;
+		}
+	}
+
+	if (dh->done) {
+		/* The VFS's end-of-directory marker. */
+		entry->name[0] = '\0';
+		goto out;
+	}
+
+	entry->type = vfs_type(stat.type);
+	entry->size = stat.size;
+	strcpy(dh->last, entry->name);
+
+out:
+	unlock();
+	return rc;
+}
+
+static int blobfs_fs_closedir(struct fs_dir_t *dirp)
+{
+	lock();
+
+	struct blobfs_dh *dh = dirp->dirp;
+
+	if (dh != NULL) {
+		dh_free(dh);
+		dirp->dirp = NULL;
+	}
+
+	unlock();
+	return 0;
 }
 
 static int blobfs_fs_mount(struct fs_mount_t *mountp)
@@ -442,7 +603,7 @@ static int blobfs_fs_mount(struct fs_mount_t *mountp)
 	}
 
 	/* Handles orphaned by an earlier unmount keep their slots until they
-	 * are closed — the pool is deliberately NOT reset here.
+	 * are closed — the pools are deliberately NOT reset here.
 	 */
 	fs_mounted = true;
 
@@ -466,6 +627,11 @@ static int blobfs_fs_unmount(struct fs_mount_t *mountp)
 			fh_pool[i].dead = true;
 		}
 	}
+	for (size_t i = 0; i < ARRAY_SIZE(dh_pool); i++) {
+		if (dh_pool[i].used) {
+			dh_pool[i].dead = true;
+		}
+	}
 
 	/* blob_db stays mounted: other interfaces may still be using it. */
 	(void)blobfs_unmount();
@@ -475,8 +641,8 @@ static int blobfs_fs_unmount(struct fs_mount_t *mountp)
 	return 0;
 }
 
-/* mkdir, opendir/readdir/closedir and statvfs stay NULL: the VFS core turns a
- * NULL op into -ENOTSUP, which is exactly what v1 owes those callers.
+/* statvfs stays NULL: the VFS core turns a NULL op into -ENOTSUP, which is
+ * exactly what v1 owes its callers.
  */
 static const struct fs_file_system_t blobfs_fs = {
 	.open = blobfs_fs_open,
@@ -489,9 +655,13 @@ static const struct fs_file_system_t blobfs_fs = {
 	.close = blobfs_fs_close,
 	.mount = blobfs_fs_mount,
 	.unmount = blobfs_fs_unmount,
+	.mkdir = blobfs_fs_mkdir,
 	.unlink = blobfs_fs_unlink,
 	.rename = blobfs_fs_rename,
 	.stat = blobfs_fs_stat,
+	.opendir = blobfs_fs_opendir,
+	.readdir = blobfs_fs_readdir,
+	.closedir = blobfs_fs_closedir,
 };
 
 static int blobfs_fs_register(void)
