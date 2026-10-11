@@ -38,11 +38,11 @@
  * nothing about blob_db, and later attaches fail or discard what it hit,
  * taking the rest of the suite with it.
  *
- * So these cases skip on UBI rather than pretend to pass. The gap is real and
- * deliberate: blob_db's crash-safety is verified on flash_area only, because
- * doing it on UBI needs injection at the store seam rather than at fixed flash
- * offsets. Everything that does not reach past the API still runs on both
- * backends — see the lib.blob_db.ubi scenario in testcase.yaml.
+ * So these cases skip on UBI rather than pretend to pass. Compaction's crash
+ * safety is covered on UBI by src/power_cut.c instead, which cuts the power
+ * under the store seam rather than forging state at fixed offsets. Everything
+ * that does not reach past the API still runs on both backends — see the
+ * lib.blob_db.ubi scenario in testcase.yaml.
  *
  * The guard goes at the top of each affected case, not inside the injection
  * helpers. ztest_test_skip() escapes by longjmp, which the compiler cannot see,

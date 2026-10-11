@@ -1,6 +1,9 @@
 common:
   tags: [storage, blob_db]
   platform_allow: native_sim
+  # src/power_cut.c replays a compaction once per byte it writes, with three
+  # mounts each; on UBI that alone takes most of a minute (twister's default).
+  timeout: 240
 # blob_db defaults to the UBI backend, but most of this suite injects faults by
 # writing the raw partition at offsets that are only blob_db's on flash_area
 # (see SKIP_UNLESS_RAW_PARTITION in src/main.c). The first three scenarios
@@ -70,7 +73,8 @@ tests:
       - CONFIG_UBI_SELF_CHECKS=y
       - CONFIG_BLOB_DB_UBI_KEY_APP=y
   # Compaction by ubi_leb_change() instead of the scratch-sector protocol
-  # (CONFIG_BLOB_DB_UBI_ATOMIC_REPLACE).
+  # (CONFIG_BLOB_DB_UBI_ATOMIC_REPLACE). src/power_cut.c cuts the power
+  # before every byte that compaction writes, inside ubi_leb_change() too.
   lib.blob_db.ubi.atomic_replace:
     extra_configs:
       - CONFIG_BLOB_DB_BACKEND_UBI=y
