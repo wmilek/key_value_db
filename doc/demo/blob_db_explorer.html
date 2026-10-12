@@ -1,0 +1,1081 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+</head>
+<body>
+<title>blob_db Bucket-Log Explorer</title>
+<meta name="description" content="Interactive simulator of the blob_db bucket-log allocator: buckets, slots, latest-wins lookup, compaction, segmented objects and crash recovery.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@75..100,500..800&family=Source+Sans+3:wght@400;600&family=JetBrains+Mono:wght@400;600&display=swap">
+<style>
+/* Layout: control rail on the left, the partition drawn as a stack of sector bars on the right,
+   with the operation trace and the object table under it. Sector bars are byte-true. */
+:root {
+  --bg: #eef0ec;
+  --panel: #f9faf7;
+  --ink: #1a1f1c;
+  --muted: #5a635d;
+  --line: #d3d8d0;
+  --live: #1d7a6c;        /* bound inline payload */
+  --live-ink: #ffffff;
+  --seg: #5458c4;         /* segments + index records */
+  --garbage: #b7bcb2;     /* superseded slots */
+  --tomb: #2f3532;        /* tombstones */
+  --torn: #c43d28;        /* CRC-bad slot */
+  --hdr: #8d958e;         /* bucket header */
+  --read: #2a6bd8;
+  --write: #e0861a;
+  --erase: #c43d28;
+  --ok: #1d7a6c;
+  --warn: #b7791f;
+  --bad: #c43d28;
+  --chip: #e3e7e0;
+  --f-display: "Archivo", "Arial Narrow", system-ui, sans-serif;
+  --f-body: "Source Sans 3", "Segoe UI", system-ui, sans-serif;
+  --f-mono: "JetBrains Mono", ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #141816; --panel: #1c211e; --ink: #e5e9e4; --muted: #9aa49d; --line: #313833;
+    --live: #2fa490; --live-ink: #06110e; --seg: #8a8ef0; --garbage: #4a514c; --tomb: #c9d0ca;
+    --torn: #ef6a52; --hdr: #6b746d; --read: #6aa2ff; --write: #f3a640; --erase: #ef6a52;
+    --ok: #3cc0a8; --warn: #e3b04b; --bad: #ef6a52; --chip: #262c28;
+    color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #141816; --panel: #1c211e; --ink: #e5e9e4; --muted: #9aa49d; --line: #313833;
+  --live: #2fa490; --live-ink: #06110e; --seg: #8a8ef0; --garbage: #4a514c; --tomb: #c9d0ca;
+  --torn: #ef6a52; --hdr: #6b746d; --read: #6aa2ff; --write: #f3a640; --erase: #ef6a52;
+  --ok: #3cc0a8; --warn: #e3b04b; --bad: #ef6a52; --chip: #262c28;
+  color-scheme: dark;
+}
+* { box-sizing: border-box; }
+body { background: var(--bg); color: var(--ink); font: 15px/1.45 var(--f-body); }
+.wrap { max-width: 1320px; margin: 0 auto; padding-inline: 16px; padding-block: 20px 40px; }
+h1, h2, h3 { font-family: var(--f-display); font-stretch: 80%; text-wrap: balance; margin: 0; }
+h1 { font-size: 1.9rem; font-weight: 800; letter-spacing: -0.01em; }
+h2 { font-size: 1.05rem; font-weight: 700; letter-spacing: 0.04em; text-transform: uppercase; }
+h3 { font-size: 0.8rem; font-weight: 700; letter-spacing: 0.08em; text-transform: uppercase; color: var(--muted); }
+p { margin: 0; }
+.intro { display: grid; gap: 6px; margin-bottom: 18px; }
+.intro p { color: var(--muted); max-width: 75ch; }
+code, .mono { font-family: var(--f-mono); font-size: 0.86em; }
+
+.layout { display: grid; grid-template-columns: 330px minmax(0, 1fr); gap: 18px; align-items: start; }
+@media (max-width: 900px) { .layout { grid-template-columns: minmax(0, 1fr); } }
+
+.panel { background: var(--panel); border: 1px solid var(--line); border-radius: 6px; padding: 14px; display: grid; gap: 12px; min-width: 0; }
+.rail { display: grid; gap: 14px; }
+
+.field { display: grid; gap: 4px; }
+.field label, .lbl { font-size: 0.78rem; color: var(--muted); letter-spacing: 0.04em; text-transform: uppercase; }
+.row { display: flex; gap: 8px; flex-wrap: wrap; align-items: end; }
+.row > .field { flex: 1 1 90px; min-width: 0; }
+input[type=number], select {
+  font: 14px var(--f-mono); color: var(--ink); background: var(--bg); border: 1px solid var(--line);
+  border-radius: 4px; padding: 6px 8px; width: 100%;
+}
+input:focus-visible, select:focus-visible, button:focus-visible { outline: 2px solid var(--read); outline-offset: 1px; }
+.check { display: flex; gap: 8px; align-items: center; font-size: 0.92rem; }
+button {
+  font: 600 13px var(--f-mono); color: var(--ink); background: var(--chip); border: 1px solid var(--line);
+  border-radius: 4px; padding: 7px 10px; cursor: pointer; white-space: nowrap;
+}
+button:hover { border-color: var(--muted); }
+button.primary { background: var(--ink); color: var(--panel); border-color: var(--ink); }
+button.danger { color: var(--bad); }
+button:disabled { opacity: 0.45; cursor: not-allowed; }
+.btns { display: flex; flex-wrap: wrap; gap: 6px; }
+.derived { font: 12px/1.6 var(--f-mono); color: var(--muted); display: grid; grid-template-columns: auto 1fr; gap: 0 10px; }
+.derived b { color: var(--ink); font-weight: 600; text-align: right; font-variant-numeric: tabular-nums; }
+.msg { font-size: 0.88rem; padding: 8px 10px; border-radius: 4px; background: var(--chip); }
+.msg.bad { color: var(--bad); }
+.scen { display: grid; gap: 6px; }
+.scen button { text-align: left; white-space: normal; font-family: var(--f-body); font-size: 0.9rem; font-weight: 600; display: grid; gap: 2px; }
+.scen button span { font-weight: 400; color: var(--muted); font-size: 0.82rem; }
+.cutbox { border: 1px dashed var(--line); border-radius: 4px; padding: 8px 10px; display: grid; gap: 4px; }
+.cutbox small { color: var(--muted); }
+
+/* partition map */
+.mapwrap { display: grid; gap: 10px; }
+.maphead { display: flex; justify-content: space-between; align-items: center; gap: 10px; flex-wrap: wrap; }
+.meta { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; }
+@media (max-width: 560px) { .meta { grid-template-columns: minmax(0, 1fr); } }
+.tile { border: 1px solid var(--line); border-radius: 4px; padding: 8px 10px; font: 12px/1.5 var(--f-mono); display: grid; gap: 2px; background: var(--bg); transition: box-shadow 0.12s; }
+.tile .t { font-family: var(--f-display); font-stretch: 80%; font-weight: 700; font-size: 0.95rem; display: flex; justify-content: space-between; gap: 6px; }
+.tile .t em { font-style: normal; font-family: var(--f-mono); font-weight: 400; font-size: 0.75rem; color: var(--muted); }
+.tile.active { border-color: var(--ink); }
+.tile.hl-read { box-shadow: 0 0 0 3px var(--read); }
+.tile.hl-write { box-shadow: 0 0 0 3px var(--write); }
+.tile.hl-erase { box-shadow: 0 0 0 3px var(--erase); }
+.tile .dim { color: var(--muted); }
+
+.buckets { display: grid; gap: 7px; }
+.bk { display: grid; grid-template-columns: 74px minmax(0, 1fr); gap: 8px; align-items: center; }
+.bk .name { font: 600 12px/1.25 var(--f-mono); }
+.bk .name small { display: block; font-weight: 400; color: var(--muted); font-size: 10.5px; }
+.bk .stat { grid-column: 2; font: 11px var(--f-mono); color: var(--muted); display: flex; gap: 12px; flex-wrap: wrap; font-variant-numeric: tabular-nums; }
+.bk.target .name { color: var(--read); }
+.bar { position: relative; height: 34px; background: repeating-linear-gradient(90deg, transparent 0 7px, color-mix(in srgb, var(--line) 55%, transparent) 7px 8px), var(--bg); border: 1px solid var(--line); border-radius: 3px; overflow: hidden; }
+.bar.erased-flash { animation: eflash 0.35s ease-out; }
+@keyframes eflash { from { background: var(--erase); } }
+.slot { position: absolute; top: 0; bottom: 0; border-right: 1px solid var(--bg); cursor: pointer; display: flex; align-items: center; justify-content: center; overflow: hidden; font: 600 10px var(--f-mono); color: var(--live-ink); }
+.slot.hdr { background: var(--hdr); cursor: default; }
+.slot.live { background: var(--live); }
+.slot.live.root { background: color-mix(in srgb, var(--live) 60%, var(--ink)); }
+.slot.garbage { background: repeating-linear-gradient(135deg, var(--garbage) 0 4px, transparent 4px 7px); color: var(--muted); }
+.slot.tomb { background: var(--tomb); color: var(--bg); }
+.slot.torn { background: repeating-linear-gradient(135deg, var(--torn) 0 3px, transparent 3px 6px); color: var(--torn); }
+.slot.seg.live { background: var(--seg); }
+.slot.index.live { background: var(--bg); box-shadow: inset 0 0 0 2px var(--seg); color: var(--seg); }
+.slot.orphan { background: repeating-linear-gradient(135deg, var(--seg) 0 3px, var(--torn) 3px 6px); }
+.slot.sel { outline: 2px solid var(--write); outline-offset: -2px; z-index: 2; }
+.cursor { position: absolute; top: -2px; bottom: -2px; width: 2px; background: var(--ink); z-index: 3; }
+.hl { position: absolute; top: 0; bottom: 0; z-index: 4; pointer-events: none; }
+.hl.read { box-shadow: inset 0 0 0 2px var(--read); background: color-mix(in srgb, var(--read) 22%, transparent); }
+.hl.scan { background: var(--read); opacity: 0.85; top: 0; bottom: 60%; }
+.hl.write { background: color-mix(in srgb, var(--write) 55%, transparent); box-shadow: inset 0 0 0 2px var(--write); }
+
+.legend { display: flex; flex-wrap: wrap; gap: 6px 14px; font-size: 0.82rem; color: var(--muted); }
+.legend span { display: inline-flex; align-items: center; gap: 6px; }
+.sw { width: 18px; height: 12px; border-radius: 2px; display: inline-block; border: 1px solid var(--line); }
+
+.player { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; font: 12px var(--f-mono); color: var(--muted); }
+.player select { width: auto; }
+.progress { flex: 1 1 120px; height: 4px; background: var(--line); border-radius: 2px; overflow: hidden; min-width: 80px; }
+.progress i { display: block; height: 100%; background: var(--read); width: 0; }
+
+.lower { display: grid; grid-template-columns: minmax(0, 1.25fr) minmax(0, 1fr); gap: 18px; margin-top: 18px; align-items: start; }
+@media (max-width: 1100px) { .lower { grid-template-columns: minmax(0, 1fr); } }
+
+.cost { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 8px; }
+@media (max-width: 520px) { .cost { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+.cost div { display: grid; gap: 0; }
+.cost b { font: 600 1.25rem var(--f-mono); font-variant-numeric: tabular-nums; }
+.cost small { font-size: 0.75rem; color: var(--muted); text-transform: uppercase; letter-spacing: 0.05em; }
+.cost .r b { color: var(--read); } .cost .w b { color: var(--write); } .cost .e b { color: var(--erase); }
+.opline { display: flex; justify-content: space-between; gap: 10px; flex-wrap: wrap; align-items: baseline; }
+.opline .call { font: 600 14px var(--f-mono); overflow-wrap: anywhere; }
+.rc { font: 600 12px var(--f-mono); padding: 2px 7px; border-radius: 3px; background: var(--chip); }
+.rc.ok { color: var(--ok); } .rc.err { color: var(--bad); } .rc.warn { color: var(--warn); }
+
+.trace { list-style: none; margin: 0; padding: 0; max-height: 420px; overflow: auto; font: 12px/1.45 var(--f-mono); border-top: 1px solid var(--line); }
+.trace li { display: grid; grid-template-columns: 54px minmax(0, 1fr) auto; gap: 8px; padding: 4px 2px; border-bottom: 1px solid var(--line); align-items: baseline; }
+.trace li.cur { background: color-mix(in srgb, var(--read) 12%, transparent); }
+.trace .k { font-weight: 600; font-size: 10.5px; text-transform: uppercase; letter-spacing: 0.05em; }
+.trace .k.read, .trace .k.scan { color: var(--read); } .trace .k.write { color: var(--write); } .trace .k.erase { color: var(--erase); }
+.trace .k.note { color: var(--muted); } .trace .k.warn { color: var(--warn); } .trace .k.bad { color: var(--bad); }
+.trace .txt { overflow-wrap: anywhere; }
+.trace .sz { color: var(--muted); font-variant-numeric: tabular-nums; text-align: right; }
+
+.tablewrap { overflow-x: auto; }
+table { width: 100%; border-collapse: collapse; font: 12.5px var(--f-mono); font-variant-numeric: tabular-nums; }
+th { text-align: left; font: 600 10.5px var(--f-mono); text-transform: uppercase; letter-spacing: 0.05em; color: var(--muted); padding: 4px 6px; border-bottom: 1px solid var(--line); }
+td { padding: 5px 6px; border-bottom: 1px solid var(--line); }
+td.num { text-align: right; }
+tr.pick { cursor: pointer; } tr.pick:hover td { background: var(--chip); }
+.kind { font-size: 11px; padding: 1px 6px; border-radius: 3px; background: var(--chip); }
+.kind.seg { color: var(--seg); } .kind.inl { color: var(--live); } .kind.unb { color: var(--muted); }
+.hist { list-style: none; margin: 0; padding: 0; display: grid; gap: 2px; max-height: 260px; overflow: auto; font: 12px var(--f-mono); }
+.hist li { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 8px; padding: 4px 6px; border-radius: 3px; cursor: pointer; }
+.hist li:hover, .hist li.on { background: var(--chip); }
+.hist .c { color: var(--muted); font-size: 11px; }
+.foot { margin-top: 22px; color: var(--muted); font-size: 0.85rem; display: grid; gap: 6px; max-width: 90ch; }
+@media (prefers-reduced-motion: reduce) { .bar.erased-flash { animation: none; } .tile { transition: none; } }
+</style>
+
+<div class="wrap">
+  <div class="intro">
+    <h1>blob_db Bucket-Log Explorer</h1>
+    <p>A step-by-step simulator of the v1 allocator in <code>lib/blob_db</code>. Each bar is one erase sector, drawn to scale in bytes. Run an operation and watch the flash reads, writes and erases it costs, in the same order the C code issues them. Models the raw <code>flash_area</code> backend.</p>
+  </div>
+
+  <div class="layout">
+    <div class="rail">
+      <section class="panel" aria-labelledby="h-geo">
+        <h2 id="h-geo">Geometry &amp; Kconfig</h2>
+        <div class="row">
+          <div class="field"><label for="cfgS">Sector (bucket) size</label>
+            <select id="cfgS"><option value="1024">1 KB</option><option value="2048">2 KB</option><option value="4096" selected>4 KB</option><option value="8192">8 KB</option></select></div>
+          <div class="field"><label for="cfgN">Buckets</label>
+            <select id="cfgN"><option>4</option><option>6</option><option selected>8</option><option>12</option><option>16</option></select></div>
+        </div>
+        <div class="row">
+          <div class="field"><label for="cfgW">Write align</label>
+            <select id="cfgW"><option>1</option><option selected>4</option><option>8</option><option>16</option></select></div>
+          <div class="field"><label for="cfgP">MAX_PAYLOAD_LEN</label>
+            <input id="cfgP" type="number" min="16" max="65535" value="2016"></div>
+        </div>
+        <label class="check"><input id="cfgL" type="checkbox" checked> <span><code>LARGE_PAYLOADS</code> (segmented objects)</span></label>
+        <div class="derived" id="derived"></div>
+        <div id="cfgMsg" class="msg bad" hidden></div>
+        <div class="btns"><button id="btnApply" class="primary">Apply &amp; format</button></div>
+      </section>
+
+      <section class="panel" aria-labelledby="h-ops">
+        <h2 id="h-ops">Operations</h2>
+        <div class="row">
+          <div class="field"><label for="opId">id</label><input id="opId" type="number" min="0" value="2" list="idlist"><datalist id="idlist"></datalist></div>
+          <div class="field"><label for="opLen">payload bytes</label><input id="opLen" type="number" min="0" value="200"></div>
+        </div>
+        <div class="btns">
+          <button data-op="update">update</button>
+          <button data-op="get">get</button>
+          <button data-op="exists">exists</button>
+          <button data-op="delete" class="danger">delete</button>
+        </div>
+        <div class="row">
+          <div class="field"><label for="opBucket">into bucket</label><input id="opBucket" type="number" min="0" value="2"></div>
+          <button id="btnAlloc">alloc_id</button>
+          <button id="btnAllocIn">alloc into bucket</button>
+        </div>
+        <div class="cutbox">
+          <label class="check"><input id="cutArm" type="checkbox"> <span>Cut power during the next write</span></label>
+          <small>An inline write lands torn (header programmed, CRC wrong). A segmented write dies after its first segment. The store then remounts.</small>
+        </div>
+        <div class="btns">
+          <button id="btnMount">remount</button>
+          <button id="btnFormat" class="danger">format</button>
+        </div>
+      </section>
+
+      <section class="panel" aria-labelledby="h-scen">
+        <h2 id="h-scen">Scenarios</h2>
+        <div class="scen" id="scen"></div>
+      </section>
+    </div>
+
+    <div style="min-width:0">
+      <section class="panel mapwrap" aria-labelledby="h-map">
+        <div class="maphead">
+          <h2 id="h-map">Partition</h2>
+          <div class="player">
+            <label for="speed">playback</label>
+            <select id="speed"><option value="0">instant</option><option value="70">fast</option><option value="260" selected>step-by-step</option><option value="700">slow</option></select>
+            <div class="progress" aria-hidden="true"><i id="prog"></i></div>
+            <button id="btnSkip">skip</button>
+            <button id="btnReplay">replay</button>
+          </div>
+        </div>
+        <div class="meta" id="meta"></div>
+        <div class="buckets" id="buckets"></div>
+        <div class="legend">
+          <span><i class="sw" style="background:var(--hdr)"></i>bucket header 16 B</span>
+          <span><i class="sw" style="background:var(--live)"></i>live inline payload</span>
+          <span><i class="sw" style="background:var(--bg);box-shadow:inset 0 0 0 2px var(--seg)"></i>index record</span>
+          <span><i class="sw" style="background:var(--seg)"></i>segment</span>
+          <span><i class="sw" style="background:repeating-linear-gradient(135deg,var(--garbage) 0 4px,transparent 4px 7px)"></i>superseded (garbage)</span>
+          <span><i class="sw" style="background:var(--tomb)"></i>tombstone</span>
+          <span><i class="sw" style="background:repeating-linear-gradient(135deg,var(--torn) 0 3px,transparent 3px 6px)"></i>torn (CRC bad)</span>
+          <span><i class="sw" style="background:var(--ink);width:3px"></i>write cursor</span>
+        </div>
+      </section>
+
+      <div class="lower">
+        <section class="panel" aria-labelledby="h-cost">
+          <h2 id="h-cost">Last operation</h2>
+          <div class="opline"><span class="call" id="opCall">—</span><span class="rc" id="opRc">—</span></div>
+          <div class="cost">
+            <div class="r"><b id="cRo">0</b><small>read ops</small></div>
+            <div class="r"><b id="cRb">0 B</b><small>bytes read</small></div>
+            <div class="w"><b id="cW">0 / 0 B</b><small>writes</small></div>
+            <div class="e"><b id="cE">0</b><small>erases</small></div>
+          </div>
+          <ol class="trace" id="trace"></ol>
+        </section>
+        <div class="rail">
+          <section class="panel" aria-labelledby="h-obj">
+            <h2 id="h-obj">Ids</h2>
+            <div class="tablewrap"><table>
+              <thead><tr><th>id</th><th>bucket</th><th>stored as</th><th class="num">bytes</th></tr></thead>
+              <tbody id="objs"></tbody>
+            </table></div>
+          </section>
+          <section class="panel" aria-labelledby="h-hist">
+            <h2 id="h-hist">History</h2>
+            <ul class="hist" id="hist"></ul>
+          </section>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="foot">
+    <p><b>Model.</b> These follow the C code: <code>scan_bucket_for</code> reads 12 B (slot header + id) per slot plus one probe of the erased tail. <code>slot_verify</code> reads the payload and the 2 B CRC. Compaction reads the whole sector, then does master → scratch → bucket → scratch → master, which is five erases on raw NOR (<code>write_master</code> erases before writing). Ids map to <code>id % buckets</code>; sectors 0–2 are master A, master B and scratch.</p>
+    <p><b>Known issue in the current code.</b> <code>build_compacted_image()</code> walks slots with <code>slot_view_at()</code>, which returns false on a CRC mismatch, and it treats that as end-of-log. Lookups instead step over a CRC-bad slot. So if a torn or rotten slot has valid slots after it, the next compaction of that bucket drops them. The last scenario reproduces this.</p>
+    <p><b>Simplified.</b> UBI, timing, crashes inside compaction, bit rot and the batch API are not modelled. Bucket counts are kept small so the bars stay readable. A real 8 MB partition has 2045 (4 KB) or 125 (64 KB) buckets.</p>
+  </div>
+</div>
+
+<script>
+(() => {
+'use strict';
+const MAXOBJ_CFG = 131072, MAXSEG = 128, TRIES = 8, HINT_STEP = 256, MASTER_LEN = 64, SEAL_LEN = 16, OVH = 14, HDR = 16;
+class Crash extends Error {}
+
+let cfg = { S: 4096, N: 8, W: 4, L: true, P: 2016 };
+let D = {};           // derived geometry
+let st = null;        // the store (flash + RAM)
+let T = null;         // trace being recorded
+const hist = [];
+let selId = null;
+
+const $ = (id) => document.getElementById(id);
+const ru = (n, a) => Math.ceil(n / a) * a;
+const slotSize = (vl) => ru(OVH + vl, cfg.W);
+const isTomb = (s) => s.kind === 'tomb' || s.kind === 'segtomb';
+const hex = (n) => '0x' + n.toString(16).padStart(3, '0');
+const fmtB = (n) => n >= 10240 ? (n / 1024).toFixed(1) + ' KB' : n + ' B';
+const bucketOf = (id) => id % cfg.N;
+const secName = (sec) => sec === 0 ? 'master A' : sec === 1 ? 'master B' : sec === 2 ? 'scratch' : 'bucket ' + (sec - 3);
+
+function derive(c) {
+  const sust = Math.floor(Math.floor((c.S - HDR) / 2) / c.W) * c.W - OVH;
+  const segLen = Math.min(Math.floor(c.S / 4), c.P - 12);
+  const idxCap = Math.floor((c.P - 16) / 8);
+  const segMax = Math.min(idxCap, MAXSEG);
+  const reach = segMax * segLen;
+  return { sust, segLen, idxCap, segMax, maxObj: Math.min(MAXOBJ_CFG, reach), reach };
+}
+
+/* ---------------- trace recording ---------------- */
+function snap() {
+  return structuredClone({ masters: st.masters, active: st.active, scratch: st.scratch, buckets: st.buckets });
+}
+function newTrace(label) { return { label, ev: [], rOps: 0, rB: 0, wOps: 0, wB: 0, er: 0, rc: null, pre: snap() }; }
+function rd(sec, off, len, text) { T.rOps++; T.rB += len; T.ev.push({ t: 'read', sec, off, len, text }); }
+function scanEv(sec, heads, text, perHeadOps = 1) {
+  T.rOps += heads.length * perHeadOps; T.rB += heads.length * 12;
+  T.ev.push({ t: 'scan', sec, heads, len: heads.length * 12, ops: heads.length * perHeadOps, text });
+}
+function wr(sec, off, len, text) { T.wOps++; T.wB += len; T.ev.push({ t: 'write', sec, off, len, text, snap: snap() }); }
+function er(sec, text) { T.er++; T.ev.push({ t: 'erase', sec, off: 0, len: cfg.S, text, snap: snap() }); }
+function note(text, lvl = 'note') { T.ev.push({ t: lvl, text }); }
+
+/* ---------------- flash primitives ---------------- */
+function writeMaster(state, cbid, why) {
+  const ina = 1 - st.active, m = st.masters[ina];
+  m.valid = false; m.erases++;
+  er(ina, `write_master: erase inactive ${secName(ina)}`);
+  st.gen++;
+  Object.assign(m, { valid: true, gen: st.gen, state, cbid, owner: st.segOwner, hint: st.hint });
+  st.active = ina;
+  wr(ina, 0, ru(MASTER_LEN, cfg.W), `write_master gen ${st.gen} ${state}${state === 'COMPACTING' ? '(' + cbid + ')' : ''} — ${why}`);
+}
+function persistSegOwner(owner) {
+  if (st.segOwner === owner) return;
+  st.segOwner = owner;
+  writeMaster('CLEAN', 0, owner ? `seg_owner = ${owner} (intent: segmented write in flight)` : 'seg_owner = 0 (done)');
+}
+function allocId() {
+  if (st.nextId >= st.hint) {
+    st.hint = st.nextId + 1 + HINT_STEP;
+    writeMaster('CLEAN', 0, `persist id ceiling ${st.hint}`);
+  }
+  const id = st.nextId++;
+  st.alloc.add(id);
+  return id;
+}
+function readHdr(b) { rd(3 + b, 0, HDR, `read_bucket_hdr(${b})`); return st.buckets[b].fmt; }
+function formatBucket(b) {
+  const B = st.buckets[b]; B.fmt = true; B.gen = 1; B.slots = [];
+  wr(3 + b, 0, HDR, `format_bucket(${b}): header`);
+}
+function cursorOf(B) { let c = HDR; for (const s of B.slots) c += s.size; return c; }
+
+function scanFor(b, id, limit, why) {
+  const B = st.buckets[b];
+  let c = HDR, target = null; const heads = [];
+  for (const s of B.slots) {
+    if (c + OVH > cfg.S) break;
+    heads.push(c);
+    if (s.id === id && c < limit) target = { s, off: c };
+    c += s.size;
+  }
+  if (c + OVH <= cfg.S) heads.push(c); // erased probe ends the log
+  scanEv(3 + b, heads, `scan_bucket_for(${b}, id ${id})${why ? ' — ' + why : ''}: ${heads.length} slot heads × 12 B`);
+  return { target, cursor: c };
+}
+function verify(b, tg) {
+  const vl = tg.s.vl, sec = 3 + b;
+  if (vl > 0) rd(sec, tg.off + 12, vl, `slot_verify: payload ${vl} B @${hex(tg.off)}`);
+  rd(sec, tg.off + 12 + vl, 2, 'slot_verify: CRC16');
+  return !tg.s.torn;
+}
+function findLive(b, id, why) {
+  let limit = cfg.S;
+  for (;;) {
+    const sc = scanFor(b, id, limit, why);
+    if (!sc.target) return { rc: '-ENOENT', cursor: sc.cursor };
+    if (!verify(b, sc.target)) {
+      note(`CRC mismatch at ${hex(sc.target.off)}: torn slot, rescan below it`, 'warn');
+      limit = sc.target.off; continue;
+    }
+    if (isTomb(sc.target.s)) return { rc: '-ENOENT', cursor: sc.cursor, tomb: true };
+    return { rc: 0, slot: sc.target.s, off: sc.target.off, cursor: sc.cursor };
+  }
+}
+function appendSlot(b, slot, cursor, text) {
+  const B = st.buckets[b];
+  slot.size = slotSize(slot.vl);
+  if (st.cut) {
+    st.cut = false; $('cutArm').checked = false;
+    if (slot.kind === 'seg') {
+      B.slots.push(slot);
+      wr(3 + b, cursor, slot.size, text);
+      note('POWER LOST after this segment, before the index commit', 'bad');
+      throw new Crash('power lost mid segmented write');
+    }
+    slot.torn = true; B.slots.push(slot);
+    wr(3 + b, cursor, slot.size, text + ' — TORN: power lost before payload/CRC landed');
+    note('POWER LOST: header and id programmed, CRC does not match', 'bad');
+    throw new Crash('power lost mid write');
+  }
+  B.slots.push(slot);
+  wr(3 + b, cursor, slot.size, text);
+}
+
+function compact(b) {
+  const B = st.buckets[b], sec = 3 + b;
+  note(`compact_bucket(${b}): the next slot does not fit`, 'warn');
+  rd(sec, 0, cfg.S, `read_bucket: whole sector into RAM`);
+  const walk = [];
+  let stopIdx = -1;
+  for (let i = 0; i < B.slots.length; i++) { if (B.slots[i].torn) { stopIdx = i; break; } walk.push(B.slots[i]); }
+  if (stopIdx >= 0) {
+    const after = B.slots.length - stopIdx - 1;
+    if (after > 0) note(`slot_view_at() treats the torn slot at index ${stopIdx} as end-of-log, so the ${after} valid slot(s) after it are NOT copied. This matches the current code; see the bug note in the footer.`, 'bad');
+  }
+  const keep = walk.filter((s, i) => !walk.slice(i + 1).some((f) => f.id === s.id) && !isTomb(s));
+  const newLen = HDR + keep.reduce((a, s) => a + s.size, 0);
+  const before = cursorOf(B);
+  if (newLen > cfg.S - ru(SEAL_LEN, cfg.W)) {
+    note(`image ${newLen} B leaves no room for the scratch seal → -ENOSPC, nothing erased`, 'bad');
+    return '-ENOSPC';
+  }
+  writeMaster('COMPACTING', b, 'enter atomic window');
+  st.scratch.erases++; st.scratch.image = null;
+  er(2, 'erase scratch');
+  st.scratch.image = { b, len: newLen, sealed: false };
+  wr(2, 0, newLen, `stage compacted image (${keep.length} live slots)`);
+  st.scratch.image.sealed = true;
+  wr(2, cfg.S - ru(SEAL_LEN, cfg.W), ru(SEAL_LEN, cfg.W), 'scratch seal (image len + CRC32)');
+  B.erases++; B.slots = []; B.fmt = false;
+  er(sec, `erase ${secName(sec)}`);
+  B.fmt = true; B.gen++; B.slots = structuredClone(keep);
+  wr(sec, 0, newLen, `write compacted image back (gen ${B.gen})`);
+  st.scratch.erases++; st.scratch.image = null;
+  er(2, 'erase scratch');
+  writeMaster('CLEAN', 0, 'leave atomic window');
+  note(`reclaimed ${before - newLen} B; bucket now ${newLen} / ${cfg.S} B`);
+  return 0;
+}
+
+/* ---------------- segments ---------------- */
+function idxLoad(id) {
+  if (st.cache && st.cache.id === id) { note(`index_load_cached(${id}): hit, no flash`); return st.cache; }
+  const b = bucketOf(id);
+  if (!readHdr(b)) return null;
+  const fl = findLive(b, id, 'index_load');
+  if (fl.rc !== 0 || fl.slot.kind !== 'index') return null;
+  st.cache = { id, segIds: fl.slot.segIds.slice(), total: fl.slot.total };
+  return st.cache;
+}
+function segWriteChunk(owner, seq, n) {
+  const vl = 12 + n, ssz = slotSize(vl);
+  for (let t = 0; t < TRIES; t++) {
+    const sid = allocId(); st.alloc.delete(sid);
+    const b = bucketOf(sid);
+    let cursor;
+    if (!readHdr(b)) { formatBucket(b); cursor = HDR; }
+    else cursor = scanFor(b, sid, cfg.S, `place segment ${seq}`).cursor;
+    if (cursor + ssz > cfg.S) {
+      const rc = compact(b);
+      if (rc === 0) cursor = scanFor(b, sid, cfg.S, 'after compaction').cursor;
+      if (cursor + ssz > cfg.S) { note(`segment ${seq}: bucket ${b} full, reprobing with a fresh id`, 'warn'); continue; }
+    }
+    appendSlot(b, { id: sid, kind: 'seg', vl, owner, seq }, cursor, `segment ${seq} of id ${owner}: ${n} B chunk as internal id ${sid}`);
+    return sid;
+  }
+  note(`segment ${seq}: no bucket with room after ${TRIES} probes`, 'bad');
+  return null;
+}
+function segRelease(ids) {
+  for (const sid of ids) {
+    const b = bucketOf(sid);
+    if (!readHdr(b)) continue;
+    const sc = scanFor(b, sid, cfg.S, 'release old segment');
+    if (sc.cursor + slotSize(0) > cfg.S) { note(`bucket ${b} full; sweep will reclaim segment ${sid}`, 'warn'); continue; }
+    appendSlot(b, { id: sid, kind: 'segtomb', vl: 0 }, sc.cursor, `tombstone old segment ${sid}`);
+  }
+}
+function segSweep(owner) {
+  note(`seg_sweep(${owner}): reclaim segments its live index does not list`, 'warn');
+  st.cache = null;
+  const idx = idxLoad(owner);
+  const listed = new Set(idx ? idx.segIds : []);
+  for (let b = 0; b < cfg.N; b++) {
+    if (!readHdr(b)) continue;
+    const B = st.buckets[b];
+    let c = HDR; const heads = [];
+    for (const s of B.slots) { heads.push(c); c += s.size; }
+    if (c + OVH <= cfg.S) heads.push(c);
+    scanEv(3 + b, heads, `sweep walk bucket ${b}`);
+    const cands = [...new Set(B.slots.filter((s) => s.kind === 'seg' && !s.torn && s.owner === owner && !listed.has(s.id)).map((s) => s.id))];
+    for (const sid of cands) {
+      const fl = findLive(b, sid, 'sweep candidate');
+      if (fl.rc !== 0 || fl.slot.kind !== 'seg') continue;
+      if (fl.cursor + slotSize(0) > cfg.S) { note(`bucket ${b} full, orphan ${sid} stays for now`, 'warn'); continue; }
+      appendSlot(b, { id: sid, kind: 'segtomb', vl: 0 }, fl.cursor, `tombstone orphan segment ${sid}`);
+    }
+  }
+  persistSegOwner(0);
+}
+function segFinishPending() { if (st.segOwner) segSweep(st.segOwner); }
+
+function indexCommit(id, segIds, total) {
+  const vl = 16 + 8 * segIds.length, ssz = slotSize(vl), b = bucketOf(id);
+  let cursor;
+  if (!readHdr(b)) { formatBucket(b); cursor = HDR; }
+  else cursor = scanFor(b, id, cfg.S, 'index_commit cursor').cursor;
+  if (cursor + ssz > cfg.S) {
+    const rc = compact(b); if (rc) return rc;
+    cursor = scanFor(b, id, cfg.S, 'after compaction').cursor;
+    if (cursor + ssz > cfg.S) return '-ENOSPC';
+  }
+  appendSlot(b, { id, kind: 'index', vl, segIds: segIds.slice(), total }, cursor, `index record for id ${id}: ${segIds.length} segment ids (${vl} B) — COMMIT POINT`);
+  st.cache = { id, segIds: segIds.slice(), total };
+  return 0;
+}
+function segUpdate(id, len, old) {
+  const k = Math.ceil(len / D.segLen);
+  if (len > D.maxObj || k > D.segMax) return '-EFBIG';
+  persistSegOwner(id);
+  const ids = [];
+  for (let j = 0; j < k; j++) {
+    const n = Math.min(D.segLen, len - j * D.segLen);
+    const sid = segWriteChunk(id, j, n);
+    if (sid === null) return '-ENOSPC';
+    ids.push(sid);
+  }
+  const rc = indexCommit(id, ids, len);
+  if (rc) return rc;
+  if (old) segRelease(old.segIds);
+  persistSegOwner(0);
+  return 0;
+}
+
+/* ---------------- public API ---------------- */
+const api = {
+  get(id) {
+    if (!st.mounted) return '-ENODEV';
+    if (id === 0) return '-ENOENT';
+    const b = bucketOf(id);
+    if (!readHdr(b)) return '-ENOENT';
+    const fl = findLive(b, id);
+    if (fl.rc) return fl.rc;
+    if (fl.slot.kind === 'seg') return '-ENOENT';
+    if (fl.slot.kind === 'index') {
+      const idx = idxLoad(id);
+      if (!idx) return '-EIO';
+      note(`segmented: read ${idx.segIds.length} segments (blob_db_read → seg_read_range)`);
+      for (const sid of idx.segIds) {
+        const sb = bucketOf(sid);
+        readHdr(sb);
+        const s = findLive(sb, sid, 'seg_chunk_read');
+        if (s.rc) { note(`segment ${sid} missing`, 'bad'); return '-EIO'; }
+      }
+      return `0 (${idx.total} B)`;
+    }
+    return `0 (${fl.slot.vl} B)`;
+  },
+  exists(id) {
+    if (!st.mounted) return '-ENODEV';
+    const b = bucketOf(id);
+    if (id === 0 || !readHdr(b)) return 'false';
+    const fl = findLive(b, id);
+    return fl.rc === 0 && fl.slot.kind !== 'seg' ? 'true' : 'false';
+  },
+  update(id, len) {
+    if (!st.mounted) return '-ENODEV';
+    if (id === 0 || id >= st.nextId) { note('id was never returned by alloc_id', 'bad'); return '-EINVAL'; }
+    if (st.dead.has(id)) { note('update on a deleted id is undefined behaviour (contract D3). The simulator refuses it.', 'bad'); return 'UB'; }
+    const lim = cfg.L ? D.maxObj : cfg.P;
+    if (len > lim) { note(`len ${len} > ${cfg.L ? 'MAX_OBJECT_LEN' : 'MAX_PAYLOAD_LEN'} ${lim}`, 'bad'); return '-EINVAL'; }
+    if (cfg.L) segFinishPending();
+    const b = bucketOf(id);
+    let cursor, old = null;
+    if (!readHdr(b)) { formatBucket(b); cursor = HDR; }
+    else if (cfg.L) {
+      const fl = findLive(b, id, 'outgoing value');
+      if (fl.rc === 0 && fl.slot.kind === 'seg') return '-EINVAL';
+      cursor = fl.cursor;
+      if (fl.rc === 0 && fl.slot.kind === 'index') old = idxLoad(id);
+    } else cursor = scanFor(b, id, cfg.S, 'find append cursor').cursor;
+    st.cache = st.cache && st.cache.id === id ? (old ? { ...old } : null) : st.cache;
+    if (cfg.L && len > cfg.P) {
+      note(`${len} B > MAX_PAYLOAD_LEN ${cfg.P}: segmented, ${Math.ceil(len / D.segLen)} × ${D.segLen} B chunks`);
+      const rc = segUpdate(id, len, old);
+      if (rc === 0) { st.alloc.delete(id); }
+      return rc;
+    }
+    const ssz = slotSize(len);
+    if (cursor + ssz > cfg.S) {
+      const rc = compact(b); if (rc) return rc;
+      cursor = scanFor(b, id, cfg.S, 'after compaction').cursor;
+      if (cursor + ssz > cfg.S) { note(`still ${cursor + ssz - cfg.S} B short after compaction: bucket ${b} is full of live data`, 'bad'); return '-ENOSPC'; }
+    }
+    if (old) persistSegOwner(id);
+    appendSlot(b, { id, kind: 'data', vl: len }, cursor, `append slot id ${id}: ${len} B payload (${ssz} B on flash)`);
+    if (old) { st.cache = null; segRelease(old.segIds); persistSegOwner(0); }
+    st.alloc.delete(id);
+    return 0;
+  },
+  del(id) {
+    if (!st.mounted) return '-ENODEV';
+    if (id === 1) { note('delete(BLOB_DB_ROOT_ID) is undefined behaviour (D7)', 'bad'); return 'UB'; }
+    if (id === 0) return '-ENOENT';
+    if (cfg.L) segFinishPending();
+    const b = bucketOf(id);
+    if (!readHdr(b)) return '-ENOENT';
+    let fl = findLive(b, id);
+    if (fl.rc) return fl.rc;
+    if (fl.slot.kind === 'seg') return '-ENOENT';
+    const old = fl.slot.kind === 'index' ? idxLoad(id) : null;
+    let cursor = fl.cursor;
+    const ssz = slotSize(0);
+    if (cursor + ssz > cfg.S) {
+      const rc = compact(b); if (rc) return rc;
+      fl = findLive(b, id, 'after compaction');
+      if (fl.rc) return fl.rc;
+      cursor = fl.cursor;
+      if (cursor + ssz > cfg.S) return '-ENOSPC';
+    }
+    if (old) persistSegOwner(id);
+    appendSlot(b, { id, kind: 'tomb', vl: 0 }, cursor, `tombstone id ${id}`);
+    if (old) { st.cache = null; segRelease(old.segIds); persistSegOwner(0); }
+    if (st.cache && st.cache.id === id) st.cache = null;
+    st.dead.add(id);
+    return 0;
+  },
+  mount() {
+    st.mounted = false; st.cache = null;
+    rd(0, 0, MASTER_LEN, 'read master A'); rd(1, 0, MASTER_LEN, 'read master B');
+    const ms = st.masters.filter((m) => m.valid).sort((a, b2) => b2.gen - a.gen);
+    const m = ms[0];
+    st.active = st.masters.indexOf(m); st.gen = m.gen; st.hint = m.hint; st.segOwner = m.owner;
+    note(`active master: ${secName(st.active)} gen ${m.gen}, id ceiling ${m.hint}, seg_owner ${m.owner}`);
+    let maxId = 0;
+    for (let b = 0; b < cfg.N; b++) {
+      rd(3 + b, 0, HDR, `scan_bucket(${b}): header`);
+      const B = st.buckets[b];
+      if (!B.fmt) continue;
+      let c = HDR; const heads = [];
+      for (const s of B.slots) { heads.push(c); c += s.size; maxId = Math.max(maxId, s.id); }
+      if (c + OVH <= cfg.S) heads.push(c);
+      scanEv(3 + b, heads, `scan_bucket(${b}): ${heads.length} slot heads (hdr + id = 2 reads each)`, 2);
+    }
+    st.nextId = Math.max(st.hint, maxId + 1);
+    st.mounted = true;
+    note(`next id ${st.nextId}: never lower than the durable ceiling, so unbound ids are not reissued`);
+    if (st.segOwner) segFinishPending();
+    return 0;
+  },
+};
+
+function format() {
+  const N = cfg.N;
+  st = {
+    mounted: true, masters: [0, 1].map(() => ({ valid: false, gen: 0, state: '—', cbid: 0, owner: 0, hint: 0, erases: 0 })),
+    active: 1, gen: 0, scratch: { erases: 0, image: null },
+    buckets: Array.from({ length: N }, () => ({ fmt: false, slots: [], erases: 0, gen: 0 })),
+    nextId: 2, hint: 2, segOwner: 0, cache: null, dead: new Set(), alloc: new Set(), cut: false,
+  };
+  T = newTrace('blob_db_format()');
+  [0, 1, 2].forEach((s) => { if (s < 2) st.masters[s].erases++; else st.scratch.erases++; er(s, `erase ${secName(s)}`); });
+  st.buckets.forEach((B, b) => { B.erases++; er(3 + b, `erase ${secName(3 + b)}`); });
+  st.active = 1; writeMaster('CLEAN', 0, 'fresh store, id ceiling 2');
+  const rb = bucketOf(1);
+  formatBucket(rb);
+  appendSlot(rb, { id: 1, kind: 'data', vl: 0 }, HDR, 'bind root id 1 to an empty payload (D7)');
+  T.rc = 0;
+  pushHist(T, false);
+}
+
+/* ---------------- running operations ---------------- */
+function run(label, fn) {
+  if (!st) return;
+  T = newTrace(label);
+  let crashed = false;
+  try { T.rc = fn(); } catch (e) { if (e instanceof Crash) { T.rc = 'power lost'; crashed = true; } else throw e; }
+  pushHist(T);
+  if (crashed) {
+    T = newTrace('blob_db_mount()  (after power loss)');
+    T.rc = api.mount();
+    pushHist(T);
+  }
+  return hist[hist.length - 1].rc;
+}
+function pushHist(tr, animate = true) {
+  tr.post = snap();
+  hist.push(tr);
+  if (animate) { queue.push(tr); if (!playing) playNext(); }
+  else if (!playing) { renderMap(null, null); renderCost(tr, -1); }
+  renderSide();
+}
+
+/* ---------------- playback ---------------- */
+const queue = [];
+let playing = null, timer = null;
+function speed() { return +$('speed').value; }
+function playNext() {
+  clearTimeout(timer);
+  const tr = queue.shift();
+  if (!tr) { playing = null; renderMap(null, null); renderCost(hist[hist.length - 1], -1); return; }
+  const sp = speed();
+  if (sp === 0 || !tr.ev.length) { playing = null; renderCost(tr, -1); renderMap(tr.post, null); if (queue.length) playNext(); else renderMap(null, null); return; }
+  playing = { tr, i: 0 };
+  step();
+}
+function step() {
+  const p = playing; if (!p) return;
+  const { tr, i } = p;
+  if (i >= tr.ev.length) { renderCost(tr, -1); renderMap(tr.post, null); timer = setTimeout(playNext, speed() * 1.5); return; }
+  let view = tr.pre;
+  for (let k = i; k >= 0; k--) if (tr.ev[k].snap) { view = tr.ev[k].snap; break; }
+  renderMap(view, tr.ev[i]);
+  renderCost(tr, i);
+  $('prog').style.width = ((i + 1) / tr.ev.length * 100) + '%';
+  p.i++;
+  const ev = tr.ev[i];
+  const d = ev.t === 'note' || ev.t === 'warn' || ev.t === 'bad' ? speed() * 0.6 : speed();
+  timer = setTimeout(step, d);
+}
+function skipAll() {
+  clearTimeout(timer);
+  const last = queue.length ? queue[queue.length - 1] : playing && playing.tr;
+  queue.length = 0; playing = null;
+  $('prog').style.width = '100%';
+  if (!st) return;
+  renderMap(null, null);
+  if (last) renderCost(last, -1);
+}
+function replay(tr) {
+  skipAll();
+  if (!tr) return;
+  queue.push(tr);
+  playNext();
+}
+
+/* ---------------- rendering ---------------- */
+function statuses(B) {
+  return B.slots.map((s, i) => {
+    if (s.torn) return 'torn';
+    if (B.slots.slice(i + 1).some((f) => !f.torn && f.id === s.id)) return 'garbage';
+    return isTomb(s) ? 'tomb' : 'live';
+  });
+}
+function liveIndex(view) {
+  const idx = new Map();
+  view.buckets.forEach((B) => statuses(B).forEach((stt, i) => { const s = B.slots[i]; if (stt === 'live' && s.kind === 'index') idx.set(s.id, new Set(s.segIds)); }));
+  return idx;
+}
+
+function renderMap(view, ev) {
+  const live = !view;
+  view = view || { masters: st.masters, active: st.active, scratch: st.scratch, buckets: st.buckets };
+  const hlSec = ev && ev.sec !== undefined ? ev.sec : -1;
+  const hlCls = ev ? (ev.t === 'scan' ? 'read' : ev.t) : '';
+  // meta tiles
+  const mt = [0, 1].map((k) => {
+    const m = view.masters[k];
+    const body = m.valid ? `gen ${m.gen} · <b>${m.state}${m.state === 'COMPACTING' ? '(' + m.cbid + ')' : ''}</b><br><span class="dim">ceiling ${m.hint} · seg_owner ${m.owner}</span>` : '<span class="dim">erased</span>';
+    return `<div class="tile ${view.active === k ? 'active' : ''} ${hlSec === k ? 'hl-' + hlCls : ''}"><div class="t">${secName(k)}<em>sector ${k} · ${m.erases} erase${m.erases === 1 ? '' : 's'}</em></div><div>${body}${view.active === k && m.valid ? ' <span class="dim">← active</span>' : ''}</div></div>`;
+  });
+  const sc = view.scratch;
+  const scBody = sc.image ? `image of bucket ${sc.image.b}, ${sc.image.len} B${sc.image.sealed ? ' · <b>sealed</b>' : ''}` : '<span class="dim">erased</span>';
+  mt.push(`<div class="tile ${hlSec === 2 ? 'hl-' + hlCls : ''}"><div class="t">scratch<em>sector 2 · ${sc.erases} erase${sc.erases === 1 ? '' : 's'}</em></div><div>${scBody}</div></div>`);
+  $('meta').innerHTML = mt.join('');
+
+  const idx = liveIndex(view);
+  const S = cfg.S, pct = (n) => (n / S * 100) + '%';
+  const html = view.buckets.map((B, b) => {
+    const sec = 3 + b;
+    const stt = statuses(B);
+    let c = HDR, liveB = 0, garbB = 0;
+    let slots = B.fmt ? `<span class="slot hdr" style="left:0;width:${pct(HDR)}" title="bucket header (16 B), gen ${B.gen}"></span>` : '';
+    B.slots.forEach((s, i) => {
+      let status = stt[i];
+      if (status === 'live' && s.kind === 'seg') { const own = idx.get(s.owner); if (!own || !own.has(s.id)) status = 'orphan'; }
+      if (status === 'live' || status === 'tomb') liveB += s.size; else garbB += s.size;
+      const kindCls = s.kind === 'seg' ? 'seg' : s.kind === 'index' ? 'index' : '';
+      const label = s.kind === 'seg' ? `${s.owner}.${s.seq}` : isTomb(s) ? '✝' : s.kind === 'index' ? `${s.id}▸` : String(s.id);
+      const desc = `${s.kind === 'seg' ? 'segment ' + s.seq + ' of id ' + s.owner + ' (internal id ' + s.id + ')' : s.kind === 'index' ? 'index record of id ' + s.id + ' → segments ' + s.segIds.join(', ') : s.kind === 'segtomb' ? 'tombstone for segment ' + s.id : s.kind === 'tomb' ? 'tombstone for id ' + s.id : 'id ' + s.id}\nval_len ${s.vl} B · slot ${s.size} B @${hex(c)}\n${status}`;
+      const pick = s.kind === 'seg' || s.kind === 'segtomb' ? s.owner || s.id : s.id;
+      slots += `<span class="slot ${status} ${kindCls} ${s.id === 1 ? 'root' : ''} ${selId !== null && (s.id === selId || s.owner === selId) ? 'sel' : ''}" data-id="${pick}" style="left:${pct(c)};width:${pct(s.size)}" title="${desc}">${s.size / S > 0.035 ? label : ''}</span>`;
+      c += s.size;
+    });
+    let hl = '';
+    if (ev && ev.sec === sec) {
+      if (ev.t === 'scan') hl = ev.heads.map((h) => `<i class="hl scan" style="left:${pct(h)};width:${pct(12)}"></i>`).join('');
+      else if (ev.t === 'read' || ev.t === 'write') hl = `<i class="hl ${ev.t}" style="left:${pct(ev.off)};width:${pct(Math.max(ev.len, 4))}"></i>`;
+    }
+    const cur = B.fmt ? `<i class="cursor" style="left:calc(${pct(c)} - 1px)"></i>` : '';
+    const flash = ev && ev.t === 'erase' && ev.sec === sec ? 'erased-flash' : '';
+    const free = B.fmt ? S - c : S;
+    return `<div class="bk ${ev && ev.sec === sec ? 'target' : ''}">
+      <div class="name">bucket ${b}<small>sector ${sec}</small></div>
+      <div class="bar ${flash}" role="img" aria-label="bucket ${b}: ${B.slots.length} slots, ${free} bytes free">${slots}${cur}${hl}</div>
+      <div class="stat"><span>${B.fmt ? `${B.slots.length} slots` : 'erased'}</span><span>live ${liveB} B</span><span>garbage ${garbB} B</span><span>free ${free} B</span><span>erases ${B.erases}</span>${B.fmt ? `<span>gen ${B.gen}</span>` : ''}</div>
+    </div>`;
+  }).join('');
+  $('buckets').innerHTML = html;
+  if (live) $('prog').style.width = '100%';
+}
+
+function rcClass(rc) { if (rc === 0 || (typeof rc === 'string' && (rc.startsWith('0') || rc === 'true'))) return 'ok'; if (rc === 'false') return 'warn'; return 'err'; }
+function renderCost(tr, cur) {
+  if (!tr) return;
+  $('opCall').textContent = tr.label;
+  const rc = $('opRc'); rc.textContent = tr.rc === 0 ? '0' : String(tr.rc); rc.className = 'rc ' + rcClass(tr.rc);
+  $('cRo').textContent = tr.rOps; $('cRb').textContent = fmtB(tr.rB);
+  $('cW').textContent = `${tr.wOps} / ${fmtB(tr.wB)}`; $('cE').textContent = tr.er;
+  const ol = $('trace');
+  ol.innerHTML = tr.ev.map((e, i) => {
+    const sz = e.t === 'scan' ? `${e.ops} op · ${e.len} B` : e.len !== undefined && e.t !== 'erase' ? `${e.len} B` : e.t === 'erase' ? fmtB(cfg.S) : '';
+    const where = e.sec !== undefined ? `<span class="mono" style="color:var(--muted)">${secName(e.sec)} · </span>` : '';
+    return `<li class="${i === cur ? 'cur' : ''}"><span class="k ${e.t}">${e.t}</span><span class="txt">${where}${esc(e.text)}</span><span class="sz">${sz}</span></li>`;
+  }).join('');
+  const curEl = ol.querySelector('.cur');
+  if (curEl) { const top = curEl.offsetTop - ol.offsetTop; if (top < ol.scrollTop || top > ol.scrollTop + ol.clientHeight - 30) ol.scrollTop = top - 60; }
+}
+function esc(s) { return String(s).replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' })[c]); }
+
+function renderSide() {
+  // ids table
+  const view = st;
+  const rows = [];
+  const seen = new Set();
+  view.buckets.forEach((B, b) => {
+    const stt = statuses(B);
+    B.slots.forEach((s, i) => {
+      if (stt[i] !== 'live' || s.kind === 'seg') return;
+      seen.add(s.id);
+      if (s.kind === 'index') rows.push({ id: s.id, b, kind: `<span class="kind seg">${s.segIds.length} segments</span>`, bytes: s.total });
+      else rows.push({ id: s.id, b, kind: `<span class="kind inl">inline${s.id === 1 ? ' · root' : ''}</span>`, bytes: s.vl });
+    });
+  });
+  const unb = [...view.alloc].filter((id) => !seen.has(id) && !view.dead.has(id)).sort((x, y) => x - y);
+  const showUnb = selId !== null && unb.includes(selId) ? [selId] : [];
+  unb.slice(-3).forEach((id) => { if (!showUnb.includes(id)) showUnb.push(id); });
+  showUnb.forEach((id) => rows.push({ id, b: bucketOf(id), kind: '<span class="kind unb">allocated, unbound</span>', bytes: '' }));
+  rows.sort((a, b) => a.id - b.id);
+  const hidden = unb.length - showUnb.length;
+  if (hidden > 0) rows.push({ id: '…', b: '', kind: `<span class="kind unb">+${hidden} more allocated, unbound</span>`, bytes: '' });
+  $('objs').innerHTML = rows.length ? rows.map((r) => `<tr class="${r.id === '…' ? '' : 'pick'}" ${r.id === '…' ? '' : `data-id="${r.id}"`}><td>${r.id}</td><td>${r.b}</td><td>${r.kind}</td><td class="num">${r.bytes}</td></tr>`).join('') : '<tr><td colspan="4" style="color:var(--muted)">No ids yet.</td></tr>';
+  $('idlist').innerHTML = rows.filter((r) => r.id !== '…').map((r) => `<option value="${r.id}">`).join('');
+  // history
+  $('hist').innerHTML = hist.slice().reverse().slice(0, 80).map((h, k) => {
+    const idx = hist.length - 1 - k;
+    return `<li data-h="${idx}"><span>${esc(h.label)} <span class="rc ${rcClass(h.rc)}">${h.rc === 0 ? '0' : esc(h.rc)}</span></span><span class="c">${h.rOps}r ${h.wOps}w ${h.er}e</span></li>`;
+  }).join('');
+}
+
+function renderDerived() {
+  const c = readCfg(), d = derive(c);
+  const lines = [
+    ['bucket of id', `id % ${c.N}`],
+    ['data area / bucket', `${c.S - HDR} B`],
+    ['max rebindable inline', `${d.sust} B`],
+    ['slot size', `⌈(14 + len) / ${c.W}⌉·${c.W}`],
+  ];
+  if (c.L) lines.push(['segment chunk', `${d.segLen} B`], ['index capacity', `${d.idxCap} ids`], ['max object (sim)', fmtB(d.maxObj)]);
+  $('derived').innerHTML = lines.map(([k, v]) => `<span>${k}</span><b>${v}</b>`).join('');
+  const msg = $('cfgMsg');
+  if (c.P > d.sust) { msg.hidden = false; msg.textContent = `Mount would refuse: MAX_PAYLOAD_LEN ${c.P} exceeds the ${d.sust} B a ${c.S} B sector can rebind (a rewrite needs the old and new slot side by side).`; }
+  else if (c.L && d.segLen <= 0) { msg.hidden = false; msg.textContent = 'MAX_PAYLOAD_LEN leaves no room for a segment chunk.'; }
+  else { msg.hidden = true; }
+  $('btnApply').disabled = !msg.hidden;
+}
+function readCfg() { return { S: +$('cfgS').value, N: +$('cfgN').value, W: +$('cfgW').value, L: $('cfgL').checked, P: +$('cfgP').value }; }
+function apply(c) {
+  skipAll();
+  cfg = c || readCfg(); D = derive(cfg);
+  ['S', 'N', 'W', 'P'].forEach((k) => { $('cfg' + k).value = cfg[k]; }); $('cfgL').checked = cfg.L;
+  renderDerived();
+  hist.length = 0; queue.length = 0;
+  format();
+}
+
+/* ---------------- UI wiring ---------------- */
+const idv = () => Math.max(0, Math.floor(+$('opId').value || 0));
+const lenv = () => Math.max(0, Math.floor(+$('opLen').value || 0));
+document.querySelectorAll('[data-op]').forEach((btn) => btn.addEventListener('click', () => {
+  const op = btn.dataset.op, id = idv(), len = lenv();
+  selId = id;
+  st.cut = $('cutArm').checked;
+  if (op === 'update') run(`blob_db_update(${id}, ${len} B)`, () => api.update(id, len));
+  if (op === 'get') run(`blob_db_get(${id})`, () => api.get(id));
+  if (op === 'exists') run(`blob_db_exists(${id})`, () => api.exists(id));
+  if (op === 'delete') run(`blob_db_delete(${id})`, () => api.del(id));
+  st.cut = false;
+}));
+$('btnAlloc').addEventListener('click', () => {
+  let got; run('blob_db_alloc_id()', () => { got = allocId(); return got; });
+  $('opId').value = got; selId = got; $('opBucket').value = bucketOf(st.nextId);
+  renderSide();
+});
+$('btnAllocIn').addEventListener('click', () => {
+  const want = Math.max(0, Math.floor(+$('opBucket').value || 0)) % cfg.N;
+  let got; run(`alloc_id until id % ${cfg.N} == ${want}`, () => {
+    let id = allocId(); let skipped = 0;
+    while (bucketOf(id) !== want) { id = allocId(); skipped++; }
+    if (skipped) note(`${skipped} id(s) allocated and left unbound on the way (ids are cheap and never reused)`);
+    got = id; return id;
+  });
+  $('opId').value = got; selId = got; renderSide();
+});
+$('btnMount').addEventListener('click', () => run('blob_db_mount()', () => api.mount()));
+$('btnFormat').addEventListener('click', () => apply(cfg));
+$('btnApply').addEventListener('click', () => apply());
+['cfgS', 'cfgN', 'cfgW', 'cfgP', 'cfgL'].forEach((k) => $(k).addEventListener('input', renderDerived));
+$('cfgL').addEventListener('change', () => { $('cfgP').value = $('cfgL').checked ? Math.min(2016, derive(readCfg()).sust) : 256; renderDerived(); });
+$('cfgS').addEventListener('change', () => { const d = derive(readCfg()); if (+$('cfgP').value > d.sust) $('cfgP').value = $('cfgL').checked ? Math.min(2016, d.sust) : Math.min(256, d.sust); renderDerived(); });
+$('btnSkip').addEventListener('click', skipAll);
+$('btnReplay').addEventListener('click', () => replay(hist[hist.length - 1]));
+$('hist').addEventListener('click', (e) => { const li = e.target.closest('li'); if (li) replay(hist[+li.dataset.h]); });
+$('objs').addEventListener('click', (e) => { const tr = e.target.closest('tr[data-id]'); if (!tr) return; selId = +tr.dataset.id; $('opId').value = selId; if (!playing) renderMap(null, null); });
+$('buckets').addEventListener('click', (e) => { const s = e.target.closest('.slot[data-id]'); if (!s) return; selId = +s.dataset.id; $('opId').value = selId; if (!playing) renderMap(null, null); });
+
+/* ---------------- scenarios ---------------- */
+const std = () => ({ ...cfg, L: true, P: Math.min(2016, derive(cfg).sust) });
+const z = (n) => Math.max(8, Math.round(n * cfg.S / 4096));
+function inBucket(b) { let id = allocId(); while (bucketOf(id) !== b) id = allocId(); return id; }
+function scenarioRun(label, fn) { run(label, () => { const r = fn(); return r; }); renderSide(); }
+const scenarios = [
+  {
+    t: 'Lookup cost grows with bucket fill',
+    d: 'Three neighbours share bucket 2, then a get on the last one scans every slot head in front of it.',
+    go() {
+      apply(std());
+      const ids = [];
+      run('alloc 3 ids in bucket 2', () => { for (let i = 0; i < 3; i++) ids.push(inBucket(2)); return 0; });
+      ids.forEach((id, k) => { const n = z(120 + 80 * k); run(`blob_db_update(${id}, ${n} B)`, () => api.update(id, n)); });
+      const n0 = z(150);
+      run(`blob_db_update(${ids[0]}, ${n0} B)`, () => api.update(ids[0], n0));
+      selId = ids[2];
+      run(`blob_db_get(${ids[2]})`, () => api.get(ids[2]));
+    },
+  },
+  {
+    t: 'Rewrite one id until the bucket compacts',
+    d: 'Every rebind appends. Garbage piles up until the next slot does not fit, then compaction runs.',
+    go() {
+      apply(std());
+      let id; run('alloc id in bucket 3', () => { id = inBucket(3); return id; });
+      selId = id;
+      const len = z(600);
+      const n = Math.ceil((cfg.S - HDR) / slotSize(len)) + 1;
+      for (let i = 0; i < n; i++) run(`blob_db_update(${id}, ${len} B)`, () => api.update(id, len));
+    },
+  },
+  {
+    t: '2 KiB neighbour, grow the other to 3 KiB',
+    d: 'Both objects live in bucket 1. The 3 KiB rewrite writes new segments elsewhere, then one small index record at home.',
+    go() {
+      apply(std());
+      let a, b; run('alloc A, B in bucket 1', () => { a = inBucket(1); b = inBucket(1); return 0; });
+      run(`blob_db_update(${a}, 2048 B)`, () => api.update(a, 2048));
+      run(`blob_db_update(${b}, 1024 B)`, () => api.update(b, 1024));
+      selId = b;
+      run(`blob_db_update(${b}, 3072 B)`, () => api.update(b, 3072));
+      run(`blob_db_get(${b})`, () => api.get(b));
+    },
+  },
+  {
+    t: 'Bucket full of live data → -ENOSPC',
+    d: 'Inline-only build. Three large live blobs fill bucket 0. A rewrite compacts, reclaims nothing and fails, so the erases are wasted.',
+    go() {
+      const d = derive({ ...cfg, L: false, P: 256 });
+      apply({ ...cfg, L: false, P: Math.max(16, d.sust) });
+      const len = Math.floor((cfg.S - 32) / 3) - cfg.W - OVH;
+      const ids = [];
+      run('alloc 3 ids in bucket 0', () => { for (let i = 0; i < 3; i++) ids.push(inBucket(0)); return 0; });
+      ids.forEach((id) => run(`blob_db_update(${id}, ${len} B)`, () => api.update(id, len)));
+      selId = ids[1];
+      run(`blob_db_update(${ids[1]}, ${len} B)`, () => api.update(ids[1], len));
+    },
+  },
+  {
+    t: 'Power cut during a rewrite',
+    d: 'The new slot lands torn. After remount, get spots the bad CRC and falls back to the previous value.',
+    go() {
+      apply(std());
+      let id; run('alloc id in bucket 4', () => { id = inBucket(4 % cfg.N); return id; });
+      selId = id;
+      const a = z(300), b = z(500);
+      run(`blob_db_update(${id}, ${a} B)`, () => api.update(id, a));
+      st.cut = true;
+      run(`blob_db_update(${id}, ${b} B)`, () => api.update(id, b));
+      st.cut = false;
+      run(`blob_db_get(${id})`, () => api.get(id));
+    },
+  },
+  {
+    t: 'Power cut mid segmented write',
+    d: 'One segment is written and the index is not. The intent marker in the master makes the remount sweep tombstone the orphan.',
+    go() {
+      apply(std());
+      let id; run('alloc id in bucket 5', () => { id = inBucket(5 % cfg.N); return id; });
+      selId = id;
+      const a = Math.max(cfg.P + 1, z(2500)), b = Math.max(cfg.P + 200, z(3500));
+      run(`blob_db_update(${id}, ${a} B)`, () => api.update(id, a));
+      st.cut = true;
+      run(`blob_db_update(${id}, ${b} B)`, () => api.update(id, b));
+      st.cut = false;
+      run(`blob_db_get(${id})`, () => api.get(id));
+    },
+  },
+  {
+    t: 'Known issue: torn slot, then compaction',
+    d: 'Reproduces the current code: compaction stops at a CRC-bad slot, so later valid slots in that bucket are lost.',
+    go() {
+      apply(std());
+      let a, b; run('alloc A, B in bucket 6', () => { a = inBucket(6 % cfg.N); b = inBucket(6 % cfg.N); return 0; });
+      const l1 = z(300), l2 = z(400), l3 = z(500);
+      run(`blob_db_update(${a}, ${l1} B)`, () => api.update(a, l1));
+      st.cut = true; run(`blob_db_update(${a}, ${l1} B)`, () => api.update(a, l1)); st.cut = false;
+      selId = b;
+      run(`blob_db_update(${b}, ${l2} B)`, () => api.update(b, l2));
+      run(`blob_db_get(${b})  before compaction`, () => api.get(b));
+      const n = Math.ceil((cfg.S - HDR) / slotSize(l3)) + 1;
+      for (let i = 0; i < n; i++) { const r = run(`blob_db_update(${a}, ${l3} B)`, () => api.update(a, l3)); if (hist[hist.length - 1].ev.some((e) => e.text && e.text.startsWith('compact_bucket'))) break; if (r !== 0) break; }
+      run(`blob_db_get(${b})  after compaction`, () => api.get(b));
+    },
+  },
+];
+$('scen').innerHTML = scenarios.map((s, i) => `<button data-s="${i}">${esc(s.t)}<span>${esc(s.d)}</span></button>`).join('');
+$('scen').addEventListener('click', (e) => { const b = e.target.closest('button[data-s]'); if (!b) return; scenarios[+b.dataset.s].go(); renderSide(); });
+
+/* boot: a small realistic store */
+apply({ S: 4096, N: 8, W: 4, L: true, P: 2016 });
+$('speed').value = '0';
+(() => {
+  const mk = (len) => { const id = allocId(); api.update(id, len); return id; };
+  T = newTrace('seed'); const ids = [180, 64, 2600, 420, 96, 1500, 240, 700, 3100, 128].map(mk);
+  api.update(ids[1], 80); api.update(ids[3], 300); api.update(ids[1], 72); api.del(ids[4]);
+  hist.length = 0; queue.length = 0;
+  selId = ids[3]; $('opId').value = ids[3];
+  T = newTrace(`blob_db_get(${ids[3]})`); T.rc = api.get(ids[3]); T.post = snap(); hist.push(T);
+})();
+$('speed').value = '260';
+renderMap(null, null); renderCost(hist[hist.length - 1], -1); renderSide();
+})();
+</script>
+
+</body>
+</html>
