@@ -1,0 +1,23 @@
+# Patches applied on top of the Zephyr revision west.yml pulls in.
+# Apply them after every `west update`:
+#
+#   west patch apply
+#
+# Each entry is temporary: drop it once the change is in Zephyr main.
+
+patches:
+  - path: zephyr/0001-drivers-flash-nrf_qspi_nor-support-mxicy-mx25r-power.patch
+    sha256sum: 6501d9b62dd39c461897cf4e83fa43723ff3f929dc58c4c81a3a3b8d84a1f00f
+    module: zephyr
+    author: Wojciech Milek
+    email: 28384009+wmilek@users.noreply.github.com
+    date: 2026-10-11
+    upstreamable: true
+    issue: https://github.com/wmilek/key_value_db/pull/44
+    merge-status: false
+    comments: |
+      nrf_qspi_nor ignores mxicy,mx25r-power-mode, so the nRF5340-DK's
+      MX25R6435F stays in its power-on ultra-low-power mode. In that mode a
+      dense read sequence returns the OR of two 64 KB blocks (see PR #44).
+      The patch makes the driver honour the property; the nRF5340-DK
+      overlays set it to "high-performance".

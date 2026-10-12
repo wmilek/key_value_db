@@ -7,6 +7,13 @@
 /delete-node/ &storage_partition;
 
 &mx25r64 {
+	/*
+	 * The MX25R's power-on ultra-low-power mode corrupts reads after dense
+	 * read sequences (key_value_db PR #44). Needs the nrf_qspi_nor patch in
+	 * zephyr/patches.yml (`west patch apply`); without it this is ignored.
+	 */
+	mxicy,mx25r-power-mode = "high-performance";
+
 	partitions {
 		compatible = "fixed-partitions";
 		#address-cells = <1>;
