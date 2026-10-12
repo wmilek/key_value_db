@@ -55,6 +55,12 @@ instructions live in the repository ``README.md``.
 
 .. toctree::
    :maxdepth: 1
+   :caption: Design — comparisons
+
+   comparisons/2026-10-11-littlefs-vs-blobfs
+
+.. toctree::
+   :maxdepth: 1
    :caption: Design — reviews
 
    reviews/2026-07-26-design-doc-review

@@ -21,8 +21,10 @@ myst_enable_extensions = []
 suppress_warnings = ['myst.header', 'myst.xref_missing']
 
 templates_path = ['_templates']
-# proposals/sizing is a measurement harness (see its README), not a doc page.
+# proposals/sizing and comparisons/fs_compare are measurement harnesses (see
+# their READMEs), not doc pages.
 exclude_patterns = ['_build_sphinx', '_doxygen', 'proposals/sizing',
+                    'comparisons/fs_compare',
                     'Thumbs.db', '.DS_Store']
 
 # -- Options for HTML output -------------------------------------------------
