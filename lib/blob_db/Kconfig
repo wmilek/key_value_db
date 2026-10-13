@@ -99,6 +99,7 @@ config BLOB_DB_UBI_RELOCATE_BUDGET
 
 config BLOB_DB_UBI_ATOMIC_REPLACE
 	bool "Replace blocks with ubi_leb_change()"
+	default y
 	help
 	  blob_db_store_replace() uses ubi_leb_change(), which leaves the old
 	  contents or the new ones across a power loss. blob_db then rewrites
@@ -110,6 +111,11 @@ config BLOB_DB_UBI_ATOMIC_REPLACE
 
 	  The replaced block is queued for reclaim rather than erased, so its
 	  old contents stay readable from raw flash until UBI reuses it.
+
+	  Turning it on for an existing store is safe. Turning it off is not:
+	  blob_db_erase_all() can then bring back blobs it deleted, so a build
+	  that disables it must format the store first
+	  (doc/impl/l0_backends.md §3).
 
 config HEAP_MEM_POOL_ADD_SIZE_BLOB_DB_UBI
 	int

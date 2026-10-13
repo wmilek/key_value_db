@@ -441,8 +441,8 @@ int blob_db_erase_all(void);
  *
  * Prepared sectors persist across a remount — the bucket header is on
  * flash, not in RAM. Prior contents of a prepared sector are discarded. On
- * flash_area and on UBI by default the sector is erased; with
- * CONFIG_BLOB_DB_UBI_ATOMIC_REPLACE UBI maps it to a fresh block instead,
+ * flash_area, and on UBI without CONFIG_BLOB_DB_UBI_ATOMIC_REPLACE, the
+ * sector is erased; on UBI by default it is mapped to a fresh block instead,
  * and the old block's bytes stay readable from raw flash until UBI reclaims
  * it.
  *

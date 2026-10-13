@@ -41,10 +41,10 @@ tests:
       # large-object tests so the commit-point claim is covered by the
       # config that ships it, not by a config nothing else uses.
       - CONFIG_BLOB_DB_TEST_CRASH_HOOKS=y
-  # The shipped default: UBI, single-slot payloads. Everything that goes
-  # through the API runs here; the raw-partition injection cases skip
-  # themselves, because under UBI those offsets are UBI's device header rather
-  # than blob_db's masters. Keeping this scenario means the default is
+  # The shipped default: UBI with atomic replace, single-slot payloads.
+  # Everything that goes through the API runs here; the raw-partition
+  # injection cases skip themselves, because under UBI those offsets are UBI's
+  # device header rather than blob_db's masters. Keeping this scenario means the default is
   # exercised by the library's own suite and not only by the apps.
   #
   # LARGE_PAYLOADS is deliberately absent, and cannot simply be added here:
@@ -72,13 +72,15 @@ tests:
       # tests, and these are the scenarios that drive UBI hardest.
       - CONFIG_UBI_SELF_CHECKS=y
       - CONFIG_BLOB_DB_UBI_KEY_APP=y
-  # Compaction by ubi_leb_change() instead of the scratch-sector protocol
-  # (CONFIG_BLOB_DB_UBI_ATOMIC_REPLACE). src/power_cut.c cuts the power
-  # before every byte that compaction writes, inside ubi_leb_change() too.
-  lib.blob_db.ubi.atomic_replace:
+  # UBI compacting through the scratch-sector protocol instead of
+  # ubi_leb_change() (CONFIG_BLOB_DB_UBI_ATOMIC_REPLACE=n). Not the default,
+  # but mount still recovers a compaction it left half done, so a store
+  # written this way must keep working; src/power_cut.c cuts the power inside
+  # that protocol here, as it does inside ubi_leb_change() on the default.
+  lib.blob_db.ubi.scratch_compaction:
     extra_configs:
       - CONFIG_BLOB_DB_BACKEND_UBI=y
       # zephyr-ubi's own bookkeeping checks after every call: meant for
       # tests, and these are the scenarios that drive UBI hardest.
       - CONFIG_UBI_SELF_CHECKS=y
-      - CONFIG_BLOB_DB_UBI_ATOMIC_REPLACE=y
+      - CONFIG_BLOB_DB_UBI_ATOMIC_REPLACE=n
