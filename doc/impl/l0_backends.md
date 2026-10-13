@@ -23,7 +23,7 @@ block at a time. A provider may therefore translate an offset as
 I/O accounting (`CONFIG_BLOB_DB_IOSTATS`) is counted at this seam, so it covers
 both providers and every caller uniformly. Note the consequence for UBI: the
 counters sit *above* UBI's own header traffic and therefore undercount actual
-flash operations there (`app_perf/RESULTS.md`).
+flash operations there (`app_perf_blob_db/RESULTS.md`).
 
 ## 2. Provider a) — `flash_area`
 
@@ -203,7 +203,7 @@ zephyr-ubi itself, PSA Crypto (whose AES tables Mbed TLS builds in RAM unless
 `CONFIG_MBEDTLS_AES_ROM_TABLES` is set) and the heap UBI takes. The CMAC runs
 only when a block header is written or verified — attach, an erase, a block's
 first write — never on an ordinary read. Measured figures for the nRF5340-DK
-are in `app_perf/RESULTS.md` and `app_cbor_persondb/RESULTS.md`.
+are in `app_perf_blob_db/RESULTS.md` and `app_cbor_persondb/RESULTS.md`.
 
 **Per-board configuration.** zephyr-ubi takes its handle, a scratch buffer
 and per-erase-block bookkeeping from the system heap at attach, and a second
@@ -292,7 +292,7 @@ invalidation before erase, …) keep zephyr-ubi's defaults (§3).
   (§3).
 - Every other suite (`blob_db_contract`, `kvdb`, `rootreg`) runs on the
   default, i.e. UBI.
-- CI builds `app` on both backends on both targets, and `app_perf` and
+- CI builds `app` on both backends on both targets, and `app_perf_blob_db` and
   `app_perf_l0` on the DK so the benchmark binaries cannot rot.
 - `app_perf_l0` measures the `flash_area` provider directly — no blob_db in
   the image — sweeping transfer size and erase span. The cost model fitted

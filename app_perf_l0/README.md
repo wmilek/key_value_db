@@ -1,6 +1,6 @@
 # `app_perf_l0` — what `flash_area` costs, and what that predicts
 
-Every other benchmark in this repository measures a stack. `app_perf` measures
+Every other benchmark in this repository measures a stack. `app_perf_blob_db` measures
 `blob_db`, `app_perf_mc` measures the model container, `app_cbor_persondb`
 measures a product-shaped workload. All of them bottom out in three L0 calls —
 `flash_area_read()`, `flash_area_write()`, `flash_area_erase()` — and none of
@@ -208,7 +208,7 @@ fragment that give `native_sim` the target's **shape** (not its timing — nothi
 in the flash simulator models that):
 
 ```shell
-west build -b native_sim key_value_db/app_perf \
+west build -b native_sim key_value_db/app_perf_blob_db \
   -DCONFIG_BLOB_DB_BACKEND_FLASH_AREA=y \
   -DCONFIG_BLOB_DB_LOG_LEVEL_INF=y \
   -DEXTRA_DTC_OVERLAY_FILE=$PWD/key_value_db/app_perf_l0/geometry/mx25r64.overlay \
@@ -216,13 +216,17 @@ west build -b native_sim key_value_db/app_perf \
 ./build/zephyr/zephyr.exe --flash=perf_mx25r64.bin --flash_erase > run.log
 ```
 
+`app_perf_blob_db` now carries the same geometry in its own
+`boards/native_sim.overlay`, so for that app the two `EXTRA_*` lines are
+redundant (and harmless); other workloads still need them.
+
 `CONFIG_BLOB_DB_LOG_LEVEL_INF=y` is what makes `blob_db` print its geometry
 line, which is how the tool checks that the run's geometry is the model's
 rather than trusting you. `--strict-geometry` turns that check into a failure.
 
 This correspondence is not assumed — it is verified. See
 [`RESULTS.md`](RESULTS.md) §2: with the overlay in place, a `native_sim`
-`app_perf` run reproduces the DK's I/O counters **byte for byte**, across all
+`app_perf_blob_db` run reproduces the DK's I/O counters **byte for byte**, across all
 twelve phases.
 
 ### 4. Predict
@@ -283,7 +287,7 @@ error rather than a finding.
 
 ### `derive`, and what a provisional model is worth
 
-An `app_perf` capture already contains, per phase, the I/O counters *and* the
+An `app_perf_blob_db` capture already contains, per phase, the I/O counters *and* the
 wall-clock they produced. That is a linear system in the same six coefficients
 the sweep measures directly, so it can be solved for them — from captures taken
 long ago, on a board that is no longer on the desk. `derive` does that with

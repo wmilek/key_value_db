@@ -1,4 +1,4 @@
-# Running `app_perf` on the nRF5340-DK
+# Running `app_perf_blob_db` on the nRF5340-DK
 
 `RESULTS.md` holds the numbers from both board runs, the raw captures, and the
 exact `nrfutil` / console commands. This file is the operator's guide: what to
@@ -44,13 +44,20 @@ afterwards.
 
 ## What to expect while it runs
 
-**5–15 minutes, with long silent stretches.** A 64 KB sector erase on this part
-takes **~1.07 s** (measured), and the run performs several hundred: each
-`bench prepare` line alone is ~100 erases, so ~100 s of apparent silence before
-it prints. That silence *is* the measurement.
+**About 10–15 minutes, with long silent stretches.** A 64 KB sector erase on
+this part takes **~1.07 s** (measured), and the run performs several hundred:
+each `bench prepare` line alone is ~100 erases, so ~100 s of apparent silence
+before it prints. That silence *is* the measurement. Since 1.1.0 the churn
+phase adds 20–36 s (measured in the QSPI's high-performance mode, where an
+erase is about half as long; see `RESULTS.md` § 1.1.0), most of it the
+erases of 8 compactions, and each `mount` phase under half a second.
 
 The app never exits — Zephyr's idle loop runs forever once `main()` returns — so
-stop capturing after the final `lg objects intact (…)` line.
+stop capturing after the final `blob_db perf: all phases passed` line. If an
+error line appears instead, the phase before it failed its read-back check.
+
+To skip the churn phase on a quick run, build with
+`-DCONFIG_APP_PERF_BLOB_DB_CHURN_OPS=0`.
 
 `/dev/ttyACM*` numbering is **not** stable; any other USB CDC device that
 enumerates first shifts it. A silent console is usually the wrong node, not a
@@ -65,9 +72,9 @@ timed loops, which also hides the two lines that confirm the geometry. To see
 them, one throwaway build:
 
 ```sh
-west build -p always -b nrf5340dk/nrf5340/cpuapp -d build/dk_geom key_value_db/app_perf -- \
-    -DCONFIG_BLOB_DB_LOG_LEVEL_INF=y -DCONFIG_APP_PERF_N_OPS=10 \
-    -DCONFIG_APP_PERF_N_LARGE=1 -DCONFIG_APP_PERF_N_PART=4
+west build -p always -b nrf5340dk/nrf5340/cpuapp -d build/dk_geom key_value_db/app_perf_blob_db -- \
+    -DCONFIG_BLOB_DB_LOG_LEVEL_INF=y -DCONFIG_APP_PERF_BLOB_DB_N_OPS=10 \
+    -DCONFIG_APP_PERF_BLOB_DB_N_LARGE=1 -DCONFIG_APP_PERF_BLOB_DB_N_PART=4
 ```
 
 Expect, near mount:
@@ -99,12 +106,36 @@ Two lines carry most of the weight:
   3187 / 3250 / 3625 / 3281 µs — flat, with `q3` below `q2`.)
 - **`partial vs whole-object write`** is the headline for why `blob_db_write`
   exists. It prints two decimals; at the default `PART_LEN=64` expect ~`1.95x`,
-  because a 64 B partial write still pays two sector erases.
+  because a 64 B partial write still pays two sector erases. The
+  `why lg pwrite` line beneath it says which: `master writes 64` — both are
+  master records, one entering the segment window and one leaving it.
+
+Since 1.1.0 there are three more kinds of line:
+
+- **`why …`** follows an `io` line whenever that phase wrote a master,
+  formatted a bucket or compacted one, and counts each. A master write or a
+  bucket format is one whole-block erase. A compaction is three on
+  flash_area and on UBI with `CONFIG_BLOB_DB_UBI_ATOMIC_REPLACE=n` (the
+  bucket, and the scratch block twice, plus two master writes), but one on
+  the default UBI build, which replaces the bucket atomically and writes no
+  masters for it. Together they account for the `er` count above them —
+  `churn`'s is 16 + 8 × 3 = 40 on flash_area and 0 + 8 × 1 = 8 on default
+  UBI. An `er` count they do not explain is worth a look.
+- **`bench mount …`** times `blob_db_mount()` at four fill levels: `empty`,
+  `list`, `large` and `churn`. On flash_area the `io` line below is the whole
+  cost. **On UBI it is not**: attaching the UBI device scans the partition's
+  block headers below the counting seam, so the wall-clock includes reads the
+  counters never see. The difference between the two backends' mount times is
+  that scan.
+- **`churn plain` / `churn compacting`** split the churn phase's updates by
+  whether one compacted, with average and worst case each; `churn amortized
+  compaction` is what compaction adds to the average update. The worst
+  compacting update is the stall a caller has to budget for.
 
 ## Shorter runs
 
 ```sh
-west build … -- -DCONFIG_APP_PERF_N_LARGE=2 -DCONFIG_APP_PERF_OBJ_LEN=32768
+west build … -- -DCONFIG_APP_PERF_BLOB_DB_N_LARGE=2 -DCONFIG_APP_PERF_BLOB_DB_OBJ_LEN=32768
 ```
 
 roughly quarters the large-object phases. Report the knob values used — every

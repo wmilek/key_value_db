@@ -19,7 +19,7 @@
  *
  * Use it for any run whose numbers will be fed to tools/l0_timing.py predict:
  *
- *   west build -b native_sim key_value_db/app_perf \
+ *   west build -b native_sim key_value_db/app_perf_blob_db \
  *       -DEXTRA_DTC_OVERLAY_FILE=$PWD/key_value_db/app_perf_l0/geometry/mx25r64.overlay
  *
  * It does NOT model the part's timing — nothing in the flash simulator does.

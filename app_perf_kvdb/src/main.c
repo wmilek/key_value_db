@@ -78,7 +78,7 @@
  *   hardware   : just reset — flash persists. Set
  *                CONFIG_APP_PERF_KVDB_FRESH_START=y to format once.
  *
- * Timing uses k_uptime_delta() (ms resolution), like app_perf: flash ops
+ * Timing uses k_uptime_delta() (ms resolution), like app_perf_blob_db: flash ops
  * are slow enough that this costs <1 % accuracy.
  */
 
@@ -209,7 +209,7 @@ static uint32_t io_line(const char *what)
 	const uint32_t wr = now.writes - io_mark.writes;
 	const uint32_t er = now.erases - io_mark.erases;
 
-	/* Same shape as app_perf's line, so app_perf_l0/tools/l0_timing.py
+	/* Same shape as app_perf_blob_db's line, so app_perf_l0/tools/l0_timing.py
 	 * can turn a native_sim capture into predicted hardware time. */
 	printk("   io %-8s : rd %6u ops/%8llu B   wr %5u ops/%8llu B   "
 	       "er %4u ops/%8llu B\n",
@@ -612,7 +612,7 @@ static int enumerate(kvdb_t *db, uint32_t G, const char *count_label,
  * blob_db_prepare() first pre-formats the blob_db buckets the id allocator
  * will land in, so the timed loop measures the warm write path — without it
  * every first touch of a 64 KB QSPI sector pays a ~1 s erase inside the
- * loop (see app_perf/RESULTS.md). Reported as its own bench line. */
+ * loop (see app_perf_blob_db/RESULTS.md). Reported as its own bench line. */
 static int populate(kvdb_t *db)
 {
 	char key[8];

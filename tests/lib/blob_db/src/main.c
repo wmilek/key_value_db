@@ -19,6 +19,7 @@
 #include <app/lib/blob_db_test.h>
 #if defined(CONFIG_BLOB_DB_INSPECT)
 #include <app/lib/blob_db_inspect.h>
+#include <app/lib/blob_db_iostats.h>
 #endif
 
 #define BLOB_DB_TEST_PARTITION_ID  PARTITION_ID(storage_partition)
@@ -704,6 +705,49 @@ ZTEST(blob_db, test_compaction_does_not_lower_id_ceiling)
 	zassert_mem_equal(buf, "v0499", 5);
 }
 
+/* 16b. The I/O counters' cause fields account for every erase. Benchmarks
+ *      read an unexplained erase count off them, so they have to add up:
+ *      a master write or a bucket format is one block erase each, and a
+ *      compaction three (bucket, and scratch twice) — or one, when the
+ *      backend replaces a block atomically and skips the scratch protocol
+ *      and its masters altogether. */
+ZTEST(blob_db, test_iostats_causes_account_for_erases)
+{
+	struct blob_db_iostats io;
+	char val[8];
+
+	blob_db_iostats_reset();
+
+	/* A fresh id: its bucket is formatted on first use. */
+	uint64_t id = put_blob("v0000", 5);
+
+	/* 500 rebinds overflow the 4 KB bucket, as in case 16a. */
+	for (int i = 0; i < 500; i++) {
+		(void)snprintk(val, sizeof(val), "v%04d", i);
+		zassert_ok(blob_db_update(id, val, 5), "update #%d failed", i);
+	}
+
+	blob_db_iostats_get(&io);
+
+	const bool atomic = IS_ENABLED(CONFIG_BLOB_DB_UBI_ATOMIC_REPLACE);
+	const uint32_t per_compaction = atomic ? 1 : 3;
+
+	zassert_true(io.compactions >= 1, "no compaction in 500 rebinds");
+	zassert_true(io.bytes_compacted > 0, "compaction rewrote nothing");
+	zassert_true(io.bucket_formats >= 1, "first bind formatted no bucket");
+	if (!atomic) {
+		zassert_true(io.master_writes >= 2 * io.compactions,
+			     "%u compactions but only %u master writes",
+			     io.compactions, io.master_writes);
+	}
+	zassert_equal(io.erases,
+		      io.master_writes + io.bucket_formats +
+		      per_compaction * io.compactions,
+		      "%u erases, causes: %u master + %u formats + %u x %u "
+		      "compactions", io.erases, io.master_writes,
+		      io.bucket_formats, per_compaction, io.compactions);
+}
+
 /* Root invariant — id=1 is live between mount and unmount (see @blob_db_root
  * in blob_db.h). */
 ZTEST(blob_db, test_root_present_after_mount)
@@ -873,7 +917,7 @@ ZTEST(blob_db, test_prepare_extends_window_after_alloc)
 }
 
 /* A prepared bucket must accept its intended write on the append-only path
- * (proof-by-round-trip; timing is measured separately in app_perf). */
+ * (proof-by-round-trip; timing is measured separately in app_perf_blob_db). */
 ZTEST(blob_db, test_prepare_then_update_roundtrips)
 {
 	int rc = blob_db_prepare(3);
@@ -1002,7 +1046,7 @@ ZTEST(blob_db, test_foreign_magic_is_refused)
  * `if (!st.mounted) return -ENODEV;`, so the single store that needs
  * discarding, the one that cannot be mounted, was the one store it rejected.
  * Found by downgrading a real DK across the format-major bump
- * (app_perf/RESULTS.md, "Downgrading"), where the only way out was to reach
+ * (app_perf_blob_db/RESULTS.md, "Downgrading"), where the only way out was to reach
  * under the library and erase the partition through flash_area directly. */
 ZTEST(blob_db, test_format_discards_an_unmountable_store)
 {

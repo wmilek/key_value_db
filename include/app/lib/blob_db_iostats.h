@@ -46,6 +46,25 @@ struct blob_db_iostats {
 	uint64_t bytes_read;     /**< bytes requested from the store  */
 	uint64_t bytes_written;  /**< bytes handed to the store       */
 	uint64_t bytes_erased;   /**< bytes covered by erase requests */
+
+	/* Why the erases above happened. The flash counters say what was done,
+	 * not on whose behalf — and on NOR it is the erases that dominate, so a
+	 * phase that erased more than expected needs these to say why. Their
+	 * cost is already included in the counters above, never in addition to
+	 * them. Counted above the storage seam, so both backends report the same
+	 * events; both also charge each master write and bucket format as one
+	 * erase of a whole block plus one write. */
+	uint32_t master_writes;  /**< master records written, one block erase
+				  *   each — including the two every
+				  *   non-atomic compaction writes */
+	uint32_t bucket_formats; /**< bucket headers written to a fresh block:
+				  *   prepare(), a bucket's first use, and the
+				  *   root bucket in format/erase_all */
+	uint32_t compactions;    /**< buckets compacted (each erases the bucket
+				  *   and, unless the backend replaces
+				  *   atomically, the scratch block twice) */
+	uint64_t bytes_compacted;/**< live bytes those compactions rewrote —
+				  *   the write amplification garbage costs */
 };
 
 /** @brief Snapshot the counters. */

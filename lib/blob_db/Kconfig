@@ -27,7 +27,7 @@ config BLOB_DB_BACKEND_FLASH_AREA
 	help
 	  Store directly on the raw storage partition via Zephyr's flash_area
 	  API. This was the original behaviour and the former default. It is
-	  faster — see app_perf/RESULTS.md, "The UBI backend" — but has no
+	  faster — see app_perf_blob_db/RESULTS.md, "The UBI backend" — but has no
 	  wear-leveling and no bad-block handling: an interrupted write can
 	  leave the part unusable until it is externally recovered.
 
@@ -45,7 +45,7 @@ config BLOB_DB_BACKEND_UBI
 	  small cost per flash access and nothing per byte; the sector erase
 	  that dominates writes is unchanged. The larger cost is footprint:
 	  UBI itself, PSA Crypto and the heap UBI takes. Measured figures are
-	  in app_perf/RESULTS.md.
+	  in app_perf_blob_db/RESULTS.md.
 
 	  UBI seals its headers with AES-CMAC through PSA Crypto (Mbed TLS
 	  unless the build has TF-M), and takes its bookkeeping from the heap
@@ -247,7 +247,9 @@ config BLOB_DB_IOSTATS
 	  (<app/lib/blob_db_iostats.h>, outside the blob_db contract). Both
 	  counts are kept because they can disagree: a change that moves fewer
 	  bytes may issue more transactions, and on a serial part each
-	  transaction carries a fixed command-and-address cost.
+	  transaction carries a fixed command-and-address cost. Alongside
+	  them it counts the usual causes of an erase — master writes, bucket
+	  formats, compactions — so a phase's erases can be attributed.
 
 	  Intended for benchmarks and regression guards. Unlike wall-clock,
 	  these numbers are deterministic, so they are meaningful on native_sim

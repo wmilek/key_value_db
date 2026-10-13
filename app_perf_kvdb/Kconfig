@@ -17,7 +17,7 @@ config APP_PERF_KVDB_N_KEYS
 	  all of them (twice), enumerates them (twice: a count call and a
 	  full next walk) and rewrites every 4th one. Sized so a rerun on
 	  the nRF5340-DK's QSPI NOR lasts about a minute at the default (from
-	  app_perf/RESULTS.md: ~34 ms per get, ~51 ms per set). Keep the
+	  app_perf_blob_db/RESULTS.md: ~34 ms per get, ~51 ms per set). Keep the
 	  per-bucket packed size under CONFIG_BLOB_DB_MAX_PAYLOAD_LEN (see
 	  kvhash). Changing this (or VAL_LEN) on a store populated with a
 	  different geometry triggers an automatic wipe + repopulation.

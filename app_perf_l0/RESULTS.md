@@ -24,7 +24,7 @@ behind them — is in [`FINDINGS.md`](FINDINGS.md).
 - **Board the derived model describes**: nRF5340-DK (PCA10095) cpuapp, with
   `storage_partition` on the on-board MX25R6435F QSPI NOR — 8 MB, 64 KB erase
   blocks, `flash_area_align()` = 4, 8 MHz Quad-SPI. Same board and same
-  captures as `app_perf/RESULTS.md`.
+  captures as `app_perf_blob_db/RESULTS.md`.
 
 ---
 
@@ -159,7 +159,7 @@ segment size from what it finds at mount. The claim behind
 `geometry/mx25r64.overlay` is that a `native_sim` build carrying the DK's shape
 issues *the same operations* the DK issues.
 
-That claim is checkable against `app_perf/RESULTS.md`, and it holds — all
+That claim is checkable against `app_perf_blob_db/RESULTS.md`, and it holds — all
 twelve phases, byte for byte:
 
 | phase | `native_sim` + `geometry/mx25r64.*` | DK `e80f404` |
@@ -181,7 +181,7 @@ parsed out of the run log and compared against the model's, and
 
 ## 3. A provisional model for the DK, and what it is worth
 
-No `app_perf_l0` run has been taken on the board yet, but three `app_perf`
+No `app_perf_l0` run has been taken on the board yet, but three `app_perf_blob_db`
 captures on the same board have — and each of their phases is one equation in
 the six coefficients. `models/observations_nrf5340dk_flash_area.txt` holds
 those captures verbatim; `derive` solves them.
@@ -198,7 +198,7 @@ python3 app_perf_l0/tools/l0_timing.py derive \
 |---|---:|---:|---|
 | read | 67.7 µs | 631 ns/B | 1548 KB/s ceiling; a read pays mostly overhead below **107 B** |
 | write | 314 µs | 29.6 µs/B | 33 KB/s ceiling; overhead dominates only below **11 B** |
-| erase | — | **1106 ms/block** | matches the ~1.07 s sector erase `app_perf/RUN_ON_DK.md` reports |
+| erase | — | **1106 ms/block** | matches the ~1.07 s sector erase `app_perf_blob_db/RUN_ON_DK.md` reports |
 
 Fitted against **36 observations spanning 46 ms to 155 s** — three and a half
 orders of magnitude — with a **median residual of 1.4 %** and a worst of 8.6 %.
@@ -376,7 +376,7 @@ overhead into its per-block figure — which is most of the 4 % it sits high by.
 
 ### What the model predicts about phases it never saw
 
-Feeding `app_perf`'s `flash_area` I/O counters through the **direct** model.
+Feeding `app_perf_blob_db`'s `flash_area` I/O counters through the **direct** model.
 This is not circular: the model comes from raw L0 calls, the counters from a
 `blob_db` stack.
 
@@ -401,7 +401,7 @@ could have separated it.
 
 ### Two conclusions elsewhere in this repo are wrong because of it
 
-**`app_perf/RESULTS.md` attributes ~7.6 ms to a 256 B page program** and calls
+**`app_perf_blob_db/RESULTS.md` attributes ~7.6 ms to a 256 B page program** and calls
 it ~4× the part's typical, "the limit is the part". The direct sweep says a page
 program is **12.16 µs/B × 256 = 3.11 ms**, which is unremarkable for an
 MX25R6435F. The part is behaving normally; the excess was software above L0.

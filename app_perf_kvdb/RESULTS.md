@@ -6,7 +6,7 @@ benchmark changes or when regenerating on new hardware.
 
 Regenerated on `e80f404` (main, after PR 10 merged). The previous numbers
 in this file predated PR 2's lookup change and are superseded — the
-reference to app_perf's "16.9 ms per blob_db read" no longer describes
+reference to app_perf_blob_db's "16.9 ms per blob_db read" no longer describes
 this library at all; a small-blob read is now 460 µs.
 
 **The two-level `kvhash` is measured on the DK in "On the two-level
@@ -138,7 +138,7 @@ cost in time; it does not remove it.
 
 Both `VERIFY PASS` results hold on both backends, at the same generations.
 
-The pattern matches `app_perf/RESULTS.md`: UBI's LEB→PEB indirection costs
+The pattern matches `app_perf_blob_db/RESULTS.md`: UBI's LEB→PEB indirection costs
 ~112 µs per flash transaction and nothing per byte, so read-dominated
 phases take the full ~2.25× while `modify`, which is half write, takes
 ~1.46×. A `kvdb_get` is two blob_db reads, and both now pay the penalty.
@@ -179,7 +179,7 @@ and `mount+open` on a rerun is nearly three times quicker, because both are
 dominated by writing or reading map structure whose largest blob just got much
 smaller. `verify` and `reverify` are pure `kvdb_get` and cost ~1.65× more,
 because a two-level lookup is an extra flash transaction and UBI charges 178 µs
-for one against 0.616 µs per byte (`app_perf/RESULTS.md`).
+for one against 0.616 µs per byte (`app_perf_blob_db/RESULTS.md`).
 
 `modify` is unchanged to within 2 % in both runs, which is the tell: it is a get
 plus an update, so the read regression and the write improvement land on top of
@@ -569,12 +569,12 @@ That build uses the default UBI backend, with the PEB pool sized in
 switching between backends** — the two layouts are not interchangeable, and
 UBI only formats a partition it finds erased.
 
-The store must also be one this build can mount. `app_perf` enables
+The store must also be one this build can mount. `app_perf_blob_db` enables
 `CONFIG_BLOB_DB_LARGE_PAYLOADS=y`, which bumps the on-flash format major
-to 2, and this app does not — so after running `app_perf` on the same
+to 2, and this app does not — so after running `app_perf_blob_db` on the same
 board, mount fails `-ENOTSUP` (a foreign store) *before* `FRESH_START`
 gets a chance to format. Erase the partition first; see the
-"Downgrading" section of `app_perf/RESULTS.md`.
+"Downgrading" section of `app_perf_blob_db/RESULTS.md`.
 
 Attach exactly one reader to the console tty. Two concurrent `cat`s split
 the byte stream and silently shred the capture.

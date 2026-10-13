@@ -78,7 +78,7 @@ The spread across rows is explained by what each operation is made of.
 `get` is ~7 reads and pays UBI's per-transaction penalty on every one, so
 it takes the full ×2.4. `set` is dominated by 4 updates whose cost is
 program time rather than transactions, so it only takes ×1.5. That matches
-`app_perf/RESULTS.md`, which fits the penalty at ~112 µs per flash
+`app_perf_blob_db/RESULTS.md`, which fits the penalty at ~112 µs per flash
 transaction and nothing per byte.
 
 ### `prepare` on UBI is not one number, it is two
@@ -121,7 +121,7 @@ that much, so the usable bucket count drops.
 ### Where the multiples come from
 
 For scale, raw blob_db on the same setup now does ~2174 reads/s (460 µs)
-and ~398 updates/s (2.51 ms) — see `app_perf/RESULTS.md`.
+and ~398 updates/s (2.51 ms) — see `app_perf_blob_db/RESULTS.md`.
 
 - **get** is now almost entirely explained by its read count. Seven reads
   at 460 µs predicts 3.22 ms against **3.53 ms** measured — 91% of the
@@ -138,7 +138,7 @@ and ~398 updates/s (2.51 ms) — see `app_perf/RESULTS.md`.
   cost is dominated by updates and deletes rather than reads, and only the
   read half of the library got faster. `delete` at 37 ms against ~6 ms of
   accountable reads and updates implies a blob_db delete costs
-  appreciably more than an update; `app_perf` does not benchmark delete,
+  appreciably more than an update; `app_perf_blob_db` does not benchmark delete,
   so that is inferred here rather than measured.
 
 That mutation factor remains the measured price of "crash-safe at every
@@ -243,9 +243,9 @@ exactly one reader: two concurrent `cat`s split the byte stream and
 silently shred the capture.
 
 This app does not enable `CONFIG_BLOB_DB_LARGE_PAYLOADS`, so it cannot
-mount a store left behind by `app_perf` (format major 2 against major 1)
+mount a store left behind by `app_perf_blob_db` (format major 2 against major 1)
 and will fail `-ENOTSUP`. Erase the partition first; see the
-"Downgrading" section of `app_perf/RESULTS.md`.
+"Downgrading" section of `app_perf_blob_db/RESULTS.md`.
 
 Wall clock depends entirely on what state the volume is in. On a raw-erased
 partition the whole run is **~4 s** (0.15 s prepare + ~3.8 s of timed phases);
