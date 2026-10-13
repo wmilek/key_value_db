@@ -48,8 +48,9 @@ afterwards.
 this part takes **~1.07 s** (measured), and the run performs several hundred:
 each `bench prepare` line alone is ~100 erases, so ~100 s of apparent silence
 before it prints. That silence *is* the measurement. Since 1.1.0 the churn
-phase adds roughly another minute (predicted ~67 s on `flash_area`, most of it
-the erases of ~8 compactions), and each `mount` phase well under a second.
+phase adds 20–36 s (measured in the QSPI's high-performance mode, where an
+erase is about half as long; see `RESULTS.md` § 1.1.0), most of it the
+erases of 8 compactions, and each `mount` phase under half a second.
 
 The app never exits — Zephyr's idle loop runs forever once `main()` returns — so
 stop capturing after the final `blob_db perf: all phases passed` line. If an

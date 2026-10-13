@@ -46,18 +46,15 @@ can be read straight off the tables:
 - **`255ce7a`** — *blob_db: fix data loss when a compaction scratch write
   is torn*, the commit immediately before PR 2. Small-blob phases only.
 
-## 1.1.0 — the phases not yet run on the board
+## 1.1.0 — first board run (`65700a8`)
 
-1.1.0 added what the earlier phases could not show, and none of it has a
-hardware capture yet. Until one exists, this section holds the `native_sim`
-counters — exact for the DK, because `boards/native_sim.overlay` now gives the
-simulator the MX25R64's geometry (the unchanged phases reproduce run 2's
-`flash_area` counters byte for byte) — and the times
-`app_perf_l0/tools/l0_timing.py predict` derives from them with
-`models/mx25r64_nrf5340dk_derived.json`. **The times are predictions.**
-Replace them with the board's when it runs.
+The phases 1.1.0 added, measured on the nRF5340-DK. Source: the hardware
+report on wmilek/key_value_db#53 ([comment][hw-1.1.0]); only its summary
+tables were posted, so there is no raw capture for this run below.
 
-What was added:
+[hw-1.1.0]: https://github.com/wmilek/key_value_db/pull/53#issuecomment-6155070727
+
+What 1.1.0 added:
 
 - **`churn`** — 1000 updates of a 4-blob hot set (512 B each) on the store
   the large-object phases left behind. The only phase in which compaction
@@ -70,50 +67,93 @@ What was added:
 - **`why` lines**: master writes, bucket formats and compactions per phase,
   from three new `blob_db_iostats` counters.
 
-`flash_area`, `native_sim` at DK geometry:
+### Setup — and why these times do not compare with the sections below
 
-| phase         | reads / bytes   | writes / bytes | erases | why                               | predicted DK |
-| ------------- | --------------: | -------------: | -----: | --------------------------------- | -----------: |
-| `mount empty` |   134 / 2314    |            0   |     0  |                                   |      10.5 ms |
-| `prepend`     | 11098 / 131584  |   201 / 7264   |     1  | 1 master                          |       2.22 s |
-| `append`      |  1194 / 17494   |   201 / 9640   |     1  | 1 master                          |       1.55 s |
-| `mount list`  |   836 / 6334    |            0   |     0  |                                   |      60.6 ms |
-| `mount large` |  1261 / 8846    |            0   |     0  |                                   |      91.0 ms |
-| `churn`       | 61050 / 1750792 |  1040 / 594752 |    40  | 16 master, 8 compactions (32800 B)|       67.4 s |
-| `mount churn` |  1431 / 9866    |            0   |     0  |                                   |     103.1 ms |
+- **Code**: PR head `65700a8`, plus the `nrf_qspi_nor` patch from #49.
+- **QSPI mode: high-performance.** The patch runs the MX25R in
+  high-performance mode, because without it the DK's QSPI flash corrupts
+  some reads (#44). Every other section of this file was measured without
+  it. A block erase here costs about **0.53 s** (`prepare`: 100 bucket
+  formats in 52.7 s) against the ~1.07 s measured below, so **times in this
+  section are not comparable with the earlier runs**. The I/O counters are.
+- **Zephyr** `4a405846193f`, SDK 1.0.1. Two nRF5340-DK PCA10095 boards
+  (J-Link SN 1050091053 and 960115021): UBI on one, `flash_area` and UBI
+  with atomic replace on the other. The partition was raw-erased before
+  each run. One run per configuration.
+- **Backend columns.** At `65700a8` UBI's default was scratch-sector
+  compaction (`CONFIG_BLOB_DB_UBI_ATOMIC_REPLACE=n`); since #51 the default
+  is atomic replace. The columns are labelled by what they ran.
 
-UBI with `CONFIG_BLOB_DB_UBI_ATOMIC_REPLACE=n` is within a few percent of
-these, as for every other phase. The default UBI build (atomic replace, the
-default since #51) differs only where it compacts: each compaction is one
-block replace with no master writes, so `churn` erases 8 blocks
-(`why churn: master writes 0 … compactions 8`) instead of 40.
+All three runs end in `blob_db perf: all phases passed`, so every read-back
+check held: list checksums, churn contents after churn and after remount,
+and the large-object checksum `0x4032e5bd` after churn and remounts.
 
-What the counters already say:
+### New phases
 
-- **Compaction is two thirds of steady-state update cost.** 8 compactions in
-  1000 updates, and the 40 erases are exactly theirs: 8 × (bucket + scratch
-  twice) = 24, plus 16 master writes. Those erases are 44 s of the predicted
-  67.4 s: 44 ms per update amortized, nearly twice the ~23 ms of reads and
-  writes that every update, compacting or not, accounts for in total. The
-  `churn plain` / `churn compacting` lines will put a measured worst case on
-  a single compacting update; its five erases alone predict ~5.5 s.
+| | flash_area | UBI, scratch compaction | UBI, atomic replace (default) |
+|---|--:|--:|--:|
+| **churn**, 1 000 updates | 36.2 s | 33.6 s | **20.5 s** |
+| plain update, avg / max | 14.9 / 18.9 ms | 14.6 / 19.0 ms | 15.1 / 19.5 ms |
+| compacting update, avg / max | 2.68 / 2.74 s | 2.37 / 2.85 s | **0.69 / 0.73 s** |
+| compactions (live data rewritten) | 8 (32 800 B) | 8 (24 672 B) | 8 (24 672 B) |
+| churn erases = master writes + k × compactions | 40 = 16 + 8×3 | 40 = 16 + 8×3 | **8 = 0 + 8×1** |
+| compaction's share of the average update | 21.3 ms (59 %) | 18.9 ms (56 %) | 5.4 ms (26 %) |
+| mount: empty / list / large / churn | 10 / 54 / 81 / 91 ms | 36 / 250 / 307 / 342 ms | 41 / 321 / 336 / 386 ms |
+| mount reads, empty → churn | 2.3 → 9.9 KB | 2.2 → 9.6 KB | 2.2 → 9.6 KB |
+
+### Earlier phases, now with cause counters
+
+| | flash_area | UBI, scratch compaction | UBI, atomic replace (default) |
+|---|--:|--:|--:|
+| `prepare` ×2 (100 bucket formats each) | 52.7 / 52.7 s | 52.9 / 53.0 s | 53.0 / 52.8 s |
+| `prepend` / `append` | 13.7 / 7.9 ms | 14.7 / 8.3 ms | 15.0 / 8.5 ms |
+| `read` / `update` (prepend list) | 0.47 / 1.87 ms | 0.48 / 1.87 ms | 0.49 / 1.92 ms |
+| `lg write`; erases = master + formats | 18.8 s/op; 9 + 124 | 18.0 s/op; 9 + 117 | 18.0 s/op; 9 + 117 |
+| `lg rewrite` | 2.48 s/op | 2.48 s/op | 2.55 s/op |
+| `lg read` | 1.82 ms/op | 1.82 ms/op | 1.85 ms/op |
+| `lg pwrite`; erases | 1.02 s/op; 64 master writes | 1.09 s/op; 64 master writes | 1.10 s/op; 64 master writes |
+
+### What it shows
+
+- **The I/O counters match `native_sim` exactly.** `boards/native_sim.overlay`
+  gives the simulator the MX25R64's geometry, and the board reproduces its
+  counts: churn's 8 compactions and 40 erases, `lg pwrite`'s 64 master
+  writes, `prepend`'s 11 098 reads. The identity
+  `erases == master_writes + bucket_formats + k × compactions` holds on every
+  `why` line, with k = 3 or, under atomic replace, k = 1, as
+  `test_iostats_causes_account_for_erases` asserts.
+- **Compaction is over half the steady-state update cost** without atomic
+  replace: 56–59 % of the average update. One compacting update stalls for
+  2.4–2.9 s, against ~15 ms for a plain one. The erases are most of that:
+  carrying the same live data with one erase and no master writes (atomic
+  replace, next) takes 0.69 s.
+- **Atomic replace cuts that to about a quarter.** A compaction becomes one block
+  replace with no master writes: 0.69 s instead of ~2.5 s, churn 1.6×
+  faster, and compaction 26 % of the average update. It is the default
+  since #51.
 - **Mount does not read the partition.** §1.5 of `doc/impl/l1_bucketlog.md`
-  budgets ~8 MB of reads; the header-driven walk reads 2–10 KB, in 134–1431
-  transactions, predicted at 10–105 ms on `flash_area`. It grows with slot
-  count, not partition size. On **UBI** these counters are not the whole
-  cost: attaching the device reads every block's headers below the counting
-  seam, so UBI's measured mount time will exceed this by that scan.
-- **`prepend` reads 41× what it stores** — 11098 read transactions for 100
-  inserts, against 1194 for `append`. Every insert rebinds the root, so the
-  root's bucket gains a slot per insert, and every `list_head()` walks all of
-  them: quadratic in `N_OPS`. Hidden until now because the insert phases
-  printed no `io` line. It is a property of `blob_db` (a hot id's bucket
+  budgets ~8 MB of reads; the header-driven walk reads 2–10 KB and grows with
+  slot count, not partition size. `flash_area` mounts in 10–91 ms. On UBI the
+  device attach, which sits below the counters, adds ~25–250 ms. Atomic
+  replace mounts 5–28 % slower than scratch-compaction UBI with identical
+  read counts — noise, or UBI's reclaim queue at attach; one run each cannot
+  tell.
+- **`prepend` reads 41× what it stores**, and costs 13.7 ms per insert
+  against `append`'s 7.9 ms. Every insert rebinds the root, so the root's
+  bucket gains a slot per insert, and every `list_head()` walks all of them:
+  quadratic in `N_OPS`. It is a property of `blob_db` (a hot id's bucket
   grows until compaction), not of the list: any caller that rebinds one id
   often pays it.
-- **`lg pwrite`'s 64 erases are all master writes** (`why lg pwrite: master
-  writes 64`) — two per partial write, entering and leaving the segment
-  window. That is the "two sector erases" §"Partial write vs whole-object
-  rewrite" attributes the ×1.95 to, now counted rather than inferred.
+- **`lg pwrite`'s erases are all master writes** — two per partial write,
+  entering and leaving the segment window. That is the "two sector erases"
+  §"Partial write vs whole-object rewrite" attributes the ×1.95 to, now
+  counted rather than inferred.
+- **The timing model does not transfer to high-performance mode.** Before
+  this run, `app_perf_l0/tools/l0_timing.py` with
+  `models/mx25r64_nrf5340dk_derived.json` predicted churn at 67.4 s on
+  `flash_area`; the board took 36.2 s. That model was fitted in the default
+  low-power mode, where an erase costs twice as much. Using it for this
+  setup needs a refit from an `app_perf_l0` capture in high-performance mode.
 
 ## Setup
 
