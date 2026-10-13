@@ -102,6 +102,9 @@ input:focus-visible, select:focus-visible, button:focus-visible, canvas:focus-vi
 .row2 { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
 .row3 { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 8px; }
 .kv { display: grid; gap: 6px; }
+.rename { align-items: end; }
+.rename button { justify-self: start; }
+button.edit { font: 500 11px var(--f-mono); padding: 1px 6px; }
 .kv label { grid-template-columns: minmax(0, 1fr) 110px; align-items: center; gap: 8px; font: 12.5px var(--f-mono); color: var(--ink); }
 .check { display: flex; gap: 8px; align-items: center; font-size: 12.5px; color: var(--ink); }
 .btns { display: flex; flex-wrap: wrap; gap: 6px; }
@@ -293,7 +296,9 @@ tr.orphan td { color: var(--err); }
 
       <section class="panel" aria-labelledby="h-op">
         <header><h2 id="h-op"><span class="step-no">3</span>Operate</h2><span class="hint">set · get · del</span></header>
-        <label for="o-k">Key<input id="o-k" type="text" autocomplete="off" spellcheck="false"></label>
+        <label for="o-k">Key<input id="o-k" type="text" autocomplete="off" spellcheck="false" list="o-keys" placeholder="type a key or pick a stored one"></label>
+        <datalist id="o-keys"></datalist>
+        <p class="hint">Picking a stored key, or <b>Edit</b> on a row under Bucket bytes, loads its current value here. Change either field and press Set.</p>
         <div class="row2">
           <label for="o-v">Value<input id="o-v" type="text" autocomplete="off" spellcheck="false"></label>
           <label for="o-vn">Repeat value to N bytes<input id="o-vn" type="number" min="0" max="65535" placeholder="as typed"></label>
@@ -314,6 +319,11 @@ tr.orphan td { color: var(--err); }
           <button id="b-get" type="button">Get</button>
           <button id="b-del" type="button">Delete</button>
         </div>
+        <div class="row2 rename">
+          <label for="o-nk">Rename key to<input id="o-nk" type="text" autocomplete="off" spellcheck="false"></label>
+          <button id="b-ren" type="button">Rename</button>
+        </div>
+        <p class="hint">kvhash has no rename: a caller does get, set under the new key, then del of the old one. The new key usually hashes to another bucket.</p>
       </section>
 
       <section class="panel" aria-labelledby="h-bulk">
@@ -1146,7 +1156,7 @@ function renderBucket(info) {
     const val = e.vs
       ? `<span class="pill vr" data-blob="${entVid(b, e)}">→ #${entVid(b, e)}</span> ${quote(valBytesOf(b, e), 28)}`
       : quote(b.subarray(e.vpos, e.vpos + e.vl), 28);
-    return `<tr class="${stale ? 'stale' : ''}" title="${stale ? 'placement differs from the current policy; moves on its next set' : ''}"><td>${j}</td><td>${e.off}</td><td>0x${kf.toString(16).padStart(4, '0')}</td><td>0x${vf.toString(16).padStart(4, '0')}</td><td class="tw">${key}</td><td class="tw">${val}</td><td>${e.len}</td></tr>`;
+    return `<tr class="${stale ? 'stale' : ''}" title="${stale ? 'placement differs from the current policy; moves on its next set' : ''}"><td><button class="edit" type="button" data-edit="${j}">Edit</button></td><td>${j}</td><td>${e.off}</td><td>0x${kf.toString(16).padStart(4, '0')}</td><td>0x${vf.toString(16).padStart(4, '0')}</td><td class="tw">${key}</td><td class="tw">${val}</td><td>${e.len}</td></tr>`;
   }).join('');
   const cls = new Array(b.length).fill('');
   for (const e of bk.ents) {
@@ -1162,7 +1172,7 @@ function renderBucket(info) {
   }
   body.innerHTML = `
     <p class="small muted" style="margin-bottom:8px">Blob <span data-blob="${bk.id}">#${bk.id}</span> · ${b.length} of ${K.MP} B · ${bk.ents.length} entr${bk.ents.length === 1 ? 'y' : 'ies'}, packed in write order (a set moves its key to the end). Bit 15 of a length field is the spill flag; the low 15 bits are always the true length.</p>
-    ${bk.ents.length ? `<div class="tscroll"><table><thead><tr><th>#</th><th>off</th><th>klen|KS</th><th>vlen|VS</th><th>key part</th><th>value part</th><th>bytes</th></tr></thead><tbody>${rows}</tbody></table></div>` : '<p class="empty">Empty payload: every entry was deleted. The bucket stays allocated and named by the directory.</p>'}
+    ${bk.ents.length ? `<div class="tscroll"><table><thead><tr><th></th><th>#</th><th>off</th><th>klen|KS</th><th>vlen|VS</th><th>key part</th><th>value part</th><th>bytes</th></tr></thead><tbody>${rows}</tbody></table></div>` : '<p class="empty">Empty payload: every entry was deleted. The bucket stays allocated and named by the directory.</p>'}
     ${b.length ? `<div class="hex" style="margin-top:10px">${hex}</div>` : ''}`;
 }
 
@@ -1215,7 +1225,29 @@ function renderAll() {
   UI.info = info;
   if (info.ok && UI.sel.top >= (info.depth === 2 ? info.nTop : 1)) UI.sel = { top: 0, idx: null };
   renderStats(info); drawOverview(info); renderLeaf(info); renderBucket(info);
-  renderTrace(); renderStore(info); renderPolicy(info); renderCalc();
+  renderTrace(); renderStore(info); renderPolicy(info); renderCalc(); renderKeyList(info);
+}
+function storedKeys(info) {
+  const out = [];
+  if (!info.ok) return out;
+  for (const s of info.subs) for (const bk of (s.buckets || [])) if (bk.b) for (const e of bk.ents) out.push({ b: bk.b, e });
+  return out;
+}
+function renderKeyList(info) {
+  $('#o-keys').innerHTML = storedKeys(info).slice(0, 500)
+    .map(({ b, e }) => `<option value="${esc(dec.decode(keyBytesOf(b, e)))}"></option>`).join('');
+}
+/* Load a stored entry into the Operate form, read straight from the model
+   (no trace: this is the page, not kvhash, looking). */
+function loadEntry(b, e) {
+  const k = dec.decode(keyBytesOf(b, e)), v = dec.decode(valBytesOf(b, e));
+  $('#o-k').value = k; $('#o-v').value = v; $('#o-vn').value = ''; $('#o-nk').value = k;
+  renderCalc();
+  $('#o-v').focus(); $('#o-v').select();
+}
+function findStored(keyStr) {
+  const key = enc.encode(keyStr);
+  return storedKeys(UI.info).find(({ b, e }) => eq(keyBytesOf(b, e), key));
 }
 
 /* ---- bulk ---- */
@@ -1332,6 +1364,31 @@ cv.addEventListener('click', ev => {
   const h = hitOverview(ev); if (!h) return;
   UI.sel = { top: h.top, idx: h.idx };
   drawOverview(UI.info); renderLeaf(UI.info); renderBucket(UI.info);
+});
+
+$('#b-body').addEventListener('click', e => {
+  const btn = e.target.closest('[data-edit]'); if (!btn) return;
+  const s = UI.info.subs[UI.sel.top], bk = s && s.buckets[UI.sel.idx];
+  if (bk && bk.b) loadEntry(bk.b, bk.ents[+btn.dataset.edit]);
+});
+$('#o-k').addEventListener('change', () => { const hit = findStored($('#o-k').value); if (hit) loadEntry(hit.b, hit.e); });
+$('#b-ren').addEventListener('click', () => {
+  const from = opKey(), to = enc.encode($('#o-nk').value);
+  if (!to.length || eq(from, to)) return;
+  const cut = takeCut();
+  run(`rename("${preview(from, 16)}" → "${preview(to, 16)}")`, () => {
+    note('1. get the old key');
+    let rc = opGet(from);
+    if (rc) return rc;
+    const val = T.value; T.value = null;
+    note('2. set the value under the new key');
+    T.cut = cut;
+    rc = opSet(to, val);
+    if (rc) return rc;
+    note('3. delete the old key. A cut before this leaves both keys, never neither.');
+    return opDel(from);
+  });
+  if (UI.last.rc === 0) { $('#o-k').value = $('#o-nk').value; renderCalc(); }
 });
 
 /* hovering anything that names a blob highlights every other mention of it */
