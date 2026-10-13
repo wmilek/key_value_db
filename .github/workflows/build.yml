@@ -120,19 +120,21 @@ jobs:
           west build -p always -b nrf5340dk/nrf5340/cpuapp -d build/nrf_sample_kvhash \
             key_value_db/samples/kvhash
 
-      # app_perf is the binary that gets flashed to produce the numbers in
-      # app_perf/RESULTS.md, and it exercises paths `app` does not: segmented
-      # large objects, blob_db_write(), and the I/O counters. Until this step
-      # existed it was never compiled for the target in CI, so "ready to run
-      # on the DK" rested on someone's last successful local build.
-      - name: Build app_perf (ARM)
+      # app_perf_blob_db is the binary that gets flashed to produce the numbers
+      # in app_perf_blob_db/RESULTS.md, and it exercises paths `app` does not:
+      # segmented large objects, blob_db_write(), compaction, and the I/O
+      # counters. Until this step existed it was never compiled for the target
+      # in CI, so "ready to run on the DK" rested on someone's last successful
+      # local build. (Twister above also runs it on native_sim, on both
+      # backends, at the DK's geometry.)
+      - name: Build app_perf_blob_db (ARM)
         run: |
           west build -p always -b nrf5340dk/nrf5340/cpuapp -d build/nrf_perf \
-            key_value_db/app_perf
+            key_value_db/app_perf_blob_db
 
       # app_perf_l0 produces the L0 cost model that turns a native_sim run
       # into a predicted hardware time, so it is flashed for exactly the same
-      # reason app_perf is. It links no storage stack, which is the point:
+      # reason app_perf_blob_db is. It links no storage stack, which is the point:
       # nothing above L0 can perturb its timings, and nothing above L0 can
       # keep it compiling either, so it needs its own build step.
       - name: Build app_perf_l0 (ARM)

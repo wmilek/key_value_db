@@ -4,7 +4,7 @@
  *
  * L0 timing benchmark — the raw cost of the `flash_area` API.
  *
- * Every other benchmark in this repository measures a stack: app_perf measures
+ * Every other benchmark in this repository measures a stack: app_perf_blob_db measures
  * blob_db, app_perf_mc measures the model container, app_cbor_persondb
  * measures a product-shaped workload. All of them bottom out in three L0
  * calls, and none of them can say what those three calls cost, so a change in

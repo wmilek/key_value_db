@@ -153,6 +153,13 @@ void blob_db_iostats_reset(void)
 {
 	memset(&g_io, 0, sizeof(g_io));
 }
+
+/* Cause counters: why the flash counters moved, not by how much. */
+#define IO_CAUSE(field)            (g_io.field++)
+#define IO_CAUSE_BYTES(field, n)   (g_io.field += (n))
+#else
+#define IO_CAUSE(field)            ((void)0)
+#define IO_CAUSE_BYTES(field, n)   ((void)0)
 #endif /* CONFIG_BLOB_DB_IOSTATS */
 
 /* Master sector helpers -------------------------------------------------- */
@@ -303,6 +310,7 @@ static int write_master(uint8_t slot, uint32_t gen, uint8_t state,
 		return -ENOTSUP;
 	}
 
+	IO_CAUSE(master_writes);
 	rc = blob_db_store_replace(peb_offset(slot), buf, len);
 	if (rc < 0) {
 		LOG_ERR("master %u write failed: %d", slot, rc);
@@ -835,6 +843,7 @@ static int format_bucket(uint16_t bid)
 	memcpy(bhdr.magic, BUCKET_MAGIC, 4);
 	bhdr.hdr_crc32 = hdr_crc32(&bhdr, sizeof(bhdr));
 
+	IO_CAUSE(bucket_formats);
 	const int rc = blob_db_store_replace(bucket_offset(bid), &bhdr,
 					     sizeof(bhdr));
 	if (rc < 0) {
@@ -1323,6 +1332,8 @@ static int compact_bucket(uint16_t bid)
 
 	LOG_INF("compact bid=%u: new bucket has %zu B (was up to %zu B)",
 		bid, new_len, st.peb_size);
+	IO_CAUSE(compactions);
+	IO_CAUSE_BYTES(bytes_compacted, new_len);
 
 	rc = compact_commit(bid, g_bbuf_new, new_len);
 	g_bbuf_new_busy = false;

@@ -1,7 +1,9 @@
-# app_perf — reference results
+# app_perf_blob_db — reference results
 
 Hardware-measured results for the workloads implemented by
-`app_perf/src/main.c` (build/flash instructions in `RUN_ON_DK.md`). Keep
+`app_perf_blob_db/src/main.c` (build/flash instructions in `RUN_ON_DK.md`).
+The app was called `app_perf` until 1.1.0; the captures below predate the
+rename and keep their original log lines. Keep
 this file honest — update it when the shape of the benchmark changes or
 when regenerating on new hardware.
 
@@ -39,10 +41,75 @@ can be read straight off the tables:
   cache (`8f5b16b`); nothing after that commit touches the read path, so
   these numbers describe `8f5b16b` as well. See
   "The index cache" below.
-- **`8428e35`** — *app_perf: add large-object phases and flash I/O
+- **`8428e35`** — *app_perf_blob_db: add large-object phases and flash I/O
   accounting*, run 1. The pre-cache baseline.
 - **`255ce7a`** — *blob_db: fix data loss when a compaction scratch write
   is torn*, the commit immediately before PR 2. Small-blob phases only.
+
+## 1.1.0 — the phases not yet run on the board
+
+1.1.0 added what the earlier phases could not show, and none of it has a
+hardware capture yet. Until one exists, this section holds the `native_sim`
+counters — exact for the DK, because `boards/native_sim.overlay` now gives the
+simulator the MX25R64's geometry (the unchanged phases reproduce run 2's
+`flash_area` counters byte for byte) — and the times
+`app_perf_l0/tools/l0_timing.py predict` derives from them with
+`models/mx25r64_nrf5340dk_derived.json`. **The times are predictions.**
+Replace them with the board's when it runs.
+
+What was added:
+
+- **`churn`** — 1000 updates of a 4-blob hot set (512 B each) on the store
+  the large-object phases left behind. The only phase in which compaction
+  runs: with every other phase writing each blob once or twice into a fresh
+  store, no bucket ever filled, even at the maximum `N_OPS`.
+- **`mount empty` / `list` / `large` / `churn`** — `blob_db_mount()` timed at
+  four fill levels, each followed by a read-back check.
+- **`io` lines for `prepare`, `prepend` and `append`**, which printed only
+  wall-clock before — so on `native_sim` the insert path produced nothing.
+- **`why` lines**: master writes, bucket formats and compactions per phase,
+  from three new `blob_db_iostats` counters.
+
+`flash_area`, `native_sim` at DK geometry:
+
+| phase         | reads / bytes   | writes / bytes | erases | why                               | predicted DK |
+| ------------- | --------------: | -------------: | -----: | --------------------------------- | -----------: |
+| `mount empty` |   134 / 2314    |            0   |     0  |                                   |      10.5 ms |
+| `prepend`     | 11098 / 131584  |   201 / 7264   |     1  | 1 master                          |       2.22 s |
+| `append`      |  1194 / 17494   |   201 / 9640   |     1  | 1 master                          |       1.55 s |
+| `mount list`  |   836 / 6334    |            0   |     0  |                                   |      60.6 ms |
+| `mount large` |  1261 / 8846    |            0   |     0  |                                   |      91.0 ms |
+| `churn`       | 61050 / 1750792 |  1040 / 594752 |    40  | 16 master, 8 compactions (32800 B)|       67.4 s |
+| `mount churn` |  1431 / 9866    |            0   |     0  |                                   |     103.1 ms |
+
+UBI's counters are within a few percent of these, as for every other phase.
+
+What the counters already say:
+
+- **Compaction is two thirds of steady-state update cost.** 8 compactions in
+  1000 updates, and the 40 erases are exactly theirs: 8 × (bucket + scratch
+  twice) = 24, plus 16 master writes. Those erases are 44 s of the predicted
+  67.4 s: 44 ms per update amortized, nearly twice the ~23 ms of reads and
+  writes that every update, compacting or not, accounts for in total. The
+  `churn plain` / `churn compacting` lines will put a measured worst case on
+  a single compacting update; its five erases alone predict ~5.5 s.
+- **Mount does not read the partition.** §1.5 of `doc/impl/l1_bucketlog.md`
+  budgets ~8 MB of reads; the header-driven walk reads 2–10 KB, in 134–1431
+  transactions, predicted at 10–105 ms on `flash_area`. It grows with slot
+  count, not partition size. On **UBI** these counters are not the whole
+  cost: attaching the device reads every block's headers below the counting
+  seam, so UBI's measured mount time will exceed this by that scan.
+- **`prepend` reads 41× what it stores** — 11098 read transactions for 100
+  inserts, against 1194 for `append`. Every insert rebinds the root, so the
+  root's bucket gains a slot per insert, and every `list_head()` walks all of
+  them: quadratic in `N_OPS`. Hidden until now because the insert phases
+  printed no `io` line. It is a property of `blob_db` (a hot id's bucket
+  grows until compaction), not of the list: any caller that rebinds one id
+  often pays it.
+- **`lg pwrite`'s 64 erases are all master writes** (`why lg pwrite: master
+  writes 64`) — two per partial write, entering and leaving the segment
+  window. That is the "two sector erases" §"Partial write vs whole-object
+  rewrite" attributes the ×1.95 to, now counted rather than inferred.
 
 ## Setup
 
@@ -355,7 +422,7 @@ old-fork capture, so the difference is UBI's own cost, not less work.
   Crypto is about a third of the flash and most of the RAM.
   `CONFIG_MBEDTLS_AES_ROM_TABLES=y` (with its default compact tables) trades
   8.7 KB of RAM for 2.0 KB of flash.
-- **`ATOMIC_REPLACE` moves nothing here**, because `app_perf` rarely
+- **`ATOMIC_REPLACE` moves nothing here**, because `app_perf_blob_db` rarely
   compacts, and every other replace (master rewrites, bucket formats) still
   pays one erase inline: blob_db never runs `UBI_MAINTENANCE_RECLAIM` and the
   volume has about four spare blocks. Its gain shows in
@@ -778,7 +845,7 @@ that inflated the per-op cost by ~11 ms.
 
 ```bash
 # From the west workspace top-dir
-west build -p always -b nrf5340dk/nrf5340/cpuapp -d build/dk_perf app_perf
+west build -p always -b nrf5340dk/nrf5340/cpuapp -d build/dk_perf app_perf_blob_db
 nrfutil device program --firmware build/dk_perf/zephyr/zephyr.hex \
     --options chip_erase_mode=ERASE_RANGES_TOUCHED_BY_FIRMWARE,reset=RESET_SYSTEM \
     --serial-number <your-jlink-sn>
@@ -789,7 +856,7 @@ build succeeds and hangs at runtime — and wipe the partition raw first,
 since the two layouts are not interchangeable:
 
 ```bash
-west build -p always -b nrf5340dk/nrf5340/cpuapp -d build/ubi_perf app_perf -- \
+west build -p always -b nrf5340dk/nrf5340/cpuapp -d build/ubi_perf app_perf_blob_db -- \
     -DCONFIG_BLOB_DB_BACKEND_UBI=y -DCONFIG_UBI_MAX_NR_OF_DATA_PEBS=126
 ```
 
@@ -810,7 +877,8 @@ console is usually the wrong node, not a dead board.
 Expect **5–15 minutes with long silent stretches.** The run performs
 several hundred ~1 s sector erases; each `bench prepare` line alone is
 ~100 s of apparent silence. The app never exits — stop capturing after
-the final `lg objects intact` line.
+the final `blob_db perf: all phases passed` line (on builds before 1.1.0,
+`lg objects intact`).
 
 ### Downgrading: erase the partition first
 

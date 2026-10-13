@@ -539,6 +539,10 @@ static int cmd_iostats(const struct shell *sh, size_t argc, char **argv)
 		    (unsigned long long)io.bytes_written);
 	shell_print(sh, "erases : %u ops, %llu B", io.erases,
 		    (unsigned long long)io.bytes_erased);
+	shell_print(sh, "causes : %u master writes, %u bucket formats, "
+		    "%u compactions (%llu B rewritten)", io.master_writes,
+		    io.bucket_formats, io.compactions,
+		    (unsigned long long)io.bytes_compacted);
 	return 0;
 }
 #endif

@@ -223,7 +223,7 @@ it demonstrates.
 This is what CI runs ([`build.yml`](.github/workflows/build.yml)), plus an
 app build on the non-default `flash_area` backend. At the merge gate it also
 cross-builds for ARM: the demo on both storage backends and with `kvdb`
-enabled, `samples/kvhash`, `app_perf`, and `app_cbor_persondb` in both of its
+enabled, `samples/kvhash`, `app_perf_blob_db`, and `app_cbor_persondb` in both of its
 frontends — so the binaries that produce the hardware numbers cannot rot
 between runs on real hardware.
 
@@ -253,7 +253,7 @@ the source.
 | Application | What it does | Reference results |
 |---|---|---|
 | [`app/`](app) | `blob_db` demo: a boot counter persisted at the root id, wiped with `blob_db_erase_all()` every 5th boot | — |
-| [`app_perf/`](app_perf) | raw `blob_db` benchmark: prepend / append / read / update over a linked list of blobs | [`RESULTS.md`](app_perf/RESULTS.md) |
+| [`app_perf_blob_db/`](app_perf_blob_db) | raw `blob_db` benchmark: list insert / read / update, large-object read / pread / pwrite, steady-state churn with compaction, and mount at several fill levels | [`RESULTS.md`](app_perf_blob_db/RESULTS.md) |
 | [`app_perf_l0/`](app_perf_l0) | **L0 cost model**: raw `flash_area` timing, swept over transfer size and erase size as a matrix of µs/op, KiB/s and marginal cost — so whether the relationship is linear is read off, not assumed. Its output feeds a timing model that turns any `native_sim` run's I/O counters into predicted hardware wall-clock, and can be checked against the part's datasheet | [`RESULTS.md`](app_perf_l0/RESULTS.md) |
 | [`app_perf_mc/`](app_perf_mc) | model-container benchmark — the price of the full crash-safe mutation discipline | [`RESULTS.md`](app_perf_mc/RESULTS.md) |
 | [`app_perf_kvdb/`](app_perf_kvdb) | `kvdb` demo + benchmark with **cross-reboot verification**: every value is predicted from a stored generation counter, so a rerun proves the previous run survived — and an interrupted run is detected and proven atomic. Also times kvhash's `count` and a full `next` walk, and proves the walk returns exactly the predicted set | [`RESULTS.md`](app_perf_kvdb/RESULTS.md) |

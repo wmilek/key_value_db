@@ -4,11 +4,11 @@ menu "Zephyr"
 source "Kconfig.zephyr"
 endmenu
 
-module = APP_PERF
-module-str = APP_PERF
+module = APP_PERF_BLOB_DB
+module-str = APP_PERF_BLOB_DB
 source "subsys/logging/Kconfig.template.log_config"
 
-config APP_PERF_N_OPS
+config APP_PERF_BLOB_DB_N_OPS
 	int "Number of add/read operations per run"
 	default 100
 	range 10 1000
@@ -16,7 +16,7 @@ config APP_PERF_N_OPS
 	  Size of the benchmark: this many nodes are added (then read back
 	  by traversal). Runtime grows roughly linearly.
 
-config APP_PERF_VAL_LEN
+config APP_PERF_BLOB_DB_VAL_LEN
 	int "Per-node payload size in bytes"
 	default 24
 	range 0 240
@@ -25,9 +25,45 @@ config APP_PERF_VAL_LEN
 	  next_id header). Keep the total node size under
 	  CONFIG_BLOB_DB_MAX_PAYLOAD_LEN.
 
+config APP_PERF_BLOB_DB_CHURN_OPS
+	int "Updates in the churn (steady-state) phase"
+	default 1000
+	range 0 100000
+	help
+	  The churn phase rewrites a small hot set of blobs this many times,
+	  so the buckets it lives in fill with superseded slots and compact.
+	  It is the only phase in which compaction runs. 0 skips it.
+
+	  A member's bucket first compacts after about (bucket size / slot
+	  size) of its updates, so the phase needs at least CHURN_SET times
+	  that. On 64 KB sectors the defaults give each of 4 members ~250
+	  updates against ~124 slots per bucket (512 B payloads) or ~240
+	  (256 B): about eight compactions, or four. Each one costs several
+	  seconds on the DK's QSPI NOR. The app warns if none happened.
+
+config APP_PERF_BLOB_DB_CHURN_SET
+	int "Blobs in the churn phase's hot set"
+	default 4
+	range 1 64
+	help
+	  Updates pick a member at random. Kept small so the churn
+	  concentrates in a few buckets: each member's bucket must fill
+	  before it first compacts, so a larger set needs proportionally
+	  more CHURN_OPS to reach the same number of compactions.
+
+config APP_PERF_BLOB_DB_CHURN_LEN
+	int "Payload size of each churn update, in bytes"
+	default 512 if BLOB_DB_LARGE_PAYLOADS
+	default 256
+	range 1 65535
+	help
+	  Must not exceed CONFIG_BLOB_DB_MAX_PAYLOAD_LEN (256 by default
+	  without large payloads). Larger payloads fill a bucket in fewer
+	  updates, so compaction comes sooner.
+
 if BLOB_DB_LARGE_PAYLOADS
 
-config APP_PERF_OBJ_LEN
+config APP_PERF_BLOB_DB_OBJ_LEN
 	int "Large-object size in bytes"
 	default 65536
 	help
@@ -36,7 +72,7 @@ config APP_PERF_OBJ_LEN
 	  values to see the size sweep that matters: partial-write cost should
 	  stay flat while whole-object rewrite cost grows with this number.
 
-config APP_PERF_N_LARGE
+config APP_PERF_BLOB_DB_N_LARGE
 	int "Number of large objects"
 	default 4
 	range 1 64
@@ -45,7 +81,7 @@ config APP_PERF_N_LARGE
 	  64 KB-sector QSPI NOR a cold pass also pays a sector erase per
 	  segment bucket.
 
-config APP_PERF_N_PART
+config APP_PERF_BLOB_DB_N_PART
 	int "Number of partial (pread/pwrite) operations per phase"
 	default 32
 	range 4 4096
@@ -56,7 +92,7 @@ config APP_PERF_N_PART
 	  without CONFIG_FLASH_SIMULATOR_SIMULATE_TIMING raise it substantially
 	  or the phase rounds to zero.
 
-config APP_PERF_PART_LEN
+config APP_PERF_BLOB_DB_PART_LEN
 	int "Bytes touched by each partial operation"
 	default 64
 	range 1 4096

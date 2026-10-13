@@ -46,7 +46,7 @@ static void print_bench(const struct bench_result *b)
 	 * printed as "5". us/op was right the whole time, so the two columns
 	 * disagreed and the wrong one was the eye-catching one.
 	 *
-	 * app_perf/src/main.c hit the same thing on its partial-vs-whole write
+	 * app_perf_blob_db/src/main.c hit the same thing on its partial-vs-whole write
 	 * ratio, where truncation turned 1.95x into "1x" and swallowed the
 	 * entire result; this is that fix applied to the other reporter.
 	 *
