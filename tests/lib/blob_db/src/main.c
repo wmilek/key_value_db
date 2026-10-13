@@ -351,6 +351,123 @@ ZTEST(blob_db, test_corrupt_slot_does_not_hide_later_slots)
 	zassert_mem_equal(buf, "SECOND", 6);
 }
 
+/* --- torn slot headers at the end of a bucket's log ----------------------
+ *
+ * A power cut can tear an append inside its 4 B slot header: the flags are
+ * programmed, val_len is still erased (or half programmed) and so reads as
+ * larger than any payload. The walk cannot size such a slot, so the log ends
+ * at its header — and so did the append cursor, which left the next append
+ * programmed over bytes that were not erased. NOR only clears bits, so the
+ * slot that landed was the AND of the torn bytes and the new ones: the write
+ * was acknowledged and then read back as a slot with a bad CRC.
+ *
+ * The simulator ANDs a write into what is already there, as NOR does, so
+ * these cases see exactly what a device would.
+ */
+
+/* `first` bound to "FIRST"; `second` allocated into the same bucket but not
+ * bound. Returns the bucket's offset in the partition. */
+static off_t two_ids_in_one_bucket(uint64_t *first, uint64_t *second)
+{
+	const uint16_t n_buckets = 2045;
+
+	*first = put_blob("FIRST", 5);
+	for (int i = 0; i < n_buckets - 1; i++) {
+		zassert_not_equal(blob_db_alloc_id(), 0, "alloc_id failed");
+	}
+	*second = blob_db_alloc_id();
+	zassert_equal(*first % n_buckets, *second % n_buckets,
+		      "test needs both ids in one bucket (%llu vs %llu)",
+		      (unsigned long long)*first, (unsigned long long)*second);
+
+	return (off_t)(3 + (*first % n_buckets)) * TEST_SECTOR_SZ;
+}
+
+/* Program `n` bytes of a slot header right after `first`'s slot — where the
+ * append that tore would have started. Unmounted around the forge. */
+static void forge_torn_header(off_t bucket_off, const uint8_t *bytes, size_t n)
+{
+	const struct flash_area *fa;
+
+	zassert_ok(blob_db_unmount());
+	zassert_ok(flash_area_open(BLOB_DB_TEST_PARTITION_ID, &fa));
+
+	const size_t align = flash_area_align(fa);
+	/* bucket header (16) + "FIRST"'s slot (14 + 5), rounded to the write
+	 * block. */
+	const off_t at = bucket_off + 16 + (off_t)ROUND_UP(14 + 5, align);
+	uint8_t blk[32];
+
+	zassert_true(ROUND_UP(n, align) <= sizeof(blk), "write block too big");
+	memset(blk, 0xff, sizeof(blk));
+	memcpy(blk, bytes, n);
+	zassert_ok(flash_area_write(fa, at, blk, ROUND_UP(n, align)));
+	flash_area_close(fa);
+
+	zassert_ok(blob_db_mount());
+}
+
+static void assert_value(uint64_t id, const char *want)
+{
+	uint8_t buf[16];
+	size_t got;
+
+	zassert_ok(blob_db_get(id, buf, sizeof(buf), &got),
+		   "id=%llu lost", (unsigned long long)id);
+	zassert_equal(got, strlen(want));
+	zassert_mem_equal(buf, want, got);
+}
+
+/* Torn after val_len's low byte: the header of a 5 B rebind of `first` reads
+ * val_len 0xff05. Binding `second` on top would have written val_len 0x0006
+ * over it, landing as 0x0004. */
+ZTEST(blob_db, test_append_after_a_torn_header_lands_on_erased_flash)
+{
+	SKIP_UNLESS_RAW_PARTITION();
+
+	uint64_t first, second;
+	const off_t bucket_off = two_ids_in_one_bucket(&first, &second);
+	const uint8_t torn[] = { 0x01 /* SEALED */, 0x00, 0x05 };
+
+	forge_torn_header(bucket_off, torn, sizeof(torn));
+
+	zassert_ok(blob_db_update(second, "SECOND", 6));
+	assert_value(second, "SECOND");
+	assert_value(first, "FIRST");
+
+	zassert_ok(blob_db_unmount());
+	zassert_ok(blob_db_mount());
+	assert_value(second, "SECOND");
+	assert_value(first, "FIRST");
+}
+
+/* Torn after the flags and reserved byte: val_len 0xffff, the case the power
+ * cut tests log. A tombstone's flags (SEALED | TOMBSTONE) programmed over the
+ * torn SEALED would have read back as a plain empty slot whose CRC fails — the
+ * delete acknowledged, and `first` still live after it. */
+ZTEST(blob_db, test_delete_after_a_torn_header_lands_on_erased_flash)
+{
+	SKIP_UNLESS_RAW_PARTITION();
+
+	uint64_t first, second;
+	const off_t bucket_off = two_ids_in_one_bucket(&first, &second);
+	const uint8_t torn[] = { 0x01 /* SEALED */, 0x00 };
+
+	forge_torn_header(bucket_off, torn, sizeof(torn));
+
+	zassert_ok(blob_db_delete(first));
+
+	uint8_t buf[16];
+	size_t got;
+
+	zassert_equal(blob_db_get(first, buf, sizeof(buf), &got), -ENOENT,
+		      "acknowledged delete did not take");
+	zassert_ok(blob_db_unmount());
+	zassert_ok(blob_db_mount());
+	zassert_equal(blob_db_get(first, buf, sizeof(buf), &got), -ENOENT,
+		      "acknowledged delete lost across remount");
+}
+
 /* 11. Hitting bucket-full triggers per-bucket compaction; the latest
  *     value survives. */
 ZTEST(blob_db, test_bucket_full_triggers_compaction)

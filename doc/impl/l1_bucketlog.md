@@ -47,7 +47,8 @@ The header is written once per erase; slots accumulate after it. Each slot is
 self-describing — flags, `val_len`, the id, the payload, a CRC — and `val_len`
 gives the stride to the next slot, so the stream is walked without any index.
 The **write cursor** is not stored anywhere: it is the first offset whose slot
-header cannot be trusted (still erased, or malformed), found by walking.
+header cannot be trusted (still erased, or malformed), found by walking. An
+append goes there only if the bytes it would cover are still erased (§3.4).
 
 ### 1.3 Three operations, one primitive
 
@@ -81,12 +82,21 @@ untouched and is still the newest valid one, so the old value survives intact.
 No journal, no two-phase write, no recovery pass: the commit point *is* the
 moment the new slot verifies.
 
+All of that rests on the write going into **erased** space. A torn write can
+leave programmed bytes *at* the write cursor, not only before it (§3.4). A slot
+programmed over them would be the bitwise AND of the old bytes and the new ones.
+That slot would fail its CRC after the write was acknowledged, and the "previous
+slot survives" argument would protect the wrong value. Hence the rule this
+section depends on: **the append cursor always points at erased flash.** An
+append that would land on anything else compacts the bucket first (§1.4).
+
 ### 1.4 Garbage, and getting rid of it
 
 The cost of never overwriting is that dead slots accumulate: every rebind and
 every delete leaves one behind. A bucket therefore fills faster than its live
 contents suggest. Compaction is lazy: when an append finds the next slot would
-not fit, the allocator **compacts** the bucket first — builds an image holding
+not fit, or would land on bytes that are not erased (§3.4), the allocator
+**compacts** the bucket first — builds an image holding
 only the live slots, dropping tombstones and superseded ones, stages it in the
 scratch sector, then erases the bucket and writes the image back (§5.6). This
 is where a tombstone's bytes finally disappear, and — apart from `format`, and
@@ -246,6 +256,32 @@ bucket until compaction.) Readers verify the CRC of the one slot they actually
 want, and fall back to the newest intact slot below it — so the visible value is
 always a committed one.
 
+**The append cursor always points at erased flash.** The end of the log is
+where the walk stops, which is not always where programmed bytes stop. A power
+cut can tear an append inside its 4 B header: the flags are programmed (SEALED
+set), but `val_len` is still `0xffff`, or half programmed and over
+`MAX_PAYLOAD_LEN`. The walk cannot size that slot, so it stops *on* the torn
+header, and the write cursor sits on bytes that are not erased. Before the
+rule, the next append was programmed straight over them. NOR only clears bits,
+so the slot that landed was the AND of the torn bytes and the new ones. For
+example, a tombstone's flags (`0x03`) programmed over a torn `0x01` read back
+as a plain slot with a bad CRC. The delete was acknowledged, and the blob was
+still live.
+
+So before every append, the bytes it would cover, `[cursor, cursor +
+slot_size)`, are read back and must all be `0xff` (`append_room()`). If they
+are not, the bucket is compacted exactly as if it were full. Compaction keeps
+only slots that verify, so the image ends before the torn tail and the rest of
+the sector is erased again. A cursor still not erased after compaction is
+`-EIO`; the append is never written over it. The check is one read of the
+slot's own size per append, and it catches a tail torn by a failed write at
+run time as well as one left by a power cut, so mount does not need to sweep
+for torn tails. The one append that skips the check is the root bind, which
+writes into a bucket it has just formatted. A segment release
+(`CONFIG_BLOB_DB_LARGE_PAYLOADS`) treats a torn tail the way it treats a full
+bucket: it skips the release and leaves it to the sweep, because the sweep calls
+it partway through walking that same bucket.
+
 ### 3.5 Large objects — segments and an index record
 
 With `CONFIG_BLOB_DB_LARGE_PAYLOADS`, a payload too big for one slot is stored
@@ -320,8 +356,11 @@ return id
 ```
 bid = id % N
 ensure bucket formatted (header write on first use)
-if write_cursor[bid] + slot_size(len) > sector_end:
-    compact_bucket(bid); if still no room: return -ENOSPC
+if write_cursor[bid] + slot_size(len) > sector_end
+   or [write_cursor, +slot_size(len)) not all 0xff:     # torn tail, §3.4
+    compact_bucket(bid); rescan
+    if still no room: return -ENOSPC
+    if still not erased: return -EIO
 build slot in stack buffer; flash_area_write at write cursor
 ```
 
@@ -491,9 +530,11 @@ so a crash mid-batch leaves exactly the completed elements (contract §2).
 
 ## 6. Atomicity & crash recovery
 
-Two atomic-commit primitives: a **single slot append** (torn → CRC fails →
-treated as end-of-log) and a **master sector write** (torn → older master
-wins). Compaction composes them.
+Two atomic-commit primitives: a **single slot append** (torn → CRC fails or
+header unsizeable → skipped, or end-of-log) and a **master sector write**
+(torn → older master wins). Compaction composes them. The slot append is atomic
+only because it always goes into erased flash. §3.4 states that rule and how it
+is enforced, and §6.2 covers what a torn slot leaves behind.
 
 ### 6.1 Compaction crash table
 
@@ -529,9 +570,21 @@ which is the answer the caller reaches anyway when compaction reclaims nothing.
 
 ### 6.2 Torn slot
 
-Torn slot write → `flags` still `0xff` or CRC fails → end-of-log at that
-offset; committed slots before it are intact; tail garbage is reclaimed by
-the next compaction.
+A torn slot write leaves one of three things. Committed slots before it are
+intact in every case.
+
+- **Nothing programmed** (`flags` still `0xff`). This is the end of the log,
+  and the cursor is on erased flash.
+- **Header intact, payload or CRC torn.** The header sizes the slot, so the
+  walk steps over it (§3.4). Its CRC fails, so readers skip it, and the cursor
+  lands after it, on erased flash.
+- **Header itself torn** (flags programmed, `val_len` unprogrammed or
+  implausible). The log ends *on* the torn header, and the cursor sits on bytes
+  that are not erased. The next append sees this (§3.4) and compacts the bucket
+  first, which drops the torn tail. Nothing is ever programmed over it.
+
+Whatever is left is reclaimed by the next compaction, which also runs
+early when a torn header is in the way.
 
 ## 7. Kconfig
 
@@ -576,7 +629,7 @@ for headers), `<zephyr/logging/log.h>`.
 
 | Scenario | Outcome |
 |---|---|
-| Crash mid-slot write | CRC/erased-flags → end-of-log; committed slots intact |
+| Crash mid-slot write | CRC/erased-flags → skipped or end-of-log; committed slots intact. A torn *header* leaves the cursor on programmed bytes, and the next append compacts first rather than write over them (§3.4, §6.2) |
 | Crash mid-compaction | master state machine + scratch (§6.1); ids unaffected |
 | Crash mid-master write | older valid master wins |
 | Bit corruption in a slot | CRC catches it; **only that slot** is unreachable — the header-driven walk steps over it (§3.4) and the next compaction drops it. Readers fall back to the newest intact slot for the id |
@@ -613,6 +666,10 @@ draft implementation and will be reworked against the final API; the
     over a mixed set (present, missing, dead ids) — per-element results
     match the scalar path, array not reordered, and a large batch reads each
     bucket at most once (assert read count ≤ N)
+16. torn slot header at the end of a bucket's log (flags programmed,
+    `val_len` torn): the next `update` / `delete` compacts first and lands
+    intact, also across remount. Without that, the simulator ANDs it into
+    the torn bytes and the acknowledged write is lost (§3.4)
 
 ## 12. End-to-end verification
 

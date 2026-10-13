@@ -1006,6 +1006,75 @@ static int find_live_slot(uint16_t bid, uint64_t id, struct bucket_scan *sc,
 	}
 }
 
+/* Where an append may go ------------------------------------------------
+ *
+ * The append cursor is where the walk ends, and the walk ends at the first
+ * header it cannot size a slot from. A power cut (or a failed write) that tears
+ * an append inside its header — flags programmed, val_len still erased — ends
+ * the walk *on* the torn bytes rather than after them. Programming the next
+ * slot there ANDs it into those bytes, because NOR only clears bits: the slot
+ * that lands is neither the torn one nor the new one, and fails its CRC after
+ * the write was acknowledged.
+ *
+ * So an append goes only where every byte it covers is still erased
+ * (l1_bucketlog.md §3.4). A cursor that fails this is cured the way a full
+ * bucket is: compaction rebuilds the bucket from its intact slots, so the image
+ * ends before the torn tail and everything after it is erased.
+ */
+
+/* 0 when a slot of `ssz` bytes can be appended at `cursor`. -ENOSPC when it
+ * would cross the end of the sector, -ENOTEMPTY when the bytes it would cover
+ * are not erased; compact_bucket() cures both. Other negatives are I/O errors.
+ */
+static int append_room(uint16_t bid, off_t cursor, size_t ssz)
+{
+	if (cursor + (off_t)ssz > (off_t)st.peb_size) {
+		return -ENOSPC;
+	}
+
+	/* Read into g_bbuf_new, which is free whenever an append is being
+	 * placed (see append_slot2). Not g_bbuf: blob_db_write() stages the
+	 * payload it is about to append there. */
+	__ASSERT(!g_bbuf_new_busy, "append_room inside compaction");
+
+	int rc = blob_db_store_read(bucket_offset(bid) + cursor, g_bbuf_new,
+				    ssz);
+
+	if (rc < 0) {
+		return rc;
+	}
+	for (size_t i = 0; i < ssz; i++) {
+		if (g_bbuf_new[i] != 0xff) {
+			LOG_WRN("bucket %u: append cursor 0x%lx is not erased "
+				"(torn tail); compacting", bid,
+				(unsigned long)cursor);
+			return -ENOTEMPTY;
+		}
+	}
+	return 0;
+}
+
+static inline bool append_needs_compaction(int rc)
+{
+	return rc == -ENOSPC || rc == -ENOTEMPTY;
+}
+
+/* append_room() once compact_bucket() has run. Compaction leaves everything
+ * after its image erased, so a cursor still sitting on programmed bytes is not
+ * a torn tail it could drop: report it as the I/O error it is rather than
+ * write over it. */
+static int append_room_compacted(uint16_t bid, off_t cursor, size_t ssz)
+{
+	const int rc = append_room(bid, cursor, ssz);
+
+	if (rc == -ENOTEMPTY) {
+		LOG_ERR("bucket %u: cursor 0x%lx not erased after compaction",
+			bid, (unsigned long)cursor);
+		return -EIO;
+	}
+	return rc;
+}
+
 /* Build and write a slot at bucket+write_cursor. Slot size on flash is
  * padded to write_block_size; padding bytes are 0xff so any truncated
  * write still reads as erased in the padding region. */
@@ -1807,7 +1876,8 @@ static int seg_write_chunk(uint64_t owner, uint16_t seq, const void *chunk,
 			cursor = sc.write_cursor;
 		}
 
-		if (cursor + (off_t)ssz > (off_t)st.peb_size) {
+		rc = append_room(bid, cursor, ssz);
+		if (append_needs_compaction(rc)) {
 			rc = compact_bucket(bid);
 			if (rc == 0) {
 				struct bucket_scan sc;
@@ -1818,12 +1888,16 @@ static int seg_write_chunk(uint64_t owner, uint16_t seq, const void *chunk,
 					return rc;
 				}
 				cursor = sc.write_cursor;
+				rc = append_room_compacted(bid, cursor, ssz);
 			}
-			if (cursor + (off_t)ssz > (off_t)st.peb_size) {
+			if (rc != 0) {
 				LOG_DBG("segment %u: bucket %u full, reprobing",
 					seq, bid);
 				continue;   /* fresh id -> different bucket */
 			}
+		}
+		if (rc < 0) {
+			return rc;
 		}
 
 		rc = append_slot2(bid, cursor, sid, BLOB_DB_SLOT_F_SEGMENT,
@@ -1858,8 +1932,9 @@ static void seg_release(const uint8_t *ids, uint16_t k)
 		if (scan_bucket_for(bid, sid, (off_t)st.peb_size, &sc) < 0) {
 			continue;
 		}
-		if (sc.write_cursor + (off_t)slot_size_for(0) >
-		    (off_t)st.peb_size) {
+		/* No compaction here: seg_sweep() calls this mid-walk of the
+		 * very bucket it would rewrite. Full or torn alike, skip. */
+		if (append_room(bid, sc.write_cursor, slot_size_for(0)) != 0) {
 			continue;   /* sweep will get it */
 		}
 		(void)append_slot2(bid, sc.write_cursor, sid,
@@ -2019,7 +2094,10 @@ static int index_commit(uint64_t id, const struct blob_db_index_hdr *h,
 		cursor = sc.write_cursor;
 	}
 
-	if (cursor + (off_t)slot_size_for(idx_len) > (off_t)st.peb_size) {
+	const size_t ssz = slot_size_for(idx_len);
+
+	rc = append_room(bid, cursor, ssz);
+	if (append_needs_compaction(rc)) {
 		rc = compact_bucket(bid);
 		if (rc < 0) {
 			return rc;
@@ -2032,9 +2110,10 @@ static int index_commit(uint64_t id, const struct blob_db_index_hdr *h,
 			return rc;
 		}
 		cursor = sc.write_cursor;
-		if (cursor + (off_t)slot_size_for(idx_len) > (off_t)st.peb_size) {
-			return -ENOSPC;
-		}
+		rc = append_room_compacted(bid, cursor, ssz);
+	}
+	if (rc < 0) {
+		return rc;
 	}
 
 	return append_slot2(bid, cursor, id, BLOB_DB_SLOT_F_INDEXED, h,
@@ -2491,7 +2570,8 @@ int blob_db_update(uint64_t id, const void *payload, size_t len)
 
 	const size_t ssz = slot_size_for((uint16_t)len);
 
-	if (write_cursor + ssz > st.peb_size) {
+	rc = append_room(bid, write_cursor, ssz);
+	if (append_needs_compaction(rc)) {
 		rc = compact_bucket(bid);
 		if (rc < 0) {
 			return rc;
@@ -2504,9 +2584,10 @@ int blob_db_update(uint64_t id, const void *payload, size_t len)
 			return rc;
 		}
 		write_cursor = sc.write_cursor;
-		if (write_cursor + ssz > st.peb_size) {
-			return -ENOSPC;
-		}
+		rc = append_room_compacted(bid, write_cursor, ssz);
+	}
+	if (rc < 0) {
+		return rc;
 	}
 
 #if defined(CONFIG_BLOB_DB_LARGE_PAYLOADS)
@@ -2591,7 +2672,8 @@ int blob_db_delete(uint64_t id)
 	const size_t ssz = slot_size_for(0);
 	off_t write_cursor = sc.write_cursor;
 
-	if (write_cursor + ssz > st.peb_size) {
+	rc = append_room(bid, write_cursor, ssz);
+	if (append_needs_compaction(rc)) {
 		rc = compact_bucket(bid);
 		if (rc < 0) {
 			return rc;
@@ -2605,9 +2687,10 @@ int blob_db_delete(uint64_t id)
 			return rc;
 		}
 		write_cursor = sc.write_cursor;
-		if (write_cursor + ssz > st.peb_size) {
-			return -ENOSPC;
-		}
+		rc = append_room_compacted(bid, write_cursor, ssz);
+	}
+	if (rc < 0) {
+		return rc;
 	}
 
 #if defined(CONFIG_BLOB_DB_LARGE_PAYLOADS)
@@ -3124,7 +3207,8 @@ int blob_db_write(uint64_t id, size_t offset, const void *buf, size_t len)
 	 * payload we are about to modify lives. */
 	const size_t ssz = slot_size_for((uint16_t)need);
 
-	if (sc.write_cursor + (off_t)ssz > (off_t)st.peb_size) {
+	rc = append_room(bid, sc.write_cursor, ssz);
+	if (append_needs_compaction(rc)) {
 		rc = compact_bucket(bid);
 		if (rc < 0) {
 			return rc;
@@ -3133,9 +3217,10 @@ int blob_db_write(uint64_t id, size_t offset, const void *buf, size_t len)
 		if (rc < 0) {
 			return rc;
 		}
-		if (sc.write_cursor + (off_t)ssz > (off_t)st.peb_size) {
-			return -ENOSPC;
-		}
+		rc = append_room_compacted(bid, sc.write_cursor, ssz);
+	}
+	if (rc < 0) {
+		return rc;
 	}
 
 	/* Zero anything between the old end and the new one, so a write past
