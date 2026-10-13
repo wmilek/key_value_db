@@ -62,6 +62,7 @@ bad-block avoidance. The three primitives map directly:
 | seam | UBI |
 |---|---|
 | `blob_db_store_erase(peb)` | `ubi_leb_erase(lnum)`, then up to `CONFIG_BLOB_DB_UBI_RELOCATE_BUDGET` wear-leveling moves |
+| `blob_db_store_replace(peb, …)` | `ubi_leb_change(lnum, …)` (atomic replace, the default), or the erase and write above |
 | `blob_db_store_write(peb, off, …)` | `ubi_leb_write_at(lnum, off, …)`, in place |
 | `blob_db_store_read(peb, off, …)` | `ubi_leb_read(lnum, off, …)`; an unmapped LEB reads as erased |
 
@@ -80,7 +81,7 @@ happened — compaction erases the scratch block to retire a sealed image — so
 the backend asks for the durable erase, at one flash erase per call, which is
 what the raw partition charges too.
 
-**Atomic replace** (`CONFIG_BLOB_DB_UBI_ATOMIC_REPLACE`, off by default).
+**Atomic replace** (`CONFIG_BLOB_DB_UBI_ATOMIC_REPLACE`, on by default).
 `blob_db_store_replace()` — "this block now holds exactly this image" — maps
 onto `ubi_leb_change()`, which leaves the old contents or the new ones across
 a power loss. blob_db then compacts a bucket in that one call instead of the
@@ -91,7 +92,54 @@ stands it back up at attach if the newest copy fails the checksum
 `ubi_leb_change()` sealed it with. Nothing may therefore be written in place
 over a replaced block: `blob_db_erase_all()`, which otherwise invalidates a
 bucket by zeroing its magic, replaces the bucket with the zeroed header
-instead.
+instead. Every other in-place write is an append past what was replaced, which
+the checksum does not cover.
+
+Turning the option on for an existing store is safe: a store compacted
+through the scratch sector is read the same way, and mount still recovers a
+compaction that protocol left half done. `tests/lib/blob_db/src/power_cut.c`
+cuts the power before every byte a compaction writes, inside
+`ubi_leb_change()` on the default and inside the scratch protocol in
+`lib.blob_db.ubi.scratch_compaction`.
+
+Known shortcomings:
+
+- **Turning it off again is not safe.** Without the option `erase_all` zeroes
+  each bucket's magic in place. On a bucket last written by
+  `ubi_leb_change()` that breaks the checksum the block was sealed with, and
+  if the block it replaced has not been reclaimed yet, the next attach stands
+  that older copy back up, with the blobs `erase_all` deleted. A build that
+  disables the option has to format the store first.
+- **`erase_all` costs a block per formatted bucket.** Each formatted bucket is
+  replaced, not written four bytes into: a UBI header and the zeroed bucket
+  header, on a fresh block, with the old block owed an erase. The call
+  erases nothing itself while UBI has erased blocks to hand, and pays one
+  erase per bucket once it has none. On `native_sim`, with 200 of 2 038
+  buckets formatted, the call wrote 13.8 KB with no erase and left about 200
+  blocks to reclaim; without the option it wrote 1.2 KB with 2 erases (the
+  root bucket and a master) and left none. The function's job is to be the
+  fast wipe, so this grows the wrong way with the store.
+- **Erases move rather than vanish.** A replaced block is erased when a later
+  write finds no free block, inside that write — blob_db does not run
+  `UBI_MAINTENANCE_RECLAIM`. A compaction's one erase can therefore land on
+  an unrelated later `update`.
+- **Old contents outlive the replace.** The replaced block stays readable from
+  raw flash until it is reclaimed. Neither path scrubs: a delete only appends
+  a tombstone and `erase_all` only invalidates headers, so deleted payloads
+  stay on flash until compaction either way; atomic replace only lengthens
+  that window.
+- **Untested crash points.** `power_cut.c` cuts the power once, during the
+  compacting update. A second cut during the recovery that follows, and a
+  cut during the deferred reclaim erase, are not exercised.
+
+The first two have one candidate fix: a wipe counter in the master, stamped
+into each bucket header at format, with a bucket whose counter is older read
+as unformatted. `erase_all` then becomes one master write and the root
+rebind, never writes into a bucket on either backend, and on UBI may unmap
+the stale buckets so reclaim takes their erases — safe there, because a
+block an attach maps back carries the old counter. It is an on-flash format
+change (a major bump: an older build would read stale buckets as live) and is
+listed in §7 (item 4).
 
 **Volume.** A volume named `blobdb`, created on first mount from the device's
 free LEBs less four spares (`BLOB_DB_UBI_SPARE_LEBS`), and found again by
@@ -131,8 +179,9 @@ counter) overrides it. A refusal fails the mount, or every later write, with
 
 **Maintenance.** zephyr-ubi has no background thread. A write that finds no
 free block erases one itself, and `ubi_leb_erase()` hands its block straight
-back to the free pool, so blob_db needs no reclaim. Two operations are run on
-blob_db's behalf:
+back to the free pool, so blob_db runs no reclaim. A block replaced by
+`ubi_leb_change()` waits in the reclaim queue until such a write takes it.
+Two operations are run on blob_db's behalf:
 
 - `UBI_MAINTENANCE_REPAIR` at every mount, which restores a degraded volume
   table and gives retired blocks another chance;
@@ -220,7 +269,7 @@ choice BLOB_DB_BACKEND                        # in lib/blob_db/Kconfig
             BLOB_DB_UBI_KEY_BUILTIN  (default)   # fixed development key
             BLOB_DB_UBI_KEY_APP                  # blob_db_ubi_ikm_key()
         BLOB_DB_UBI_RELOCATE_BUDGET  (1)          # wear-leveling moves per erase
-        BLOB_DB_UBI_ATOMIC_REPLACE   (n)          # replace and compact by ubi_leb_change()
+        BLOB_DB_UBI_ATOMIC_REPLACE   (y)          # replace and compact by ubi_leb_change()
     BLOB_DB_UBI_HEAP_SIZE                     # heap for UBI, from the partition size
 ```
 
@@ -237,7 +286,10 @@ invalidation before erase, …) keep zephyr-ubi's defaults (§3).
   suite covers the backend's own decisions (§4), and
   `lib.blob_db.ubi.app_key` adds the application hooks: a wrong key refused
   with `-EBADMSG` and the store intact, a refused state check at mount and at
-  run time.
+  run time. `lib.blob_db.ubi.scratch_compaction` keeps the scratch-sector
+  compaction covered on UBI with atomic replace turned off, and
+  `src/power_cut.c` cuts the power during a compaction on every scenario
+  (§3).
 - Every other suite (`blob_db_contract`, `kvdb`, `rootreg`) runs on the
   default, i.e. UBI.
 - CI builds `app` on both backends on both targets, and `app_perf_blob_db` and
@@ -261,3 +313,7 @@ invalidation before erase, …) keep zephyr-ubi's defaults (§3).
 3. **`-Werror` in zephyr-ubi.** The module compiles its sources with its own
    warning set as errors (`cmake/warnings.cmake`), so a new warning from a
    Zephyr header on `main` fails the build there first.
+4. **Atomic replace: `erase_all` and the off switch** — §3. `erase_all` costs a
+   block per formatted bucket, and turning the option off on an existing store
+   can bring deleted blobs back. Candidate fix: a wipe counter in the master
+   and bucket headers, an L1 format change.
