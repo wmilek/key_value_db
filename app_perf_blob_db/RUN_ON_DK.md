@@ -112,11 +112,14 @@ Two lines carry most of the weight:
 Since 1.1.0 there are three more kinds of line:
 
 - **`why …`** follows an `io` line whenever that phase wrote a master,
-  formatted a bucket or compacted one, and counts each. On flash_area and on
-  UBI by default a master write or a bucket format is one whole-block erase
-  and a compaction three (the bucket, and the scratch block twice), so
-  together they account for the `er` count above them — `churn`'s 40 is
-  16 + 8 × 3. An `er` count they do not explain is worth a look.
+  formatted a bucket or compacted one, and counts each. A master write or a
+  bucket format is one whole-block erase. A compaction is three on
+  flash_area and on UBI with `CONFIG_BLOB_DB_UBI_ATOMIC_REPLACE=n` (the
+  bucket, and the scratch block twice, plus two master writes), but one on
+  the default UBI build, which replaces the bucket atomically and writes no
+  masters for it. Together they account for the `er` count above them —
+  `churn`'s is 16 + 8 × 3 = 40 on flash_area and 0 + 8 × 1 = 8 on default
+  UBI. An `er` count they do not explain is worth a look.
 - **`bench mount …`** times `blob_db_mount()` at four fill levels: `empty`,
   `list`, `large` and `churn`. On flash_area the `io` line below is the whole
   cost. **On UBI it is not**: attaching the UBI device scans the partition's

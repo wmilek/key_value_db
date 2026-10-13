@@ -82,7 +82,11 @@ What was added:
 | `churn`       | 61050 / 1750792 |  1040 / 594752 |    40  | 16 master, 8 compactions (32800 B)|       67.4 s |
 | `mount churn` |  1431 / 9866    |            0   |     0  |                                   |     103.1 ms |
 
-UBI's counters are within a few percent of these, as for every other phase.
+UBI with `CONFIG_BLOB_DB_UBI_ATOMIC_REPLACE=n` is within a few percent of
+these, as for every other phase. The default UBI build (atomic replace, the
+default since #51) differs only where it compacts: each compaction is one
+block replace with no master writes, so `churn` erases 8 blocks
+(`why churn: master writes 0 … compactions 8`) instead of 40.
 
 What the counters already say:
 
