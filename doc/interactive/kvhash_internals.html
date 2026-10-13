@@ -1,0 +1,1387 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>kvhash Internals</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans+Condensed:wght@500;600;700&family=IBM+Plex+Sans:wght@400;500;600&display=swap">
+<style>
+/* Layout: instrument-panel workbench. Controls on the left, the live on-flash
+   structure in the centre, the flash trace and blob store on the right. */
+:root {
+  --bg: #e9edf1;
+  --panel: #fbfcfd;
+  --sunk: #dfe5eb;
+  --ink: #16202b;
+  --muted: #5a6775;
+  --line: #ccd4dc;
+  --accent: #b4531a;
+  --accent-ink: #ffffff;
+  --c-hdr: #9aa5b1;
+  --c-key: #2b67c2;
+  --c-val: #138a79;
+  --c-kref: #d47616;
+  --c-vref: #8a43c2;
+  --c-dir: #4a5868;
+  --ok: #2a7a4a;
+  --err: #b5302a;
+  --warn: #9a6c00;
+  --heat0: #d5dde5;
+  --hl: #ffd86b;
+  --f-display: "IBM Plex Sans Condensed", "Arial Narrow", system-ui, sans-serif;
+  --f-body: "IBM Plex Sans", system-ui, -apple-system, "Segoe UI", sans-serif;
+  --f-mono: "IBM Plex Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  --r: 6px;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #0e1318; --panel: #151c23; --sunk: #1d262f; --ink: #e2e8ee; --muted: #93a0ad;
+    --line: #2b3641; --accent: #e3864a; --accent-ink: #1a0f08;
+    --c-hdr: #5f6d7b; --c-key: #6c9fec; --c-val: #43c2ae; --c-kref: #f0a457; --c-vref: #bf8ae8;
+    --c-dir: #9fb0c0; --ok: #5cc28a; --err: #f07067; --warn: #e2b444; --heat0: #25303b; --hl: #7a6420;
+    color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #0e1318; --panel: #151c23; --sunk: #1d262f; --ink: #e2e8ee; --muted: #93a0ad;
+  --line: #2b3641; --accent: #e3864a; --accent-ink: #1a0f08;
+  --c-hdr: #5f6d7b; --c-key: #6c9fec; --c-val: #43c2ae; --c-kref: #f0a457; --c-vref: #bf8ae8;
+  --c-dir: #9fb0c0; --ok: #5cc28a; --err: #f07067; --warn: #e2b444; --heat0: #25303b; --hl: #7a6420;
+  color-scheme: dark;
+}
+
+* { box-sizing: border-box; }
+body {
+  margin: 0; background: var(--bg); color: var(--ink);
+  font: 14px/1.5 var(--f-body);
+  padding-inline: 16px; padding-block: 20px 40px;
+}
+.wrap { max-width: 1680px; margin: 0 auto; display: grid; gap: 16px; }
+h1, h2, h3 { font-family: var(--f-display); text-wrap: balance; margin: 0; }
+h1 { font-size: 30px; font-weight: 700; letter-spacing: -0.01em; line-height: 1.1; }
+h2 { font-size: 15px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.06em; }
+h3 { font-size: 14px; font-weight: 600; }
+p { margin: 0; }
+code, .mono { font-family: var(--f-mono); font-size: 12.5px; }
+.muted { color: var(--muted); }
+.small { font-size: 12.5px; }
+
+/* header */
+.top { display: grid; gap: 10px; grid-template-columns: minmax(0, 1fr) auto; align-items: end; }
+.eyebrow { font: 500 12px var(--f-mono); color: var(--accent); letter-spacing: 0.04em; }
+.lede { color: var(--muted); max-width: 78ch; margin-top: 6px; }
+.legend { display: flex; flex-wrap: wrap; gap: 6px 14px; font-size: 12px; color: var(--muted); }
+.legend span { display: inline-flex; align-items: center; gap: 6px; }
+.sw { width: 12px; height: 12px; border-radius: 2px; display: inline-block; }
+.sw.h { background: var(--c-hdr); } .sw.k { background: var(--c-key); } .sw.v { background: var(--c-val); }
+.sw.kr { background: var(--c-kref); } .sw.vr { background: var(--c-vref); } .sw.d { background: var(--c-dir); }
+@media (max-width: 900px) { .top { grid-template-columns: minmax(0, 1fr); } }
+
+/* app grid */
+.app { display: grid; gap: 16px; grid-template-columns: 330px minmax(0, 1fr) 380px; align-items: start; }
+@media (max-width: 1320px) { .app { grid-template-columns: 330px minmax(0, 1fr); } .side { grid-column: 1 / -1; } }
+@media (max-width: 900px) { .app { grid-template-columns: minmax(0, 1fr); } }
+.col { display: grid; gap: 16px; min-width: 0; }
+.side { display: grid; gap: 16px; min-width: 0; grid-template-columns: minmax(0, 1fr); }
+@media (max-width: 1320px) and (min-width: 901px) { .side { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); } }
+
+.panel { background: var(--panel); border: 1px solid var(--line); border-radius: var(--r); padding: 14px; display: grid; grid-template-columns: minmax(0, 1fr); gap: 12px; min-width: 0; }
+.panel > * { min-width: 0; }
+.panel > header { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; flex-wrap: wrap; }
+.step-no { font: 600 12px var(--f-mono); color: var(--accent); margin-right: 6px; }
+
+/* form */
+label { display: grid; gap: 3px; font-size: 12px; color: var(--muted); min-width: 0; }
+input[type="text"], input[type="number"], select {
+  font: 13px var(--f-mono); color: var(--ink); background: var(--bg);
+  border: 1px solid var(--line); border-radius: 4px; padding: 6px 8px; width: 100%; min-width: 0;
+}
+input:focus-visible, select:focus-visible, button:focus-visible, canvas:focus-visible, .brow:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+.row2 { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+.row3 { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 8px; }
+.kv { display: grid; gap: 6px; }
+.kv label { grid-template-columns: minmax(0, 1fr) 110px; align-items: center; gap: 8px; font: 12.5px var(--f-mono); color: var(--ink); }
+.check { display: flex; gap: 8px; align-items: center; font-size: 12.5px; color: var(--ink); }
+.btns { display: flex; flex-wrap: wrap; gap: 6px; }
+button {
+  font: 600 13px var(--f-body); border-radius: 4px; padding: 6px 12px; cursor: pointer;
+  border: 1px solid var(--line); background: var(--sunk); color: var(--ink);
+}
+button:hover { border-color: var(--muted); }
+button.primary { background: var(--accent); color: var(--accent-ink); border-color: var(--accent); }
+button.danger { color: var(--err); }
+button.ghost { background: transparent; }
+button.chip { font: 500 12px var(--f-mono); padding: 3px 8px; }
+.calc { background: var(--sunk); border-radius: 4px; padding: 8px 10px; display: grid; gap: 2px; font: 12px/1.55 var(--f-mono); overflow-wrap: anywhere; }
+.calc b { font-weight: 600; }
+.derive { margin: 0; padding-left: 18px; font-size: 12.5px; display: grid; gap: 2px; }
+.derive li::marker { color: var(--muted); font: 11px var(--f-mono); }
+.verdict { font: 600 13px var(--f-mono); }
+.verdict.bad { color: var(--err); }
+.risk { font-size: 12.5px; color: var(--warn); }
+.hint { font-size: 12px; color: var(--muted); }
+details > summary { cursor: pointer; font-size: 12.5px; color: var(--muted); }
+
+/* summary strip */
+.stats { display: flex; flex-wrap: wrap; gap: 1px; background: var(--line); border: 1px solid var(--line); border-radius: var(--r); overflow: hidden; }
+.stat { background: var(--panel); padding: 8px 12px; min-width: 0; flex: 1 1 104px; }
+.stat .k { font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.05em; }
+.stat .v { font: 600 20px var(--f-mono); font-variant-numeric: tabular-nums; }
+.stat .v.bad { color: var(--err); }
+.stat .s { font-size: 11.5px; color: var(--muted); font-family: var(--f-mono); }
+
+/* overview */
+.ov-wrap { position: relative; }
+canvas#ov { display: block; width: 100%; cursor: crosshair; }
+.tip { position: absolute; pointer-events: none; background: var(--ink); color: var(--bg); font: 12px/1.4 var(--f-mono); padding: 6px 8px; border-radius: 4px; white-space: nowrap; z-index: 2; }
+.scale { display: flex; align-items: center; gap: 8px; font: 11.5px var(--f-mono); color: var(--muted); flex-wrap: wrap; }
+.sbar { width: 160px; height: 8px; border-radius: 2px; position: relative; display: inline-block; }
+.sbar i { position: absolute; left: 60%; top: -3px; bottom: -3px; width: 1px; background: var(--ink); }
+
+/* leaf directory */
+.dirhdr { display: flex; flex-wrap: wrap; gap: 4px; font: 12px var(--f-mono); }
+.dirhdr span { background: var(--sunk); border-left: 3px solid var(--c-dir); padding: 2px 8px; border-radius: 2px; }
+.blist { display: grid; gap: 3px; max-height: 520px; overflow: auto; padding-right: 2px; }
+.brow { display: grid; grid-template-columns: 44px 58px minmax(0, 1fr) minmax(0, 150px); gap: 8px; align-items: center; padding: 3px 4px; border-radius: 3px; cursor: pointer; font: 12px var(--f-mono); }
+.brow:hover { background: var(--sunk); }
+.brow.sel { background: var(--sunk); box-shadow: inset 3px 0 0 var(--ink); }
+.brow.path { box-shadow: inset 3px 0 0 var(--accent); }
+.brow.sel.path { box-shadow: inset 3px 0 0 var(--accent), inset 0 0 0 1px var(--ink); }
+.brow .idx { color: var(--muted); text-align: right; }
+.brow .bid.zero { color: var(--muted); opacity: 0.6; }
+.bar { position: relative; height: 18px; background: var(--sunk); border-radius: 2px; overflow: hidden; display: flex; }
+.bar .seg { height: 100%; flex: none; border-right: 1px solid var(--panel); }
+.bar .seg.h { background: var(--c-hdr); } .bar .seg.k { background: var(--c-key); } .bar .seg.v { background: var(--c-val); }
+.bar .seg.kr { background: var(--c-kref); } .bar .seg.vr { background: var(--c-vref); }
+.bar .mark { position: absolute; left: 60%; top: 0; bottom: 0; width: 0; border-left: 1px dashed var(--muted); }
+.brow .meta { color: var(--muted); font-size: 11.5px; display: flex; gap: 4px; flex-wrap: wrap; align-items: center; min-width: 0; }
+.pill { display: inline-block; font: 500 11px var(--f-mono); padding: 0 6px; border-radius: 9px; border: 1px solid currentColor; line-height: 16px; white-space: nowrap; }
+.pill.kr { color: var(--c-kref); } .pill.vr { color: var(--c-vref); }
+.pill.ok { color: var(--ok); } .pill.err { color: var(--err); } .pill.warn { color: var(--warn); }
+.pill.dir { color: var(--c-dir); }
+@media (max-width: 560px) { .brow { grid-template-columns: 30px 44px minmax(0, 1fr); } .brow .meta { grid-column: 3; } }
+
+/* inspector */
+.tscroll { overflow-x: auto; }
+table { border-collapse: collapse; width: 100%; font: 12px var(--f-mono); font-variant-numeric: tabular-nums; }
+th { text-align: left; font: 600 11px var(--f-body); color: var(--muted); text-transform: uppercase; letter-spacing: 0.04em; border-bottom: 1px solid var(--line); padding: 4px 6px; white-space: nowrap; }
+td { border-bottom: 1px solid var(--line); padding: 4px 6px; vertical-align: top; white-space: nowrap; }
+td.tw { white-space: normal; overflow-wrap: anywhere; min-width: 140px; }
+tr.stale td:first-child { box-shadow: inset 3px 0 0 var(--warn); }
+.hex { font: 12px/1.6 var(--f-mono); overflow-x: auto; background: var(--sunk); border-radius: 4px; padding: 8px 10px; }
+.hex .ln { white-space: pre; }
+.hex .off { color: var(--muted); margin-right: 10px; }
+.hex b { font-weight: 400; padding: 0 1px; border-radius: 2px; }
+.hex b.h { color: var(--c-hdr); } .hex b.k { color: var(--c-key); } .hex b.v { color: var(--c-val); }
+.hex b.kr { color: var(--c-kref); font-weight: 600; } .hex b.vr { color: var(--c-vref); font-weight: 600; }
+.hex b.d { color: var(--c-dir); }
+.empty { color: var(--muted); font-size: 13px; padding: 10px 0; }
+
+/* trace */
+.trace-head { display: flex; flex-wrap: wrap; gap: 6px 10px; align-items: center; }
+.trace-head .op { font: 600 14px var(--f-mono); overflow-wrap: anywhere; }
+.counts { font: 12px var(--f-mono); color: var(--muted); }
+.steps { list-style: none; margin: 0; padding: 0; display: grid; gap: 2px; max-height: 560px; overflow: auto; }
+.steps li { display: grid; grid-template-columns: 22px minmax(0, 1fr); gap: 8px; font-size: 12.5px; padding: 3px 4px; border-radius: 3px; }
+.steps li.dim { color: var(--muted); }
+.steps li .tag { font: 600 11px var(--f-mono); text-align: center; border-radius: 3px; line-height: 18px; height: 18px; }
+.steps li.R .tag { background: var(--sunk); color: var(--c-key); }
+.steps li.W .tag { background: var(--accent); color: var(--accent-ink); }
+.steps li.D .tag { background: var(--sunk); color: var(--err); }
+.steps li.X .tag, .steps li.E .tag { background: var(--err); color: var(--panel); }
+.steps li.N .tag { color: var(--muted); }
+.steps li.commit { background: var(--sunk); }
+.steps li.commit .txt::before { content: "COMMIT "; font: 600 11px var(--f-mono); color: var(--accent); }
+.steps li.warn .txt { color: var(--warn); }
+.steps li.err .txt { color: var(--err); }
+.steps li.cut { background: var(--sunk); }
+.idchip { font: 500 11.5px var(--f-mono); color: var(--c-dir); margin-right: 4px; }
+.result { font: 12.5px var(--f-mono); background: var(--sunk); padding: 6px 8px; border-radius: 4px; overflow-wrap: anywhere; }
+.hist { list-style: none; margin: 0; padding: 0; font: 12px var(--f-mono); display: grid; gap: 1px; max-height: 180px; overflow: auto; }
+.hist li { display: flex; justify-content: space-between; gap: 8px; color: var(--muted); }
+.hist li span:first-child { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--ink); }
+
+.hl { background: var(--hl) !important; color: var(--ink) !important; }
+.store-scroll { max-height: 420px; overflow: auto; }
+tr.orphan td { color: var(--err); }
+
+.foot { color: var(--muted); font-size: 12.5px; max-width: 110ch; display: grid; gap: 6px; }
+
+@media (prefers-reduced-motion: no-preference) {
+  .flash { animation: flash 900ms ease-out; }
+  @keyframes flash { from { background: var(--hl); } to { background: transparent; } }
+}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header class="top">
+    <div>
+      <p class="eyebrow">lib/containers/kvhash · L2 Map provider on blob_db</p>
+      <h1>kvhash internals</h1>
+      <p class="lede">A live model of how kvhash lays a map out on flash. Pick a population and watch the geometry it derives, add entries and see where each one lands, and lower the spill thresholds to detach keys and values into blobs of their own. Every operation runs a port of the <code>kvhash.c</code> code path against an in-browser blob store and lists each flash read, write and delete it makes.</p>
+    </div>
+    <div class="legend" aria-label="Colour legend">
+      <span><i class="sw d"></i>directory</span>
+      <span><i class="sw h"></i>entry header</span>
+      <span><i class="sw k"></i>inline key</span>
+      <span><i class="sw v"></i>inline value</span>
+      <span><i class="sw kr"></i>spilled-key ref (fp + id)</span>
+      <span><i class="sw vr"></i>spilled-value ref (id)</span>
+    </div>
+  </header>
+
+  <main class="app">
+    <!-- controls -->
+    <div class="col">
+      <section class="panel" aria-labelledby="h-geo">
+        <header><h2 id="h-geo"><span class="step-no">1</span>Geometry</h2><span class="hint">map_ops.create</span></header>
+        <p class="hint">The caller declares what it will store; <code>derive_geometry()</code> picks the shape.</p>
+        <div class="btns" id="presets"></div>
+        <div class="kv">
+          <label for="g-n">expected_entries<input id="g-n" type="number" min="0" step="1"></label>
+          <label for="g-t">typical_entry_bytes<input id="g-t" type="number" min="0" step="1"></label>
+          <label for="g-m">max_entry_bytes<input id="g-m" type="number" min="0" step="1"></label>
+        </div>
+        <div class="row2">
+          <label for="g-mp">MAX_PAYLOAD_LEN
+            <select id="g-mp">
+              <option value="128">128 B</option>
+              <option value="256" selected>256 B (default)</option>
+              <option value="512">512 B</option>
+              <option value="1024">1024 B</option>
+              <option value="2016">2016 B (large payloads)</option>
+              <option value="4096">4096 B</option>
+            </select>
+          </label>
+          <label for="g-ver">Map version
+            <select id="g-ver">
+              <option value="3" selected>v3 (spilling)</option>
+              <option value="2">v2 (never spills)</option>
+            </select>
+          </label>
+        </div>
+        <label class="check" for="g-large"><input id="g-large" type="checkbox">CONFIG_BLOB_DB_LARGE_PAYLOADS (a spilled value may exceed one slot)</label>
+        <ol class="derive" id="g-derive"></ol>
+        <p class="verdict" id="g-verdict"></p>
+        <p class="risk" id="g-risk" hidden></p>
+        <div class="btns">
+          <button class="primary" id="b-create" type="button">Create map</button>
+          <button class="danger" id="b-destroy" type="button">Destroy map</button>
+        </div>
+        <p class="hint">Create starts a fresh blob store; root id is #1. The geometry is fixed for the life of the map.</p>
+      </section>
+
+      <section class="panel" aria-labelledby="h-spill">
+        <header><h2 id="h-spill"><span class="step-no">2</span>Spill policy</h2><span class="hint">kvhash_set_inline_max()</span></header>
+        <p class="hint">A key or value longer than its threshold is detached into a blob of its own. The thresholds are read only when <code>set</code> builds a new entry; reads go by the flag bits stored in each entry.</p>
+        <div class="row2">
+          <label for="p-k">KEY_INLINE_MAX (B)<input id="p-k" type="number" min="0" max="32767"></label>
+          <label for="p-v">VAL_INLINE_MAX (B)<input id="p-v" type="number" min="0" max="32767"></label>
+        </div>
+        <div class="btns">
+          <button class="chip" type="button" data-pol="32767,32767">never (shipped default)</button>
+          <button class="chip" type="button" data-pol="32,64">32 / 64 (proposal §7)</button>
+          <button class="chip" type="button" data-pol="24,40">24 / 40</button>
+          <button class="chip" type="button" data-pol="0,0">0 / 0 (spill all)</button>
+        </div>
+        <p class="small" id="p-stale"></p>
+        <div class="btns"><button id="b-migrate" type="button">Rewrite misplaced entries</button></div>
+      </section>
+
+      <section class="panel" aria-labelledby="h-op">
+        <header><h2 id="h-op"><span class="step-no">3</span>Operate</h2><span class="hint">set · get · del</span></header>
+        <label for="o-k">Key<input id="o-k" type="text" autocomplete="off" spellcheck="false"></label>
+        <div class="row2">
+          <label for="o-v">Value<input id="o-v" type="text" autocomplete="off" spellcheck="false"></label>
+          <label for="o-vn">Repeat value to N bytes<input id="o-vn" type="number" min="0" max="65535" placeholder="as typed"></label>
+        </div>
+        <div class="calc" id="o-calc" aria-live="polite"></div>
+        <label for="o-cut">Power cut for the next operation
+          <select id="o-cut">
+            <option value="-1">off</option>
+            <option value="0">before kvhash's 1st flash write</option>
+            <option value="1">after 1 write</option>
+            <option value="2">after 2 writes</option>
+            <option value="3">after 3 writes</option>
+            <option value="4">after 4 writes</option>
+          </select>
+        </label>
+        <div class="btns">
+          <button class="primary" id="b-set" type="button">Set</button>
+          <button id="b-get" type="button">Get</button>
+          <button id="b-del" type="button">Delete</button>
+        </div>
+      </section>
+
+      <section class="panel" aria-labelledby="h-bulk">
+        <header><h2 id="h-bulk"><span class="step-no">4</span>Fill</h2><span class="hint">many sets</span></header>
+        <div class="row3">
+          <label for="f-n">Entries<input id="f-n" type="number" min="1" max="20000" value="40"></label>
+          <label for="f-k">Key bytes<input id="f-k" type="text" value="8-20" spellcheck="false"></label>
+          <label for="f-v">Value bytes<input id="f-v" type="text" value="4-60" spellcheck="false"></label>
+        </div>
+        <div class="btns"><button id="b-fill" type="button">Insert random entries</button></div>
+        <p class="hint">Ranges are <code>min-max</code>. Keys are random, so a few may land in the same bucket and fill it.</p>
+      </section>
+    </div>
+
+    <!-- visualisation -->
+    <div class="col">
+      <div class="stats" id="stats"></div>
+
+      <section class="panel" aria-labelledby="h-ov">
+        <header>
+          <h2 id="h-ov">Map overview</h2>
+          <div class="scale"><span>bucket fill</span><span class="sbar" id="scale-bar"><i title="BUCKET_FILL_PCT 60%"></i></span><span>0 → MAX_PAYLOAD</span></div>
+        </header>
+        <p class="hint" id="ov-hint"></p>
+        <div class="ov-wrap" id="ov-wrap">
+          <canvas id="ov" tabindex="0" aria-label="Heatmap of every bucket in the map. Click a cell to inspect that bucket."></canvas>
+          <div class="tip" id="tip" hidden></div>
+        </div>
+      </section>
+
+      <section class="panel" aria-labelledby="h-leaf">
+        <header><h2 id="h-leaf">Leaf directory</h2><label class="check" for="l-hide"><input id="l-hide" type="checkbox">hide empty slots</label></header>
+        <div class="dirhdr" id="l-hdr"></div>
+        <div class="blist" id="l-list" role="listbox" aria-label="Buckets in this directory"></div>
+      </section>
+
+      <section class="panel" aria-labelledby="h-bkt">
+        <header><h2 id="h-bkt">Bucket bytes</h2><span class="hint" id="b-title"></span></header>
+        <div id="b-body"></div>
+      </section>
+    </div>
+
+    <!-- trace + store -->
+    <div class="side">
+      <section class="panel" aria-labelledby="h-tr">
+        <header><h2 id="h-tr">Flash trace</h2><span class="hint">last operation</span></header>
+        <div id="tr"></div>
+        <details>
+          <summary>History</summary>
+          <ul class="hist" id="hist"></ul>
+        </details>
+      </section>
+
+      <section class="panel" aria-labelledby="h-st">
+        <header><h2 id="h-st">Blob store</h2><span class="hint" id="st-sum"></span></header>
+        <p class="hint">What blob_db holds, classified by walking the map from its root. A blob nothing reaches is an orphan: leaked space, never a wrong answer.</p>
+        <div class="store-scroll tscroll" id="st"></div>
+      </section>
+
+      <section class="panel" aria-labelledby="h-pop">
+        <header><h2 id="h-pop">Geometry by population</h2></header>
+        <p class="hint">The form's typical and max entry sizes and payload, at other <code>expected_entries</code>.</p>
+        <div class="tscroll" id="pop"></div>
+      </section>
+    </div>
+  </main>
+
+  <footer class="foot">
+    <p>Modelled from <code>lib/containers/kvhash/kvhash.c</code>, <code>doc/impl/l2_kvhash.md</code> and <code>doc/proposals/2026-10-09-kvhash-spill.md</code>. The port follows <code>derive_geometry</code>, <code>resolve_leaf</code>, <code>bkt_entry</code>, <code>bkt_find</code>, <code>kvhash_get/set/del/destroy</code> step for step, with the same CRC-32 (bucket hash) and CRC-32C (key fingerprint), little-endian. blob_db itself is reduced to an id → bytes map: slots, compaction, segments and timing are not modelled, and <code>next</code>/<code>count</code> are computed by walking the model rather than traced.</p>
+    <p>The example entries loaded on open are sample data, written with the policy set to 24 / 40 so some of them spill.</p>
+  </footer>
+</div>
+
+<script>
+'use strict';
+/* ================================================================
+ * Model: a port of kvhash.c over an in-memory blob store.
+ * ================================================================ */
+const enc = new TextEncoder();
+const dec = new TextDecoder('utf-8');
+
+const EINTR = -4, EIO = -5, ENOENT = -2, ENOMEM = -12, EINVAL = -22, ENOSPC = -28;
+const ERRNAME = { 0: '0', [-4]: '-EINTR', [-5]: '-EIO', [-2]: '-ENOENT', [-12]: '-ENOMEM', [-22]: '-EINVAL', [-28]: '-ENOSPC' };
+
+function crcTable(poly) {
+  const t = new Uint32Array(256);
+  for (let i = 0; i < 256; i++) {
+    let c = i;
+    for (let k = 0; k < 8; k++) c = (c & 1) ? (c >>> 1) ^ poly : c >>> 1;
+    t[i] = c >>> 0;
+  }
+  return t;
+}
+const T_IEEE = crcTable(0xEDB88320), T_C = crcTable(0x82F63B78);
+function crcRun(t, b) {
+  let c = 0xFFFFFFFF;
+  for (let i = 0; i < b.length; i++) c = t[(c ^ b[i]) & 0xff] ^ (c >>> 8);
+  return (c ^ 0xFFFFFFFF) >>> 0;
+}
+const crc32 = b => crcRun(T_IEEE, b);   /* crc32_ieee: picks the bucket */
+const crc32c = b => crcRun(T_C, b);     /* crc32_c: spilled-key fingerprint */
+
+/* Build configuration, fixed at create. */
+const K = { MP: 256, LARGE: false, OBJ: 131072 };
+const DIR_HDR = 8, ENT_HDR = 4, KREF = 12, VREF = 8, SPILL = 0x8000, LMASK = 0x7fff;
+const MAGIC = 0x4b564841, DYING = 0x4b564844;
+const DEFAULT_BUCKETS = 8, SMALL_MAP_LOAD = 4, ONE_LEVEL_MAX_BUCKETS = 255,
+      MIN_BUCKET_BYTES = 4096, BUCKET_FILL_PCT = 60;
+const maxBuckets = mp => Math.floor((mp - DIR_HDR) / 8);
+const entryLimit = mp => mp - ENT_HDR;
+const policy = { key: 32767, val: 32767 };
+
+/* blob_db stand-in */
+const S = { blobs: new Map(), next: 1, root: 0 };
+const allocId = () => S.next++;
+
+/* host-order (little-endian) accessors */
+const u16 = (b, o) => b[o] | (b[o + 1] << 8);
+const p16 = (b, o, v) => { b[o] = v & 255; b[o + 1] = (v >>> 8) & 255; };
+const u32 = (b, o) => (b[o] | (b[o + 1] << 8) | (b[o + 2] << 16) | (b[o + 3] << 24)) >>> 0;
+const p32 = (b, o, v) => { for (let i = 0; i < 4; i++) b[o + i] = (v >>> (8 * i)) & 255; };
+const u64 = (b, o) => u32(b, o) + u32(b, o + 4) * 4294967296;
+const p64 = (b, o, v) => { p32(b, o, v % 4294967296); p32(b, o + 4, Math.floor(v / 4294967296)); };
+const eq = (a, b) => { if (a.length !== b.length) return false; for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false; return true; };
+const hex32 = v => '0x' + (v >>> 0).toString(16).padStart(8, '0');
+
+/* ---- trace: every flash access kvhash makes goes through here ---- */
+let T = null;
+function newTrace(op, quiet) { return { op, steps: [], r: 0, w: 0, d: 0, cut: -1, cutFired: false, quiet: !!quiet, path: null, rc: 0 }; }
+function st(kind, id, text, cls) {
+  if (!T) return;
+  if (kind === 'R') T.r++; else if (kind === 'W') T.w++; else if (kind === 'D') T.d++;
+  if (!T.quiet) T.steps.push({ kind, id, text, cls });
+}
+const note = (text, cls) => st('N', null, text, cls || '');
+function bGet(id, why) { st('R', id, why); const b = S.blobs.get(id); return b ? b.slice() : null; }
+/* power_cut(): the test hook in kvhash.c. Every update and delete passes it. */
+function powerCut(id, why) {
+  if (!T || T.cut < 0) return 0;
+  if (T.cut === 0) { T.cutFired = true; st('X', id, 'power lost: ' + why + ' never reaches flash', 'cut'); return EINTR; }
+  T.cut--; return 0;
+}
+function kvUpdate(id, bytes, why, cls) {
+  const rc = powerCut(id, why);
+  if (rc) return rc;
+  const lim = K.LARGE ? K.OBJ : K.MP;
+  if (bytes.length > lim) {
+    st('E', id, `blob_db_update refuses ${bytes.length} B, over ${K.LARGE ? 'MAX_OBJECT_LEN' : 'MAX_PAYLOAD_LEN'} (${lim} B)`, 'err');
+    return EINVAL;
+  }
+  st('W', id, why, cls);
+  S.blobs.set(id, bytes.slice());
+  return 0;
+}
+function kvDelete(id, why) {
+  const rc = powerCut(id, why);
+  if (rc) return rc;
+  if (!S.blobs.has(id)) { st('D', id, why + ' (already gone: -ENOENT)', 'dim'); return ENOENT; }
+  st('D', id, why);
+  S.blobs.delete(id);
+  return 0;
+}
+
+/* ---- geometry ---- */
+function deriveGeometry(d, mp) {
+  const L = [];
+  const EL = entryLimit(mp), MB = maxBuckets(mp);
+  const entries = d.entries || 0, typical = d.typical || 0, maxent = d.maxent || 0;
+  L.push(`MAX_PAYLOAD ${mp} B gives ENTRY_LIMIT ${EL} B and MAX_BUCKETS ${MB} per directory.`);
+  if (MB < 2) { L.push('Payload too small to hold a directory (BUILD_ASSERT).'); return { rc: EINVAL, lines: L }; }
+  if (maxent && maxent > EL) { L.push(`max_entry_bytes ${maxent} > ENTRY_LIMIT ${EL}: refused.`); return { rc: EINVAL, lines: L }; }
+  if (typical && maxent && typical > maxent) { L.push(`typical ${typical} > max ${maxent}: contradiction, refused.`); return { rc: EINVAL, lines: L }; }
+  if (!entries) {
+    L.push(`expected_entries = 0 means "I do not know": DEFAULT_BUCKETS = ${DEFAULT_BUCKETS}, one level.`);
+    return { rc: 0, depth: 1, nTop: DEFAULT_BUCKETS, nSub: 0, lines: L };
+  }
+  let load = SMALL_MAP_LOAD;
+  if (maxent) {
+    const safe = Math.floor(mp * BUCKET_FILL_PCT / 100), by = Math.floor(safe / maxent);
+    L.push(`60% of a payload is ${safe} B; at max_entry ${maxent} B that holds ${by} entries.`);
+    if (by < load) load = by;
+    if (!load) load = 1;
+  }
+  L.push(`Load target: ${load} entr${load === 1 ? 'y' : 'ies'} per bucket (SMALL_MAP_LOAD ${SMALL_MAP_LOAD}${maxent ? ', capped by size' : ''}).`);
+  let want = Math.ceil(entries / load);
+  if (want < 2) want = 2;
+  const flatCap = Math.min(ONE_LEVEL_MAX_BUCKETS, MB);
+  L.push(`One level wants ⌈${entries} / ${load}⌉ = ${want} buckets; the flat limit here is ${flatCap}.`);
+  if (want <= ONE_LEVEL_MAX_BUCKETS && want <= MB) {
+    L.push(`${want} fits: build one flat directory of ${want} buckets.`);
+    return { rc: 0, depth: 1, nTop: want, nSub: 0, lines: L };
+  }
+  L.push(want > ONE_LEVEL_MAX_BUCKETS ? `Past ONE_LEVEL_MAX_BUCKETS (255): spend a second level.` : `Past MAX_BUCKETS (${MB}): one directory cannot name them, so two levels.`);
+  let buckets = entries;
+  L.push(`Two levels aim at about one entry per bucket: ${entries}.`);
+  if (typical) {
+    const by = Math.floor(entries * typical / MIN_BUCKET_BYTES);
+    L.push(`Floor of 4096 B content per bucket: ${entries} × ${typical} / 4096 = ${by}.`);
+    if (by < buckets) buckets = by;
+  }
+  if (buckets < ONE_LEVEL_MAX_BUCKETS) { L.push(`${buckets} is raised to ONE_LEVEL_MAX_BUCKETS = 255.`); buckets = ONE_LEVEL_MAX_BUCKETS; }
+  let side = 1;
+  while (side * side < buckets) side++;
+  if (side < 2) side = 2;
+  L.push(`Square fan-out: ⌈√${buckets}⌉ = ${side}, so ${side} sub-maps × ${side} buckets = ${side * side}.`);
+  if (side > MB) { L.push(`${side} per level > MAX_BUCKETS ${MB}: refused, not clamped.`); return { rc: EINVAL, lines: L }; }
+  return { rc: 0, depth: 2, nTop: side, nSub: side, lines: L };
+}
+
+/* ---- directories ---- */
+function dirFormat(n, depth, ver) {
+  const b = new Uint8Array(DIR_HDR + 8 * n);
+  p32(b, 0, MAGIC); p16(b, 4, n); b[6] = ver; b[7] = depth;
+  return b;
+}
+const dirChild = (b, i) => u64(b, DIR_HDR + 8 * i);
+const dirSetChild = (b, i, id) => p64(b, DIR_HDR + 8 * i, id);
+function parseDir(b) {
+  if (!b || b.length < DIR_HDR) return { rc: EIO };
+  const m = u32(b, 0);
+  let dying;
+  if (m === MAGIC) dying = false; else if (m === DYING) dying = true; else return { rc: EIO };
+  if (b[6] < 2 || b[6] > 3) return { rc: EIO };
+  const n = u16(b, 4), depth = b[7];
+  if (n < 2 || n > maxBuckets(K.MP) || b.length < DIR_HDR + 8 * n) return { rc: EIO };
+  if (depth !== 1 && depth !== 2) return { rc: EIO };
+  return { rc: 0, b, n, depth, dying, ver: b[6] };
+}
+function dirLoadRaw(id, why) {
+  const b = bGet(id, why);
+  if (!b) return { rc: ENOENT };
+  return parseDir(b);
+}
+function dirLoad(id, why) {
+  const d = dirLoadRaw(id, why);
+  if (d.rc) return d;
+  if (d.dying) { note('Directory is stamped KVHD: destroy has committed, so the whole map answers -ENOENT.', 'err'); return { rc: ENOENT }; }
+  return d;
+}
+function resolveLeaf(key) {
+  const h = crc32(key);
+  note(`CRC-32(key) = ${hex32(h)}: top half ${(h >>> 16)}, low half ${h & 0xffff}`);
+  const d = dirLoad(S.root, 'read root directory');
+  if (d.rc) return d;
+  if (d.depth === 1) {
+    const idx = (h & 0xffff) % d.n;
+    note(`depth 1: bucket = ${h & 0xffff} mod ${d.n} = ${idx}`);
+    return { rc: 0, h, top: 0, idx, leaf: S.root, n: d.n, dir: d.b, ver: d.ver };
+  }
+  const top = (h >>> 16) % d.n, sub = dirChild(d.b, top);
+  note(`depth 2: sub-map = ${h >>> 16} mod ${d.n} = ${top} (id #${sub})`);
+  if (!sub) return { rc: EIO };
+  const s = dirLoad(sub, `read sub-directory ${top}`);
+  if (s.rc) return s;
+  if (s.depth !== 1) return { rc: EIO };
+  const idx = (h & 0xffff) % s.n;
+  note(`bucket = ${h & 0xffff} mod ${s.n} = ${idx}`);
+  return { rc: 0, h, top, idx, leaf: sub, n: s.n, dir: s.b, ver: s.ver };
+}
+
+/* ---- buckets ---- */
+function bktEntry(b, used, off) {
+  if (off + ENT_HDR > used) return null;
+  const kf = u16(b, off), vf = u16(b, off + 2);
+  const e = { off, ks: !!(kf & SPILL), vs: !!(vf & SPILL), kl: kf & LMASK, vl: vf & LMASK };
+  e.kpos = off + ENT_HDR;
+  e.vpos = e.kpos + (e.ks ? KREF : e.kl);
+  e.len = ENT_HDR + (e.ks ? KREF : e.kl) + (e.vs ? VREF : e.vl);
+  return off + e.len <= used ? e : null;
+}
+function entries(b) { const out = []; let e; for (let off = 0; (e = bktEntry(b, b.length, off)); off += e.len) out.push(e); return out; }
+const entKid = (b, e) => e.ks ? u64(b, e.kpos + 4) : 0;
+const entVid = (b, e) => e.vs ? u64(b, e.vpos) : 0;
+
+function bktFind(b, used, key, fp) {
+  let i = 0, e;
+  for (let off = 0; (e = bktEntry(b, used, off)); off += e.len, i++) {
+    if (e.kl !== key.length) { note(`entry ${i}: klen ${e.kl} ≠ ${key.length}, skip`, 'dim'); continue; }
+    if (!e.ks) {
+      if (!eq(b.subarray(e.kpos, e.kpos + e.kl), key)) { note(`entry ${i}: inline key, bytes differ, skip`, 'dim'); continue; }
+      note(`entry ${i}: inline key matches`);
+    } else {
+      const efp = u32(b, e.kpos);
+      if (efp !== fp) { note(`entry ${i}: spilled key, fp ${hex32(efp)} ≠ ${hex32(fp)}, skip without reading its blob`, 'dim'); continue; }
+      const kid = u64(b, e.kpos + 4);
+      if (!kid) return { rc: EIO };
+      const kb = bGet(kid, `entry ${i}: fingerprint matches, read the spilled key to compare bytes`);
+      if (!kb || kb.length < key.length) return { rc: EIO };
+      if (!eq(kb.subarray(0, key.length), key)) { note(`entry ${i}: fingerprint collision, bytes differ, skip`, 'warn'); continue; }
+      note(`entry ${i}: spilled key matches`);
+    }
+    return { rc: 0, off, e, i };
+  }
+  note('no entry matches', 'dim');
+  return { rc: ENOENT };
+}
+
+/* ---- map_ops ---- */
+function opCreate(decl, mp, ver, large) {
+  const g = deriveGeometry(decl, mp);
+  if (g.rc) { note('Nothing written: validation is arithmetic.', 'err'); return g.rc; }
+  K.MP = mp; K.LARGE = large;
+  S.blobs.clear(); S.next = 1; S.root = allocId();
+  note(`blob store formatted; root id #${S.root}`);
+  if (g.depth === 1) {
+    return kvUpdate(S.root, dirFormat(g.nTop, 1, ver), `write root directory: ${g.nTop} empty slots (${DIR_HDR + 8 * g.nTop} B)`, 'commit');
+  }
+  note(`depth 2: ${g.nTop} sub-maps are created now, so the top is written once and never again`);
+  const top = dirFormat(g.nTop, 2, ver), img = dirFormat(g.nSub, 1, ver);
+  for (let i = 0; i < g.nTop; i++) {
+    const sub = allocId();
+    const rc = kvUpdate(sub, img, `write sub-directory ${i}: ${g.nSub} empty slots (unreachable until the root lands)`);
+    if (rc) return rc;
+    dirSetChild(top, i, sub);
+  }
+  return kvUpdate(S.root, top, `write root directory naming ${g.nTop} sub-maps (${DIR_HDR + 8 * g.nTop} B)`, 'commit');
+}
+
+function opGet(key) {
+  if (!key.length || key.length > 0xffff) return EINVAL;
+  if (key.length > LMASK) return ENOENT;
+  const r = resolveLeaf(key);
+  if (r.rc) return r.rc;
+  T.path = { top: r.top, idx: r.idx };
+  const bid = dirChild(r.dir, r.idx);
+  if (!bid) { note(`slot ${r.idx} holds id 0: the bucket was never created, so no bucket read`); return ENOENT; }
+  const b = bGet(bid, `read bucket ${r.idx}`);
+  if (!b) return ENOENT;
+  const f = bktFind(b, b.length, key, crc32c(key));
+  if (f.rc) return f.rc;
+  if (!f.e.vs) { T.value = b.slice(f.e.vpos, f.e.vpos + f.e.vl); note(`value is inline: ${f.e.vl} B copied out of the bucket`); return 0; }
+  const vid = u64(b, f.e.vpos);
+  if (!vid) return EIO;
+  const v = bGet(vid, `value is spilled: read its blob (${f.e.vl} B)`);
+  if (!v || v.length !== f.e.vl) return EIO;
+  T.value = v;
+  return 0;
+}
+
+function releasePart(id, why) {
+  if (!id) return;
+  const rc = kvDelete(id, why);
+  if (rc && rc !== ENOENT) note(`blob #${id} not released (${ERRNAME[rc]}): leaked, the operation still succeeded`, 'warn');
+}
+
+function opSet(key, val) {
+  const klen = key.length, vlen = val.length;
+  if (!klen || klen > 0xffff || vlen > 0xffff) return EINVAL;
+  if (klen > LMASK || vlen > LMASK) { note('length field has 15 bits', 'err'); return ENOSPC; }
+  const r = resolveLeaf(key);
+  if (r.rc) return r.rc;
+  T.path = { top: r.top, idx: r.idx };
+  const canSpill = r.ver >= 3;
+  const kspill = canSpill && klen > policy.key, vspill = canSpill && vlen > policy.val;
+  if (!canSpill) note('v2 map: never spills, whatever the thresholds');
+  else note(`policy: key ${klen} B ${kspill ? '>' : '≤'} ${policy.key} → ${kspill ? 'spill (12 B ref)' : 'inline'}; value ${vlen} B ${vspill ? '>' : '≤'} ${policy.val} → ${vspill ? 'spill (8 B ref)' : 'inline'}`);
+  if (kspill && klen > K.MP) { note('a spilled key must fit one slot, so a lookup can hold it', 'err'); return ENOSPC; }
+
+  const fp = crc32c(key);
+  let bid = dirChild(r.dir, r.idx);
+  let bkt = new Uint8Array(0), used = 0, haveOld = false, old = null, oldKid = 0, oldVid = 0;
+  if (bid) {
+    const b = bGet(bid, `read bucket ${r.idx}`);
+    if (!b) return ENOENT;
+    bkt = b; used = b.length;
+    const f = bktFind(bkt, used, key, fp);
+    if (f.rc === 0) {
+      haveOld = true; old = f.e;
+      oldKid = entKid(bkt, old); oldVid = entVid(bkt, old);
+      if (old.ks === kspill && old.vs && vspill && old.vl === vlen) {
+        if (!oldVid) return EIO;
+        note('same placement, spilled value of the same length: the bucket is not touched');
+        return kvUpdate(oldVid, val, `overwrite the value blob in place (${vlen} B)`, 'commit');
+      }
+      note(`drop the old entry (${old.len} B) from the bucket image`);
+      const nb = new Uint8Array(used - old.len);
+      nb.set(bkt.subarray(0, f.off), 0);
+      nb.set(bkt.subarray(f.off + old.len, used), f.off);
+      bkt = nb; used = nb.length;
+    } else if (f.rc !== ENOENT) return f.rc;
+  } else {
+    note(`slot ${r.idx} holds id 0: this insert creates the bucket`);
+  }
+
+  const need = ENT_HDR + (kspill ? KREF : klen) + (vspill ? VREF : vlen);
+  if (used + need > K.MP) {
+    note(`bucket would need ${used} + ${need} = ${used + need} B, over MAX_PAYLOAD ${K.MP} B`, 'err');
+    return ENOSPC;
+  }
+
+  let kid = (kspill && haveOld && old.ks) ? oldKid : 0, vid = 0, freshKid = false, rc = 0;
+  if (kspill && kid) note(`key stays spilled: reuse key blob #${kid}`);
+  if (kspill && !kid) {
+    kid = allocId();
+    rc = kvUpdate(kid, key, `bind key blob (${klen} B), unreferenced so far`);
+    if (rc) return rc;
+    freshKid = true;
+  }
+  const undo = () => {
+    releasePart(vid, 'undo: release the fresh value blob');
+    if (freshKid) releasePart(kid, 'undo: release the fresh key blob');
+  };
+  if (vspill) {
+    vid = allocId();
+    rc = kvUpdate(vid, val, `bind value blob (${vlen} B), unreferenced so far`);
+    if (rc) { vid = 0; undo(); return rc; }
+  }
+
+  const nb = new Uint8Array(used + need);
+  nb.set(bkt.subarray(0, used), 0);
+  p16(nb, used, klen | (kspill ? SPILL : 0));
+  p16(nb, used + 2, vlen | (vspill ? SPILL : 0));
+  let pos = used + ENT_HDR;
+  if (kspill) { p32(nb, pos, fp); p64(nb, pos + 4, kid); pos += KREF; } else { nb.set(key, pos); pos += klen; }
+  if (vspill) p64(nb, pos, vid); else nb.set(val, pos);
+  used += need;
+
+  const fresh = !bid;
+  if (fresh) bid = allocId();
+  rc = kvUpdate(bid, nb, fresh
+    ? `write fresh bucket ${r.idx} (${used} B), unreachable until published`
+    : `rewrite bucket ${r.idx} with the entry appended (${used} / ${K.MP} B)`, fresh ? '' : 'commit');
+  if (rc) { undo(); return rc; }
+  if (fresh) {
+    const dir = r.dir.slice();
+    dirSetChild(dir, r.idx, bid);
+    rc = kvUpdate(r.leaf, dir, `publish bucket #${bid} into slot ${r.idx} of ${r.leaf === S.root ? 'the root directory' : 'sub-directory ' + r.top}`, 'commit');
+    if (rc) { undo(); return rc; }
+  }
+  if (oldKid !== kid) releasePart(oldKid, 'release the old key blob');
+  releasePart(oldVid, 'release the old value blob');
+  return 0;
+}
+
+function opDel(key) {
+  if (!key.length || key.length > 0xffff) return EINVAL;
+  if (key.length > LMASK) return ENOENT;
+  const r = resolveLeaf(key);
+  if (r.rc) return r.rc;
+  T.path = { top: r.top, idx: r.idx };
+  const bid = dirChild(r.dir, r.idx);
+  if (!bid) { note(`slot ${r.idx} holds id 0`); return ENOENT; }
+  const b = bGet(bid, `read bucket ${r.idx}`);
+  if (!b) return ENOENT;
+  const f = bktFind(b, b.length, key, crc32c(key));
+  if (f.rc) return f.rc;
+  const kid = entKid(b, f.e), vid = entVid(b, f.e);
+  const nb = new Uint8Array(b.length - f.e.len);
+  nb.set(b.subarray(0, f.off), 0);
+  nb.set(b.subarray(f.off + f.e.len), f.off);
+  const rc = kvUpdate(bid, nb, `rewrite bucket ${r.idx} without the entry (${nb.length} B${nb.length ? '' : '; an emptied bucket stays allocated'})`, 'commit');
+  if (rc) return rc;
+  releasePart(kid, 'release the spilled key blob');
+  releasePart(vid, 'release the spilled value blob');
+  return 0;
+}
+
+function releaseBucket(bid, label) {
+  const b = bGet(bid, `read ${label} to find its spilled blobs`);
+  if (!b) return 0;
+  let first = 0;
+  for (const e of entries(b)) {
+    for (const id of [entKid(b, e), entVid(b, e)]) {
+      if (!id) continue;
+      const rc = kvDelete(id, `release spilled blob of ${label}`);
+      if (rc && rc !== ENOENT && !first) first = rc;
+    }
+  }
+  if (first) return first;
+  const rc = kvDelete(bid, `release ${label}`);
+  return (rc && rc !== ENOENT) ? rc : 0;
+}
+function releaseBuckets(dir, n, where) {
+  let first = 0;
+  for (let i = 0; i < n; i++) {
+    const bid = dirChild(dir, i);
+    if (!bid) continue;
+    const rc = releaseBucket(bid, `${where}bucket ${i}`);
+    if (rc && !first) first = rc;
+  }
+  return first;
+}
+function opDestroy() {
+  let d = dirLoadRaw(S.root, 'read root directory');
+  if (d.rc) return d.rc;
+  if (!d.dying) {
+    const b = d.b.slice(); p32(b, 0, DYING);
+    const rc = kvUpdate(S.root, b, "stamp the root 'KVHD': from here every reader gets -ENOENT", 'commit');
+    if (rc) return rc;
+  } else note('root already stamped KVHD: resume the release');
+  let first = 0;
+  if (d.depth === 1) first = releaseBuckets(d.b, d.n, '');
+  else {
+    for (let i = 0; i < d.n; i++) {
+      const t = dirLoadRaw(S.root, `re-read root for sub-map ${i}`);
+      if (t.rc) { if (!first) first = t.rc; continue; }
+      const sub = dirChild(t.b, i);
+      if (!sub) continue;
+      const s = dirLoadRaw(sub, `read sub-directory ${i}`);
+      if (s.rc === ENOENT) continue;
+      if (s.rc) { if (!first) first = s.rc; continue; }
+      const brc = releaseBuckets(s.b, s.n, `sub ${i} / `);
+      if (brc) { if (!first) first = brc; continue; }
+      const drc = kvDelete(sub, `release sub-directory ${i}`);
+      if (drc && drc !== ENOENT && !first) first = drc;
+    }
+  }
+  if (first) { note('a release failed: the root stays stamped, so repeating destroy resumes here', 'warn'); return first; }
+  return kvDelete(S.root, 'release the root, last');
+}
+
+/* ---- read-only walk for the views (not traced) ---- */
+function classify() {
+  const kinds = new Map();
+  const info = { ok: false, rc: 0, kinds, orphans: [], subs: [], entries: 0, sk: 0, sv: 0, stale: [], bytes: 0, depth: 0, nTop: 0, nSub: 0, ver: 0, dying: false, allocated: 0, maxFill: 0 };
+  for (const b of S.blobs.values()) info.bytes += b.length;
+  const rb = S.blobs.get(S.root);
+  if (!S.root || !rb) { info.rc = ENOENT; }
+  else {
+    const d = parseDir(rb);
+    if (d.rc) info.rc = d.rc;
+    else {
+      info.ok = true; info.depth = d.depth; info.nTop = d.n; info.ver = d.ver; info.dying = d.dying;
+      kinds.set(S.root, { kind: d.dying ? 'root dir (KVHD)' : 'root dir', note: `depth ${d.depth}, n ${d.n}` });
+      const subs = [];
+      if (d.depth === 1) subs.push({ top: 0, id: S.root, dir: d });
+      else for (let i = 0; i < d.n; i++) {
+        const sid = dirChild(d.b, i);
+        const sb = sid ? S.blobs.get(sid) : null;
+        const sd = sb ? parseDir(sb) : { rc: ENOENT };
+        if (sid && sb) kinds.set(sid, { kind: 'sub-dir', note: `sub-map ${i}` });
+        subs.push({ top: i, id: sid, dir: sd.rc ? null : sd });
+      }
+      for (const s of subs) {
+        s.buckets = [];
+        if (!s.dir) continue;
+        if (d.depth === 2) info.nSub = s.dir.n;
+        for (let i = 0; i < s.dir.n; i++) {
+          const bid = dirChild(s.dir.b, i);
+          const bb = bid ? S.blobs.get(bid) : null;
+          const bk = { idx: i, id: bid, b: bb, used: bb ? bb.length : 0, ents: bb ? entries(bb) : [], missing: !!bid && !bb };
+          s.buckets.push(bk);
+          if (!bid || !bb) continue;
+          info.allocated++;
+          info.maxFill = Math.max(info.maxFill, bk.used);
+          kinds.set(bid, { kind: 'bucket', note: (d.depth === 2 ? `sub ${s.top} / ` : '') + `bucket ${i}, ${bk.ents.length} entr${bk.ents.length === 1 ? 'y' : 'ies'}` });
+          bk.ents.forEach((e, j) => {
+            info.entries++;
+            const kid = entKid(bb, e), vid = entVid(bb, e);
+            if (kid) { info.sk++; kinds.set(kid, { kind: 'key blob', note: `bucket #${bid} entry ${j}` }); }
+            if (vid) { info.sv++; kinds.set(vid, { kind: 'value blob', note: `bucket #${bid} entry ${j}` }); }
+            if (s.dir.ver >= 3 && ((e.kl > policy.key) !== e.ks || (e.vl > policy.val) !== e.vs)) info.stale.push({ b: bb, e });
+          });
+        }
+      }
+      info.subs = subs;
+    }
+  }
+  for (const id of S.blobs.keys()) if (!kinds.has(id)) info.orphans.push(id);
+  return info;
+}
+function keyBytesOf(b, e) { return e.ks ? (S.blobs.get(u64(b, e.kpos + 4)) || new Uint8Array(0)) : b.slice(e.kpos, e.kpos + e.kl); }
+function valBytesOf(b, e) { return e.vs ? (S.blobs.get(u64(b, e.vpos)) || new Uint8Array(0)) : b.slice(e.vpos, e.vpos + e.vl); }
+
+/* ================================================================
+ * UI
+ * ================================================================ */
+const $ = s => document.querySelector(s);
+const esc = s => String(s).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+const UI = { sel: { top: 0, idx: null }, path: null, last: null, hist: [], info: null };
+
+function preview(bytes, max = 36) {
+  let s = '';
+  try { s = dec.decode(bytes.subarray(0, Math.min(bytes.length, max * 4))); } catch (e) { s = ''; }
+  s = s.replace(/[\x00-\x1f\x7f]/g, '·');
+  if (s.length > max) s = s.slice(0, max) + '…';
+  return s;
+}
+const quote = (bytes, max) => `"${esc(preview(bytes, max))}"` + (bytes.length > max ? ` <span class="muted">${bytes.length} B</span>` : '');
+
+function run(op, fn, opts = {}) {
+  T = newTrace(op, opts.quiet);
+  T.cut = opts.cut ?? -1;
+  const rc = fn();
+  T.rc = rc;
+  const t = T; T = null;
+  UI.last = t;
+  UI.hist.unshift({ op: t.op, rc, r: t.r, w: t.w, d: t.d });
+  UI.hist.length = Math.min(UI.hist.length, 60);
+  if (t.path) { UI.path = t.path; UI.sel = { top: t.path.top, idx: t.path.idx }; }
+  if (!opts.noRender) renderAll();
+  return rc;
+}
+
+/* ---- geometry form ---- */
+const PRESETS = [
+  { name: 'Unknown size', n: 0, t: 0, m: 0, mp: 256 },
+  { name: 'Settings, 24 entries', n: 24, t: 30, m: 60, mp: 256 },
+  { name: 'Sensor log, 2 000', n: 2000, t: 40, m: 80, mp: 256 },
+  { name: 'Person records, 5 000', n: 5000, t: 380, m: 700, mp: 2016 },
+  { name: '1 M entries at 256 B', n: 1000000, t: 24, m: 48, mp: 256 },
+];
+function geoDecl() { return { entries: +$('#g-n').value || 0, typical: +$('#g-t').value || 0, maxent: +$('#g-m').value || 0 }; }
+function renderDerive() {
+  const mp = +$('#g-mp').value;
+  const g = deriveGeometry(geoDecl(), mp);
+  $('#g-derive').innerHTML = g.lines.map(l => `<li>${esc(l)}</li>`).join('');
+  const v = $('#g-verdict');
+  if (g.rc) { v.textContent = 'create → -EINVAL, nothing written'; v.className = 'verdict bad'; }
+  else {
+    v.className = 'verdict';
+    v.textContent = g.depth === 1 ? `depth 1 · ${g.nTop} buckets · get = 2 reads` : `depth 2 · ${g.nTop} × ${g.nSub} = ${g.nTop * g.nSub} buckets · get = 3 reads · create = ${g.nTop + 1} writes`;
+  }
+  /* The page's own estimate, not something kvhash computes: the mean bytes a
+     bucket will carry if the declared population arrives. */
+  const d = geoDecl(), risk = $('#g-risk');
+  risk.hidden = true;
+  if (!g.rc && d.entries && d.typical) {
+    const buckets = g.depth === 1 ? g.nTop : g.nTop * g.nSub;
+    const mean = d.entries / buckets * (d.typical + ENT_HDR);
+    if (mean > mp * BUCKET_FILL_PCT / 100) {
+      risk.hidden = false;
+      risk.textContent = `Estimate: a bucket will carry about ${Math.round(mean)} B on average (${(d.entries / buckets).toFixed(1)} entries × ${d.typical + ENT_HDR} B), past ${BUCKET_FILL_PCT}% of the ${mp} B payload. Expect -ENOSPC before the declared population is in. Spilling large values, or a larger payload, gives the buckets room.`;
+    }
+  }
+  renderPop();
+}
+function renderPop() {
+  const mp = +$('#g-mp').value, d = geoDecl();
+  const ns = [0, 10, 50, 100, 500, 1000, 5000, 20000, 100000, 1000000];
+  if (d.entries && !ns.includes(d.entries)) { ns.push(d.entries); ns.sort((a, b) => a - b); }
+  const rows = ns.map(n => {
+    const g = deriveGeometry({ entries: n, typical: d.typical, maxent: d.maxent }, mp);
+    const cur = n === d.entries ? ' style="font-weight:600"' : '';
+    if (g.rc) return `<tr${cur}><td>${n.toLocaleString('en')}</td><td colspan="4" style="color:var(--err)">-EINVAL</td></tr>`;
+    const b = g.depth === 1 ? g.nTop : g.nTop * g.nSub;
+    const per = n ? (n / b) : 0;
+    return `<tr${cur}><td>${n.toLocaleString('en')}</td><td>${g.depth}</td><td>${g.depth === 1 ? g.nTop : g.nTop + ' × ' + g.nSub}</td><td>${b.toLocaleString('en')}</td><td>${per ? per.toFixed(per < 10 ? 2 : 0) : '–'}</td></tr>`;
+  }).join('');
+  $('#pop').innerHTML = `<table><thead><tr><th>entries</th><th>depth</th><th>shape</th><th>buckets</th><th>per bucket</th></tr></thead><tbody>${rows}</tbody></table>`;
+}
+
+/* ---- key calculator ---- */
+function opKey() { return enc.encode($('#o-k').value); }
+function opVal() {
+  const t = enc.encode($('#o-v').value);
+  const n = $('#o-vn').value === '' ? -1 : Math.max(0, Math.min(65535, +$('#o-vn').value | 0));
+  if (n < 0) return t;
+  const src = t.length ? t : enc.encode('.');
+  const out = new Uint8Array(n);
+  for (let i = 0; i < n; i++) out[i] = src[i % src.length];
+  return out;
+}
+function renderCalc() {
+  const key = opKey(), val = opVal(), info = UI.info;
+  const el = $('#o-calc');
+  if (!key.length) { el.innerHTML = '<span class="muted">Type a key to see where it lands.</span>'; return; }
+  const h = crc32(key), fp = crc32c(key);
+  const L = [`CRC-32 <b>${hex32(h)}</b> · CRC-32C fp <b>${hex32(fp)}</b>`];
+  if (info && info.ok) {
+    if (info.depth === 1) L.push(`bucket = ${h & 0xffff} mod ${info.nTop} = <b>${(h & 0xffff) % info.nTop}</b>`);
+    else L.push(`sub-map = ${h >>> 16} mod ${info.nTop} = <b>${(h >>> 16) % info.nTop}</b>, bucket = ${h & 0xffff} mod ${info.nSub} = <b>${(h & 0xffff) % info.nSub}</b>`);
+    const can = info.ver >= 3;
+    const ks = can && key.length > policy.key, vs = can && val.length > policy.val;
+    const foot = ENT_HDR + (ks ? KREF : key.length) + (vs ? VREF : val.length);
+    L.push(`key ${key.length} B ${ks ? '<span style="color:var(--c-kref)">spills</span>' : 'inline'} · value ${val.length} B ${vs ? '<span style="color:var(--c-vref)">spills</span>' : 'inline'} · entry ${foot} B in bucket`);
+    L.push(`get costs ${info.depth + 1}${ks ? ' + 1 (key blob on fp match)' : ''}${vs ? ' + 1 (value blob)' : ''} reads`);
+  }
+  el.innerHTML = L.map(x => `<div>${x}</div>`).join('');
+}
+
+/* ---- stats ---- */
+function renderStats(info) {
+  const cells = [];
+  const c = (k, v, s, bad) => cells.push(`<div class="stat"><div class="k">${k}</div><div class="v${bad ? ' bad' : ''}">${v}</div>${s ? `<div class="s">${s}</div>` : ''}</div>`);
+  if (!info.ok) {
+    c('map', 'none', S.root ? `root #${S.root} ${info.rc === ENOENT ? 'not on flash' : 'unreadable'}` : 'create one', true);
+  } else {
+    c('depth', info.depth, `v${info.ver}${info.dying ? ' · KVHD' : ''}`, info.dying);
+    c('shape', info.depth === 1 ? info.nTop : `${info.nTop}×${info.nSub}`, `${(info.depth === 1 ? info.nTop : info.nTop * info.nSub).toLocaleString('en')} buckets`);
+    c('allocated', info.allocated, 'bucket blobs');
+    c('entries', info.entries, `${info.sk} key · ${info.sv} value spilled`);
+    c('fullest', `${Math.round(info.maxFill / K.MP * 100)}%`, `${info.maxFill} / ${K.MP} B`, info.maxFill > K.MP * 0.9);
+  }
+  c('blobs', S.blobs.size, `${info.bytes.toLocaleString('en')} B payload`);
+  c('orphans', info.orphans.length, info.orphans.length ? 'leaked by a cut' : 'none', info.orphans.length > 0);
+  $('#stats').innerHTML = cells.join('');
+}
+
+/* ---- overview canvas ---- */
+const cssv = n => getComputedStyle(document.documentElement).getPropertyValue(n).trim();
+function rgb(h) { h = h.replace('#', ''); if (h.length === 3) h = h.split('').map(c => c + c).join(''); const n = parseInt(h, 16); return [(n >> 16) & 255, (n >> 8) & 255, n & 255]; }
+function mix(a, b, t) { const A = rgb(a), B = rgb(b); return `rgb(${A.map((v, i) => Math.round(v + (B[i] - v) * t)).join(',')})`; }
+let OV = null;
+function drawOverview(info) {
+  const cv = $('#ov'), wrap = $('#ov-wrap');
+  const W = Math.max(240, wrap.clientWidth);
+  const hint = $('#ov-hint');
+  $('#scale-bar').style.background = `linear-gradient(90deg, ${cssv('--heat0')}, ${cssv('--accent')})`;
+  if (!info.ok) {
+    cv.width = W; cv.height = 60; cv.style.height = '60px';
+    const g = cv.getContext('2d'); g.clearRect(0, 0, W, 60);
+    g.fillStyle = cssv('--muted'); g.font = '13px ' + cssv('--f-body');
+    g.fillText('No live map. Create one in step 1.', 8, 34);
+    hint.textContent = ''; OV = null; return;
+  }
+  const nT = info.depth === 2 ? info.nTop : 1;
+  const nS = info.depth === 2 ? info.nSub : info.nTop;
+  const tc = Math.ceil(Math.sqrt(nT)), tr = Math.ceil(nT / tc);
+  const cc = Math.ceil(Math.sqrt(nS)), cr = Math.ceil(nS / cc);
+  const tgap = nT > 1 ? (tc > 12 ? 3 : 6) : 0, pad = nT > 1 ? 3 : 0;
+  let cell = Math.floor((W - (tc - 1) * tgap - tc * pad * 2) / (tc * cc));
+  cell = Math.min(nT > 1 ? 30 : 44, cell);
+  cell = Math.min(cell, Math.floor((560 - (tr - 1) * tgap - tr * pad * 2) / (tr * cr)));
+  cell = Math.max(2, cell);
+  const cgap = cell >= 6 ? 1 : 0;
+  const tw = cc * cell + pad * 2, th = cr * cell + pad * 2;
+  const H = tr * th + (tr - 1) * tgap;
+  const dpr = window.devicePixelRatio || 1;
+  cv.width = Math.round(W * dpr); cv.height = Math.round(H * dpr); cv.style.height = H + 'px';
+  const g = cv.getContext('2d'); g.setTransform(dpr, 0, 0, dpr, 0, 0); g.clearRect(0, 0, W, H);
+  const C = { sunk: cssv('--sunk'), line: cssv('--line'), heat0: cssv('--heat0'), acc: cssv('--accent'), ink: cssv('--ink'), vref: cssv('--c-vref'), kref: cssv('--c-kref'), panel: cssv('--panel'), err: cssv('--err') };
+  OV = { tc, cc, tw, th, tgap, pad, cell, nT, nS, W, H };
+  for (let t = 0; t < nT; t++) {
+    const tx = (t % tc) * (tw + tgap), ty = Math.floor(t / tc) * (th + tgap);
+    const s = info.subs[t];
+    if (nT > 1) {
+      g.fillStyle = C.sunk; g.fillRect(tx, ty, tw, th);
+      if (UI.sel.top === t) { g.strokeStyle = C.ink; g.lineWidth = 1.5; g.strokeRect(tx + 0.75, ty + 0.75, tw - 1.5, th - 1.5); }
+    }
+    for (let i = 0; i < nS; i++) {
+      const x = tx + pad + (i % cc) * cell, y = ty + pad + Math.floor(i / cc) * cell;
+      const bk = s && s.buckets[i];
+      const w = cell - cgap;
+      if (!s || !s.dir) { g.fillStyle = C.err; g.fillRect(x, y, w, w); continue; }
+      if (!bk.id) { g.fillStyle = C.panel; g.fillRect(x, y, w, w); if (w >= 6) { g.strokeStyle = C.line; g.lineWidth = 1; g.strokeRect(x + 0.5, y + 0.5, w - 1, w - 1); } }
+      else {
+        const f = Math.min(1, bk.used / K.MP);
+        g.fillStyle = bk.missing ? C.err : mix(C.heat0, C.acc, 0.12 + 0.88 * f);
+        g.fillRect(x, y, w, w);
+        if (w >= 8 && bk.ents.some(e => e.vs || e.ks)) {
+          g.fillStyle = bk.ents.some(e => e.vs) ? C.vref : C.kref;
+          const m = Math.max(3, Math.floor(w / 3));
+          g.beginPath(); g.moveTo(x + w - m, y); g.lineTo(x + w, y); g.lineTo(x + w, y + m); g.closePath(); g.fill();
+        }
+      }
+      const isPath = UI.path && UI.path.top === t && UI.path.idx === i;
+      const isSel = UI.sel.top === t && UI.sel.idx === i;
+      if ((isPath || isSel) && w >= 3) {
+        g.strokeStyle = isPath ? C.acc : C.ink; g.lineWidth = 2;
+        g.strokeRect(x - 1, y - 1, w + 2, w + 2);
+      }
+    }
+  }
+  hint.textContent = info.depth === 1
+    ? `One directory of ${info.nTop} buckets. Each square is a bucket; a corner mark means it holds a spilled part. Click to inspect.`
+    : `${info.nTop} sub-maps (tiles) × ${info.nSub} buckets each. The top 16 bits of the key's CRC pick the tile, the low 16 bits the bucket. Click to inspect.`;
+}
+function hitOverview(ev) {
+  if (!OV) return null;
+  const r = $('#ov').getBoundingClientRect();
+  const x = ev.clientX - r.left, y = ev.clientY - r.top;
+  const col = Math.floor(x / (OV.tw + OV.tgap)), row = Math.floor(y / (OV.th + OV.tgap));
+  if (col < 0 || col >= OV.tc) return null;
+  const t = row * OV.tc + col;
+  if (t < 0 || t >= OV.nT) return null;
+  const lx = x - col * (OV.tw + OV.tgap) - OV.pad, ly = y - row * (OV.th + OV.tgap) - OV.pad;
+  if (lx < 0 || ly < 0 || lx >= OV.cc * OV.cell) return { top: t, idx: null };
+  const i = Math.floor(ly / OV.cell) * OV.cc + Math.floor(lx / OV.cell);
+  return { top: t, idx: i < OV.nS ? i : null };
+}
+
+/* ---- leaf directory ---- */
+function renderLeaf(info) {
+  const list = $('#l-list'), hdr = $('#l-hdr');
+  if (!info.ok) { hdr.innerHTML = ''; list.innerHTML = '<p class="empty">No map.</p>'; return; }
+  const s = info.subs[UI.sel.top] || info.subs[0];
+  if (!s || !s.dir) { hdr.innerHTML = ''; list.innerHTML = '<p class="empty">This sub-directory is missing.</p>'; return; }
+  const d = s.dir;
+  hdr.innerHTML = [
+    `<span data-blob="${s.id}">blob #${s.id}${info.depth === 2 ? ` · sub-map ${s.top}` : ' · root'}</span>`,
+    `<span>magic ${d.dying ? "'KVHD'" : "'KVHA'"}</span>`, `<span>n ${d.n}</span>`, `<span>version ${d.ver}</span>`,
+    `<span>depth ${d.depth}</span>`, `<span>${DIR_HDR + 8 * d.n} B = 8 + 8 × ${d.n}</span>`
+  ].join('');
+  const hide = $('#l-hide').checked;
+  const rows = [];
+  for (const bk of s.buckets) {
+    if (hide && !bk.id) continue;
+    const isSel = UI.sel.idx === bk.idx, isPath = UI.path && UI.path.top === s.top && UI.path.idx === bk.idx;
+    let segs = '', meta = '';
+    if (bk.id && bk.b) {
+      for (const e of bk.ents) {
+        const w = x => (x / K.MP * 100).toFixed(3) + '%';
+        segs += `<span class="seg h" style="width:${w(ENT_HDR)}"></span>`;
+        segs += `<span class="seg ${e.ks ? 'kr' : 'k'}" style="width:${w(e.ks ? KREF : e.kl)}"></span>`;
+        if (e.vs || e.vl) segs += `<span class="seg ${e.vs ? 'vr' : 'v'}" style="width:${w(e.vs ? VREF : e.vl)}"></span>`;
+      }
+      const chips = bk.ents.flatMap(e => {
+        const out = [];
+        if (e.ks) out.push(`<span class="pill kr" data-blob="${entKid(bk.b, e)}">K#${entKid(bk.b, e)} ${e.kl}B</span>`);
+        if (e.vs) out.push(`<span class="pill vr" data-blob="${entVid(bk.b, e)}">V#${entVid(bk.b, e)} ${e.vl}B</span>`);
+        return out;
+      });
+      meta = `<span>${bk.used}/${K.MP}B · ${bk.ents.length}</span>${chips.join('')}`;
+    } else if (bk.id) meta = '<span class="pill err">missing</span>';
+    else meta = '<span>empty</span>';
+    rows.push(`<div class="brow${isSel ? ' sel' : ''}${isPath ? ' path' : ''}" role="option" aria-selected="${isSel}" tabindex="0" data-idx="${bk.idx}" ${bk.id ? `data-blob="${bk.id}"` : ''}>
+      <span class="idx">${bk.idx}</span><span class="bid${bk.id ? '' : ' zero'}">${bk.id ? '#' + bk.id : '0'}</span>
+      <span class="bar">${segs}<span class="mark" title="BUCKET_FILL_PCT"></span></span><span class="meta">${meta}</span></div>`);
+  }
+  list.innerHTML = rows.join('') || '<p class="empty">Every slot is empty (id 0). Buckets are created on first insert.</p>';
+}
+
+/* ---- bucket inspector ---- */
+function renderBucket(info) {
+  const body = $('#b-body'), title = $('#b-title');
+  const s = info.ok && (info.subs[UI.sel.top] || null);
+  const bk = s && s.buckets && UI.sel.idx != null ? s.buckets[UI.sel.idx] : null;
+  if (!bk) { title.textContent = ''; body.innerHTML = '<p class="empty">Pick a bucket in the overview or the directory.</p>'; return; }
+  title.textContent = (info.depth === 2 ? `sub-map ${s.top} · ` : '') + `slot ${bk.idx}`;
+  if (!bk.id) { body.innerHTML = `<p class="empty">Slot ${bk.idx} holds id 0: no blob yet. The first set that hashes here allocates the bucket, writes it, then publishes its id into this directory.</p>`; return; }
+  if (!bk.b) { body.innerHTML = `<p class="empty">Bucket #${bk.id} is named but not on flash.</p>`; return; }
+  const b = bk.b;
+  const rows = bk.ents.map((e, j) => {
+    const kf = u16(b, e.off), vf = u16(b, e.off + 2);
+    const stale = info.ver >= 3 && ((e.kl > policy.key) !== e.ks || (e.vl > policy.val) !== e.vs);
+    const key = e.ks
+      ? `<span class="pill kr" data-blob="${entKid(b, e)}">fp ${hex32(u32(b, e.kpos))} → #${entKid(b, e)}</span> ${quote(keyBytesOf(b, e), 28)}`
+      : quote(b.subarray(e.kpos, e.kpos + e.kl), 28);
+    const val = e.vs
+      ? `<span class="pill vr" data-blob="${entVid(b, e)}">→ #${entVid(b, e)}</span> ${quote(valBytesOf(b, e), 28)}`
+      : quote(b.subarray(e.vpos, e.vpos + e.vl), 28);
+    return `<tr class="${stale ? 'stale' : ''}" title="${stale ? 'placement differs from the current policy; moves on its next set' : ''}"><td>${j}</td><td>${e.off}</td><td>0x${kf.toString(16).padStart(4, '0')}</td><td>0x${vf.toString(16).padStart(4, '0')}</td><td class="tw">${key}</td><td class="tw">${val}</td><td>${e.len}</td></tr>`;
+  }).join('');
+  const cls = new Array(b.length).fill('');
+  for (const e of bk.ents) {
+    for (let i = e.off; i < e.kpos; i++) cls[i] = 'h';
+    for (let i = e.kpos; i < e.vpos; i++) cls[i] = e.ks ? 'kr' : 'k';
+    for (let i = e.vpos; i < e.off + e.len; i++) cls[i] = e.vs ? 'vr' : 'v';
+  }
+  let hex = '';
+  for (let o = 0; o < b.length; o += 16) {
+    let line = `<span class="off">${o.toString(16).padStart(4, '0')}</span>`;
+    for (let i = o; i < Math.min(o + 16, b.length); i++) line += `<b class="${cls[i]}">${b[i].toString(16).padStart(2, '0')}</b>${i % 16 === 7 ? ' ' : ''}`;
+    hex += `<div class="ln">${line}</div>`;
+  }
+  body.innerHTML = `
+    <p class="small muted" style="margin-bottom:8px">Blob <span data-blob="${bk.id}">#${bk.id}</span> · ${b.length} of ${K.MP} B · ${bk.ents.length} entr${bk.ents.length === 1 ? 'y' : 'ies'}, packed in write order (a set moves its key to the end). Bit 15 of a length field is the spill flag; the low 15 bits are always the true length.</p>
+    ${bk.ents.length ? `<div class="tscroll"><table><thead><tr><th>#</th><th>off</th><th>klen|KS</th><th>vlen|VS</th><th>key part</th><th>value part</th><th>bytes</th></tr></thead><tbody>${rows}</tbody></table></div>` : '<p class="empty">Empty payload: every entry was deleted. The bucket stays allocated and named by the directory.</p>'}
+    ${b.length ? `<div class="hex" style="margin-top:10px">${hex}</div>` : ''}`;
+}
+
+/* ---- trace ---- */
+function renderTrace() {
+  const t = UI.last, el = $('#tr');
+  if (!t) { el.innerHTML = '<p class="empty">No operation yet.</p>'; }
+  else {
+    const ok = t.rc === 0;
+    const rcPill = `<span class="pill ${ok ? 'ok' : (t.rc === ENOENT ? 'warn' : 'err')}">${ERRNAME[t.rc] || t.rc}</span>`;
+    let res = '';
+    if (t.value) res = `<div class="result">value (${t.value.length} B): ${quote(t.value, 120)}</div>`;
+    if (t.cutFired) res += `<div class="result" style="color:var(--err)">Power was cut. blob_db writes are atomic, so the map holds whatever landed before the cut. Check the blob store for orphans.</div>`;
+    if (t.summary) res += `<div class="result">${t.summary}</div>`;
+    const steps = t.steps.map(s => `<li class="${s.kind} ${s.cls || ''}" ${s.id ? `data-blob="${s.id}"` : ''}><span class="tag">${s.kind === 'N' ? '·' : s.kind}</span><span class="txt">${s.id ? `<span class="idchip">#${s.id}</span>` : ''}${esc(s.text)}</span></li>`).join('');
+    el.innerHTML = `<div class="trace-head"><span class="op">${esc(t.op)}</span>${rcPill}<span class="counts">${t.r} read · ${t.w} write · ${t.d} delete</span></div>
+      ${res}${steps ? `<ol class="steps" style="margin-top:8px">${steps}</ol>` : ''}`;
+  }
+  $('#hist').innerHTML = UI.hist.map(h => `<li><span>${esc(h.op)}</span><span>${ERRNAME[h.rc] || h.rc} · R${h.r} W${h.w} D${h.d}</span></li>`).join('');
+}
+
+/* ---- store ---- */
+function renderStore(info) {
+  const ids = [...S.blobs.keys()].sort((a, b) => a - b);
+  const orph = new Set(info.orphans);
+  const LIM = 400;
+  const rows = ids.slice(0, LIM).map(id => {
+    const k = info.kinds.get(id), b = S.blobs.get(id);
+    const kind = k ? k.kind : 'orphan';
+    return `<tr class="${orph.has(id) ? 'orphan' : ''}" data-blob="${id}"><td>#${id}</td><td>${kind}</td><td>${b.length}</td><td class="tw">${esc(k ? k.note : 'referenced by nothing')}</td></tr>`;
+  }).join('');
+  $('#st').innerHTML = ids.length
+    ? `<table><thead><tr><th>id</th><th>kind</th><th>B</th><th>where</th></tr></thead><tbody>${rows}</tbody></table>${ids.length > LIM ? `<p class="hint">Showing the first ${LIM} of ${ids.length}.</p>` : ''}`
+    : '<p class="empty">The store is empty.</p>';
+  $('#st-sum').textContent = `${ids.length} blobs · next id #${S.next}`;
+}
+
+function renderPolicy(info) {
+  $('#p-k').value = policy.key; $('#p-v').value = policy.val;
+  const el = $('#p-stale');
+  if (!info.ok) { el.textContent = ''; return; }
+  if (info.ver < 3) { el.textContent = 'This is a v2 map: it never spills, so the thresholds do not apply to it.'; return; }
+  el.innerHTML = info.stale.length
+    ? `<span style="color:var(--warn)">${info.stale.length} entr${info.stale.length === 1 ? 'y is' : 'ies are'} stored differently from the current policy.</span> They stay readable as they are and move only when their key is next set.`
+    : 'Every entry matches the current policy.';
+}
+
+function renderAll() {
+  const info = classify();
+  UI.info = info;
+  if (info.ok && UI.sel.top >= (info.depth === 2 ? info.nTop : 1)) UI.sel = { top: 0, idx: null };
+  renderStats(info); drawOverview(info); renderLeaf(info); renderBucket(info);
+  renderTrace(); renderStore(info); renderPolicy(info); renderCalc();
+}
+
+/* ---- bulk ---- */
+let seed = 0x5eed;
+function rand() { seed |= 0; seed = (seed + 0x6D2B79F5) | 0; let t = Math.imul(seed ^ (seed >>> 15), 1 | seed); t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t; return ((t ^ (t >>> 14)) >>> 0) / 4294967296; }
+function range(str, lo, hi) {
+  const m = String(str).match(/^\s*(\d+)\s*(?:-\s*(\d+))?\s*$/);
+  let a = m ? +m[1] : lo, b = m && m[2] ? +m[2] : a;
+  a = Math.max(lo, Math.min(hi, a)); b = Math.max(a, Math.min(hi, b));
+  return () => a + Math.floor(rand() * (b - a + 1));
+}
+let fillSeq = 0;
+const ALPHA = 'abcdefghijklmnopqrstuvwxyz0123456789';
+function randText(n, prefix) {
+  let s = prefix || '';
+  while (s.length < n) s += ALPHA[Math.floor(rand() * ALPHA.length)];
+  return enc.encode(s.slice(0, n));
+}
+function bulk() {
+  const n = Math.max(1, Math.min(20000, +$('#f-n').value | 0));
+  const kr = range($('#f-k').value, 1, 32767), vr = range($('#f-v').value, 0, 32767);
+  const tally = {}; let lastFull = null;
+  run(`insert ${n} random entries`, () => {
+    for (let i = 0; i < n; i++) {
+      const key = randText(kr(), (fillSeq++).toString(36) + '.');
+      const val = randText(vr(), 'v');
+      const rc = opSet(key, val);
+      tally[rc] = (tally[rc] || 0) + 1;
+      if (rc === ENOSPC) lastFull = T.path;
+    }
+    if (lastFull) T.path = lastFull;
+    return tally[ENOSPC] ? ENOSPC : 0;
+  }, { quiet: true, noRender: true });
+  const parts = Object.keys(tally).sort().map(k => `${tally[k]} × ${ERRNAME[k] || k}`);
+  UI.last.summary = `${parts.join(', ')}${tally[ENOSPC] ? '. -ENOSPC means the target bucket could not take one more entry; the geometry is fixed at create, so the cure is a larger declaration. The last refused bucket is selected.' : ''}`;
+  UI.last.steps = [];
+  renderAll();
+}
+function migrate() {
+  const info = classify();
+  const list = info.stale.map(({ b, e }) => ({ k: keyBytesOf(b, e), v: valBytesOf(b, e) }));
+  if (!list.length) return;
+  const before = S.blobs.size;
+  run(`rewrite ${list.length} misplaced entr${list.length === 1 ? 'y' : 'ies'}`, () => {
+    let first = 0;
+    for (const x of list) { const rc = opSet(x.k, x.v); if (rc && !first) first = rc; }
+    return first;
+  }, { quiet: true, noRender: true });
+  UI.last.summary = `Each was set again under the current policy: bind any new blobs, rewrite the bucket (commit), release blobs only the old entry used. Blob count ${before} → ${S.blobs.size}.`;
+  renderAll();
+}
+
+/* ---- wiring ---- */
+function create() {
+  const mp = +$('#g-mp').value, ver = +$('#g-ver').value, large = $('#g-large').checked;
+  const cut = takeCut();
+  UI.sel = { top: 0, idx: null }; UI.path = null;
+  run(`create(${geoDecl().entries}, ${geoDecl().typical}, ${geoDecl().maxent}) @ ${mp} B`, () => opCreate(geoDecl(), mp, ver, large), { cut });
+}
+function takeCut() { const v = +$('#o-cut').value; $('#o-cut').value = '-1'; return v; }
+function label(op, key, val) { return `${op}("${preview(key, 24)}"${val ? `, ${val.length} B` : ''})`; }
+
+$('#presets').innerHTML = PRESETS.map((p, i) => `<button class="chip" type="button" data-p="${i}">${esc(p.name)}</button>`).join('');
+$('#presets').addEventListener('click', e => {
+  const b = e.target.closest('[data-p]'); if (!b) return;
+  const p = PRESETS[+b.dataset.p];
+  $('#g-n').value = p.n; $('#g-t').value = p.t; $('#g-m').value = p.m; $('#g-mp').value = String(p.mp);
+  renderDerive();
+});
+['#g-n', '#g-t', '#g-m', '#g-mp'].forEach(s => $(s).addEventListener('input', renderDerive));
+$('#b-create').addEventListener('click', create);
+$('#b-destroy').addEventListener('click', () => { if (S.root && S.blobs.has(S.root)) run('destroy()', opDestroy, { cut: takeCut() }); });
+
+function applyPolicy(k, v) { kvhashSetInlineMax(k, v); renderAll(); }
+function kvhashSetInlineMax(k, v) { policy.key = Math.max(0, Math.min(LMASK, k | 0)); policy.val = Math.max(0, Math.min(LMASK, v | 0)); }
+$('#p-k').addEventListener('change', () => applyPolicy(+$('#p-k').value, policy.val));
+$('#p-v').addEventListener('change', () => applyPolicy(policy.key, +$('#p-v').value));
+document.querySelectorAll('[data-pol]').forEach(b => b.addEventListener('click', () => { const [k, v] = b.dataset.pol.split(',').map(Number); applyPolicy(k, v); }));
+$('#b-migrate').addEventListener('click', migrate);
+
+['#o-k', '#o-v', '#o-vn'].forEach(s => $(s).addEventListener('input', renderCalc));
+$('#b-set').addEventListener('click', () => { const k = opKey(), v = opVal(); run(label('set', k, v), () => opSet(k, v), { cut: takeCut() }); });
+$('#b-get').addEventListener('click', () => { const k = opKey(); run(label('get', k), () => opGet(k)); });
+$('#b-del').addEventListener('click', () => { const k = opKey(); run(label('del', k), () => opDel(k), { cut: takeCut() }); });
+$('#o-k').addEventListener('keydown', e => { if (e.key === 'Enter') $('#b-get').click(); });
+$('#b-fill').addEventListener('click', bulk);
+$('#l-hide').addEventListener('change', () => renderLeaf(UI.info));
+
+$('#l-list').addEventListener('click', e => {
+  const r = e.target.closest('.brow'); if (!r) return;
+  UI.sel = { top: UI.sel.top, idx: +r.dataset.idx };
+  renderLeaf(UI.info); renderBucket(UI.info); drawOverview(UI.info);
+});
+$('#l-list').addEventListener('keydown', e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); e.target.closest('.brow')?.click(); } });
+
+const cv = $('#ov'), tip = $('#tip');
+cv.addEventListener('mousemove', ev => {
+  const h = hitOverview(ev), info = UI.info;
+  if (!h || !info || !info.ok) { tip.hidden = true; return; }
+  const s = info.subs[h.top];
+  let txt = info.depth === 2 ? `sub-map ${h.top} (#${s.id})` : 'root';
+  if (h.idx != null && s.buckets[h.idx]) {
+    const bk = s.buckets[h.idx];
+    txt += ` · bucket ${h.idx} · ` + (bk.id ? `#${bk.id} · ${bk.ents.length} entr${bk.ents.length === 1 ? 'y' : 'ies'} · ${bk.used}/${K.MP} B` : 'id 0 (empty)');
+  }
+  tip.textContent = txt; tip.hidden = false;
+  const wr = $('#ov-wrap').getBoundingClientRect();
+  let x = ev.clientX - wr.left + 12, y = ev.clientY - wr.top + 14;
+  if (x + tip.offsetWidth > wr.width) x = Math.max(0, ev.clientX - wr.left - tip.offsetWidth - 8);
+  tip.style.left = x + 'px'; tip.style.top = y + 'px';
+});
+cv.addEventListener('mouseleave', () => { tip.hidden = true; });
+cv.addEventListener('click', ev => {
+  const h = hitOverview(ev); if (!h) return;
+  UI.sel = { top: h.top, idx: h.idx };
+  drawOverview(UI.info); renderLeaf(UI.info); renderBucket(UI.info);
+});
+
+/* hovering anything that names a blob highlights every other mention of it */
+let hlId = null;
+document.addEventListener('mouseover', e => {
+  const el = e.target.closest('[data-blob]');
+  const id = el ? el.dataset.blob : null;
+  if (id === hlId) return;
+  document.querySelectorAll('.hl').forEach(x => x.classList.remove('hl'));
+  hlId = id;
+  if (id) document.querySelectorAll(`[data-blob="${id}"]`).forEach(x => x.classList.add('hl'));
+});
+
+let ovW = 0;
+new ResizeObserver(() => {
+  const w = $('#ov-wrap').clientWidth;
+  if (w !== ovW) { ovW = w; if (UI.info) drawOverview(UI.info); }
+}).observe($('#ov-wrap'));
+const redraw = () => UI.info && drawOverview(UI.info);
+window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', redraw);
+new MutationObserver(redraw).observe(document.documentElement, { attributes: true, attributeFilter: ['data-theme'] });
+
+/* ---- open in a working state: sample entries ---- */
+(function boot() {
+  const p = PRESETS[1];
+  $('#g-n').value = p.n; $('#g-t').value = p.t; $('#g-m').value = p.m; $('#g-mp').value = String(p.mp);
+  renderDerive();
+  run('create', () => opCreate(geoDecl(), 256, 3, false), { noRender: true });
+  kvhashSetInlineMax(24, 40);
+  const sample = [
+    ['wifi/ssid', 'workshop-2g'],
+    ['wifi/psk', 'correct-horse-battery'],
+    ['led/brightness', '72'],
+    ['sensor/temp/offset', '-0.35'],
+    ['ble/name', 'kv-node-07'],
+    ['fw/channel', 'stable'],
+    ['tz', 'Europe/Warsaw'],
+    ['boot/count', '1187'],
+    ['log/level', 'info'],
+    ['cal/accel/xyz', '0.012,-0.004,1.003'],
+    ['net/mqtt/broker', 'mqtts://broker.local:8883'],
+    ['ui/welcome-banner', 'Welcome back. Sensors are calibrated and the last sync finished without errors. Tap to open the dashboard.'],
+    ['certs/device/attestation-intermediate', '-----BEGIN CERTIFICATE-----MIIBszCCAVmgAwIBAgIUQ2k7vZ1yKx0aT3b8m1nR0wCgYIKoZIzj0EAwIwJzElMCMGA1UEAwwca3Ytbm9kZSBhdHRlc3RhdGlvbiBDQSAyMDI2-----END CERTIFICATE-----'],
+  ];
+  for (const [k, v] of sample) run(`set("${k}")`, () => opSet(enc.encode(k), enc.encode(v)), { noRender: true });
+  $('#o-k').value = 'certs/device/attestation-intermediate';
+  $('#o-v').value = 'rotated-2026-10';
+  run('get("certs/device/attestation-intermediate")', () => opGet(enc.encode('certs/device/attestation-intermediate')), { noRender: true });
+  renderAll();
+})();
+</script>
+</body>
+</html>

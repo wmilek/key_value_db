@@ -7,6 +7,10 @@ change as long as the shape's contract holds. Callers must not depend on
 anything in this document (P6); `include/app/lib/containers/shape_map.h` is
 what they may rely on.
 
+An interactive model of this document — geometry derivation, bucket layout,
+spilling and the flash trace of each operation — is
+`doc/interactive/kvhash_internals.html`; open it in a browser.
+
 ---
 
 ## 1. On-flash layout
