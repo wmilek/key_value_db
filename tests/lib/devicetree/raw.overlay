@@ -1,0 +1,12 @@
+/*
+ * The store on the plain partition: no UBI, so the backend defaults to
+ * flash_area. The partition is a plain mapped partition again.
+ */
+&storage_partition {
+	compatible = "zephyr,mapped-partition";
+	/delete-node/ volumes;
+};
+
+&blobdb0 {
+	storage = <&storage_partition>;
+};

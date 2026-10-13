@@ -1,0 +1,59 @@
+# Copyright (c) 2026
+# SPDX-License-Identifier: Apache-2.0
+
+description: |
+  A blob_db store (lib/blob_db).
+
+  "storage" says where the store lives. Pointing it at a UBI volume (a
+  "volumes" child of a "kvdb,ubi" partition) selects the UBI backend by
+  default; pointing it at a plain fixed partition selects the raw flash_area
+  backend. CONFIG_BLOB_DB_BACKEND_* can still override the default: the
+  flash_area backend over a UBI volume uses the partition under it raw, and
+  the UBI backend over a plain partition creates a volume named "blobdb".
+
+  blob_db is a single store: at most one node of this compatible, and the
+  chosen node "kvdb,blob-db" must point at it (Kconfig finds the store's
+  partition through it):
+
+    chosen {
+            kvdb,blob-db = &blobdb0;
+    };
+
+    blobdb0: blob-db {
+            compatible = "kvdb,blob-db";
+            storage = <&blobdb_vol>;
+            automount;
+    };
+
+  The node is a device. With "automount" its init mounts the store before
+  main(), and device_is_ready() reports whether that worked. Without it, the
+  first blob_db call mounts the store. "zephyr,deferred-init" postpones
+  device init until the application calls device_init(), for an
+  application-provisioned UBI key (CONFIG_BLOB_DB_UBI_KEY_APP) that does not
+  exist yet at boot.
+
+compatible: "kvdb,blob-db"
+
+include: base.yaml
+
+properties:
+  storage:
+    type: phandle
+    required: true
+    description: |
+      The UBI volume node (UBI backend) or fixed partition node (flash_area
+      backend) the store lives on.
+
+  automount:
+    type: boolean
+    description: |
+      Mount the store during device init, before main(). Without it the
+      store is mounted by the first blob_db call that needs it.
+
+  no-format:
+    type: boolean
+    description: |
+      Never format a store whose master sectors are both unreadable: mount
+      fails with -EIO instead, and the caller decides with blob_db_format().
+      Sets the default of CONFIG_BLOB_DB_AUTOFORMAT_ON_CORRUPT to n. A
+      virgin (erased) partition is always formatted.

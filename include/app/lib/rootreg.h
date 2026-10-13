@@ -35,16 +35,21 @@ extern "C" {
 	(((uint64_t)(uint32_t)(magic32) << 32) | (uint32_t)(instance32))
 
 /**
- * @brief Bootstrap the registry. Run once after blob_db_mount(), before any
- *        other storage user.
+ * @brief Bootstrap the registry explicitly. Optional.
  *
  * On a virgin store (root exists with an empty payload — the post-format
  * state) this binds id = 1 to an empty registry image. On a store that
  * already holds a valid registry it is a no-op. Idempotent.
  *
+ * No other call needs it: every rootreg operation reads a virgin store as an
+ * empty registry, and the first one that registers a key writes the image.
+ * blob_db mounts itself on first use too, so an application can call
+ * rootreg_get_or_create() straight away. Call this to bootstrap at a moment
+ * of your choosing, or to check early that id = 1 belongs to rootreg.
+ *
  * @retval 0        registry ready
  * @retval -ENOTSUP id = 1 holds a foreign (non-registry) payload; refused
- * @retval -ENODEV  blob_db not mounted
+ * @retval -ENODEV  blob_db was explicitly unmounted
  * @retval -EIO     flash error or corrupt registry image
  */
 int rootreg_init(void);
@@ -54,7 +59,7 @@ int rootreg_init(void);
  *
  * @retval 0        found; *root_id filled
  * @retval -ENOENT  key not registered
- * @retval -ENOTSUP registry not bootstrapped (run rootreg_init())
+ * @retval -ENOTSUP id = 1 holds a foreign (non-registry) payload
  * @retval -EINVAL  key is 0 or root_id is NULL
  */
 int rootreg_get(uint64_t key, uint64_t *root_id);
@@ -70,7 +75,7 @@ int rootreg_get(uint64_t key, uint64_t *root_id);
  *
  * @retval 0        *root_id filled (existing or freshly registered)
  * @retval -ENOSPC  registry is full (CONFIG_ROOTREG_MAX_ROOTS)
- * @retval -ENOTSUP registry not bootstrapped
+ * @retval -ENOTSUP id = 1 holds a foreign (non-registry) payload
  * @retval -EINVAL  key is 0 or root_id is NULL
  * @retval -EIO     id allocation or flash error
  */
@@ -82,7 +87,7 @@ int rootreg_get_or_create(uint64_t key, uint64_t *root_id);
  * @retval 0        registered
  * @retval -EEXIST  key already present
  * @retval -ENOSPC  registry is full
- * @retval -ENOTSUP registry not bootstrapped
+ * @retval -ENOTSUP id = 1 holds a foreign (non-registry) payload
  * @retval -EINVAL  key or root_id is 0
  */
 int rootreg_set(uint64_t key, uint64_t root_id);
@@ -93,7 +98,7 @@ int rootreg_set(uint64_t key, uint64_t root_id);
  *
  * @retval 0        entry removed
  * @retval -ENOENT  key not registered
- * @retval -ENOTSUP registry not bootstrapped
+ * @retval -ENOTSUP id = 1 holds a foreign (non-registry) payload
  * @retval -EINVAL  key is 0
  */
 int rootreg_unregister(uint64_t key);
@@ -107,7 +112,7 @@ typedef int (*rootreg_iter_cb_t)(uint64_t key, uint64_t root_id, void *user);
  *
  * @retval 0        full walk completed
  * @retval other    value the callback returned to stop early
- * @retval -ENOTSUP registry not bootstrapped
+ * @retval -ENOTSUP id = 1 holds a foreign (non-registry) payload
  * @retval -EINVAL  cb is NULL
  */
 int rootreg_iterate(rootreg_iter_cb_t cb, void *user);

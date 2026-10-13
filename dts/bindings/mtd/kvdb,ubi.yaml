@@ -1,0 +1,86 @@
+# Copyright (c) 2026
+# SPDX-License-Identifier: Apache-2.0
+
+description: |
+  A fixed flash partition formatted as a UBI device (zephyr-ubi).
+
+  The node is an ordinary child of a "fixed-partitions" node -- it keeps its
+  partition id and flash_map entry -- with this compatible added. Its UBI
+  volumes are described under a "volumes" child, one node per volume, in the
+  shape of Linux's "linux,ubi" binding:
+
+    ubi0: partition@0 {
+            compatible = "kvdb,ubi";
+            label = "storage";
+            reg = <0x00000000 0x00800000>;
+            spare-lebs = <4>;
+
+            volumes {
+                    blobdb_vol: ubi-volume-blobdb {
+                            volname = "blobdb";
+                    };
+            };
+    };
+
+  On boards whose partitions are "zephyr,mapped-partition" nodes rather than
+  fixed-partitions children (native_sim, for one), keep that compatible
+  second -- it is what makes the node a partition:
+
+    compatible = "kvdb,ubi", "zephyr,mapped-partition";
+
+  A consumer points at a volume node with a phandle (for blob_db, the
+  "storage" property of a "kvdb,blob-db" node). The consumer attaches the
+  device and creates its volume on first use; volumes nothing points at are
+  only documentation.
+
+compatible: "kvdb,ubi"
+
+include: base.yaml
+
+properties:
+  reg:
+    required: true
+    description: |
+      <OFFSET SIZE> of the partition, relative to the parent flash memory,
+      exactly as for any fixed-partitions child.
+
+  label:
+    type: string
+    description: Human readable name of the partition.
+
+  read-only:
+    type: boolean
+    description: Set if the partition is read-only.
+
+  spare-lebs:
+    type: int
+    default: 4
+    description: |
+      LEBs left out of a volume that takes "the rest of the device" (one
+      without a "size"). They give UBI's relocation a block to move onto and
+      absorb blocks retired after a failed write, so neither turns into
+      -ENOSPC once every LEB of the volume is mapped.
+
+child-binding:
+  description: |
+    The "volumes" container. Holds one child node per UBI volume.
+
+  child-binding:
+    description: One UBI volume.
+
+    properties:
+      volname:
+        type: string
+        required: true
+        description: |
+          Volume name, unique within the device (at most
+          UBI_VOLUME_NAME_MAX_LEN characters). The consumer finds the volume
+          by this name and creates it when it is not there.
+
+      size:
+        type: int
+        description: |
+          Volume size in bytes, rounded up to whole LEBs when the volume is
+          created. Absent means the rest of the device, less "spare-lebs".
+          A volume's size is fixed at creation; changing it here does not
+          resize an existing volume.

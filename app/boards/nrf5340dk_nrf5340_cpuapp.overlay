@@ -14,8 +14,30 @@
 		#size-cells = <1>;
 
 		storage_partition: partition@0 {
+			compatible = "kvdb,ubi";
 			label = "storage";
 			reg = <0x00000000 0x00800000>;
+
+			volumes {
+				blobdb_vol: ubi-volume-blobdb {
+					volname = "blobdb";
+				};
+			};
 		};
+	};
+};
+
+/*
+ * The blob_db store on the volume above, mounted before main() runs.
+ */
+/ {
+	chosen {
+		kvdb,blob-db = &blobdb0;
+	};
+
+	blobdb0: blob-db {
+		compatible = "kvdb,blob-db";
+		storage = <&blobdb_vol>;
+		automount;
 	};
 };

@@ -1,0 +1,36 @@
+# Each scenario layers one devicetree variation over base.overlay and checks what the store does from the moment the program starts: whether
+# it is mounted before main(), mounts on first use, waits for device_init(),
+# and which Kconfig defaults the node produced. One program per variation,
+# because the interesting state is the one boot leaves behind.
+#
+# Twister passes these files as DTC_OVERLAY_FILE, which replaces the
+# boards/<board>.overlay lookup, so the base layout is listed here rather than
+# kept under boards/.
+common:
+  tags: [storage, blob_db, devicetree]
+  platform_allow: native_sim
+  integration_platforms:
+    - native_sim
+  extra_dtc_overlay_files:
+    - base.overlay
+tests:
+  lib.devicetree.lazy: {}
+  lib.devicetree.automount:
+    extra_dtc_overlay_files:
+      - automount.overlay
+  lib.devicetree.deferred:
+    extra_dtc_overlay_files:
+      - deferred.overlay
+  lib.devicetree.no_format:
+    extra_dtc_overlay_files:
+      - no_format.overlay
+  lib.devicetree.raw:
+    extra_dtc_overlay_files:
+      - raw.overlay
+  lib.devicetree.fstab:
+    extra_dtc_overlay_files:
+      - fstab.overlay
+    extra_configs:
+      - CONFIG_FILE_SYSTEM=y
+      - CONFIG_BLOBDB_BLOBFS=y
+      - CONFIG_BLOBFS_FS_INTEROP=y

@@ -165,9 +165,14 @@ Reboot recovery: `kvdb_open` → `rootreg_get(ROOTREG_KEY('KVDB',0))` (one read
 of id = 1) → hash root → done. The only persisted "pointer" anyone remembered
 is the integer 1.
 
-Boot ordering: the application (or a `SYS_INIT` hook it provides) calls
-`blob_db_mount()` once, then `rootreg_init()`; interfaces attach lazily on
-their first `open`. No other initialization order exists.
+Boot ordering: devicetree describes the store (a `kvdb,blob-db` node on a UBI
+volume or a partition) and nothing has to be called. With `automount` the
+blob_db device mounts the store before `main()`; without it the first call
+that needs the store mounts it. rootreg bootstraps on its first registration,
+interfaces attach lazily on their first `open`, and a `kvdb,fstab,blobfs`
+node with `automount` mounts blobfs at boot. `blob_db_mount()` and
+`rootreg_init()` remain for callers that want the order explicit
+(`doc/proposals/2026-10-12-devicetree-configuration.md`).
 
 ## 7. Repository layout (target)
 

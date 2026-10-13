@@ -38,18 +38,33 @@
 
 #include <app/lib/blob_db_ubi.h>
 
+#include "blob_db_dt.h"
 #include "blob_db_store.h"
 
 LOG_MODULE_REGISTER(blob_db_store, CONFIG_BLOB_DB_LOG_LEVEL);
 
-#define BLOB_DB_UBI_PARTITION   storage_partition
-#define BLOB_DB_UBI_VOL_NAME    "blobdb"
+/* The volume devicetree gives the store (dts/bindings/mtd/kvdb,ubi.yaml).
+ * When "storage" is a plain partition instead (the backend overridden in
+ * Kconfig), UBI takes the whole partition and the volume gets the defaults
+ * below. */
+#define BLOB_DB_UBI_PARTITION_ID  BLOB_DB_DT_PARTITION_ID
 
-/* LEBs left out of the volume, on top of the three UBI holds back for its
- * volume table. They give relocation a block to move onto and absorb blocks
- * retired after a failed write, so neither turns into -ENOSPC once every LEB
- * of the volume is mapped. */
-#define BLOB_DB_UBI_SPARE_LEBS  4
+#define BLOB_DB_UBI_VOL_NAME                                                \
+	COND_CODE_1(BLOB_DB_DT_ON_UBI_VOLUME,                               \
+		    (DT_PROP(BLOB_DB_DT_STORAGE, volname)), ("blobdb"))
+
+/* Volume size in bytes from devicetree; 0 takes the rest of the device. */
+#define BLOB_DB_UBI_VOL_SIZE                                                \
+	COND_CODE_1(BLOB_DB_DT_ON_UBI_VOLUME,                               \
+		    (DT_PROP_OR(BLOB_DB_DT_STORAGE, size, 0)), (0))
+
+/* LEBs left out of a rest-of-device volume, on top of the three UBI holds
+ * back for its volume table. They give relocation a block to move onto and
+ * absorb blocks retired after a failed write, so neither turns into -ENOSPC
+ * once every LEB of the volume is mapped. */
+#define BLOB_DB_UBI_SPARE_LEBS                                              \
+	COND_CODE_1(BLOB_DB_DT_ON_UBI_VOLUME,                               \
+		    (DT_PROP(BLOB_DB_DT_PARTITION, spare_lebs)), (4))
 
 /* Separates this partition's derived keys from any other partition sealed
  * under the same keying material (struct ubi_config.key_context). */
@@ -252,14 +267,24 @@ static int open_volume(const struct ubi_device_info *dev, uint32_t *leb_count)
 	int rc = ubi_volume_find(g_ubi, BLOB_DB_UBI_VOL_NAME, &g_vol_id);
 
 	if (rc == -ENOENT) {
-		if (dev->free_lebs <= BLOB_DB_UBI_SPARE_LEBS) {
+		uint32_t want = (BLOB_DB_UBI_VOL_SIZE != 0)
+			? DIV_ROUND_UP((uint32_t)BLOB_DB_UBI_VOL_SIZE, dev->leb_size)
+			: 0;
+
+		if (want == 0 && dev->free_lebs <= BLOB_DB_UBI_SPARE_LEBS) {
 			LOG_ERR("device too small: %u free LEBs", dev->free_lebs);
 			return -EINVAL;
+		}
+		if (want > dev->free_lebs) {
+			LOG_ERR("volume of %u LEBs does not fit %u free LEBs",
+				want, dev->free_lebs);
+			return -ENOSPC;
 		}
 
 		const struct ubi_volume_config cfg = {
 			.name = BLOB_DB_UBI_VOL_NAME,
-			.leb_count = dev->free_lebs - BLOB_DB_UBI_SPARE_LEBS,
+			.leb_count = (want != 0)
+				? want : dev->free_lebs - BLOB_DB_UBI_SPARE_LEBS,
 		};
 
 		rc = ubi_volume_create(g_ubi, &cfg, &g_vol_id);
@@ -316,7 +341,7 @@ int blob_db_store_open(struct blob_db_store_geom *geom, bool discard)
 	}
 
 	struct ubi_config config = {
-		.flash_area_id = PARTITION_ID(BLOB_DB_UBI_PARTITION),
+		.flash_area_id = BLOB_DB_UBI_PARTITION_ID,
 		.key_context = g_key_context,
 		.key_context_size = sizeof(g_key_context) - 1,
 		.event_cb = on_event,

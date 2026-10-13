@@ -10,14 +10,23 @@
  * fast wipe: prior blobs vanish, root is re-bound with an empty payload,
  * next allocation restarts at 2, and the boot counter resets to 1.
  *
+ * Nothing here brings the store up. The board's devicetree describes it (the
+ * kvdb,blob-db node in boards/<board>.overlay) and marks it "automount", so
+ * the blob_db device mounts it before main() runs; device_is_ready() reports
+ * whether that worked. Without "automount" the first blob_db call below would
+ * mount it instead.
+ *
  * Run natively with a backing flash file to see the count persist:
  *   ./zephyr.exe --flash=/tmp/blob.bin
  */
+
+#include <errno.h>
 
 #include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
 
 #include <app/lib/blob_db.h>
+#include <app/lib/blob_db_device.h>
 
 #include <zephyr/app_version.h>
 
@@ -33,16 +42,18 @@ int main(void)
 {
 	printk("Zephyr Key-Value DB %s\n", APP_VERSION_STRING);
 
-	int rc = blob_db_mount();
-	if (rc < 0) {
-		LOG_ERR("blob_db_mount failed: %d", rc);
+	int rc;
+
+	if (!device_is_ready(BLOB_DB_DEVICE)) {
+		LOG_ERR("blob_db did not mount at boot");
+		rc = -ENODEV;
 		goto out;
 	}
 
 	uint32_t boot_count;
 	size_t got;
 
-	/* Root is guaranteed live after mount; distinguish virgin from used
+	/* Root is guaranteed live once mounted; distinguish virgin from used
 	 * by the payload size — format() leaves it empty. */
 	rc = blob_db_get(BLOB_DB_ROOT_ID, &boot_count, sizeof(boot_count), &got);
 	if (rc < 0) {

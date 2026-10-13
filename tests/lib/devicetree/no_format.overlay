@@ -1,0 +1,6 @@
+/* Refuse to format an unreadable store: CONFIG_BLOB_DB_AUTOFORMAT_ON_CORRUPT
+ * defaults to n.
+ */
+&blobdb0 {
+	no-format;
+};

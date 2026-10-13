@@ -536,11 +536,12 @@ the next compaction.
 ## 7. Kconfig
 
 ```
-BLOB_DB                        bool, select FLASH, FLASH_MAP, CRC
-BLOB_DB_PARTITION_LABEL        string, default "storage"
+BLOB_DB                        bool, default y if a kvdb,blob-db node is enabled
+                               # the partition comes from that node's "storage"
 BLOB_DB_MAX_PAYLOAD_LEN        int, default 256, range 1 65535  # geometry checked at mount
 BLOB_DB_SECTOR_BUF_SIZE        int, default 4096
-BLOB_DB_AUTOFORMAT_ON_CORRUPT  bool, default y   # see §3.1
+BLOB_DB_AUTOFORMAT_ON_CORRUPT  bool, default y; n with "no-format"   # see §3.1
+BLOB_DB_INIT_PRIORITY          int, default 90  # the kvdb,blob-db device, POST_KERNEL
 BLOB_DB_LARGE_PAYLOADS         bool, default n   # segmented objects (§3.5)
 BLOB_DB_MAX_OBJECT_LEN         int, default 131072   # validated at mount
 BLOB_DB_MAX_SEGMENTS           int, default 128      # 16 B of .bss each

@@ -47,6 +47,33 @@ ZTEST(rootreg, test_virgin_bootstrap_and_idempotent_init)
 	zassert_ok(rootreg_init());
 }
 
+/* rootreg_init() is optional: a virgin store (root bound empty) reads as an
+ * empty registry, read-only calls leave it untouched, and the first
+ * registration bootstraps it (doc/proposals/2026-10-12-devicetree-
+ * configuration.md §3.5). */
+ZTEST(rootreg, test_virgin_store_needs_no_init)
+{
+	uint8_t probe[8];
+	size_t got;
+	uint64_t id, again;
+
+	zassert_ok(blob_db_format());   /* virgin again, and no rootreg_init() */
+	zassert_ok(blob_db_get(BLOB_DB_ROOT_ID, probe, sizeof(probe), &got));
+	zassert_equal(got, 0, "format must leave the root empty");
+
+	zassert_equal(rootreg_get(KEY_A, &id), -ENOENT);
+	zassert_equal(rootreg_unregister(KEY_A), -ENOENT);
+	zassert_ok(blob_db_get(BLOB_DB_ROOT_ID, probe, sizeof(probe), &got));
+	zassert_equal(got, 0, "a call that changes nothing must not bootstrap");
+
+	zassert_ok(rootreg_get_or_create(KEY_A, &id));
+	zassert_ok(rootreg_get(KEY_A, &again));
+	zassert_equal(id, again);
+	zassert_ok(blob_db_size(BLOB_DB_ROOT_ID, &got));
+	zassert_true(got > 0, "the first registration must write the registry");
+	zassert_ok(rootreg_init(), "init on a bootstrapped registry is a no-op");
+}
+
 /* §10.2 — foreign id 1: refuse with -ENOTSUP and leave the payload alone. */
 ZTEST(rootreg, test_foreign_root_refused)
 {

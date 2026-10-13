@@ -120,10 +120,12 @@ All mutations rewrite the registry image in RAM and commit with **one**
 
 ## 6. Bootstrap — how id = 1 comes to exist
 
-Run once after `blob_db_mount()`, before any other storage user. Mount
-guarantees id = 1 exists (L1 root convention, D7): on a virgin or freshly
-formatted store it is bound to an **empty payload**, so `get(1)` never
-returns `-ENOENT` and no allocation step is involved:
+No call is required. Every operation reads a virgin store — id = 1 bound to
+an **empty payload**, the L1 root convention (D7) — as an empty registry, and
+read-only operations leave it so. The first operation that registers a key
+writes the image, and that write is the bootstrap. `rootreg_init()` remains as
+an explicit, idempotent way to do it at a moment of the application's
+choosing, or to check early that id = 1 belongs to rootreg:
 
 ```
 rootreg_init():
@@ -134,8 +136,10 @@ rootreg_init():
     else:                                    → -ENOTSUP (foreign payload; refuse)
 ```
 
-A crash before the claiming `update` leaves the empty payload untouched; the
-next boot repeats the sequence — idempotent, no residue possible. After this
+`rootreg_get_or_create()` and `rootreg_set()` on a virgin store follow the
+same path, writing the image with their entry already in it. A crash before
+the claiming `update` leaves the empty payload untouched; the next boot repeats
+the sequence — idempotent, no residue possible. After this
 point, id = 1 holds the registry image for the lifetime of the store.
 
 ## 7. `get_or_create` — the entry is the creation intent

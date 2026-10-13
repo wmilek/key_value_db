@@ -1,0 +1,3 @@
+# Devicetree vendor prefixes defined by this module, one per line:
+# <prefix><TAB><what it names>. Zephyr reads this file from every dts_root.
+kvdb	key_value_db (this repository): blob_db, its UBI layout and blobfs

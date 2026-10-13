@@ -253,9 +253,10 @@ static int sb_commit(struct persondb *db)
  *
  * Two hazards come with it, and the app can detect neither:
  *
- *  - It names `storage_partition` directly, because that is what the
- *    flash_area backend hardcodes. CONFIG_BLOB_DB_PARTITION_LABEL looks like
- *    the right thing to honour instead and is never read by anything (B11).
+ *  - It names `storage_partition` directly. blob_db takes its partition from
+ *    the devicetree (the kvdb,blob-db node's "storage"), which this app's
+ *    overlays point at storage_partition; nothing checks that the two agree
+ *    (B11, now that CONFIG_BLOB_DB_PARTITION_LABEL is gone).
  *  - On CONFIG_BLOB_DB_BACKEND_UBI the answer is simply wrong: blob_db is on a
  *    UBI volume over a *different* partition, its erase unit is a UBI LEB
  *    rather than a flash sector, and UBI reserves PEBs the raw partition size

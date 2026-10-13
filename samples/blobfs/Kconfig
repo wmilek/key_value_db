@@ -1,0 +1,12 @@
+# blobfs sample — Kconfig entry point.
+#
+# Copyright (c) 2026
+# SPDX-License-Identifier: Apache-2.0
+
+menu "Zephyr"
+source "Kconfig.zephyr"
+endmenu
+
+module = SAMPLE_BLOBFS
+module-str = SAMPLE_BLOBFS
+source "subsys/logging/Kconfig.template.log_config"

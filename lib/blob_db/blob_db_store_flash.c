@@ -13,11 +13,15 @@
 #include <zephyr/logging/log.h>
 #include <zephyr/storage/flash_map.h>
 
+#include "blob_db_dt.h"
 #include "blob_db_store.h"
 
 LOG_MODULE_REGISTER(blob_db_store, CONFIG_BLOB_DB_LOG_LEVEL);
 
-#define BLOB_DB_PARTITION_ID  PARTITION_ID(storage_partition)
+/* The partition devicetree gives the store. Over a UBI volume (the backend
+ * overridden in Kconfig) that is the UBI device's partition, used raw: the
+ * same bytes, laid out by blob_db instead of UBI. */
+#define BLOB_DB_PARTITION_ID  BLOB_DB_DT_PARTITION_ID
 
 static const struct flash_area *g_fa;
 static size_t g_peb_size;

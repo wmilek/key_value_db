@@ -55,21 +55,41 @@ struct rr_image {
 
 /* Read + validate the registry image from id = 1.
  *
- * Returns 0 with the parsed image, -ENOTSUP if id = 1 does not hold a valid
- * v1 registry (empty root = never bootstrapped; foreign bytes = some other
- * owner of id 1 — either way rootreg must not touch it), or a blob_db error.
+ * An EMPTY root payload is the virgin store (blob_db binds id 1 empty at
+ * format): it reads as an empty registry, and *virgin (when given) is set, so
+ * every operation works without rootreg_init() having run first — the first
+ * mutation writes the image and that is the bootstrap.
+ *
+ * Returns 0 with the parsed image, -ENOTSUP if id = 1 holds something that
+ * is not a v1 registry (a foreign owner of id 1 — rootreg must not touch
+ * it), or a blob_db error.
  */
-static int rr_load(struct rr_image *img)
+static int rr_load(struct rr_image *img, bool *virgin)
 {
 	uint8_t buf[RR_IMAGE_MAX];
 	size_t got;
 	int rc = blob_db_get(BLOB_DB_ROOT_ID, buf, sizeof(buf), &got);
 
+	if (virgin) {
+		*virgin = false;
+	}
+	if (rc == -ENOMEM) {
+		return -ENOTSUP;   /* larger than any registry: foreign */
+	}
 	if (rc < 0) {
 		return rc;
 	}
+	if (got == 0) {
+		memset(img, 0, sizeof(*img));
+		memcpy(img->hdr.magic, RR_MAGIC, 4);
+		img->hdr.version = RR_VERSION;
+		if (virgin) {
+			*virgin = true;
+		}
+		return 0;
+	}
 	if (got < sizeof(struct rr_hdr)) {
-		return -ENOTSUP;   /* empty (not bootstrapped) or truncated */
+		return -ENOTSUP;   /* truncated or foreign */
 	}
 
 	memcpy(&img->hdr, buf, sizeof(img->hdr));
@@ -116,39 +136,21 @@ static int rr_find(const struct rr_image *img, uint64_t key)
 int rootreg_init(void)
 {
 	struct rr_image img;
-	int rc = rr_load(&img);
+	bool virgin;
+	int rc = rr_load(&img, &virgin);
 
-	if (rc == 0) {
+	if (rc < 0) {
+		if (rc == -ENOTSUP) {
+			LOG_ERR("id 1 holds a foreign payload; refusing to bootstrap");
+		}
+		return rc;
+	}
+	if (!virgin) {
 		LOG_DBG("registry ready (%u roots)", img.hdr.count);
 		return 0;
 	}
-	if (rc != -ENOTSUP) {
-		return rc;
-	}
 
-	/* -ENOTSUP from rr_load covers two cases that must diverge here:
-	 * an EMPTY root payload is the virgin signal (root always exists
-	 * after format, bound empty — bootstrap now); any non-empty payload
-	 * that fails validation belongs to a foreign owner of id 1 and must
-	 * not be overwritten. */
-	uint8_t probe[sizeof(struct rr_hdr)];
-	size_t got;
-
-	rc = blob_db_get(BLOB_DB_ROOT_ID, probe, sizeof(probe), &got);
-	if (rc == -ENOMEM || (rc == 0 && got > 0)) {
-		LOG_ERR("id 1 holds a foreign payload; refusing to bootstrap");
-		return -ENOTSUP;
-	}
-	if (rc < 0) {
-		return rc;
-	}
-
-	struct rr_image fresh = {
-		.hdr = { .version = RR_VERSION, .count = 0 },
-	};
-
-	memcpy(fresh.hdr.magic, RR_MAGIC, 4);
-	rc = rr_store(&fresh);   /* one atomic bind — virgin bootstrap done */
+	rc = rr_store(&img);   /* one atomic bind — virgin bootstrap done */
 	if (rc < 0) {
 		return rc;
 	}
@@ -164,7 +166,7 @@ int rootreg_get(uint64_t key, uint64_t *root_id)
 	}
 
 	struct rr_image img;
-	int rc = rr_load(&img);
+	int rc = rr_load(&img, NULL);
 
 	if (rc < 0) {
 		return rc;
@@ -186,7 +188,7 @@ int rootreg_get_or_create(uint64_t key, uint64_t *root_id)
 	}
 
 	struct rr_image img;
-	int rc = rr_load(&img);
+	int rc = rr_load(&img, NULL);
 
 	if (rc < 0) {
 		return rc;
@@ -232,7 +234,7 @@ int rootreg_set(uint64_t key, uint64_t root_id)
 	}
 
 	struct rr_image img;
-	int rc = rr_load(&img);
+	int rc = rr_load(&img, NULL);
 
 	if (rc < 0) {
 		return rc;
@@ -258,7 +260,7 @@ int rootreg_unregister(uint64_t key)
 	}
 
 	struct rr_image img;
-	int rc = rr_load(&img);
+	int rc = rr_load(&img, NULL);
 
 	if (rc < 0) {
 		return rc;
@@ -285,7 +287,7 @@ int rootreg_iterate(rootreg_iter_cb_t cb, void *user)
 	}
 
 	struct rr_image img;
-	int rc = rr_load(&img);
+	int rc = rr_load(&img, NULL);
 
 	if (rc < 0) {
 		return rc;

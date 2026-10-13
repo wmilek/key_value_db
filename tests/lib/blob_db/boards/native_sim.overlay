@@ -13,5 +13,31 @@
 };
 
 &storage_partition {
+	/* A UBI device with one volume, which blob_db lives on. Keep
+	 * "zephyr,mapped-partition": it is what makes the node a partition on
+	 * native_sim.
+	 */
+	compatible = "kvdb,ubi", "zephyr,mapped-partition";
 	reg = <0x00800000 DT_SIZE_M(8)>;
+
+	volumes {
+		blobdb_vol: ubi-volume-blobdb {
+			volname = "blobdb";
+		};
+	};
+};
+
+/*
+ * The blob_db store on the volume above. No "automount": the suite mounts,
+ * formats and unmounts the store itself.
+ */
+/ {
+	chosen {
+		kvdb,blob-db = &blobdb0;
+	};
+
+	blobdb0: blob-db {
+		compatible = "kvdb,blob-db";
+		storage = <&blobdb_vol>;
+	};
 };

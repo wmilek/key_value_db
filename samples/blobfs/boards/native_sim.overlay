@@ -1,0 +1,57 @@
+/*
+ * The whole storage stack of this sample, described rather than coded:
+ *
+ *   storage_partition     8 MB of sim-flash, formatted as a UBI device
+ *     └ blobdb_vol        a UBI volume
+ *         └ blobdb0       the blob_db store on that volume
+ *             └ /blob     blobfs, mounted at boot by the fstab node
+ *
+ * main() then uses ordinary fs_*() calls and never calls an init function.
+ * Same 16 MB sim-flash / 8 MB storage_partition layout as the rest of the
+ * repository.
+ */
+
+&flashcontroller0 {
+	reg = <0x00000000 DT_SIZE_M(16)>;
+};
+
+&flash0 {
+	reg = <0x00000000 DT_SIZE_M(16)>;
+};
+
+&storage_partition {
+	/* Keep "zephyr,mapped-partition": it is what makes the node a
+	 * partition on native_sim.
+	 */
+	compatible = "kvdb,ubi", "zephyr,mapped-partition";
+	reg = <0x00800000 DT_SIZE_M(8)>;
+
+	volumes {
+		blobdb_vol: ubi-volume-blobdb {
+			volname = "blobdb";
+		};
+	};
+};
+
+/ {
+	chosen {
+		kvdb,blob-db = &blobdb0;
+	};
+
+	/* No "automount" here: mounting blobfs mounts the store under it. */
+	blobdb0: blob-db {
+		compatible = "kvdb,blob-db";
+		storage = <&blobdb_vol>;
+	};
+
+	fstab {
+		compatible = "zephyr,fstab";
+
+		blobfs0: blobfs {
+			compatible = "kvdb,fstab,blobfs";
+			mount-point = "/blob";
+			db = <&blobdb0>;
+			automount;
+		};
+	};
+};

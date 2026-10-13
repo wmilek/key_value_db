@@ -134,8 +134,10 @@ choice BLOB_DB_BACKEND
     BLOB_DB_BACKEND_UBI           dynamic UBI volume        (default)
 ```
 
-The partition is named by `CONFIG_BLOB_DB_PARTITION_LABEL` under either
-backend.
+The partition comes from devicetree under either backend: the `storage`
+phandle of the `kvdb,blob-db` node names a UBI volume (whose `kvdb,ubi`
+partition UBI attaches) or a plain partition. The choice defaults from what it
+names (`doc/proposals/2026-10-12-devicetree-configuration.md` §3.3).
 
 ## 6. What an L0 provider must never do
 

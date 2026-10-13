@@ -1,8 +1,8 @@
 # kvhash sample — the Map shape, one operation at a time
 
 The smallest complete program that uses `kvhash`, the L2 hash-map container:
-it opens the storage stack, creates a map, and then performs each `map_ops`
-operation once, printing the call and its return code.
+it creates a map and then performs each `map_ops` operation once, printing the
+call and its return code.
 
 Nothing here is timed. For throughput numbers see
 [`app_perf_kvdb/`](../../app_perf_kvdb).
@@ -23,8 +23,16 @@ map->get(root, key, strlen(key), buf, sizeof(buf), &len);
 map->del(root, key, strlen(key));
 ```
 
+Bringing the storage stack up is not one of the caller's jobs. The board
+overlay ([`boards/native_sim.overlay`](boards/native_sim.overlay)) describes
+the store — a UBI volume on the storage partition, and a `kvdb,blob-db` node
+on top of it — and the first blob_db call mounts it. The root registry needs
+no init either: a fresh store reads as an empty registry. Step 1 therefore
+calls nothing. Adding `automount;` to the `kvdb,blob-db` node mounts the store
+before `main()` instead, as [`app/`](../../app) does.
+
 That leaves the caller two jobs beyond the four operations, and they are the
-first two steps of the sample:
+subject of step 2:
 
 1. **Where the root id comes from.** `rootreg_get_or_create()` maps a
    compile-time key (`ROOTREG_KEY('SMPL', 0)`) to a root id, so the next boot
@@ -64,10 +72,9 @@ Expected output (abridged):
 ```
 kvhash sample 1.0.0 — the L2 Map shape, one operation at a time
 
-[1] bring the storage stack up
-    blob_db_mount() -> 0
+[1] no bring-up: the board's devicetree describes the store
+    nothing to call: the first call below mounts the store
     blob_db_erase_all() -> 0  (start from an empty store)
-    rootreg_init() -> 0
 
 [2] find the map's root id, and create the map the first time
     rootreg_get_or_create('SMPL':0) -> 0, root id 2
