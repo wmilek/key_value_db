@@ -33,6 +33,13 @@ timings do not transfer in either direction — see §5e.
 **5–6× slower**, because ~8 000 extra blobs lengthen blob_db's per-lookup slot
 walk for every map in the store. A net loss for this read-heavy app.
 
+**§5h fills 10 000 persons in 1 000-person steps, with `ATOMIC_REPLACE` off and
+on** (flash in high-performance mode, #49). Both modes do the same 1 277
+compactions, but atomic replace does them with **one erase each instead of five**:
+6 456 → 1 348 erases. The fill runs **2.19× faster** overall (68.6 → 31.3 min) and
+2.70× faster in the last step. The per-person cost still grows as the store fills:
+4.8× from the first step to the last with atomic replace, 13× without.
+
 **`blob_db` now defaults to the UBI backend; §4a, §5 and §5b are
 `flash_area`.** §5c measures the default's *timings* on the same board: reads
 cost ~1.9× more, `fill` is 1.10× *cheaper*, and the `A4` floor improves
@@ -1394,6 +1401,107 @@ credentials; flash-operation counts are within 2 % of the old-fork run.
   `ubi_leb_change()` instead of five block erases (master, scratch, bucket,
   scratch, master), about six compactions' worth of erases over this run.
   The I/O counters are byte-identical with and without it.
+
+## 5h. Filling to 10 000 persons in 1 000-person steps, `ATOMIC_REPLACE` off and on
+
+§5f filled 10 000 persons in one run, and §5g measured `ATOMIC_REPLACE` at
+1 000 persons, where the store barely compacts. Neither shows how the fill cost
+grows as the store fills, or what atomic replace does once compaction
+dominates. These two runs do.
+
+### Setup
+
+- **Code:**
+  - Atomic off: key_value_db `fd974dc`.
+  - Atomic on: `579d9df`, built with `-DCONFIG_BLOB_DB_UBI_ATOMIC_REPLACE=y`.
+  - The two have identical `lib/`, `include/` and `app_cbor_persondb/`; `579d9df` only adds the power-cut tests of #48.
+- **Zephyr:** `4a405846193f` plus the `nrf_qspi_nor` patch from #49, so the
+  MX25R6435F runs in **high-performance mode**.
+  - That patch changes flash timing, so these numbers are **not comparable**
+    with §5–§5g, which ran in the flash's default ultra-low-power mode.
+- **Build:** shell frontend (`CONFIG_APP_CBOR_PERSONDB_FRONTEND_SHELL=y`),
+  `CONFIG_APP_CBOR_PERSONDB_N_PERSONS=10000`, default UBI backend.
+- **Store:** freshly created on a raw-erased partition. People map depth 2,
+  961 buckets; credential map depth 2, 256 buckets.
+- **Procedure:** ten `persondb fill 1000` commands. Before each one
+  `blob_db iostats reset`; after each one `persondb stat`, `blob_db iostats`
+  and `blob_db stats`. So the I/O columns below are per step, and the space
+  columns are the state after the step.
+- **Boards:** nRF5340-DK (PCA10095). Atomic off ran on the board with J-Link
+  SN 960115021, atomic on on SN 1050091053. Both are in high-performance mode.
+
+### Per step
+
+| persons after | `fill` off | `fill` on | speed-up | compactions (total) | live / garbage / free | erases off → on | written off → on (MB) |
+|--:|--:|--:|--:|--:|---|--:|--:|
+| 1 000 | 74.7 s | 74.5 s | 1.00× | 0 | 5.9 / 9.2 / 84.9 % | 70 → 70 | 1.16 → 1.16 |
+| 2 000 | 84.4 s | 82.8 s | 1.02× | 0 | 11.6 / 28.8 / 59.7 % | 1 → 1 | 1.95 → 1.95 |
+| 3 000 | 157.0 s | 135.5 s | 1.16× | 12 | 17.2 / **52.6** / 30.2 % | 60 → 12 | 3.19 → 3.05 |
+| 4 000 | 311.8 s | 166.9 s | 1.87× | 105 | 22.8 / 34.3 / 42.9 % | 465 → 93 | 6.28 → 5.04 |
+| 5 000 | 291.1 s | 147.2 s | 1.98× | 197 | 28.5 / 34.8 / 36.7 % | 460 → 92 | 7.98 → 6.42 |
+| 6 000 | 368.8 s | 169.5 s | 2.18× | 319 | 34.1 / 34.4 / 31.5 % | 610 → 122 | 10.78 → 8.26 |
+| 7 000 | 472.1 s | 205.4 s | 2.30× | 483 | 39.7 / 30.4 / 29.9 % | 820 → 164 | 14.69 → 10.65 |
+| 8 000 | 599.2 s | 239.8 s | 2.50× | 685 | 45.3 / 27.6 / 27.1 % | 1 010 → 202 | 18.84 → 13.16 |
+| 9 000 | 785.0 s | 294.7 s | 2.66× | 947 | 50.9 / 23.2 / 25.9 % | 1 310 → 262 | 25.17 → 16.82 |
+| 10 000 | 969.5 s | 359.1 s | 2.70× | 1 277 | 56.6 / 22.2 / 21.3 % | 1 650 → 330 | 33.29 → 21.38 |
+| **total** | **68.6 min** | **31.3 min** | **2.19×** | 1 277 | | **6 456 → 1 348** | **123.3 → 87.9** |
+
+Notes on the columns:
+- Space shares are of blob_db's 7 716 256 B data area. Erases are blob_db
+  store erases of 65 408 B each.
+- The compaction counts and live/garbage/free come from the atomic-off run.
+  The atomic-on run's are identical at every step.
+- So are the per-step read counts, for example 354 747 reads (40.1 MB) in the
+  last step in both runs.
+
+Both runs end with `persondb verify` → `VERIFY PASS` (256 persons, 660 cards).
+The store holds 10 000 of 10 000 persons and 24 868 credentials, 0 overflows,
+1 268 live ids. Live content is 4 333 726 B = 51.6 % of the partition.
+
+### What it shows
+
+- **Atomic replace changes the price of a compaction, not how many there
+  are.** Compaction count, space usage and reads are the same in both modes
+  at every step.
+  - In every step past 3 000 the erase count is exactly **one per compaction
+    with atomic replace, against five without**. For example, 330 compactions
+    cost 330 erases instead of 1 650 in the last step.
+  - The atomic replace also writes the compacted image once instead of
+    staging it through the scratch sector, so writes drop by 20–36 % per step from 4 000 persons on.
+- **The speed-up grows with fill**, from 1.16× at 3 000 to 2.70× at 10 000.
+  As the store fills, compactions per step rise from 93 to 330, so the erases
+  that atomic replace removes become a growing share of each step.
+  - §5g's 19 % at 1 000 persons came from a store with only six compactions.
+- **Below about 2 000 persons nothing compacts**, and the two modes are equal.
+  Garbage peaks at 52.6 % of the data area at 3 000 persons, just before
+  compaction starts. From there it settles at 22–35 %.
+- **Wear: about 4.8× fewer erases.** A fill to 10 000 costs about 11 store
+  erases per volume block with atomic replace, against about 53 without. Each
+  of these is a whole 64 KB sector.
+- **Fill cost per person still grows as the store fills**, from 75 ms in the
+  first step to 359 ms in the last with atomic replace (4.8×), and to 970 ms
+  without (13×).
+  - This is §5f's finding again: write cost tracks compaction, which tracks
+    how full the store is.
+  - Atomic replace takes about 60 % off the late steps and flattens the curve,
+    but doesn't remove it.
+- **Final layout, `blob_db buckets`:** 10–11 ids per bucket. 20 of 118
+  buckets are over 90 % used, and the fullest has 56 B free. Every full bucket
+  still holds 26–34 KB of reclaimable garbage, so nothing is stuck.
+  - Compactions per bucket range from 5 to 19. That's uneven wear at the
+    blob_db level, which UBI's wear-leveling has to absorb underneath.
+
+### Not covered
+
+- One run per mode. Run-to-run agreement at this scale was not re-measured;
+  §5f's two runs agreed within 2–3 % on reads.
+- The two modes ran on different boards. Both boards were checked for the same
+  flash mode, and step 1–2 times agree within 2 %. Nothing else here depends
+  on the board.
+- `put`/`check` latencies (`persondb bench`) and `mutate` were not run on
+  these stores.
+- Power-loss behaviour of atomic replace is covered on `native_sim` by
+  `tests/lib/blob_db/src/power_cut.c` (#48), not on hardware.
 
 ## 6. What the numbers say
 
