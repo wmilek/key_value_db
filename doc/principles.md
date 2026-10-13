@@ -26,6 +26,13 @@ contract.
 O(1) steady-state RAM per module: no per-blob/key/node RAM, no caches, no
 mount-time index rebuild. State is re-read from flash on demand.
 
+**One opt-in exception:** `CONFIG_BLOB_DB_SLOT_INDEX` keeps an id → slot
+offset table in RAM (`doc/impl/l1_bucketlog.md` §5.4a). It is off by default,
+fixed in size by Kconfig rather than growing with the store, filled by the scan
+mount already does, and a hint rather than state: a lost or full index costs
+speed, never correctness. It exists because the measured alternative, walking
+every slot on every lookup, dominates read cost on large erase blocks.
+
 ## P4 — Configurable via Kconfig
 
 Every module above the core has its own symbol; disabled = zero flash/RAM.

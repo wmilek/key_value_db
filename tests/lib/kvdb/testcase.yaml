@@ -3,3 +3,12 @@ common:
   platform_allow: native_sim
 tests:
   lib.kvdb: {}
+  # The same suite over blob_db's RAM slot index, each indexed answer
+  # cross-checked against the walk.
+  lib.kvdb.slot_index:
+    extra_configs:
+      - CONFIG_BLOB_DB_SLOT_INDEX=y
+      # native_sim's 4 KB erase blocks make about 2 000 buckets.
+      - CONFIG_BLOB_DB_SLOT_INDEX_MAX_BUCKETS=2048
+      - CONFIG_BLOB_DB_SLOT_INDEX_VERIFY=y
+      - CONFIG_ASSERT=y
