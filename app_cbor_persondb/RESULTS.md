@@ -1491,6 +1491,46 @@ The store holds 10 000 of 10 000 persons and 24 868 credentials, 0 overflows,
   - Compactions per bucket range from 5 to 19. That's uneven wear at the
     blob_db level, which UBI's wear-leveling has to absorb underneath.
 
+### The 8 000-person benchmark, three builds
+
+The default benchmark frontend at 8 000 persons gives the same comparison with
+`persondb bench` latencies. Each build ran on a freshly erased partition. Same
+Zephyr, flash mode and boards as above:
+- **atomic off:** main `fd974dc`, board SN 960115021.
+- **atomic on:** main `579d9df` with `-DCONFIG_BLOB_DB_UBI_ATOMIC_REPLACE=y`,
+  board SN 960115021.
+- **#45:** the `blob_db_maintain()` PR at `ed98e59`, merged with main
+  `fd974dc`, board SN 1050091053. That PR changes the default of
+  `BLOB_DB_UBI_ATOMIC_REPLACE` to `y`, so this build had atomic replace on
+  without any extra flag.
+
+| phase | atomic off | atomic on | #45 (atomic by default) |
+|---|--:|--:|--:|
+| `fill` 8 000 | > 64 min* | **34.4 min** | 33.7 min |
+| `mutate` (64 assigned) | 46.0 s | 29.1 s | 28.6 s |
+| `check` | 15.58 ms | 15.02 ms | 14.91 ms |
+| `byid` | 9.17 ms | 9.14 ms | 9.11 ms |
+| `miss` | 6.83 ms | 6.34 ms | 6.24 ms |
+| **`put`** | **1 165.6 ms** | **533.2 ms** | 523.4 ms |
+| `put`, flash bytes over 200 ops | 29.4 MB | 13.4 MB | 13.4 MB |
+| `cbor` (control) | 0.972 ms | 0.970 ms | 0.934 ms |
+
+All three runs end with `VERIFY PASS` twice, 19 969 credentials and 0
+overflows.
+
+\* The atomic-off fill hit the capture's 3 000 s limit at about 7 170 persons.
+A reset then resumed it, and the remaining 832 persons took 835 s more. That
+run's `bench` figures were taken on the completed store after the resume.
+
+- **`put` is 2.19× faster with atomic replace**: the same 863 store
+  operations, but 13.4 MB of flash traffic instead of 29.4 MB. That matches
+  the fill speed-up above.
+- **Reads don't change.** `check`, `byid` and `miss` are within 0–8 %, and
+  their flash operation counts match to within 11 %.
+- **#45 matches "atomic on" to within 2 % on every flash phase**, with byte-identical flash I/O
+  in `bench`. Its gain over main comes from the default change, not from
+  `blob_db_maintain()`.
+
 ### Not covered
 
 - One run per mode. Run-to-run agreement at this scale was not re-measured;
