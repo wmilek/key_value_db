@@ -38,6 +38,32 @@ extern "C" {
  * and unmounting releases only blobfs, leaving blob_db mounted for whatever
  * else shares it (kvdb, for instance).
  *
+ * @section blobfs_fs_fstab Mounting from devicetree
+ *
+ * Like littlefs, the mount can be described in devicetree instead
+ * (dts/bindings/fs/kvdb,fstab,blobfs.yaml), and with `automount` it is
+ * mounted during boot, so `main()` calls nothing:
+ *
+ * ```dts
+ * fstab {
+ *         compatible = "zephyr,fstab";
+ *         blobfs0: blobfs {
+ *                 compatible = "kvdb,fstab,blobfs";
+ *                 mount-point = "/blob";
+ *                 db = <&blobdb0>;
+ *                 automount;
+ *         };
+ * };
+ * ```
+ *
+ * The driver defines the node's `struct fs_mount_t`; reach it with
+ * `FS_FSTAB_DECLARE_ENTRY(DT_NODELABEL(blobfs0))` and
+ * `&FS_FSTAB_ENTRY(DT_NODELABEL(blobfs0))` to mount it yourself (without
+ * `automount`) or to unmount it. `read-only` is enforced by the VFS;
+ * `no-format` belongs on the `kvdb,blob-db` node, not here. Automount runs
+ * at the APPLICATION init level and only logs a failure, as littlefs does;
+ * `fs_stat()` on the mount point tells whether it is there.
+ *
  * @section blobfs_fs_scope What the driver supports
  *
  * Everything a file needs: `fs_open` (with `FS_O_CREATE`, `FS_O_APPEND`,

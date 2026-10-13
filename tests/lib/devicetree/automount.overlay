@@ -1,0 +1,4 @@
+/* The store mounts during device init, before main(). */
+&blobdb0 {
+	automount;
+};

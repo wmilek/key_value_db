@@ -675,3 +675,60 @@ static int blobfs_fs_register(void)
 }
 
 SYS_INIT(blobfs_fs_register, POST_KERNEL, CONFIG_FILE_SYSTEM_INIT_PRIORITY);
+
+/* fstab entries (dts/bindings/fs/kvdb,fstab,blobfs.yaml), littlefs-style: one
+ * struct fs_mount_t per node, named FS_FSTAB_ENTRY(node_id), mounted below
+ * when the node says "automount".
+ */
+#define DT_DRV_COMPAT kvdb_fstab_blobfs
+
+BUILD_ASSERT(DT_NUM_INST_STATUS_OKAY(DT_DRV_COMPAT) <= 1,
+	     "blobfs supports one mount: at most one kvdb,fstab,blobfs node");
+
+#define BLOBFS_FSTAB_DEFINE(inst)                                              \
+	BUILD_ASSERT(!DT_INST_PROP(inst, disk_access),                         \
+		     "kvdb,fstab,blobfs: disk-access is not supported");       \
+	BUILD_ASSERT(DT_SAME_NODE(DT_INST_PHANDLE(inst, db),                   \
+				  DT_CHOSEN(kvdb_blob_db)),                    \
+		     "kvdb,fstab,blobfs: 'db' must be the chosen kvdb,blob-db"); \
+	/* Mounting at boot would mount blob_db too, before the application \
+	 * has called device_init() to say the store may be opened.          \
+	 */                                                                    \
+	BUILD_ASSERT(!(DT_INST_PROP(inst, automount) &&                        \
+		       DT_PROP_OR(DT_INST_PHANDLE(inst, db),                   \
+				  zephyr_deferred_init, 0)),                   \
+		     "kvdb,fstab,blobfs: automount needs a blob_db without "   \
+		     "zephyr,deferred-init");                                  \
+	struct fs_mount_t FS_FSTAB_ENTRY(DT_DRV_INST(inst)) = {                \
+		.type = BLOBFS_FS_TYPE,                                        \
+		.mnt_point = DT_INST_PROP(inst, mount_point),                  \
+		.flags = FSTAB_ENTRY_DT_MOUNT_FLAGS(DT_DRV_INST(inst)),        \
+	};
+
+DT_INST_FOREACH_STATUS_OKAY(BLOBFS_FSTAB_DEFINE)
+
+#define BLOBFS_FSTAB_AUTOMOUNT(inst)                                           \
+	IF_ENABLED(DT_INST_PROP(inst, automount),                              \
+		   (automount(&FS_FSTAB_ENTRY(DT_DRV_INST(inst)));))
+
+static __maybe_unused void automount(struct fs_mount_t *mp)
+{
+	int rc = fs_mount(mp);
+
+	if (rc != 0) {
+		LOG_ERR("automount at %s: %d", mp->mnt_point, rc);
+	} else {
+		LOG_DBG("automounted at %s", mp->mnt_point);
+	}
+}
+
+/* At APPLICATION level: after the VFS registration above and after the
+ * blob_db device (POST_KERNEL), whose own automount this then finds done.
+ */
+static int blobfs_fs_automount(void)
+{
+	DT_INST_FOREACH_STATUS_OKAY(BLOBFS_FSTAB_AUTOMOUNT)
+	return 0;
+}
+
+SYS_INIT(blobfs_fs_automount, APPLICATION, CONFIG_APPLICATION_INIT_PRIORITY);

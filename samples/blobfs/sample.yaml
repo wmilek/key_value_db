@@ -1,0 +1,22 @@
+# Lets Twister build (and, on native_sim, run) the sample:
+#   west twister -T key_value_db/samples -p native_sim -v --inline-logs
+sample:
+  description: blobfs mounted from devicetree, with no init code
+  name: blobfs-fstab
+tests:
+  sample.blobfs:
+    platform_allow: native_sim
+    harness: console
+    harness_config:
+      type: multi_line
+      ordered: true
+      regex:
+        - "\\[1\\] nothing to bring up"
+        - "boot count is now 1"
+        - "\\[4\\] list /blob"
+        - "boot.cnt"
+        - "sample complete"
+  # Anywhere the sample cannot be run by Twister, still keep it compiling.
+  sample.blobfs.build:
+    platform_exclude: native_sim
+    build_only: true

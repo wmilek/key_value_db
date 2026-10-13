@@ -22,12 +22,7 @@ containers turn those ids into data structures and `kvdb` exposes the familiar
 string-key / byte-value API:
 
 ```c
-#include <app/lib/blob_db.h>
-#include <app/lib/rootreg.h>
 #include <app/lib/kvdb.h>
-
-blob_db_mount();                       /* once, at boot */
-rootreg_init();
 
 kvdb_t db;
 kvdb_open(&db, "config", NULL);        /* named store; created on first open */
@@ -37,6 +32,35 @@ kvdb_set(&db, "wifi.ssid", "home", 4);
 char ssid[32];
 size_t len;
 kvdb_get(&db, "wifi.ssid", ssid, sizeof(ssid), &len);
+```
+
+There is no init call. The board's devicetree says what the storage is made
+of, and the first call mounts it (or, with `automount`, the store is mounted
+before `main()`):
+
+```dts
+&storage_partition {
+	compatible = "kvdb,ubi";            /* this partition is a UBI device;
+					     * on native_sim, keep
+					     * "zephyr,mapped-partition" second */
+	volumes {
+		blobdb_vol: ubi-volume-blobdb {
+			volname = "blobdb";
+		};
+	};
+};
+
+/ {
+	chosen {
+		kvdb,blob-db = &blobdb0;
+	};
+
+	blobdb0: blob-db {                  /* blob_db lives on that volume */
+		compatible = "kvdb,blob-db";
+		storage = <&blobdb_vol>;
+		automount;
+	};
+};
 ```
 
 Nothing is cached across a reboot and nothing is rebuilt at mount: every
@@ -292,18 +316,19 @@ unrepresentable.
 |---|---|---|
 | String key/value store | `CONFIG_BLOBDB_KVDB=y` | blob_db + rootreg + kvhash + kvdb |
 | Files, through Zephyr's `fs_*` API | `CONFIG_BLOBDB_BLOBFS=y` `CONFIG_BLOBFS_FS_INTEROP=y` | + blobfs and its VFS driver |
-| Ids and blobs only, no containers | `CONFIG_BLOB_DB=y` | blob_db |
-| Raw partition instead of UBI | `+ CONFIG_BLOB_DB_BACKEND_FLASH_AREA=y` | drops the UBI volume backend |
+| Ids and blobs only, no containers | a `kvdb,blob-db` node in devicetree (turns on `CONFIG_BLOB_DB`) | blob_db |
+| Raw partition instead of UBI | point the node's `storage` at a plain partition | drops the UBI volume backend |
+| Files, mounted at boot from devicetree | a `kvdb,fstab,blobfs` node with `automount` | as for files |
 | Objects larger than one flash sector | `+ CONFIG_BLOB_DB_LARGE_PAYLOADS=y` | + segmented objects and partial access |
 
 Frequently adjusted options (see the module `Kconfig` files for the rest):
 
 | Option | Meaning |
 |---|---|
-| `CONFIG_BLOB_DB_PARTITION_LABEL` | fixed-partition label to store blobs in (default `storage`) |
+| `kvdb,blob-db` node (devicetree) | where the store lives (`storage`), `automount`, `no-format` — see `dts/bindings/` |
 | `CONFIG_BLOB_DB_UBI_KEY_APP` | UBI's metadata key comes from the application, not the built-in development key (UBI backend) |
 | `CONFIG_BLOB_DB_UBI_HEAP_SIZE` | heap reserved for UBI's bookkeeping; defaults from the partition size (UBI backend) |
-| `CONFIG_BLOB_DB_AUTOFORMAT_ON_CORRUPT` | reformat when both master blocks are unreadable (default `y`; set `n` in production) |
+| `CONFIG_BLOB_DB_AUTOFORMAT_ON_CORRUPT` | reformat when both master blocks are unreadable (default `y`, or `n` with `no-format` on the node; use `no-format` in production) |
 | `CONFIG_BLOB_DB_MAX_PAYLOAD_LEN` | largest blob payload; also caps the kvhash bucket directory |
 | `CONFIG_BLOB_DB_SECTOR_BUF_SIZE` | upper bound on supported flash sector size (64 KB for mx25r64) |
 | `CONFIG_ROOTREG_MAX_ROOTS` | how many structure roots the registry can hold |

@@ -1,0 +1,13 @@
+/* blobfs mounted at boot from an fstab node, littlefs-style. */
+/ {
+	fstab {
+		compatible = "zephyr,fstab";
+
+		blobfs0: blobfs {
+			compatible = "kvdb,fstab,blobfs";
+			mount-point = "/blob";
+			db = <&blobdb0>;
+			automount;
+		};
+	};
+};

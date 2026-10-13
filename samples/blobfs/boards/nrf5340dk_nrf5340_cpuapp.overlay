@@ -1,0 +1,48 @@
+/*
+ * The same stack as boards/native_sim.overlay, on the nRF5340-DK's MX25R64
+ * QSPI NOR (8 MB) instead of the app core's internal NVMC (32 KB at 0xf8000).
+ */
+
+/delete-node/ &storage_partition;
+
+&mx25r64 {
+	partitions {
+		compatible = "fixed-partitions";
+		#address-cells = <1>;
+		#size-cells = <1>;
+
+		storage_partition: partition@0 {
+			compatible = "kvdb,ubi";
+			label = "storage";
+			reg = <0x00000000 0x00800000>;
+
+			volumes {
+				blobdb_vol: ubi-volume-blobdb {
+					volname = "blobdb";
+				};
+			};
+		};
+	};
+};
+
+/ {
+	chosen {
+		kvdb,blob-db = &blobdb0;
+	};
+
+	blobdb0: blob-db {
+		compatible = "kvdb,blob-db";
+		storage = <&blobdb_vol>;
+	};
+
+	fstab {
+		compatible = "zephyr,fstab";
+
+		blobfs0: blobfs {
+			compatible = "kvdb,fstab,blobfs";
+			mount-point = "/blob";
+			db = <&blobdb0>;
+			automount;
+		};
+	};
+};

@@ -71,7 +71,8 @@ leave unreferenced blobs — is demonstrated operation by operation in
 
 **Id = 1 is reserved and always present** (decision D7). Format — and
 therefore the first mount of a virgin store — consumes id 1 internally and
-binds it to an empty payload. After every successful `blob_db_mount()`:
+binds it to an empty payload. Whenever the store is mounted — by
+`blob_db_mount()`, at boot, or by the first call that needs it (§4):
 
 - `blob_db_exists(1)` is `true`; `blob_db_get(1, …)` never returns `-ENOENT`
   (on a virgin store it yields the empty payload);
@@ -221,8 +222,9 @@ int blob_db_multi_exists(const uint64_t *ids, bool *out_present, size_t n);
 int blob_db_multi_delete(const uint64_t *ids, int  *results,     size_t n);
 ```
 
-Errors: `-ENOENT`, `-ENOSPC`, `-ENOMEM`, `-EINVAL`, `-EIO`, `-ENODEV` (not
-mounted), `-EALREADY` (double mount), `-ENOTSUP` (foreign on-flash format).
+Errors: `-ENOENT`, `-ENOSPC`, `-ENOMEM`, `-EINVAL`, `-EIO`, `-ENODEV`
+(explicitly unmounted), `-EALREADY` (double mount), `-ENOTSUP` (foreign
+on-flash format).
 
 **Mount never destroys a store it does not understand.** A partition whose
 master sectors read as *erased* is virgin and is formatted. A partition
@@ -234,6 +236,26 @@ every version stamps a version-and-identity record that any other version can
 parse and verify. Consequently a caller must treat mount failure as a real
 outcome — the pre-v1 behaviour of silently reformatting anything unparseable
 is gone.
+
+**When the store is mounted.** Devicetree says where the store lives (a
+`kvdb,blob-db` node, dts/bindings/storage/kvdb,blob-db.yaml), and that node is
+a Zephyr device (`<app/lib/blob_db_device.h>`). The store is mounted by
+whichever of these comes first:
+
+- the device's init, before `main()`, when the node has `automount`
+  (`device_is_ready()` reports whether it worked) — or `device_init()`, when
+  the node also has `zephyr,deferred-init`;
+- the first call that needs a mounted store. Every operation listed above
+  except `blob_db_mount()`, `blob_db_unmount()` and `blob_db_format()` mounts
+  the store itself if it has never been mounted, and returns the mount's error
+  if that fails; the next call tries again;
+- an explicit `blob_db_mount()`.
+
+**An explicit `blob_db_unmount()` holds:** afterwards operations report
+`-ENODEV` and mount nothing, until the caller runs `blob_db_mount()` or
+`blob_db_format()`. Only a store that has never been unmounted mounts itself.
+`-ENODEV` therefore means "explicitly unmounted", never "not mounted yet".
+(Proposal: `doc/proposals/2026-10-12-devicetree-configuration.md`.)
 
 **Concurrency contract (v1):** single-threaded — caller serializes. v2 may
 add a `k_mutex`. Corollary used by client recovery: at most one mutation is

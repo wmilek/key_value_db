@@ -1,0 +1,31 @@
+# Copyright (c) 2026
+# SPDX-License-Identifier: Apache-2.0
+
+description: |
+  A blobfs mount (CONFIG_BLOBFS_FS_INTEROP), as a child of a "zephyr,fstab"
+  node -- the same shape as "zephyr,fstab,littlefs":
+
+    fstab {
+            compatible = "zephyr,fstab";
+            blobfs0: blobfs {
+                    compatible = "kvdb,fstab,blobfs";
+                    mount-point = "/blob";
+                    db = <&blobdb0>;
+                    automount;
+            };
+    };
+
+  The driver defines a struct fs_mount_t for the node, reachable as
+  FS_FSTAB_ENTRY(node_id) after FS_FSTAB_DECLARE_ENTRY(node_id), and mounts it
+  during boot when "automount" is set. blobfs supports one mount at a time,
+  so at most one node of this compatible. "disk-access" is not supported.
+
+compatible: "kvdb,fstab,blobfs"
+
+include: "zephyr,fstab-common.yaml"
+
+properties:
+  db:
+    type: phandle
+    required: true
+    description: The "kvdb,blob-db" store the file system lives in.

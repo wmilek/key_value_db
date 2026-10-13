@@ -29,8 +29,12 @@ mount-time index rebuild. State is re-read from flash on demand.
 ## P4 — Configurable via Kconfig
 
 Every module above the core has its own symbol; disabled = zero flash/RAM.
-Backends are `choice`s; selection flows downward (L3 `select`s its L2
-container, L2 depends on L1). Tunables are Kconfig options, not magic numbers.
+**Storage layout and instances — which partition, which UBI volume, whether
+a store mounts at boot — are described in devicetree; Kconfig symbols that
+depend on them default from it**
+(`doc/proposals/2026-10-12-devicetree-configuration.md`). Backends are
+`choice`s; selection flows downward (L3 `select`s its L2 container, L2
+depends on L1). Tunables are Kconfig options, not magic numbers.
 
 ## P5 — Single-integer reachability
 

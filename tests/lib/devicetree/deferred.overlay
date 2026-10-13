@@ -1,0 +1,5 @@
+/* Device init waits for device_init(); with "automount" that call mounts. */
+&blobdb0 {
+	automount;
+	zephyr,deferred-init;
+};

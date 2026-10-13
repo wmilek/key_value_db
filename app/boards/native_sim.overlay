@@ -3,6 +3,11 @@
  * storage_partition for kv_db. Leaves the default mcuboot / slot partitions
  * in the first 1 MB intact so existing tooling expectations still hold.
  *
+ * The partition is a UBI device holding one volume, and blob_db lives on
+ * that volume (dts/bindings/mtd/kvdb,ubi.yaml, storage/kvdb,blob-db.yaml).
+ * "automount" mounts the store before main() runs, so main() calls no init
+ * function at all.
+ *
  * See doc/layers/l1_blob_db.md §1 "Capacity".
  */
 
@@ -15,5 +20,27 @@
 };
 
 &storage_partition {
+	/* Keep "zephyr,mapped-partition": it is what makes the node a partition
+	 * on native_sim (its flash_map entry and partition id).
+	 */
+	compatible = "kvdb,ubi", "zephyr,mapped-partition";
 	reg = <0x00800000 DT_SIZE_M(8)>;
+
+	volumes {
+		blobdb_vol: ubi-volume-blobdb {
+			volname = "blobdb";
+		};
+	};
+};
+
+/ {
+	chosen {
+		kvdb,blob-db = &blobdb0;
+	};
+
+	blobdb0: blob-db {
+		compatible = "kvdb,blob-db";
+		storage = <&blobdb_vol>;
+		automount;
+	};
 };

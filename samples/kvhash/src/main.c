@@ -128,16 +128,16 @@ static int run(void)
 	uint64_t root;
 	int rc;
 
-	step(1, "bring the storage stack up");
+	step(1, "no bring-up: the board's devicetree describes the store");
 
-	/* blob_db is the store every container lives in; -EALREADY just means
-	 * something else mounted it first. */
-	rc = blob_db_mount();
-	if (rc != 0 && rc != -EALREADY) {
-		printk("    blob_db_mount() -> %d  FAILED\n", rc);
-		return rc;
-	}
-	printk("    blob_db_mount() -> %d\n", rc);
+	/* Nothing to call. The kvdb,blob-db node in boards/<board>.overlay says
+	 * where the store lives (a UBI volume) and has no "automount", so the
+	 * first blob_db call that needs the store mounts it — here, the first
+	 * call of step 2. The root registry needs no init either: an empty
+	 * store reads as an empty registry, and its first registration writes
+	 * it. An application that wants the mount done before main() adds
+	 * "automount" to the node instead (see app/). */
+	printk("    nothing to call: the first call below mounts the store\n");
 
 	if (IS_ENABLED(CONFIG_SAMPLE_KVHASH_FRESH_START)) {
 		/* Only so every run of the sample prints the same thing.
@@ -149,18 +149,11 @@ static int run(void)
 		}
 	}
 
-	/* The registry owns blob id 1 and must be bootstrapped before anything
-	 * that keeps a root in it. Idempotent. */
-	rc = rootreg_init();
-	printk("    rootreg_init() -> %d\n", rc);
-	if (rc != 0) {
-		return rc;
-	}
-
 	step(2, "find the map's root id, and create the map the first time");
 
 	/* Absent: allocate an id and register it, atomically. Present: return
-	 * the id registered by an earlier boot. */
+	 * the id registered by an earlier boot. Unless FRESH_START already did,
+	 * this is the call that mounts the store. */
 	rc = rootreg_get_or_create(SAMPLE_MAP_KEY, &root);
 	if (rc != 0) {
 		printk("    rootreg_get_or_create() -> %d  FAILED\n", rc);

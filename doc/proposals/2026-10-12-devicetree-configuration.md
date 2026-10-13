@@ -1,6 +1,7 @@
 # Design change proposal — configuring the stack from devicetree
 
-Status: **proposed** · 2026-10-12
+Status: **implemented (draft)** · 2026-10-12 · what was built, and where it
+differs from this design: §9
 · Target contract: `doc/layers/l1_blob_db.md` (mount), `doc/layers/l1_root_registry.md`
 (`rootreg_init`), `include/app/lib/blobfs_fs.h` (mounting)
 · Target implementation: `lib/blob_db/` (`blob_db.c`, `blob_db_store_ubi.c`,
@@ -579,3 +580,41 @@ Each step builds and passes on its own.
 
 Steps 1 and 2 are worth having even if the rest is declined: they fix B11 and
 let a board choose the store's location and backend without touching code.
+
+## 9. As implemented
+
+All eight steps of §8 are in one change. Where the code differs from the
+design above, the code is right and this section says why.
+
+| § | Design | Implemented | Why |
+|---|---|---|---|
+| 3.2 | volumes have `volname`, `volid`, `size` | `volname` and `size` only | zephyr-ubi v0.1.0 assigns volume ids itself; `struct ubi_volume_config` has no id |
+| 3.2 | the partition carries `compatible = "kvdb,ubi"` | on native_sim: `"kvdb,ubi", "zephyr,mapped-partition"` | Zephyr main now marks native_sim's partitions `zephyr,mapped-partition`, and that compatible is what makes the node a partition (its id and flash_map entry). QSPI partitions under `fixed-partitions` (nRF5340-DK) take `"kvdb,ubi"` alone, as designed |
+| 3.2 | — | `dts/bindings/vendor-prefixes.txt` registers `kvdb` | twister builds with `--edtlib-Werror`, which rejects an unknown vendor prefix |
+| 3.3 | a `BUILD_ASSERT` refuses a backend that disagrees with `storage` | an override is honoured: flash_area over a UBI volume uses the UBI device's partition raw; UBI over a plain partition creates volume `"blobdb"` with 4 spare LEBs | CI and `tests/lib/blob_db` build the same overlay on both backends (`-DCONFIG_BLOB_DB_BACKEND_FLASH_AREA=y`), and the benchmarks compare them on one partition. The default still follows devicetree |
+| 3.4 | device at the APPLICATION level | POST_KERNEL, `CONFIG_BLOB_DB_INIT_PRIORITY` = 90 | Zephyr refuses devices at the APPLICATION level (`Z_DEVICE_CHECK_INIT_LEVEL`). 90 is after the flash drivers (QSPI NOR: 41, flash simulator: 50); the `storage` phandle makes the flash a devicetree dependency, which `CONFIG_CHECK_INIT_PRIORITIES` checks at link time |
+| 3.4 | `<app/lib/blob_db.h>` gets the device | `<app/lib/blob_db_device.h>`, `BLOB_DB_DEVICE` | `blob_db.h` is the contract every blob_db implementation provides; the device is this implementation's configuration |
+| 3.7 | after a failed automount "every API call returns the mount's error" | every call retries the mount and returns its error if it fails again | one rule for every case: an unmounted store that was never explicitly unmounted mounts on the next call. A corrupt or foreign store fails the same way each time, so nothing is lost |
+| 5 | `BLOB_DB_AUTOFORMAT_ON_CORRUPT` is removed | kept; its default is `n` when the node has `no-format` | the `lib.blob_db.no_autoformat` scenario and existing board files set the symbol directly; keeping it costs nothing, and the devicetree still decides by default |
+| 3.6 | blobfs automount in its `SYS_INIT` | a separate `SYS_INIT` at the APPLICATION level | registration stays at POST_KERNEL with the VFS; mounting waits until after the blob_db device |
+
+**Not done:** proposing the UBI binding upstream (§6.3), and multi-instance
+(§6.2), both out of scope as designed.
+
+**Where to look.**
+
+| What | Where |
+|---|---|
+| Bindings | `dts/bindings/mtd/kvdb,ubi.yaml`, `dts/bindings/storage/kvdb,blob-db.yaml`, `dts/bindings/fs/kvdb,fstab,blobfs.yaml` |
+| Devicetree lookup | `lib/blob_db/blob_db_dt.h`, used by both backends |
+| Kconfig defaults from devicetree | `lib/blob_db/Kconfig` (`KVDB_DT_*` variables) |
+| Device, automount | `lib/blob_db/blob_db_device.c`, `include/app/lib/blob_db_device.h` |
+| Lazy mount, `held_down` | `ensure_mounted()` in `lib/blob_db/blob_db.c` |
+| Lazy rootreg | `rr_load()` in `lib/rootreg/rootreg.c` |
+| blobfs fstab | end of `lib/blobfs/blobfs_zephyr_fs.c` |
+| No init code in `main()` | `app/` (`automount`), `samples/kvhash/` (mount on first use), `samples/blobfs/` (fstab) |
+| Tests | `tests/lib/devicetree/` (one scenario per devicetree variation: lazy, automount, deferred, no-format, raw, fstab), `tests/lib/rootreg` (`test_virgin_store_needs_no_init`) |
+
+The benchmark applications (`app_perf*`, `app_cbor_persondb`) keep their
+explicit `blob_db_mount()` / `blob_db_format()` / `blob_db_unmount()` calls
+and have no `automount`: they time and reset the store on purpose.

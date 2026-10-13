@@ -30,9 +30,10 @@ flash operations there (`app_perf/RESULTS.md`).
 `CONFIG_BLOB_DB_BACKEND_FLASH_AREA`, `lib/blob_db/blob_db_store_flash.c`
 (~100 lines, all of it translation).
 
-- Opens the `fixed-partitions` device-tree node labelled
-  `CONFIG_BLOB_DB_PARTITION_LABEL` (default `storage`) and reports its geometry
-  from `flash_area_get_sectors`. Nothing is hard-coded; on `native_sim` that is
+- Opens the partition the `kvdb,blob-db` node's `storage` phandle names
+  (`lib/blob_db/blob_db_dt.h`) — or, when that is a UBI volume and the
+  backend was overridden in Kconfig, the UBI device's partition, raw — and
+  reports its geometry from `flash_area_get_sectors`. Nothing is hard-coded; on `native_sim` that is
   an 8 MB partition of 4 KB blocks (2048 blocks), and on the nRF5340-DK the
   MX25R64's 64 KB blocks.
 - One block = one physical erase block, whole and unshared. Offsets are

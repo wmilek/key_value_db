@@ -17,6 +17,7 @@ benchmark applications one level up:
 | Sample | Demonstrates |
 |---|---|
 | [`kvhash/`](kvhash) | the L2 Map shape (`kvhash_map_ops`): create / get / set / del over a persistent hash map, plus where a container's root id comes from |
+| [`blobfs/`](blobfs) | the whole stack described in devicetree — UBI partition, blob_db store, blobfs mounted from an fstab node — so `main()` uses plain `fs_*()` calls and no init function |
 
 ## Building and running
 

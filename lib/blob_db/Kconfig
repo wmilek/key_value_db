@@ -1,8 +1,21 @@
 # Copyright (c) 2026
 # SPDX-License-Identifier: Apache-2.0
 
+# Where the store lives comes from devicetree: the chosen node "kvdb,blob-db"
+# names a "kvdb,blob-db" node, whose "storage" phandle is a UBI volume (child
+# of a "volumes" node under a "kvdb,ubi" partition) or a plain partition. The
+# defaults below read it; dts/bindings/storage/kvdb,blob-db.yaml documents it.
+# (Kconfig splits function arguments on commas, hence the variables.)
+KVDB_DT_CHOSEN_BLOB_DB := kvdb,blob-db
+KVDB_DT_COMPAT_UBI := kvdb,ubi
+KVDB_DT_BLOB_DB := $(dt_chosen_path,$(KVDB_DT_CHOSEN_BLOB_DB))
+KVDB_DT_STORAGE := $(dt_node_ph_prop_path,$(KVDB_DT_BLOB_DB),storage)
+KVDB_DT_UBI_DEV := $(dt_node_parent,$(dt_node_parent,$(KVDB_DT_STORAGE)))
+
 config BLOB_DB
 	bool "Stable-id blob storage library"
+	default y
+	depends on DT_HAS_KVDB_BLOB_DB_ENABLED
 	select FLASH
 	select FLASH_MAP
 	select CRC
@@ -11,16 +24,26 @@ config BLOB_DB
 	  Zephyr's flash_area API. See doc/layers/l1_blob_db.md for the on-flash
 	  format, atomicity model, and stability contract.
 
+	  On by default whenever the devicetree has an enabled "kvdb,blob-db"
+	  node; the node says where the store lives.
+
 if BLOB_DB
 
 choice BLOB_DB_BACKEND
 	prompt "blob_db storage backend"
-	default BLOB_DB_BACKEND_UBI
+	default BLOB_DB_BACKEND_UBI if $(dt_node_has_compat,$(KVDB_DT_UBI_DEV),$(KVDB_DT_COMPAT_UBI))
+	default BLOB_DB_BACKEND_FLASH_AREA
 	help
 	  Selects the substrate blob_db stores blobs on. Both expose the same
 	  PEB-addressed store interface (lib/blob_db/blob_db_store.h); the
 	  on-flash layouts are NOT interchangeable, so switching an existing
 	  device between them requires erasing the partition first.
+
+	  The default follows devicetree: UBI when the kvdb,blob-db node's
+	  "storage" is a UBI volume, flash_area when it is a plain partition.
+	  Overriding it keeps the same partition: flash_area over a UBI volume
+	  uses the UBI device's partition raw, and UBI over a plain partition
+	  creates a volume named "blobdb" on it.
 
 config BLOB_DB_BACKEND_FLASH_AREA
 	bool "Raw partition (flash_area)"
@@ -122,25 +145,20 @@ endif # BLOB_DB_BACKEND_UBI
 
 config BLOB_DB_UBI_HEAP_SIZE
 	int "Heap reserved for the UBI device"
-	default $(add,$(div,$(dt_nodelabel_reg_size_int,storage_partition),512),4096)
+	default $(add,$(div,$(dt_node_reg_size_int,$(KVDB_DT_UBI_DEV)),512),4096) if $(dt_node_has_compat,$(KVDB_DT_UBI_DEV),$(KVDB_DT_COMPAT_UBI))
+	default $(add,$(div,$(dt_node_reg_size_int,$(KVDB_DT_STORAGE)),512),4096)
 	help
 	  zephyr-ubi takes its handle, a scratch buffer and per-erase-block
 	  bookkeeping from the system heap at attach, and a second handle and
 	  scratch buffer during a format. The default sizes the per-block part
-	  for the storage partition as if it were made of 4 KB erase blocks,
+	  for the store's partition (from devicetree) as if it were made of
+	  4 KB erase blocks,
 	  the smallest NOR geometry, plus a fixed allowance for the rest; a
 	  board with larger blocks may lower it. Too little makes blob_db_mount() fail with
 	  -ENOMEM at run time, not at build time.
 
 	  Used only by the UBI backend; a flash_area build reserves nothing,
 	  so a board file can set it whichever backend the build picks.
-
-config BLOB_DB_PARTITION_LABEL
-	string "Storage partition label"
-	default "storage"
-	help
-	  Label of the fixed flash partition where blobs are stored. Must
-	  refer to a fixed-partitions child node in the device tree.
 
 config BLOB_DB_MAX_PAYLOAD_LEN
 	int "Max single-slot payload length in bytes"
@@ -280,8 +298,21 @@ config BLOB_DB_SHELL
 	  use these while the application is not calling blob_db. A full-store
 	  scan reads every bucket sector, which takes a while on large parts.
 
+config BLOB_DB_INIT_PRIORITY
+	int "Init priority of the blob_db device"
+	default 90
+	help
+	  The kvdb,blob-db node is a device initialised at the POST_KERNEL
+	  level with this priority. It must come after the flash driver under
+	  its partition; the node's "storage" phandle makes that a devicetree
+	  dependency, which CONFIG_CHECK_INIT_PRIORITIES verifies. With
+	  "automount" its init mounts the store; without it init does nothing
+	  and the first blob_db call mounts. blobfs's fstab automount runs at
+	  the APPLICATION level, after it.
+
 config BLOB_DB_AUTOFORMAT_ON_CORRUPT
 	bool "Format when both master sectors are unreadable"
+	default n if $(dt_node_bool_prop,$(KVDB_DT_BLOB_DB),no-format)
 	default y
 	help
 	  Controls what mount does when neither master can be parsed AND the
@@ -293,6 +324,8 @@ config BLOB_DB_AUTOFORMAT_ON_CORRUPT
 
 	  n (production): return -EIO and leave the partition untouched, so the
 	  caller decides whether to discard it with blob_db_format().
+
+	  The default follows the kvdb,blob-db node: "no-format" makes it n.
 
 	  This does NOT apply to a store written in a format this build does not
 	  understand. That is always refused with -ENOTSUP and never formatted,

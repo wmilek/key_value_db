@@ -509,11 +509,40 @@ err_close:
 	return rc;
 }
 
+/* Set by blob_db_unmount(), cleared by blob_db_mount() and blob_db_format().
+ * An explicit unmount is a decision the caller made, so a later call must not
+ * quietly undo it: only a store that has never been unmounted mounts itself.
+ */
+static bool held_down;
+
+/* Mount on first use (doc/proposals/2026-10-12-devicetree-configuration.md
+ * §3.5). Every public entry point that needs a mounted store calls this
+ * instead of failing with -ENODEV, so the application does not have to call
+ * blob_db_mount() before its first blob_db call. A failed mount is retried
+ * by the next call: what fails at boot (no key yet, flash not powered) is
+ * often gone by then, and a store that cannot be mounted keeps returning the
+ * same error.
+ */
+static int ensure_mounted(void)
+{
+	if (st.mounted) {
+		return 0;
+	}
+	if (held_down) {
+		return -ENODEV;
+	}
+
+	int rc = blob_db_mount();
+
+	return (rc == -EALREADY) ? 0 : rc;
+}
+
 int blob_db_mount(void)
 {
 	if (st.mounted) {
 		return -EALREADY;
 	}
+	held_down = false;
 
 	IDX_INVALIDATE();
 	st.wedged = false;   /* recovery below re-establishes a safe state */
@@ -697,6 +726,7 @@ err_close:
 
 int blob_db_unmount(void)
 {
+	held_down = true;
 	if (!st.mounted) {
 		return 0;
 	}
@@ -2267,7 +2297,7 @@ static int seg_update(uint64_t id, const void *payload, size_t len,
 
 uint64_t blob_db_alloc_id(void)
 {
-	if (!st.mounted) {
+	if (ensure_mounted() != 0) {
 		return 0;   /* 0 is never a valid id */
 	}
 
@@ -2293,8 +2323,10 @@ uint64_t blob_db_alloc_id(void)
 
 int blob_db_get(uint64_t id, void *out, size_t out_sz, size_t *out_len)
 {
-	if (!st.mounted) {
-		return -ENODEV;
+	int mrc = ensure_mounted();
+
+	if (mrc != 0) {
+		return mrc;
 	}
 	if (out_sz > 0 && !out) {
 		return -EINVAL;
@@ -2357,8 +2389,10 @@ int blob_db_get(uint64_t id, void *out, size_t out_sz, size_t *out_len)
 
 int blob_db_update(uint64_t id, const void *payload, size_t len)
 {
-	if (!st.mounted) {
-		return -ENODEV;
+	int mrc = ensure_mounted();
+
+	if (mrc != 0) {
+		return mrc;
 	}
 	if (st.wedged) {
 		return -EIO;   /* torn compaction; see compact_commit() */
@@ -2532,8 +2566,10 @@ int blob_db_update(uint64_t id, const void *payload, size_t len)
 
 int blob_db_delete(uint64_t id)
 {
-	if (!st.mounted) {
-		return -ENODEV;
+	int mrc = ensure_mounted();
+
+	if (mrc != 0) {
+		return mrc;
 	}
 	if (st.wedged) {
 		return -EIO;   /* torn compaction; see compact_commit() */
@@ -2648,7 +2684,7 @@ int blob_db_delete(uint64_t id)
 
 bool blob_db_exists(uint64_t id)
 {
-	if (!st.mounted || id == 0) {
+	if (id == 0 || ensure_mounted() != 0) {
 		return false;
 	}
 
@@ -2744,7 +2780,7 @@ static int count_visitor(uint64_t id, const uint8_t *p, uint16_t l, void *user)
 
 size_t blob_db_count(void)
 {
-	if (!st.mounted) {
+	if (ensure_mounted() != 0) {
 		return 0;
 	}
 
@@ -2776,8 +2812,10 @@ static int iterate_visitor(uint64_t id, const uint8_t *p, uint16_t l, void *u)
 
 int blob_db_iterate(blob_db_iter_cb_t cb, void *user)
 {
-	if (!st.mounted) {
-		return -ENODEV;
+	int mrc = ensure_mounted();
+
+	if (mrc != 0) {
+		return mrc;
 	}
 	if (!cb) {
 		return -EINVAL;
@@ -2853,8 +2891,10 @@ bool blob_db_core_bucket_hdr_valid(const uint8_t *buf, uint16_t bid)
 
 int blob_db_size(uint64_t id, size_t *out_size)
 {
-	if (!st.mounted) {
-		return -ENODEV;
+	int mrc = ensure_mounted();
+
+	if (mrc != 0) {
+		return mrc;
 	}
 	if (!out_size) {
 		return -EINVAL;
@@ -2955,8 +2995,10 @@ static int seg_read_range(uint64_t id, const struct blob_db_index_hdr *h,
 int blob_db_read(uint64_t id, size_t offset, void *out, size_t len,
 		 size_t *out_read)
 {
-	if (!st.mounted) {
-		return -ENODEV;
+	int mrc = ensure_mounted();
+
+	if (mrc != 0) {
+		return mrc;
 	}
 	if (len > 0 && !out) {
 		return -EINVAL;
@@ -3032,8 +3074,10 @@ int blob_db_read(uint64_t id, size_t offset, void *out, size_t len,
 
 int blob_db_write(uint64_t id, size_t offset, const void *buf, size_t len)
 {
-	if (!st.mounted) {
-		return -ENODEV;
+	int mrc = ensure_mounted();
+
+	if (mrc != 0) {
+		return mrc;
 	}
 	if (st.wedged) {
 		return -EIO;   /* torn compaction; see compact_commit() */
@@ -3197,6 +3241,7 @@ int blob_db_format(void)
 #endif
 	}
 
+	held_down = false;   /* the caller asked for a store: it has one */
 	LOG_INF("format: complete; next_id=%llu",
 		(unsigned long long)st.next_id);
 	return 0;
@@ -3232,8 +3277,10 @@ static int bind_root_empty(void)
 
 int blob_db_erase_all(void)
 {
-	if (!st.mounted) {
-		return -ENODEV;
+	int mrc = ensure_mounted();
+
+	if (mrc != 0) {
+		return mrc;
 	}
 	if (st.wedged) {
 		return -EIO;   /* torn compaction; see compact_commit() */
@@ -3328,8 +3375,10 @@ int blob_db_erase_all(void)
 
 int blob_db_prepare(size_t n)
 {
-	if (!st.mounted) {
-		return -ENODEV;
+	int mrc = ensure_mounted();
+
+	if (mrc != 0) {
+		return mrc;
 	}
 	if (st.wedged) {
 		return -EIO;   /* torn compaction; see compact_commit() */

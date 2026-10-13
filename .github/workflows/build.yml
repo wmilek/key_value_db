@@ -120,6 +120,13 @@ jobs:
           west build -p always -b nrf5340dk/nrf5340/cpuapp -d build/nrf_sample_kvhash \
             key_value_db/samples/kvhash
 
+      # The devicetree-only bring-up: UBI partition, blob_db store and blobfs
+      # fstab node on the QSPI NOR, with no init code in main().
+      - name: Build samples/blobfs (ARM)
+        run: |
+          west build -p always -b nrf5340dk/nrf5340/cpuapp -d build/nrf_sample_blobfs \
+            key_value_db/samples/blobfs
+
       # app_perf is the binary that gets flashed to produce the numbers in
       # app_perf/RESULTS.md, and it exercises paths `app` does not: segmented
       # large objects, blob_db_write(), and the I/O counters. Until this step
