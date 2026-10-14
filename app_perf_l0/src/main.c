@@ -105,7 +105,7 @@ LOG_MODULE_REGISTER(app_perf_l0, CONFIG_APP_PERF_L0_LOG_LEVEL);
 
 /* One buffer serves every phase; MAX_XFER is clamped to the erase block at
  * runtime, so on a part with small blocks most of it goes unused. */
-static uint8_t g_buf[MAX_XFER];
+static uint8_t __aligned(4) g_buf[MAX_XFER];
 
 static const struct flash_area *g_fa;
 

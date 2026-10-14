@@ -84,9 +84,14 @@ static inline void idx_invalidate(void);
 
 /* Sector-sized scratch buffers. g_bbuf is used by every read-a-bucket op
  * (mount, get, update, delete, exists, count, iterate) and by compaction
- * as the "old" image; g_bbuf_new is used by compaction as the "new" image. */
-static uint8_t g_bbuf[BLOB_DB_SECTOR_BUF_MAX];
-static uint8_t g_bbuf_new[BLOB_DB_SECTOR_BUF_MAX];
+ * as the "old" image; g_bbuf_new is used by compaction as the "new" image.
+ *
+ * Every buffer handed to the store is word-aligned: nrf_qspi_nor DMAs only
+ * from aligned RAM and otherwise copies through a 4-byte stack buffer
+ * (CONFIG_NORDIC_QSPI_NOR_STACK_WRITE_BUFFER_SIZE), one program per word.
+ * On the nRF5340-DK an unaligned g_bbuf_new made writes 4.3x slower. */
+static uint8_t __aligned(4) g_bbuf[BLOB_DB_SECTOR_BUF_MAX];
+static uint8_t __aligned(4) g_bbuf_new[BLOB_DB_SECTOR_BUF_MAX];
 
 /* Set while compaction owns g_bbuf_new, so append_slot() — which also stages
  * there — can assert the two never overlap. Debug builds only; release
@@ -191,7 +196,7 @@ static const char *const master_class_str[] = {
 static int read_master(uint8_t slot, struct blob_db_master_hdr *out,
 		       enum master_class *cls)
 {
-	uint8_t buf[BLOB_DB_MASTER_HDR_MAX];
+	uint8_t __aligned(4) buf[BLOB_DB_MASTER_HDR_MAX];
 
 	*cls = MASTER_CORRUPT;
 
@@ -281,7 +286,7 @@ static int write_master(uint8_t slot, uint32_t gen, uint8_t state,
 
 	/* Staged 0xff-filled so any write-alignment padding matches erased
 	 * flash rather than introducing zero bits. */
-	uint8_t buf[BLOB_DB_MASTER_HDR_MAX];
+	uint8_t __aligned(4) buf[BLOB_DB_MASTER_HDR_MAX];
 
 	memset(buf, 0xff, sizeof(buf));
 
@@ -1166,7 +1171,7 @@ static inline off_t scratch_seal_off(void)
 static int scratch_seal_write(off_t scratch_off, const uint8_t *image,
 			      size_t image_len)
 {
-	uint8_t buf[BLOB_DB_MAX_WRITE_ALIGN + sizeof(struct blob_db_scratch_seal)];
+	uint8_t __aligned(4) buf[BLOB_DB_MAX_WRITE_ALIGN + sizeof(struct blob_db_scratch_seal)];
 	struct blob_db_scratch_seal *seal = (struct blob_db_scratch_seal *)buf;
 
 	memset(buf, 0xff, sizeof(buf));
@@ -1432,8 +1437,8 @@ static int recover_compaction(uint16_t bid)
  * segment all in. Two, because a rebind holds the outgoing and incoming lists
  * at once: the old one must survive until the new index commits so its
  * segments can be released afterwards. */
-static uint8_t g_seg_a[8u * CONFIG_BLOB_DB_MAX_SEGMENTS];
-static uint8_t g_seg_b[8u * CONFIG_BLOB_DB_MAX_SEGMENTS];
+static uint8_t __aligned(4) g_seg_a[8u * CONFIG_BLOB_DB_MAX_SEGMENTS];
+static uint8_t __aligned(4) g_seg_b[8u * CONFIG_BLOB_DB_MAX_SEGMENTS];
 
 /* Derived at mount from the geometry; validated there too. */
 static uint16_t g_seg_len;      /* chunk bytes per segment */
@@ -1982,7 +1987,7 @@ static int seg_sweep(uint64_t owner)
  * appended, and it cannot share g_bbuf: writing a segment may compact its
  * bucket, and compaction owns g_bbuf. At most two chunks per call are partial
  * (the first and the last), but they still need somewhere to be built. */
-static uint8_t g_chunk[CONFIG_BLOB_DB_MAX_PAYLOAD_LEN];
+static uint8_t __aligned(4) g_chunk[CONFIG_BLOB_DB_MAX_PAYLOAD_LEN];
 
 /* Build and commit the index record for `id`. This is THE COMMIT for any
  * segmented write: before it the new segments are unreferenced, after it the
@@ -3257,7 +3262,7 @@ int blob_db_erase_all(void)
 	IDX_INVALIDATE();
 
 	const uint16_t root_bid = (uint16_t)(BLOB_DB_ROOT_ID % st.n_buckets);
-	uint8_t zeros[BLOB_DB_MAX_WRITE_ALIGN];
+	uint8_t __aligned(4) zeros[BLOB_DB_MAX_WRITE_ALIGN];
 	const size_t zlen = MAX(sizeof(uint32_t),
 				MIN(st.write_align, sizeof(zeros)));
 

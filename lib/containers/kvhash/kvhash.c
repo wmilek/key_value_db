@@ -161,9 +161,10 @@ void kvhash_set_inline_max(size_t key_max, size_t val_max)
 }
 
 /* Reused across calls (single-threaded contract). One holds the directory
- * currently being walked, the other the packed bucket being read/rewritten. */
-static uint8_t dir_buf[MAX_PAYLOAD];
-static uint8_t bkt_buf[MAX_PAYLOAD];
+ * currently being walked, the other the packed bucket being read/rewritten.
+ * Word-aligned like blob_db's own buffers (see g_bbuf in blob_db.c). */
+static uint8_t __aligned(4) dir_buf[MAX_PAYLOAD];
+static uint8_t __aligned(4) bkt_buf[MAX_PAYLOAD];
 
 /* Host-order packed accessors — the store is read back on the same CPU that
  * wrote it, matching blob_db's own convention. */
