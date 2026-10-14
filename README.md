@@ -91,6 +91,7 @@ bottom-up. Modules marked *skeleton* are build-wired and Kconfig-gated
 | L0 | raw partition (`flash_area`) | `BLOB_DB_BACKEND_FLASH_AREA` | implemented | `tests/lib/blob_db` (3 pinned scenarios) |
 | L1 | `blob_db` | `BLOB_DB` | implemented | `tests/lib/blob_db`, `tests/lib/blob_db_contract` |
 | L1 | large payloads (segmented objects) | `BLOB_DB_LARGE_PAYLOADS` | implemented (opt-in, `default n`) | `tests/lib/blob_db` (`.large_payloads`, with crash injection) |
+| L1 | RAM slot index (id → newest slot) | `BLOB_DB_SLOT_INDEX` | implemented (opt-in, `default n`) | `tests/lib/blob_db` (`.slot_index*`), `tests/lib/{containers,kvdb,blobfs}` (`.slot_index`), every answer cross-checked against the walk |
 | L1½ | `rootreg` | `BLOB_ROOTREG` | implemented | `tests/lib/rootreg` |
 | L2 | `kvhash` (Map, O(1)) | `BLOB_CONTAINER_KVHASH` | implemented | via `tests/lib/kvdb` |
 | L2 | `kvlist` · `kvtree` · `seq` | `BLOB_CONTAINER_*` | skeleton | — |

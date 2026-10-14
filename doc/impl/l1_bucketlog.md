@@ -343,6 +343,91 @@ slots, and turning each comparison into a flash read would cost far more than
 the sector read it replaced. They are diagnostics and maintenance, not the hot
 path (contract D5).
 
+### 5.4a Optional slot index (`CONFIG_BLOB_DB_SLOT_INDEX`)
+
+**The walk is the cost.** A `get` is one 16 B bucket-header read, one 12 B read
+per slot in the bucket, then the payload and a 2 B CRC. The walk cannot stop at
+the first match, because the newest slot wins and the log has no back-pointers.
+On the nRF5340-DK's QSPI NOR a read costs about 69 µs of command overhead plus
+0.25 µs per byte, so a 12 B header read is 72 µs, almost all of it overhead. In
+`app_cbor_persondb` at 8 000 persons the walk is **73 %** of an access check's
+flash time at the shipped kvhash geometry (18 slots per walk) and **91–95 %**
+once kvhash buckets are made smaller (51–102 slots per walk). About half of the
+slots walked are superseded versions awaiting compaction. Measured on
+`native_sim` with every flash read classified, timed on the DK flash model
+(`app_perf_l0/models/mx25r64_nrf5340dk_full.json`).
+
+**The index.** An opt-in, fixed-size RAM table from id to the offset of that
+id's newest slot, and one append cursor per bucket
+(`lib/blob_db/blob_db_slot_index.c`). With a hit, a `get` is three reads: slot
+head, payload, CRC. The bucket header read is skipped too, because the index
+holds a cursor only for a bucket whose header it has seen valid. `update` takes
+its append cursor from the index instead of walking.
+
+| Operation | Without | With the index |
+|---|---|---|
+| `get` (hit) | 1 + slots + 2 reads | 3 reads |
+| `update` (cursor known) | 1 + slots reads, then the append | the append |
+| `mount` | full scan | the same scan, which also fills the index |
+| RAM | none | 12 B per table cell + 6 B per bucket, fixed by Kconfig |
+
+**Why it can be trusted.** The index is a hint, and it is built so that the one
+error no check could catch, naming an *older* slot of an id, cannot arise:
+
+- Per bucket, the cursor is either unknown or the true end of the log, and an
+  unknown cursor means the table holds nothing for that bucket.
+- Every slot append goes through `append_slot2()`, which updates the entry and
+  advances the cursor. An append anywhere but at the known cursor, or a failed
+  write that may have left a torn slot, makes the index forget the bucket.
+- Anything that rewrites a bucket other than by appending forgets it or rebuilds
+  it: `format_bucket()` starts it empty, compaction re-indexes the image it just
+  wrote (still in RAM), and `erase_all`, `format`, mount and unmount reset the
+  whole table. Mount-time compaction recovery runs before the scan that fills
+  the index.
+- A hit is still checked against flash: the slot must be sealed, carry the same
+  id, fit below the cursor and pass its CRC. Anything else, and every miss,
+  takes the walk exactly as before. A walk over the full log teaches the index
+  the answer it found. One that had to fall back past a rotten slot does not.
+- Before any append at a cursor the index supplied, the writer reads the 12
+  bytes a slot head would occupy there and requires them erased
+  (`confirm_cursor()`). If they are not, the index forgets the bucket and the
+  writer walks for the true end of log. While mounted, only blob_db writes the
+  store, so this should never fire. It is there because programming over
+  non-erased flash is the one failure an index must not be able to cause. It
+  costs one read per write, and reads do not pay it. The test suite forges a
+  torn slot into raw flash under a mounted store, which reaches exactly this
+  case.
+
+So a crash, a torn write or bit-rot costs a walk, never a wrong answer, and the
+index has no on-flash state and no format impact. When the table is full,
+further ids are not indexed and their lookups walk. Nothing is evicted.
+`CONFIG_BLOB_DB_SLOT_INDEX_VERIFY` makes every indexed answer also walk and
+assert agreement. The `.slot_index` test scenarios run the blob_db, containers,
+kvdb and blobfs suites that way, on both backends, with large payloads, and
+with a 64-cell table.
+
+**Effect** (`app_cbor_persondb`, 8 000 persons, DK flash model, flash time only):
+
+| kvhash bucket floor | index | check | insert (fill avg) | rewrite | index RAM |
+|---|---|--:|--:|--:|--:|
+| 4096 (shipped) | off | 10.9 ms | 240 ms | 535 ms | — |
+| 4096 | on, 2 048 cells | 3.0 ms | 192 ms | 512 ms | 24 KiB |
+| 1024 | off | 24.4 ms | 168 ms | 266 ms | — |
+| 1024 | on, 4 096 cells | 2.2 ms | 88 ms | 204 ms | 48 KiB |
+| 256 | off | 46.1 ms | 191 ms | 204 ms | — |
+| 256 | on, 8 192 cells | 2.1 ms | 56 ms | 77 ms | 96 KiB |
+
+Without the index, smaller kvhash buckets trade read speed for write speed,
+because every extra blob lengthens the walk for every lookup sharing its
+bucket. With it, blob count stops affecting lookups, and smaller buckets
+improve both reads and writes.
+
+**The departure from P3 is deliberate**, and it is why the index is off by
+default. Its RAM is set at build time and does not grow with the store, mount
+reads nothing extra to fill it, and losing it costs speed, never correctness.
+The cell could be made smaller, for example 8 B by storing `id / n_buckets` in
+32 bits and the offset in 16 bits where sectors allow; that is not done yet.
+
 ### 5.5 `delete`
 
 Verify presence (1 read); append a TOMBSTONE slot (`val_len = 0`).

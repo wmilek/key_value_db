@@ -84,3 +84,49 @@ tests:
       # tests, and these are the scenarios that drive UBI hardest.
       - CONFIG_UBI_SELF_CHECKS=y
       - CONFIG_BLOB_DB_UBI_ATOMIC_REPLACE=n
+  # The RAM slot index (CONFIG_BLOB_DB_SLOT_INDEX), with every indexed answer
+  # cross-checked against the walk it replaces: a disagreement asserts. Run on
+  # both backends, since the index follows compaction, which is an atomic
+  # replace on UBI and the scratch protocol on flash_area, and with large
+  # payloads, whose segment and sweep paths append through the same hook. The
+  # raw-partition injections in the flash_area run are what prove a hit is
+  # checked against flash rather than trusted.
+  lib.blob_db.slot_index:
+    extra_configs:
+      - CONFIG_BLOB_DB_BACKEND_FLASH_AREA=y
+      - CONFIG_BLOB_DB_SLOT_INDEX=y
+      # native_sim's 4 KB erase blocks make 2 038 buckets.
+      - CONFIG_BLOB_DB_SLOT_INDEX_MAX_BUCKETS=2048
+      - CONFIG_BLOB_DB_SLOT_INDEX_VERIFY=y
+      - CONFIG_ASSERT=y
+  lib.blob_db.slot_index.ubi:
+    extra_configs:
+      - CONFIG_BLOB_DB_BACKEND_UBI=y
+      - CONFIG_UBI_SELF_CHECKS=y
+      - CONFIG_BLOB_DB_SLOT_INDEX=y
+      # native_sim's 4 KB erase blocks make 2 038 buckets.
+      - CONFIG_BLOB_DB_SLOT_INDEX_MAX_BUCKETS=2048
+      - CONFIG_BLOB_DB_SLOT_INDEX_VERIFY=y
+      - CONFIG_ASSERT=y
+  lib.blob_db.slot_index.large_payloads:
+    extra_configs:
+      - CONFIG_BLOB_DB_BACKEND_FLASH_AREA=y
+      - CONFIG_BLOB_DB_LARGE_PAYLOADS=y
+      - CONFIG_MAIN_STACK_SIZE=32768
+      - CONFIG_BLOB_DB_TEST_CRASH_HOOKS=y
+      - CONFIG_BLOB_DB_SLOT_INDEX=y
+      # native_sim's 4 KB erase blocks make 2 038 buckets.
+      - CONFIG_BLOB_DB_SLOT_INDEX_MAX_BUCKETS=2048
+      - CONFIG_BLOB_DB_SLOT_INDEX_VERIFY=y
+      - CONFIG_ASSERT=y
+  # A table far too small for the suite: most ids miss and walk, and every
+  # insert into a full table must be refused rather than evict a live entry.
+  lib.blob_db.slot_index.tiny:
+    extra_configs:
+      - CONFIG_BLOB_DB_BACKEND_FLASH_AREA=y
+      - CONFIG_BLOB_DB_SLOT_INDEX=y
+      # native_sim's 4 KB erase blocks make 2 038 buckets.
+      - CONFIG_BLOB_DB_SLOT_INDEX_MAX_BUCKETS=2048
+      - CONFIG_BLOB_DB_SLOT_INDEX_ENTRIES=64
+      - CONFIG_BLOB_DB_SLOT_INDEX_VERIFY=y
+      - CONFIG_ASSERT=y

@@ -23,6 +23,7 @@
 #include <app/lib/blob_db_test.h>
 
 #include "blob_db_internal.h"
+#include "blob_db_slot_index.h"
 #include "blob_db_store.h"
 
 LOG_MODULE_REGISTER(blob_db, CONFIG_BLOB_DB_LOG_LEVEL);
@@ -53,6 +54,8 @@ struct bucket_scan {
 	off_t            write_cursor;  /* end of log — where an append goes   */
 	off_t            target_off;    /* < 0 when the id has no slot here    */
 	struct slot_head target;        /* the target's on-flash bytes         */
+	bool             from_index;    /* cursor is the slot index's, not a
+					 * walk's: see confirm_cursor()       */
 };
 
 static int read_bucket_hdr(uint16_t bid, bool *valid);
@@ -375,6 +378,8 @@ static int scan_bucket(uint16_t bid, uint64_t *max_id_inout)
 	const size_t min_slot = sizeof(struct blob_db_slot_hdr) +
 				 sizeof(uint64_t) + sizeof(uint16_t);
 
+	blob_db_sidx_begin(bid, (uint32_t)cursor);
+
 	while (cursor + min_slot <= st.peb_size) {
 		struct blob_db_slot_hdr shdr;
 		rc = blob_db_store_read(base + cursor, &shdr, sizeof(shdr));
@@ -393,6 +398,13 @@ static int scan_bucket(uint16_t bid, uint64_t *max_id_inout)
 			LOG_WRN("bucket %u: bad val_len %u at off 0x%lx; truncating",
 				bid, shdr.val_len, (unsigned long)cursor);
 			break;
+		}
+		/* scan_bucket_for() ends the log at a flag it does not know;
+		 * this scan carries on for the id ceiling's sake. The two then
+		 * disagree on where the log ends, so leave the bucket to the
+		 * walk rather than index a cursor the walk would not find. */
+		if (shdr.flags & ~(uint8_t)BLOB_DB_SLOT_F_KNOWN) {
+			blob_db_sidx_forget(bid);
 		}
 		const size_t base_sz = sizeof(shdr) + sizeof(uint64_t) +
 				       shdr.val_len + sizeof(uint16_t);
@@ -415,6 +427,8 @@ static int scan_bucket(uint16_t bid, uint64_t *max_id_inout)
 			*max_id_inout = id;
 		}
 
+		blob_db_sidx_note(bid, id, (uint32_t)cursor, (uint32_t)slot_sz,
+				  (shdr.flags & BLOB_DB_SLOT_F_TOMBSTONE) != 0);
 		cursor += slot_sz;
 	}
 
@@ -536,6 +550,10 @@ int blob_db_mount(void)
 	if (rc < 0) {
 		return rc;
 	}
+
+	/* Rebuilt by the bucket scan below, at no flash cost of its own: the
+	 * scan reads every slot header anyway. */
+	blob_db_sidx_reset(st.n_buckets);
 
 	/* Pick the authoritative master. */
 	struct blob_db_master_hdr m_a, m_b;
@@ -704,6 +722,7 @@ int blob_db_mount(void)
 	return 0;
 
 err_close:
+	blob_db_sidx_disable();
 	blob_db_store_close();
 	return rc;
 }
@@ -716,6 +735,7 @@ int blob_db_unmount(void)
 	blob_db_store_close();
 	st.mounted = false;
 	IDX_INVALIDATE();
+	blob_db_sidx_disable();
 	LOG_INF("unmounted");
 	return 0;
 }
@@ -853,6 +873,9 @@ static int format_bucket(uint16_t bid)
 					     sizeof(bhdr));
 	if (rc < 0) {
 		LOG_ERR("bucket %u format: %d", bid, rc);
+		blob_db_sidx_forget(bid);
+	} else {
+		blob_db_sidx_begin(bid, BLOB_DB_BUCKET_DATA_OFF);
 	}
 	return rc;
 }
@@ -873,6 +896,15 @@ static int format_bucket(uint16_t bid)
 
 static int read_bucket_hdr(uint16_t bid, bool *valid)
 {
+	uint32_t known;
+
+	/* The index holds a cursor only for a bucket whose header it has seen
+	 * valid, and forgets it whenever the bucket is rewritten. */
+	if (blob_db_sidx_cursor(bid, &known)) {
+		*valid = true;
+		return 0;
+	}
+
 	struct blob_db_bucket_hdr bhdr;
 	int rc = blob_db_store_read(bucket_offset(bid), &bhdr, sizeof(bhdr));
 
@@ -904,6 +936,7 @@ static int scan_bucket_for(uint16_t bid, uint64_t target_id, off_t limit,
 	off_t cursor = BLOB_DB_BUCKET_DATA_OFF;
 
 	out->target_off = -1;
+	out->from_index = false;
 
 	for (;;) {
 		if (cursor + (off_t)BLOB_DB_SLOT_OVERHEAD > (off_t)st.peb_size) {
@@ -972,17 +1005,11 @@ static int slot_verify(uint16_t bid, const struct bucket_scan *sc, void *dst)
 	return 0;
 }
 
-/* Find the newest *intact* slot for `id`, staging its payload in `dst`.
- *
- * Retries below a slot that fails its CRC, so the visible value is the newest
- * committed one — the same answer the resident walk gave, since there a torn
- * slot ended the log and left the previous one live.
- *
- * On success `sc` describes the slot (`sc->write_cursor` is the append cursor
- * either way). Returns -ENOENT when the id has no live slot here.
- */
-static int find_live_slot(uint16_t bid, uint64_t id, struct bucket_scan *sc,
-			  void *dst)
+/* The walk behind find_live_slot(). With @p learn, an answer taken from the
+ * full log is taught to the slot index; one found below a rotten slot is not,
+ * since it is not the id's newest slot. */
+static int walk_live_slot(uint16_t bid, uint64_t id, struct bucket_scan *sc,
+			  void *dst, bool learn)
 {
 	off_t limit = (off_t)st.peb_size;
 
@@ -993,6 +1020,10 @@ static int find_live_slot(uint16_t bid, uint64_t id, struct bucket_scan *sc,
 			return rc;
 		}
 		if (sc->target_off < 0) {
+			if (learn && limit == (off_t)st.peb_size) {
+				blob_db_sidx_learn(bid, id, -1,
+						   (uint32_t)sc->write_cursor);
+			}
 			return -ENOENT;
 		}
 
@@ -1007,8 +1038,197 @@ static int find_live_slot(uint16_t bid, uint64_t id, struct bucket_scan *sc,
 		if (sc->target.hdr.flags & BLOB_DB_SLOT_F_TOMBSTONE) {
 			return -ENOENT;
 		}
+		if (learn && limit == (off_t)st.peb_size) {
+			blob_db_sidx_learn(bid, id, sc->target_off,
+					   (uint32_t)sc->write_cursor);
+		}
 		return 0;
 	}
+}
+
+/* Where an append to bucket @p bid goes: the slot index's cursor when it has
+ * one, else a walk (which teaches the index the cursor). Only write_cursor is
+ * meaningful in @p sc afterwards, and a writer passes it through
+ * confirm_cursor() before appending there. */
+static int bucket_cursor(uint16_t bid, uint64_t id, struct bucket_scan *sc)
+{
+	uint32_t cursor;
+
+	if (blob_db_sidx_cursor(bid, &cursor)) {
+		sc->write_cursor = cursor;
+		sc->target_off = -1;
+		sc->from_index = true;
+		return 0;
+	}
+
+	int rc = scan_bucket_for(bid, id, (off_t)st.peb_size, sc);
+
+	if (rc == 0) {
+		blob_db_sidx_learn(bid, id, -1, (uint32_t)sc->write_cursor);
+	}
+	return rc;
+}
+
+/* Called by every writer before it appends at sc->write_cursor. A cursor the
+ * walk found is where the log ends by definition. One the slot index supplied
+ * is where the log ended after the last append blob_db made, and flash could
+ * only differ if something else wrote it. That cannot happen while mounted, but
+ * programming over non-erased bytes is the one failure an index must never
+ * cause, so the 12 bytes a slot head would occupy are checked to be erased
+ * first. One read per write; reads do not pay it. */
+static int confirm_cursor(uint16_t bid, uint64_t id, struct bucket_scan *sc)
+{
+#if defined(CONFIG_BLOB_DB_SLOT_INDEX)
+	if (!sc->from_index) {
+		return 0;
+	}
+	sc->from_index = false;
+
+	const off_t at = sc->write_cursor;
+
+	if (at + (off_t)sizeof(struct slot_head) <= (off_t)st.peb_size) {
+		uint8_t head[sizeof(struct slot_head)];
+		int rc = blob_db_store_read(bucket_offset(bid) + at, head,
+					    sizeof(head));
+
+		if (rc < 0) {
+			return rc;
+		}
+		for (size_t i = 0; i < sizeof(head); i++) {
+			if (head[i] != 0xff) {
+				LOG_WRN("slot index: bucket %u not erased at "
+					"cursor %ld; walking", bid, (long)at);
+				blob_db_sidx_forget(bid);
+
+				struct bucket_scan walk;
+
+				rc = scan_bucket_for(bid, id,
+						     (off_t)st.peb_size, &walk);
+				if (rc < 0) {
+					return rc;
+				}
+				sc->write_cursor = walk.write_cursor;
+				return 0;
+			}
+		}
+	}
+
+#if defined(CONFIG_BLOB_DB_SLOT_INDEX_VERIFY)
+	struct bucket_scan walk;
+	int vrc = scan_bucket_for(bid, id, (off_t)st.peb_size, &walk);
+
+	if (vrc < 0) {
+		return vrc;
+	}
+	if (walk.write_cursor != sc->write_cursor) {
+		LOG_ERR("slot index: bucket %u cursor %ld, walk says %ld",
+			bid, (long)sc->write_cursor, (long)walk.write_cursor);
+		__ASSERT(false, "slot index cursor disagrees with the walk");
+		return -EIO;
+	}
+#endif
+#else
+	ARG_UNUSED(bid);
+	ARG_UNUSED(id);
+	ARG_UNUSED(sc);
+#endif
+	return 0;
+}
+
+#if defined(CONFIG_BLOB_DB_SLOT_INDEX)
+/* The slot index's answer for @p id, checked against the slot it names: one
+ * 12-byte read in place of the walk. -EAGAIN when the index has no answer, or
+ * one that does not hold up, and the caller walks instead. */
+static int find_indexed_slot(uint16_t bid, uint64_t id,
+			     struct bucket_scan *sc, void *dst)
+{
+	uint32_t off, cursor;
+
+	if (!blob_db_sidx_lookup(bid, id, &off, &cursor)) {
+		return -EAGAIN;
+	}
+
+	struct slot_head sh;
+	int rc;
+
+	if (off + BLOB_DB_SLOT_OVERHEAD > cursor) {
+		goto stale;
+	}
+	rc = blob_db_store_read(bucket_offset(bid) + off, &sh, sizeof(sh));
+	if (rc < 0) {
+		return rc;
+	}
+	if (sh.id != id || sh.hdr.flags == 0xff ||
+	    !(sh.hdr.flags & BLOB_DB_SLOT_F_SEALED) ||
+	    (sh.hdr.flags & ~(uint8_t)BLOB_DB_SLOT_F_KNOWN) ||
+	    sh.hdr.val_len > CONFIG_BLOB_DB_MAX_PAYLOAD_LEN ||
+	    off + slot_size_for(sh.hdr.val_len) > cursor) {
+		goto stale;
+	}
+
+	sc->write_cursor = cursor;
+	sc->target_off = off;
+	sc->target = sh;
+	sc->from_index = true;
+
+	rc = slot_verify(bid, sc, dst);
+	if (rc == -EBADMSG) {
+		return -EAGAIN;   /* rotten: the walk falls back past it */
+	}
+	if (rc < 0) {
+		return rc;
+	}
+
+	const int hit = (sh.hdr.flags & BLOB_DB_SLOT_F_TOMBSTONE) ? -ENOENT : 0;
+
+#if defined(CONFIG_BLOB_DB_SLOT_INDEX_VERIFY)
+	/* Compare answers, not raw scans: the walk's own answer skips a slot
+	 * that fails its CRC, exactly as a lookup would. It stages the same
+	 * slot's payload in dst if it agrees. */
+	struct bucket_scan walk;
+	int wrc = walk_live_slot(bid, id, &walk, dst, false);
+
+	if (wrc != hit || (wrc == 0 && walk.target_off != sc->target_off)) {
+		LOG_ERR("slot index: id %llu bid %u: index answers %d at off "
+			"%ld, walk answers %d at off %ld",
+			(unsigned long long)id, bid, hit, (long)sc->target_off,
+			wrc, (long)walk.target_off);
+		__ASSERT(false, "slot index disagrees with the walk");
+		return -EIO;
+	}
+#endif
+	return hit;
+
+stale:
+	/* Should not happen while every append is noted; if it does, stop
+	 * trusting this bucket until a walk re-learns it. */
+	LOG_WRN("slot index: stale entry for id %llu in bucket %u",
+		(unsigned long long)id, bid);
+	blob_db_sidx_forget(bid);
+	return -EAGAIN;
+}
+#endif
+
+/* Find the newest *intact* slot for `id`, staging its payload in `dst`.
+ *
+ * Retries below a slot that fails its CRC, so the visible value is the newest
+ * committed one — the same answer the resident walk gave, since there a torn
+ * slot ended the log and left the previous one live.
+ *
+ * On success `sc` describes the slot (`sc->write_cursor` is the append cursor
+ * either way). Returns -ENOENT when the id has no live slot here.
+ */
+static int find_live_slot(uint16_t bid, uint64_t id, struct bucket_scan *sc,
+			  void *dst)
+{
+#if defined(CONFIG_BLOB_DB_SLOT_INDEX)
+	int irc = find_indexed_slot(bid, id, sc, dst);
+
+	if (irc != -EAGAIN) {
+		return irc;
+	}
+#endif
+	return walk_live_slot(bid, id, sc, dst, true);
 }
 
 /* Build and write a slot at bucket+write_cursor. Slot size on flash is
@@ -1089,8 +1309,21 @@ static int append_slot2(uint16_t bid, off_t write_cursor, uint64_t id,
 		return -ENOTSUP;
 	}
 
-	return blob_db_store_write(bucket_offset(bid) + write_cursor,
-				buf, total);
+	int rc = blob_db_store_write(bucket_offset(bid) + write_cursor,
+				     buf, total);
+
+	/* The one place a slot is added, so the one place the slot index has
+	 * to follow. A failed write may have left a torn slot the walk will
+	 * step over, at a cursor the index cannot know. */
+	if (rc < 0) {
+		blob_db_sidx_forget(bid);
+	} else {
+		const bool tomb = (extra_flags & BLOB_DB_SLOT_F_TOMBSTONE) != 0;
+
+		blob_db_sidx_note(bid, id, (uint32_t)write_cursor,
+				  (uint32_t)total, tomb);
+	}
+	return rc;
 }
 
 /* Per-bucket compaction & crash recovery (stage 5) ---------------------- */
@@ -1341,6 +1574,30 @@ static int compact_bucket(uint16_t bid)
 	IO_CAUSE_BYTES(bytes_compacted, new_len);
 
 	rc = compact_commit(bid, g_bbuf_new, new_len);
+
+	/* Every slot moved. The image is still in RAM, so re-index it from
+	 * there rather than leave the bucket's lookups to walk. */
+	if (rc < 0) {
+		blob_db_sidx_forget(bid);
+	} else {
+		off_t off = BLOB_DB_BUCKET_DATA_OFF;
+		struct slot_view sv;
+
+		blob_db_sidx_begin(bid, (uint32_t)off);
+		while (off < (off_t)new_len &&
+		       slot_view_at(g_bbuf_new, off, &sv)) {
+			const bool tomb =
+				(sv.flags & BLOB_DB_SLOT_F_TOMBSTONE) != 0;
+
+			blob_db_sidx_note(bid, sv.id, (uint32_t)off,
+					  (uint32_t)sv.total_size, tomb);
+			off += sv.total_size;
+		}
+		if (off != (off_t)new_len) {
+			blob_db_sidx_forget(bid);
+		}
+	}
+
 	g_bbuf_new_busy = false;
 	return rc;
 }
@@ -2470,11 +2727,18 @@ int blob_db_update(uint64_t id, const void *payload, size_t len)
 #else
 		/* Only the append cursor is needed: latest-wins (§4) makes the
 		 * new slot live without consulting the old one. */
-		rc = scan_bucket_for(bid, id, (off_t)st.peb_size, &sc);
+		rc = bucket_cursor(bid, id, &sc);
 		if (rc < 0) {
 			return rc;
 		}
 #endif
+		{
+			int crc = confirm_cursor(bid, id, &sc);
+
+			if (crc < 0) {
+				return crc;
+			}
+		}
 		write_cursor = sc.write_cursor;
 #if defined(CONFIG_BLOB_DB_LARGE_PAYLOADS)
 		if (indexed) {
@@ -2504,7 +2768,11 @@ int blob_db_update(uint64_t id, const void *payload, size_t len)
 
 		struct bucket_scan sc;
 
-		rc = scan_bucket_for(bid, id, (off_t)st.peb_size, &sc);
+		rc = bucket_cursor(bid, id, &sc);
+		if (rc < 0) {
+			return rc;
+		}
+		rc = confirm_cursor(bid, id, &sc);
 		if (rc < 0) {
 			return rc;
 		}
@@ -2594,6 +2862,12 @@ int blob_db_delete(uint64_t id)
 #endif
 
 	const size_t ssz = slot_size_for(0);
+
+	rc = confirm_cursor(bid, id, &sc);
+	if (rc < 0) {
+		return rc;
+	}
+
 	off_t write_cursor = sc.write_cursor;
 
 	if (write_cursor + ssz > st.peb_size) {
@@ -2606,6 +2880,10 @@ int blob_db_delete(uint64_t id)
 			/* Compaction dropped this id — already deleted. */
 			return -ENOENT;
 		}
+		if (rc < 0) {
+			return rc;
+		}
+		rc = confirm_cursor(bid, id, &sc);
 		if (rc < 0) {
 			return rc;
 		}
@@ -3129,12 +3407,20 @@ int blob_db_write(uint64_t id, size_t offset, const void *buf, size_t len)
 	 * payload we are about to modify lives. */
 	const size_t ssz = slot_size_for((uint16_t)need);
 
+	rc = confirm_cursor(bid, id, &sc);
+	if (rc < 0) {
+		return rc;
+	}
 	if (sc.write_cursor + (off_t)ssz > (off_t)st.peb_size) {
 		rc = compact_bucket(bid);
 		if (rc < 0) {
 			return rc;
 		}
 		rc = find_live_slot(bid, id, &sc, g_bbuf);
+		if (rc < 0) {
+			return rc;
+		}
+		rc = confirm_cursor(bid, id, &sc);
 		if (rc < 0) {
 			return rc;
 		}
@@ -3174,6 +3460,7 @@ int blob_db_format(void)
 	}
 
 	IDX_INVALIDATE();
+	blob_db_sidx_reset(st.n_buckets);
 	st.wedged = false;   /* the whole store, scratch included, goes away */
 
 	rc = blob_db_store_erase(0, st.fa_size);
@@ -3258,8 +3545,10 @@ int blob_db_erase_all(void)
 	/* Not redundant, despite the bind_root_empty() append at the end: the
 	 * bucket magics below are zeroed *in place*, and every error path
 	 * between here and that append returns without one — leaving the cache
-	 * naming an object whose bucket has just been invalidated. */
+	 * naming an object whose bucket has just been invalidated. The slot
+	 * index goes for the same reason. */
 	IDX_INVALIDATE();
+	blob_db_sidx_reset(st.n_buckets);
 
 	const uint16_t root_bid = (uint16_t)(BLOB_DB_ROOT_ID % st.n_buckets);
 	uint8_t __aligned(4) zeros[BLOB_DB_MAX_WRITE_ALIGN];

@@ -317,6 +317,62 @@ config BLOB_DB_SECTOR_BUF_SIZE
 	  target flash's largest sector — e.g. 65536 for the mx25r64 QSPI
 	  NOR on the nRF5340-DK.
 
+config BLOB_DB_SLOT_INDEX
+	bool "RAM index from blob id to its newest slot (opt-in; departs from P3)"
+	help
+	  Keep, in RAM, the offset of every indexed id's newest slot and each
+	  bucket's append cursor. A get, exists, size or read then costs one
+	  12-byte header read plus the payload, instead of one 12-byte read per
+	  slot in the id's bucket; an update no longer walks the bucket to find
+	  where to append.
+
+	  The walk is what dominates lookups on large erase blocks: in
+	  app_cbor_persondb on the nRF5340-DK model it is 73 % of an access
+	  check at the shipped kvhash geometry and 95 % with smaller kvhash
+	  buckets (doc/impl/l1_bucketlog.md §5.4a).
+
+	  This is a deliberate exception to P3 ("no per-blob RAM, no caches,
+	  no mount-time index rebuild"), which is why it is off by default:
+	  - RAM is fixed by BLOB_DB_SLOT_INDEX_ENTRIES (12 B each) and
+	    BLOB_DB_SLOT_INDEX_MAX_BUCKETS (6 B each), in .bss. It does not
+	    grow with the store; ids beyond capacity are looked up by walking.
+	  - It is built during the bucket scan mount already performs, so
+	    mount reads nothing extra.
+	  - It is a hint. Every hit is checked against the slot it names
+	    (sealed, same id, CRC), and anything it cannot vouch for falls
+	    back to the walk, so a crash, a torn write or bit-rot never turns
+	    into a wrong answer. Nothing about it is on flash.
+
+if BLOB_DB_SLOT_INDEX
+
+config BLOB_DB_SLOT_INDEX_ENTRIES
+	int "Slot index capacity (power of two)"
+	default 2048
+	range 64 1048576
+	help
+	  Cells in the id table. Up to 7/8 of them are filled, so size it at
+	  about 1.15x the live blobs the store will hold (blob_db_count()).
+	  12 bytes of RAM per cell: 2048 cells is 24 KiB.
+
+config BLOB_DB_SLOT_INDEX_MAX_BUCKETS
+	int "Largest bucket count the slot index covers"
+	default 256
+	range 1 65535
+	help
+	  One append cursor and one entry count per bucket: 6 bytes each. A
+	  store with more buckets than this mounts with the index off and
+	  logs a warning. The nRF5340-DK's 8 MiB UBI volume has 118 buckets;
+	  a raw partition of 4 KB sectors has one per sector.
+
+config BLOB_DB_SLOT_INDEX_VERIFY
+	bool "Cross-check every slot index answer against a walk (tests)"
+	help
+	  Each indexed lookup also walks the bucket and asserts both agree
+	  on the slot and the cursor. Doubles the cost of every lookup; for
+	  test suites only.
+
+endif # BLOB_DB_SLOT_INDEX
+
 module = BLOB_DB
 module-str = BLOB_DB
 source "subsys/logging/Kconfig.template.log_config"
