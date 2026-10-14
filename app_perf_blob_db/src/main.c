@@ -422,8 +422,8 @@ BUILD_ASSERT(OBJ_LEN <= CONFIG_BLOB_DB_MAX_OBJECT_LEN,
 BUILD_ASSERT(PART_LEN <= OBJ_LEN, "APP_PERF_BLOB_DB_PART_LEN exceeds OBJ_LEN");
 
 /* Static, not stack: OBJ_LEN is tens of kilobytes. */
-static uint8_t g_obj[OBJ_LEN];
-static uint8_t g_win[PART_LEN];
+static uint8_t __aligned(4) g_obj[OBJ_LEN];
+static uint8_t __aligned(4) g_win[PART_LEN];
 static uint64_t g_ids[N_LARGE];
 
 /* Throughput line for the phases where bytes matter more than operations. */
@@ -654,8 +654,8 @@ BUILD_ASSERT(CHURN_LEN <= CONFIG_BLOB_DB_MAX_PAYLOAD_LEN,
 
 static uint64_t g_churn_ids[CHURN_SET];
 static uint16_t g_churn_ver[CHURN_SET];
-static uint8_t g_churn_buf[CHURN_LEN];
-static uint8_t g_churn_rd[CHURN_LEN];
+static uint8_t __aligned(4) g_churn_buf[CHURN_LEN];
+static uint8_t __aligned(4) g_churn_rd[CHURN_LEN];
 
 /* Contents are a function of (member, version), so the final state can be
  * checked without keeping a copy of it. */
