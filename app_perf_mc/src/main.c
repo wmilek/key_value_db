@@ -48,7 +48,7 @@ LOG_MODULE_REGISTER(app_perf_mc, CONFIG_APP_PERF_MC_LOG_LEVEL);
 
 /* This app is the container's CLIENT — it owns root-id persistence and
  * registers the container's root under its own key. */
-#define MC_ROOTREG_KEY  ROOTREG_KEY(0x4d434e54 /* 'MCNT' */, 0)
+#define MC_ROOTREG_KEY  ROOTREG_KEY(0x4d434853 /* 'MCHS': model container hash */, 0)
 
 #define N_KEYS  CONFIG_APP_PERF_MC_N_KEYS
 #define N_GET   CONFIG_APP_PERF_MC_N_GET

@@ -659,7 +659,7 @@ structure with a single root (P5). The instance field is there to distinguish a
 *second*, independent store of the same type (`l1_root_registry.md` §3, whose
 own example reserves `('KVDB', 1)` for exactly that) — so the only instance is
 instance **0**, matching every other client in the tree (`'KVDB',0`, `'BLFS',0`,
-`'BOOT',0`, `'MCNT',0`). This app registered its sole superblock as `('PADB', 1)`
+`'BOOT',0`, `'MCHS',0`). This app registered its sole superblock as `('PADB', 1)`
 until `main` at `64caa99`, which implied a `('PADB', 0)` that never existed: the
 same mistake as §12.1's, one field further down — treating the registry as
 something that counts rather than something that names. Changing it moves the

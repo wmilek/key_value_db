@@ -135,8 +135,10 @@ int blob_db_unmount(void);
  * The returned id is never returned before in this DB's lifetime — across
  * crashes — and strictly greater than every id previously returned. Bind it
  * with `blob_db_update()`. An allocated-but-unbound id is durable: a later
- * mount never re-issues it, which is the watermark client crash-recovery is
- * built on.
+ * mount never re-issues it. Client crash recovery is built on that: a
+ * mutation reserves its ids before staging and names them in its intent, and
+ * recovery may delete a named id that was never bound without hitting
+ * another owner's blob (l1_model_container.md §4).
  *
  * Never returns `BLOB_DB_ROOT_ID` (= 1); that id is reserved and consumed at
  * format time (see @ref blob_db_root). The concrete value of the first

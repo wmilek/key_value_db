@@ -632,7 +632,7 @@ draft implementation and will be reworked against the final API; the
    one is reached, and mount takes `next_id = next_id_hint` (the bucket scan
    only ever *raises* it defensively, never lowers it). This protects
    allocated-but-unbound ids across a crash — the property the model
-   container's watermark recovery and (future) root-registry `get_or_create`
+   container's intent recovery and (future) root-registry `get_or_create`
    depend on. It subsumes both earlier monotonicity patches (tombstones toward
    the scan max, the `hint↑` compaction ride-along). Cost: one master write
    per block of 256 allocations. Note: the ceiling never lowers, so `next_id`
