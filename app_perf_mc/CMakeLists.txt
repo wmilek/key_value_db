@@ -16,6 +16,6 @@ set(MC_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../tests/lib/blob_db_contract/src)
 
 target_sources(app PRIVATE
 	src/main.c
-	${MC_DIR}/model_container.c
+	${MC_DIR}/model_container_map.c
 )
 target_include_directories(app PRIVATE ${MC_DIR})

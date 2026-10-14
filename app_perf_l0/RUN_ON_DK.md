@@ -146,7 +146,7 @@ Read the residual table `-v` prints before using the model. Then:
   python3 …/l0_timing.py verify -m …/mx25r64_nrf5340dk.json dk_perf.log
   ```
 
-  with any `app_perf` hardware capture. A median ratio near 1.0 means the model
+  with any `app_perf_blob_db` hardware capture. A median ratio near 1.0 means the model
   transfers; consistently below 1.0 is CPU time above L0 that the model does
   not carry.
 - Update `RESULTS.md`: replace §3's derived model with the measured one, keep

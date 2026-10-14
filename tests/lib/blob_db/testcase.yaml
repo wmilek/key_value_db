@@ -1,6 +1,9 @@
 common:
   tags: [storage, blob_db]
   platform_allow: native_sim
+  # src/power_cut.c replays a compaction once per byte it writes, with three
+  # mounts each; on UBI that alone takes most of a minute (twister's default).
+  timeout: 240
 # blob_db defaults to the UBI backend, but most of this suite injects faults by
 # writing the raw partition at offsets that are only blob_db's on flash_area
 # (see SKIP_UNLESS_RAW_PARTITION in src/main.c). The first three scenarios
@@ -12,6 +15,13 @@ tests:
   lib.blob_db:
     extra_configs:
       - CONFIG_BLOB_DB_BACKEND_FLASH_AREA=y
+  # The read-only `blob_db` shell commands. Building them here is what keeps
+  # lib/blob_db/blob_db_shell.c compiling; the suite itself runs unchanged.
+  lib.blob_db.shell:
+    extra_configs:
+      - CONFIG_BLOB_DB_BACKEND_FLASH_AREA=y
+      - CONFIG_SHELL=y
+      - CONFIG_BLOB_DB_SHELL=y
   # Production policy for an unparseable-but-not-erased master: refuse with
   # -EIO instead of reformatting. Exercises the other half of the recovery
   # branch in blob_db_mount().
@@ -31,10 +41,10 @@ tests:
       # large-object tests so the commit-point claim is covered by the
       # config that ships it, not by a config nothing else uses.
       - CONFIG_BLOB_DB_TEST_CRASH_HOOKS=y
-  # The shipped default: UBI, single-slot payloads. Everything that goes
-  # through the API runs here; the raw-partition injection cases skip
-  # themselves, because under UBI those offsets are UBI's device header rather
-  # than blob_db's masters. Keeping this scenario means the default is
+  # The shipped default: UBI with atomic replace, single-slot payloads.
+  # Everything that goes through the API runs here; the raw-partition
+  # injection cases skip themselves, because under UBI those offsets are UBI's
+  # device header rather than blob_db's masters. Keeping this scenario means the default is
   # exercised by the library's own suite and not only by the apps.
   #
   # LARGE_PAYLOADS is deliberately absent, and cannot simply be added here:
@@ -44,7 +54,7 @@ tests:
   # MAX_PAYLOAD_LEN to 2016 — mount then refuses with -ENOTSUP, correctly.
   # The pair is only reachable on this geometry by also lowering
   # MAX_PAYLOAD_LEN to <= 1962. The DK's 64 KB blocks have room to spare and
-  # are unaffected, which is why app_perf runs both options there.
+  # are unaffected, which is why app_perf_blob_db runs both options there.
   lib.blob_db.ubi:
     extra_configs:
       - CONFIG_BLOB_DB_BACKEND_UBI=y
@@ -62,12 +72,15 @@ tests:
       # tests, and these are the scenarios that drive UBI hardest.
       - CONFIG_UBI_SELF_CHECKS=y
       - CONFIG_BLOB_DB_UBI_KEY_APP=y
-  # Compaction by ubi_leb_change() instead of the scratch-sector protocol
-  # (CONFIG_BLOB_DB_UBI_ATOMIC_REPLACE).
-  lib.blob_db.ubi.atomic_replace:
+  # UBI compacting through the scratch-sector protocol instead of
+  # ubi_leb_change() (CONFIG_BLOB_DB_UBI_ATOMIC_REPLACE=n). Not the default,
+  # but mount still recovers a compaction it left half done, so a store
+  # written this way must keep working; src/power_cut.c cuts the power inside
+  # that protocol here, as it does inside ubi_leb_change() on the default.
+  lib.blob_db.ubi.scratch_compaction:
     extra_configs:
       - CONFIG_BLOB_DB_BACKEND_UBI=y
       # zephyr-ubi's own bookkeeping checks after every call: meant for
       # tests, and these are the scenarios that drive UBI hardest.
       - CONFIG_UBI_SELF_CHECKS=y
-      - CONFIG_BLOB_DB_UBI_ATOMIC_REPLACE=y
+      - CONFIG_BLOB_DB_UBI_ATOMIC_REPLACE=n

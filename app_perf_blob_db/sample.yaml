@@ -1,0 +1,22 @@
+sample:
+  description: blob_db performance benchmark
+  name: blob-db-perf
+common:
+  # Run, not just built, on native_sim: the I/O counters are deterministic
+  # there, and every phase checks what it reads back, so a run that reaches
+  # the last line has exercised the whole store. Without this an app that
+  # could not even mount on native_sim went unnoticed.
+  platform_allow:
+    - native_sim
+  integration_platforms:
+    - native_sim
+  harness: console
+  harness_config:
+    type: one_line
+    regex:
+      - "blob_db perf: all phases passed"
+tests:
+  perf.blob_db.ubi: {}
+  perf.blob_db.flash_area:
+    extra_configs:
+      - CONFIG_BLOB_DB_BACKEND_FLASH_AREA=y

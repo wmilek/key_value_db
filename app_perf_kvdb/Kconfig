@@ -14,9 +14,10 @@ config APP_PERF_KVDB_N_KEYS
 	range 8 2048
 	help
 	  Size of the predicted key set ("k000".."kNNN"). Every run verifies
-	  all of them (twice) and rewrites every 4th one. Sized so a rerun on
+	  all of them (twice), enumerates them (twice: a count call and a
+	  full next walk) and rewrites every 4th one. Sized so a rerun on
 	  the nRF5340-DK's QSPI NOR lasts about a minute at the default (from
-	  app_perf/RESULTS.md: ~34 ms per get, ~51 ms per set). Keep the
+	  app_perf_blob_db/RESULTS.md: ~34 ms per get, ~51 ms per set). Keep the
 	  per-bucket packed size under CONFIG_BLOB_DB_MAX_PAYLOAD_LEN (see
 	  kvhash). Changing this (or VAL_LEN) on a store populated with a
 	  different geometry triggers an automatic wipe + repopulation.
@@ -28,6 +29,23 @@ config APP_PERF_KVDB_VAL_LEN
 	help
 	  Derived-pattern bytes stored in each value, in addition to the
 	  8-byte {gen, idx} stamp that verification checks.
+
+config APP_PERF_KVDB_VALUE_BLOBS
+	bool "Store every value in its own blob (map holds only blob ids)"
+	help
+	  Benchmark variant: the kvhash map stores key -> u64 blob id, and
+	  each value lives in a blob_db blob of its own — the full
+	  indirection of l1_model_container.md §2 for values (keys stay in
+	  the map). A get is a map get plus one blob read; a set over an
+	  existing key rewrites only the value blob; a new key allocates
+	  and binds the value blob, then publishes its id in the map; a
+	  delete removes the map entry, then the value blob. The workload,
+	  verification and power-loss protocol are unchanged, so every
+	  phase is directly comparable with the default (inline) build.
+
+	  Uses its own kvdb store name ("perf_vb"), so switching this option
+	  on a persistent store starts a separate store rather than
+	  misreading the other layout.
 
 config APP_PERF_KVDB_FRESH_START
 	bool "Format the store at boot (start over)"

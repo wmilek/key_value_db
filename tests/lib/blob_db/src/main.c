@@ -16,6 +16,11 @@
 #include <zephyr/ztest.h>
 
 #include <app/lib/blob_db.h>
+#include <app/lib/blob_db_test.h>
+#if defined(CONFIG_BLOB_DB_INSPECT)
+#include <app/lib/blob_db_inspect.h>
+#include <app/lib/blob_db_iostats.h>
+#endif
 
 #define BLOB_DB_TEST_PARTITION_ID  PARTITION_ID(storage_partition)
 
@@ -34,11 +39,11 @@
  * nothing about blob_db, and later attaches fail or discard what it hit,
  * taking the rest of the suite with it.
  *
- * So these cases skip on UBI rather than pretend to pass. The gap is real and
- * deliberate: blob_db's crash-safety is verified on flash_area only, because
- * doing it on UBI needs injection at the store seam rather than at fixed flash
- * offsets. Everything that does not reach past the API still runs on both
- * backends — see the lib.blob_db.ubi scenario in testcase.yaml.
+ * So these cases skip on UBI rather than pretend to pass. Compaction's crash
+ * safety is covered on UBI by src/power_cut.c instead, which cuts the power
+ * under the store seam rather than forging state at fixed offsets. Everything
+ * that does not reach past the API still runs on both backends — see the
+ * lib.blob_db.ubi scenario in testcase.yaml.
  *
  * The guard goes at the top of each affected case, not inside the injection
  * helpers. ztest_test_skip() escapes by longjmp, which the compiler cannot see,
@@ -622,7 +627,8 @@ ZTEST(blob_db, test_iterate_visits_each_live_blob_once)
 /* 16. Durable id allocation (contract §2 / impl §13.1): an id that was
  *     allocated but never bound must NEVER be handed out again after a
  *     remount — otherwise a client that durably recorded that id (a root
- *     registry entry, a mutation watermark) would collide with a new owner. */
+ *     registry entry, an id named in a mutation intent) would collide with
+ *     a new owner. */
 ZTEST(blob_db, test_allocated_unbound_id_survives_remount)
 {
 	/* Bind one real blob so the store isn't trivially empty. */
@@ -698,6 +704,49 @@ ZTEST(blob_db, test_compaction_does_not_lower_id_ceiling)
 	zassert_ok(blob_db_get(id, buf, sizeof(buf), &got));
 	zassert_equal(got, 5);
 	zassert_mem_equal(buf, "v0499", 5);
+}
+
+/* 16b. The I/O counters' cause fields account for every erase. Benchmarks
+ *      read an unexplained erase count off them, so they have to add up:
+ *      a master write or a bucket format is one block erase each, and a
+ *      compaction three (bucket, and scratch twice) — or one, when the
+ *      backend replaces a block atomically and skips the scratch protocol
+ *      and its masters altogether. */
+ZTEST(blob_db, test_iostats_causes_account_for_erases)
+{
+	struct blob_db_iostats io;
+	char val[8];
+
+	blob_db_iostats_reset();
+
+	/* A fresh id: its bucket is formatted on first use. */
+	uint64_t id = put_blob("v0000", 5);
+
+	/* 500 rebinds overflow the 4 KB bucket, as in case 16a. */
+	for (int i = 0; i < 500; i++) {
+		(void)snprintk(val, sizeof(val), "v%04d", i);
+		zassert_ok(blob_db_update(id, val, 5), "update #%d failed", i);
+	}
+
+	blob_db_iostats_get(&io);
+
+	const bool atomic = IS_ENABLED(CONFIG_BLOB_DB_UBI_ATOMIC_REPLACE);
+	const uint32_t per_compaction = atomic ? 1 : 3;
+
+	zassert_true(io.compactions >= 1, "no compaction in 500 rebinds");
+	zassert_true(io.bytes_compacted > 0, "compaction rewrote nothing");
+	zassert_true(io.bucket_formats >= 1, "first bind formatted no bucket");
+	if (!atomic) {
+		zassert_true(io.master_writes >= 2 * io.compactions,
+			     "%u compactions but only %u master writes",
+			     io.compactions, io.master_writes);
+	}
+	zassert_equal(io.erases,
+		      io.master_writes + io.bucket_formats +
+		      per_compaction * io.compactions,
+		      "%u erases, causes: %u master + %u formats + %u x %u "
+		      "compactions", io.erases, io.master_writes,
+		      io.bucket_formats, per_compaction, io.compactions);
 }
 
 /* Root invariant — id=1 is live between mount and unmount (see @blob_db_root
@@ -869,7 +918,7 @@ ZTEST(blob_db, test_prepare_extends_window_after_alloc)
 }
 
 /* A prepared bucket must accept its intended write on the append-only path
- * (proof-by-round-trip; timing is measured separately in app_perf). */
+ * (proof-by-round-trip; timing is measured separately in app_perf_blob_db). */
 ZTEST(blob_db, test_prepare_then_update_roundtrips)
 {
 	int rc = blob_db_prepare(3);
@@ -998,7 +1047,7 @@ ZTEST(blob_db, test_foreign_magic_is_refused)
  * `if (!st.mounted) return -ENODEV;`, so the single store that needs
  * discarding, the one that cannot be mounted, was the one store it rejected.
  * Found by downgrading a real DK across the format-major bump
- * (app_perf/RESULTS.md, "Downgrading"), where the only way out was to reach
+ * (app_perf_blob_db/RESULTS.md, "Downgrading"), where the only way out was to reach
  * under the library and erase the partition through flash_area directly. */
 ZTEST(blob_db, test_format_discards_an_unmountable_store)
 {
@@ -2648,3 +2697,143 @@ ZTEST(blob_db, test_review_failed_write_orphans_never_swept)
 }
 #endif /* CONFIG_BLOB_DB_TEST_CRASH_HOOKS */
 #endif /* CONFIG_BLOB_DB_LARGE_PAYLOADS */
+
+#if defined(CONFIG_BLOB_DB_INSPECT)
+/* Introspection ---------------------------------------------------------- */
+
+struct slot_log {
+	uint64_t id;
+	int n;
+	enum blob_db_inspect_slot_state state[4];
+};
+
+static int log_slots_of(const struct blob_db_inspect_slot *s, void *user)
+{
+	struct slot_log *l = user;
+
+	if (s->id == l->id && l->n < (int)ARRAY_SIZE(l->state)) {
+		l->state[l->n++] = s->state;
+	}
+	return 0;
+}
+
+static void assert_bytes_add_up(const struct blob_db_inspect_bucket *bs)
+{
+	zassert_equal(bs->live_bytes + bs->garbage_bytes + bs->tail_bytes +
+		      bs->free_bytes, bs->capacity,
+		      "bucket byte accounting does not add up");
+}
+
+ZTEST(blob_db, test_inspect_info_matches_state)
+{
+	struct blob_db_inspect_info in;
+
+	zassert_ok(blob_db_inspect_info_get(&in));
+	zassert_equal(in.n_sectors, in.n_buckets + 3);
+	zassert_equal(in.partition_size, in.sector_size * in.n_sectors);
+	zassert_equal(in.next_id, 2, "format leaves next_id at 2");
+	zassert_false(in.wedged);
+
+	(void)blob_db_alloc_id();
+	zassert_ok(blob_db_inspect_info_get(&in));
+	zassert_equal(in.next_id, 3);
+
+	zassert_equal(blob_db_inspect_info_get(NULL), -EINVAL);
+	zassert_ok(blob_db_unmount());
+	zassert_equal(blob_db_inspect_info_get(&in), -ENODEV);
+}
+
+ZTEST(blob_db, test_inspect_bucket_accounting)
+{
+	struct blob_db_inspect_info in;
+	struct blob_db_inspect_bucket bs;
+	uint8_t v[20];
+
+	memset(v, 0xa5, sizeof(v));
+	zassert_ok(blob_db_inspect_info_get(&in));
+	zassert_true(in.n_buckets > 4, "geometry too small for this case");
+
+	const size_t a = in.write_align ? in.write_align : 1;
+	const uint32_t slot10 = ROUND_UP(in.slot_overhead + 10, a);
+	const uint32_t slot20 = ROUND_UP(in.slot_overhead + 20, a);
+	const uint32_t slot0 = ROUND_UP(in.slot_overhead, a);
+
+	/* id a: bound, then rebound — one live slot, one stale. */
+	uint64_t ida = put_blob(v, 10);
+
+	zassert_ok(blob_db_update(ida, v, 20));
+
+	/* id b: bound, then deleted — a stale slot and a tombstone. */
+	uint64_t idb = put_blob(v, 10);
+
+	zassert_ok(blob_db_delete(idb));
+	zassert_not_equal(ida % in.n_buckets, idb % in.n_buckets);
+
+	struct slot_log log = { .id = ida };
+
+	zassert_ok(blob_db_inspect_bucket_get(ida % in.n_buckets, &bs,
+					      log_slots_of, &log));
+	zassert_true(bs.formatted);
+	zassert_equal(bs.objects, 1);
+	zassert_equal(bs.superseded, 1);
+	zassert_equal(bs.tombstones, 0);
+	zassert_equal(bs.live_bytes, slot20);
+	zassert_equal(bs.payload_bytes, 20);
+	zassert_equal(bs.garbage_bytes, slot10);
+	zassert_equal(bs.tail_bytes, 0);
+	assert_bytes_add_up(&bs);
+	zassert_equal(log.n, 2);
+	zassert_equal(log.state[0], BLOB_DB_INSPECT_SUPERSEDED);
+	zassert_equal(log.state[1], BLOB_DB_INSPECT_LIVE);
+
+	zassert_ok(blob_db_inspect_bucket_get(idb % in.n_buckets, &bs, NULL,
+					      NULL));
+	zassert_equal(bs.objects, 0);
+	zassert_equal(bs.superseded, 1);
+	zassert_equal(bs.tombstones, 1);
+	zassert_equal(bs.live_bytes, 0);
+	zassert_equal(bs.garbage_bytes, slot10 + slot0);
+	assert_bytes_add_up(&bs);
+
+	/* The root's bucket holds the empty root slot. */
+	zassert_ok(blob_db_inspect_bucket_get(BLOB_DB_ROOT_ID % in.n_buckets,
+					      &bs, NULL, NULL));
+	zassert_equal(bs.objects, 1);
+	zassert_equal(bs.live_bytes, slot0);
+
+	/* A bucket nothing has touched since format is all free. */
+	const uint16_t untouched = (uint16_t)((idb + 1) % in.n_buckets);
+
+	zassert_ok(blob_db_inspect_bucket_get(untouched, &bs, NULL, NULL));
+	zassert_false(bs.formatted);
+	zassert_equal(bs.free_bytes, bs.capacity);
+	zassert_equal(bs.capacity, in.bucket_capacity);
+
+	zassert_equal(blob_db_inspect_bucket_get(in.n_buckets, &bs, NULL, NULL),
+		      -EINVAL);
+}
+
+ZTEST(blob_db, test_inspect_compaction_reclaims_garbage)
+{
+	struct blob_db_inspect_info in;
+	struct blob_db_inspect_bucket bs;
+	uint8_t v[64];
+
+	memset(v, 0x3c, sizeof(v));
+	zassert_ok(blob_db_inspect_info_get(&in));
+
+	uint64_t id = put_blob(v, sizeof(v));
+	const uint16_t bid = id % in.n_buckets;
+
+	/* Rebind until the bucket has compacted at least once. */
+	do {
+		zassert_ok(blob_db_update(id, v, sizeof(v)));
+		zassert_ok(blob_db_inspect_bucket_get(bid, &bs, NULL, NULL));
+	} while (bs.gen == 1);
+
+	zassert_equal(bs.objects, 1);
+	zassert_true(bs.garbage_bytes < bs.capacity / 2,
+		     "compaction left %u B of garbage", bs.garbage_bytes);
+	assert_bytes_add_up(&bs);
+}
+#endif /* CONFIG_BLOB_DB_INSPECT */

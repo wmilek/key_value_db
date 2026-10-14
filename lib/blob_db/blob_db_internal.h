@@ -10,7 +10,10 @@
 #ifndef LIB_BLOB_DB_INTERNAL_H_
 #define LIB_BLOB_DB_INTERNAL_H_
 
+#include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
+#include <sys/types.h>
 
 #include <zephyr/sys/util.h>
 #include <zephyr/toolchain.h>
@@ -252,5 +255,50 @@ struct __packed blob_db_seg_hdr {
 };
 BUILD_ASSERT(sizeof(struct blob_db_seg_hdr) == 12,
 	     "blob_db_seg_hdr layout drift");
+
+/* Hooks for the inspection module (CONFIG_BLOB_DB_INSPECT) ---------------
+ *
+ * blob_db_inspect.c lives outside blob_db.c so that <app/lib/blob_db.h>
+ * carries only the contract. These are the few pieces of core state and
+ * parsing it needs; they are internal to the library, not public API. */
+#if defined(CONFIG_BLOB_DB_INSPECT)
+struct blob_db_core_state {
+	bool     mounted;
+	bool     wedged;
+	size_t   fa_size;
+	size_t   peb_size;
+	size_t   write_align;
+	uint16_t n_pebs;
+	uint16_t n_buckets;
+	uint8_t  active_master;
+	uint32_t master_gen;
+	uint64_t next_id;
+	uint64_t next_id_hint;
+	uint64_t seg_owner;
+};
+
+/* Snapshot of the mount state. */
+void blob_db_core_state_get(struct blob_db_core_state *out);
+
+/* The core's sector-sized scratch buffer. Shared, so only usable between
+ * blob_db calls (single-threaded contract). */
+uint8_t *blob_db_core_sector_buf(void);
+
+/* A committed slot, as the core's own walk sees it. */
+struct blob_db_core_slot {
+	uint64_t id;
+	uint8_t  flags;
+	uint16_t val_len;
+	size_t   total_size;
+};
+
+/* Parse the slot at buf[off] of a resident bucket image. False at end of log
+ * (erased, unsealed, unknown flag, implausible length, or CRC mismatch). */
+bool blob_db_core_slot_at(const uint8_t *buf, off_t off,
+			  struct blob_db_core_slot *out);
+
+/* Whether a resident bucket image carries a valid header for bucket bid. */
+bool blob_db_core_bucket_hdr_valid(const uint8_t *buf, uint16_t bid);
+#endif /* CONFIG_BLOB_DB_INSPECT */
 
 #endif /* LIB_BLOB_DB_INTERNAL_H_ */

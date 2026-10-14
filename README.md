@@ -96,7 +96,7 @@ bottom-up. Modules marked *skeleton* are build-wired and Kconfig-gated
 | L2 | `kvlist` · `kvtree` · `seq` | `BLOB_CONTAINER_*` | skeleton | — |
 | L2 | shared intent helper | `BLOB_CONTAINERS_INTENT` | skeleton | — |
 | L3 | `kvdb` | `BLOBDB_KVDB` | implemented (kvhash backend) | `tests/lib/kvdb` |
-| L3 | `blobfs` | `BLOBDB_BLOBFS` | implemented (flat namespace) | `tests/lib/blobfs` |
+| L3 | `blobfs` | `BLOBDB_BLOBFS` | implemented (directories; rename within one) | `tests/lib/blobfs` |
 
 `blobfs` registers with Zephyr's virtual file system when
 `CONFIG_BLOBFS_FS_INTEROP=y`, so the stack is reachable through the ordinary
@@ -111,15 +111,17 @@ fs_open(&file, "/blob/wifi.ssid", FS_O_CREATE | FS_O_RDWR);
 ```
 
 Its test suite runs Zephyr's own filesystem conformance bodies
-(`tests/subsys/fs/common`) unmodified against a blobfs mount. v1 is a flat
-namespace with one-blob file bodies: `mkdir`/`readdir` report `-ENOTSUP`
-(directory iteration needs an `iterate` op the Map shape does not define yet)
-and `CONFIG_BLOB_DB_MAX_PAYLOAD_LEN` caps file size until chunked bodies land.
+(`tests/subsys/fs/common`) unmodified against a blobfs mount. Directories
+nest (`mkdir`, `readdir` through the Map shape's `next`, `unlink` of an empty
+one); `rename` stays within one directory (`-EXDEV` across), `statvfs`
+reports `-ENOTSUP`, and `CONFIG_BLOB_DB_MAX_PAYLOAD_LEN` caps file size until
+chunked bodies land.
 
-`tests/lib/blob_db_contract` is the acceptance suite for the *model container*
-of `doc/layers/l1_model_container.md`: a reference key/value structure built
-purely on the L1 contract, with crash injection at every mutation step. It is
-the proof that the `blob_db` contract is sufficient to carry the layers above.
+`tests/lib/blob_db_contract` is the acceptance suite for the *model container
+map* (`model_container_map`) of `doc/layers/l1_model_container.md`: an
+unoptimized reference key/value structure built purely on the L1 contract,
+with crash injection at every mutation step. It is the proof that the
+`blob_db` contract is sufficient to carry the layers above.
 
 ## Getting started
 
@@ -222,7 +224,7 @@ it demonstrates.
 This is what CI runs ([`build.yml`](.github/workflows/build.yml)), plus an
 app build on the non-default `flash_area` backend. At the merge gate it also
 cross-builds for ARM: the demo on both storage backends and with `kvdb`
-enabled, `samples/kvhash`, `app_perf`, and `app_cbor_persondb` in both of its
+enabled, `samples/kvhash`, `app_perf_blob_db`, and `app_cbor_persondb` in both of its
 frontends — so the binaries that produce the hardware numbers cannot rot
 between runs on real hardware.
 
@@ -252,10 +254,10 @@ the source.
 | Application | What it does | Reference results |
 |---|---|---|
 | [`app/`](app) | `blob_db` demo: a boot counter persisted at the root id, wiped with `blob_db_erase_all()` every 5th boot | — |
-| [`app_perf/`](app_perf) | raw `blob_db` benchmark: prepend / append / read / update over a linked list of blobs | [`RESULTS.md`](app_perf/RESULTS.md) |
+| [`app_perf_blob_db/`](app_perf_blob_db) | raw `blob_db` benchmark: list insert / read / update, large-object read / pread / pwrite, steady-state churn with compaction, and mount at several fill levels | [`RESULTS.md`](app_perf_blob_db/RESULTS.md) |
 | [`app_perf_l0/`](app_perf_l0) | **L0 cost model**: raw `flash_area` timing, swept over transfer size and erase size as a matrix of µs/op, KiB/s and marginal cost — so whether the relationship is linear is read off, not assumed. Its output feeds a timing model that turns any `native_sim` run's I/O counters into predicted hardware wall-clock, and can be checked against the part's datasheet | [`RESULTS.md`](app_perf_l0/RESULTS.md) |
 | [`app_perf_mc/`](app_perf_mc) | model-container benchmark — the price of the full crash-safe mutation discipline | [`RESULTS.md`](app_perf_mc/RESULTS.md) |
-| [`app_perf_kvdb/`](app_perf_kvdb) | `kvdb` demo + benchmark with **cross-reboot verification**: every value is predicted from a stored generation counter, so a rerun proves the previous run survived — and an interrupted run is detected and proven atomic | [`RESULTS.md`](app_perf_kvdb/RESULTS.md) |
+| [`app_perf_kvdb/`](app_perf_kvdb) | `kvdb` demo + benchmark with **cross-reboot verification**: every value is predicted from a stored generation counter, so a rerun proves the previous run survived — and an interrupted run is detected and proven atomic. Also times kvhash's `count` and a full `next` walk, and proves the walk returns exactly the predicted set | [`RESULTS.md`](app_perf_kvdb/RESULTS.md) |
 | [`app_cbor_persondb/`](app_cbor_persondb) | a CBOR person/credential database — 10 000 people over the L2 Map shape, with the access decision, crash safety and capacity planning a real product needs. Both a **worked example** of building on this stack and a **probe** of it | [`RESULTS.md`](app_cbor_persondb/RESULTS.md) |
 
 `app_perf_l0` is the one to reach for when a change moves flash traffic and

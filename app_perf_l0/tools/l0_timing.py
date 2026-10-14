@@ -680,7 +680,7 @@ def solve_derived(obs, block_bytes):
 def cmd_derive(args):
     """Fit a model from stack-level hardware observations, not from an L0 run.
 
-    An app_perf capture already contains, for each phase, the I/O counters and
+    An app_perf_blob_db capture already contains, for each phase, the I/O counters and
     the wall-clock they produced. That is a linear system in the same six
     coefficients the L0 sweep measures directly, so it can be solved for them
     — and it can be solved from captures taken years ago, on a board that is

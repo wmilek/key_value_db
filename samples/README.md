@@ -11,7 +11,7 @@ benchmark applications one level up:
 | If you want | Look at |
 |---|---|
 | how an API is called, in the smallest complete program | `samples/` (here) |
-| how fast it is on real hardware | [`app_perf/`](../app_perf), [`app_perf_mc/`](../app_perf_mc), [`app_perf_kvdb/`](../app_perf_kvdb) |
+| how fast it is on real hardware | [`app_perf_blob_db/`](../app_perf_blob_db), [`app_perf_mc/`](../app_perf_mc), [`app_perf_kvdb/`](../app_perf_kvdb) |
 | how to build a real product on the stack | [`app_cbor_persondb/`](../app_cbor_persondb) |
 
 | Sample | Demonstrates |

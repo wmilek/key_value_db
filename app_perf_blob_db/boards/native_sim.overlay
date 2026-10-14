@@ -1,0 +1,31 @@
+/*
+ * native_sim, shaped like the nRF5340-DK's on-board MX25R6435F: 64 KB erase
+ * blocks, 4 B write alignment, and the same 8 MB storage_partition at the same
+ * offset the DK overlay uses.
+ *
+ * blob_db derives its bucket count, slot alignment and segment size from the
+ * geometry it finds at mount, so on the simulator's native 4 KB / 1 B geometry
+ * this app would issue a different number of flash operations than the board
+ * it is meant to predict — and on the default UBI backend it would not mount
+ * at all: large payloads raise CONFIG_BLOB_DB_MAX_PAYLOAD_LEN to 2016, more
+ * than a 4 KB block minus UBI's headers can rebind. With this geometry a
+ * native_sim run reproduces the DK's I/O counters, which is what
+ * app_perf_l0/tools/l0_timing.py predicts from.
+ *
+ * Same values as app_perf_l0/geometry/mx25r64.overlay; passing that one as
+ * well is harmless.
+ */
+
+&flashcontroller0 {
+	reg = <0x00000000 DT_SIZE_M(16)>;
+};
+
+&flash0 {
+	reg = <0x00000000 DT_SIZE_M(16)>;
+	erase-block-size = <65536>;
+	write-block-size = <4>;
+};
+
+&storage_partition {
+	reg = <0x00800000 DT_SIZE_M(8)>;
+};

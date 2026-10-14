@@ -29,11 +29,11 @@
 #include <app/lib/blob_db.h>
 #include <app/lib/rootreg.h>
 
-#include "model_container.h"
+#include "model_container_map.h"
 
 /* This suite is the container's CLIENT — it owns root-id persistence
  * (l1_root_registry.md §2) and registers the container under its key. */
-#define MC_ROOTREG_KEY  ROOTREG_KEY(0x4d434e54 /* 'MCNT' */, 0)
+#define MC_ROOTREG_KEY  ROOTREG_KEY(0x4d435f4d /* 'MC_M': model container, map */, 0)
 
 /* Structural blob floor: the root registry (id = 1) + the list root + the
  * intent blob. Each live entry adds exactly two blobs (key + value). "No
@@ -82,6 +82,7 @@ static void fresh_container(void)
 static void before(void *f)
 {
 	ARG_UNUSED(f);
+	mc_fail_after(MC_STEP_NONE, 0);
 	blob_db_unmount();
 	zassert_ok(blob_db_mount());
 	fresh_container();
@@ -314,6 +315,147 @@ ZTEST(blob_db_contract, test_destroy_empty_container)
 
 	open_container();           /* fresh container, fresh id */
 	assert_no_leak();
+}
+
+/* --- recovery touches only the ids the intent names -------------------- */
+
+/* A second structure in the same store, registered under its own key. */
+#define OTHER_ROOTREG_KEY  ROOTREG_KEY(0x4f544852 /* 'OTHR' */, 0)
+
+/* Firmware opens stores lazily, so after a reboot another client may
+ * allocate and bind blobs BEFORE this container's mc_open() runs recovery.
+ * Those blobs have ids above anything the interrupted mutation allocated,
+ * and the container's list does not reference them. Rolling back must still
+ * leave them alone: recovery deletes only what its intent named. */
+ZTEST(blob_db_contract, test_rollback_spares_other_store)
+{
+	zassert_equal(mc_set("foo", "bar", 3, MC_STEP_PREPARE), MC_STOPPED);
+
+	/* Reboot, but let another store come up and write first. */
+	zassert_ok(blob_db_unmount());
+	zassert_ok(blob_db_mount());
+	zassert_ok(rootreg_init());
+
+	uint64_t other;
+
+	zassert_ok(rootreg_get_or_create(OTHER_ROOTREG_KEY, &other));
+	zassert_ok(blob_db_update(other, "cfg", 3));
+
+	/* Only now is the container opened, and its insert rolled back. */
+	open_container();
+
+	char buf[16];
+	size_t got;
+
+	zassert_equal(get_str("foo", buf, sizeof(buf)), -ENOENT);
+	zassert_ok(blob_db_get(other, buf, sizeof(buf), &got),
+		   "recovery deleted another store's blob");
+	zassert_equal(got, 3);
+	zassert_mem_equal(buf, "cfg", 3);
+
+	/* No leak either: the container's floor plus the other store's root. */
+	zassert_equal(blob_db_count(), STRUCT_BLOBS + 1,
+		      "live blobs=%zu, expected=%d", blob_db_count(),
+		      STRUCT_BLOBS + 1);
+}
+
+/* A full list is refused before anything is written: nothing to undo, and
+ * nothing left behind. */
+ZTEST(blob_db_contract, test_failed_set_leaks_nothing)
+{
+	char key[8];
+	int rc;
+	size_t n = 0;
+
+	do {
+		snprintk(key, sizeof(key), "k%zu", n++);
+		rc = mc_set(key, "v", 1, MC_STEP_NONE);
+	} while (rc == 0);
+
+	zassert_equal(rc, -ENOSPC);
+	assert_no_leak();
+
+	/* The container still works, and a later mutation leaks nothing. */
+	zassert_ok(mc_del("k0", MC_STEP_NONE));
+	zassert_ok(mc_set("late", "v", 1, MC_STEP_NONE));
+	assert_no_leak();
+}
+
+/* --- clean failures (§5 abort path), no remount ----------------------- */
+
+/* A step that fails without a power cut aborts through the same recovery a
+ * remount runs: rolled back (error returned) before COMMIT, finished (0
+ * returned) after it. Either way nothing leaks, without remounting. */
+ZTEST(blob_db_contract, test_failed_mutation_aborts_cleanly)
+{
+	const struct crash_case cases[] = {
+		{ MC_STEP_STAGE,   false },
+		{ MC_STEP_PREPARE, false },
+		{ MC_STEP_COMMIT,  true  },
+		{ MC_STEP_CLEANUP, true  },
+	};
+	char buf[16];
+
+	for (size_t i = 0; i < ARRAY_SIZE(cases); i++) {
+		const bool done = cases[i].committed;
+
+		/* Insert. */
+		fresh_container();
+		mc_fail_after(cases[i].cp, -EIO);
+		zassert_equal(mc_set("foo", "bar", 3, MC_STEP_NONE),
+			      done ? 0 : -EIO, "insert case %zu", i);
+		if (done) {
+			zassert_ok(get_str("foo", buf, sizeof(buf)));
+			zassert_str_equal(buf, "bar");
+		} else {
+			zassert_equal(get_str("foo", buf, sizeof(buf)), -ENOENT);
+		}
+		assert_no_leak();
+
+		/* Overwrite. */
+		fresh_container();
+		zassert_ok(mc_set("foo", "bar", 3, MC_STEP_NONE));
+		mc_fail_after(cases[i].cp, -EIO);
+		zassert_equal(mc_set("foo", "bazzz", 5, MC_STEP_NONE),
+			      done ? 0 : -EIO, "overwrite case %zu", i);
+		zassert_ok(get_str("foo", buf, sizeof(buf)));
+		zassert_str_equal(buf, done ? "bazzz" : "bar");
+		assert_no_leak();
+
+		/* Delete. */
+		fresh_container();
+		zassert_ok(mc_set("foo", "bar", 3, MC_STEP_NONE));
+		mc_fail_after(cases[i].cp, -EIO);
+		zassert_equal(mc_del("foo", MC_STEP_NONE),
+			      done ? 0 : -EIO, "delete case %zu", i);
+		zassert_equal(get_str("foo", buf, sizeof(buf)),
+			      done ? -ENOENT : 0);
+		assert_no_leak();
+
+		/* The container keeps working after the abort. */
+		zassert_ok(mc_set("next", "v", 1, MC_STEP_NONE));
+		assert_no_leak();
+	}
+}
+
+/* An interrupted mutation that nobody recovered yet (no remount) is
+ * finished by the next mutation before it stages, and by destroy before it
+ * deletes, so its prepared blobs are never stranded. */
+ZTEST(blob_db_contract, test_staged_intent_finished_before_next_mutation)
+{
+	zassert_equal(mc_set("foo", "bar", 3, MC_STEP_PREPARE), MC_STOPPED);
+	zassert_ok(mc_set("other", "v", 1, MC_STEP_NONE));
+
+	char buf[16];
+
+	zassert_equal(get_str("foo", buf, sizeof(buf)), -ENOENT);
+	assert_no_leak();
+
+	zassert_equal(mc_set("foo", "bar", 3, MC_STEP_PREPARE), MC_STOPPED);
+	zassert_ok(mc_destroy());
+	zassert_ok(rootreg_unregister(MC_ROOTREG_KEY));
+	zassert_equal(blob_db_count(), 1,
+		      "want registry only, got %zu blobs", blob_db_count());
 }
 
 /* §8.3 Delete: committed once the entry is unlinked (COMMIT). */

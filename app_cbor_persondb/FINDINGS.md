@@ -133,7 +133,7 @@ erase block — and then walks it in RAM.
 
 On the DK's MX25R6435F that is **64 KB of SPI traffic per operation**, whether
 the payload is 5 bytes or 4 KB. It is the single cause of every latency figure
-here: the measured 16.9 ms `blob_db` read (`app_perf/RESULTS.md`) is 64 KB at
+here: the measured 16.9 ms `blob_db` read (`app_perf_blob_db/RESULTS.md`) is 64 KB at
 ~4 MB/s, not a seek or an erase.
 
 **Measured, pre-merge** (every figure in this paragraph is the *before* half of

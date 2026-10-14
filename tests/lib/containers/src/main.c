@@ -30,6 +30,7 @@
 #include <zephyr/ztest.h>
 
 #include <app/lib/blob_db.h>
+#include <app/lib/blob_db_iostats.h>
 #include <app/lib/containers/shape_map.h>
 #ifdef CONFIG_BLOB_CONTAINER_KVHASH
 #include <app/lib/containers/kvhash.h>

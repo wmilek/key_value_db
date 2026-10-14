@@ -30,8 +30,9 @@ implementation design exists with tracked open items. **L1 (`blob_db`) is
 implemented** against the current contract — `alloc_id` + bind/rebind
 `update`, durable leading id ceiling (impl §13.1) — and validated on
 `native_sim` by a unit suite (`tests/lib/blob_db`) and the model-container
-acceptance suite (`tests/lib/blob_db_contract`, the sufficiency proof of
-`l1_model_container.md` with crash injection at every mutation step).
+acceptance suite (`tests/lib/blob_db_contract`: `model_container_map`, the
+sufficiency proof of `l1_model_container.md`, with crash injection at every
+mutation step).
 
 **L0 ships two providers behind a seam inside L1.** `blob_db` addresses
 storage as an array of erase blocks through `lib/blob_db/blob_db_store.h`, and
@@ -187,7 +188,7 @@ lib/
 include/app/lib/      blob_db.h · rootreg.h · containers/{shape_map,shape_seq,…}.h
                       · kvdb.h · blobfs.h
 tests/lib/            blob_db/ (exists) · blob_db_contract/ (exists, model
-                      container) · rootreg/ (exists) · kvdb/ (exists — covers
+                      container map) · rootreg/ (exists) · kvdb/ (exists — covers
                       kvhash) · containers/ · blobfs/
 tests/support/        flash_fault/ — fail-after-N-writes flash_area shim,
                       shared by all crash-injection suites

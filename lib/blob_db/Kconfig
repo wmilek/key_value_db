@@ -27,7 +27,7 @@ config BLOB_DB_BACKEND_FLASH_AREA
 	help
 	  Store directly on the raw storage partition via Zephyr's flash_area
 	  API. This was the original behaviour and the former default. It is
-	  faster — see app_perf/RESULTS.md, "The UBI backend" — but has no
+	  faster — see app_perf_blob_db/RESULTS.md, "The UBI backend" — but has no
 	  wear-leveling and no bad-block handling: an interrupted write can
 	  leave the part unusable until it is externally recovered.
 
@@ -45,7 +45,7 @@ config BLOB_DB_BACKEND_UBI
 	  small cost per flash access and nothing per byte; the sector erase
 	  that dominates writes is unchanged. The larger cost is footprint:
 	  UBI itself, PSA Crypto and the heap UBI takes. Measured figures are
-	  in app_perf/RESULTS.md.
+	  in app_perf_blob_db/RESULTS.md.
 
 	  UBI seals its headers with AES-CMAC through PSA Crypto (Mbed TLS
 	  unless the build has TF-M), and takes its bookkeeping from the heap
@@ -99,6 +99,7 @@ config BLOB_DB_UBI_RELOCATE_BUDGET
 
 config BLOB_DB_UBI_ATOMIC_REPLACE
 	bool "Replace blocks with ubi_leb_change()"
+	default y
 	help
 	  blob_db_store_replace() uses ubi_leb_change(), which leaves the old
 	  contents or the new ones across a power loss. blob_db then rewrites
@@ -110,6 +111,11 @@ config BLOB_DB_UBI_ATOMIC_REPLACE
 
 	  The replaced block is queued for reclaim rather than erased, so its
 	  old contents stay readable from raw flash until UBI reuses it.
+
+	  Turning it on for an existing store is safe. Turning it off is not:
+	  blob_db_erase_all() can then bring back blobs it deleted, so a build
+	  that disables it must format the store first
+	  (doc/impl/l0_backends.md §3).
 
 config HEAP_MEM_POOL_ADD_SIZE_BLOB_DB_UBI
 	int
@@ -228,6 +234,8 @@ config BLOB_DB_TEST_CRASH_HOOKS
 
 	  For tests only. Leave off in production builds — it adds a comparison
 	  on the write path and exports a symbol that can corrupt a store.
+	  The hooks are declared in <app/lib/blob_db_test.h>, not in the
+	  contract header.
 
 endif # BLOB_DB_LARGE_PAYLOADS
 
@@ -235,10 +243,13 @@ config BLOB_DB_IOSTATS
 	bool "Count flash operations and bytes"
 	help
 	  Count reads, writes and erases — operations and bytes — at the
-	  storage seam, and expose them through blob_db_iostats_get(). Both
+	  storage seam, and expose them through blob_db_iostats_get()
+	  (<app/lib/blob_db_iostats.h>, outside the blob_db contract). Both
 	  counts are kept because they can disagree: a change that moves fewer
 	  bytes may issue more transactions, and on a serial part each
-	  transaction carries a fixed command-and-address cost.
+	  transaction carries a fixed command-and-address cost. Alongside
+	  them it counts the usual causes of an erase — master writes, bucket
+	  formats, compactions — so a phase's erases can be attributed.
 
 	  Intended for benchmarks and regression guards. Unlike wall-clock,
 	  these numbers are deterministic, so they are meaningful on native_sim
@@ -248,6 +259,34 @@ config BLOB_DB_IOSTATS
 
 	  A handful of counters and one call per store operation; leave it off
 	  in production builds.
+
+config BLOB_DB_INSPECT
+	bool "Inspection API (geometry, per-bucket occupancy)"
+	help
+	  Build <app/lib/blob_db_inspect.h>: the store's geometry and
+	  allocator state, and for each bucket how its sector splits into live
+	  data, garbage awaiting compaction, unreadable tail and erased space,
+	  with an optional per-slot walk.
+
+	  Kept apart from <app/lib/blob_db.h> on purpose. That header is the
+	  contract every blob_db implementation provides; this one describes
+	  the bucket-log implementation only, for diagnostics. Containers and
+	  interfaces must not depend on it.
+
+config BLOB_DB_SHELL
+	bool "Shell commands to inspect the store"
+	depends on SHELL
+	select BLOB_DB_INSPECT
+	help
+	  Add a `blob_db` shell command group: geometry and master state, a
+	  whole-store occupancy summary with the fill distribution across
+	  buckets, a per-bucket table, a slot-by-slot view of one bucket, where
+	  an id lives, and a hex dump of a blob. Read-only: no command writes
+	  to flash.
+
+	  blob_db is not thread-safe and the shell runs on its own thread, so
+	  use these while the application is not calling blob_db. A full-store
+	  scan reads every bucket sector, which takes a while on large parts.
 
 config BLOB_DB_AUTOFORMAT_ON_CORRUPT
 	bool "Format when both master sectors are unreadable"

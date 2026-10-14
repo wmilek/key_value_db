@@ -1,7 +1,7 @@
 # Observations for `l0_timing.py derive` — nRF5340-DK, MX25R6435F, flash_area
 #
 # NOT a benchmark output. These are the three raw UART captures from
-# app_perf/RESULTS.md that were taken on the flash_area backend, copied here
+# app_perf_blob_db/RESULTS.md that were taken on the flash_area backend, copied here
 # verbatim so a derived model has a checked-in, quotable input. Provenance and
 # board details are in that file; the setup is
 #
@@ -18,7 +18,7 @@
 # counters, so its phases have wall-clock and nothing to attribute it to.
 #
 # Regenerate this file if RESULTS.md gains a new flash_area capture:
-#   sed -n '473,600p' app_perf/RESULTS.md >> this file
+#   sed -n '473,600p' app_perf_blob_db/RESULTS.md >> this file
 ## Raw UART capture — `e80f404` (run 3, main)
 
 ```

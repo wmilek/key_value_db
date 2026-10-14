@@ -16,10 +16,17 @@
  * via rootreg_get_or_create() — and passes it to mc_open(). Everything is
  * still reachable from the single integer id = 1 (P5), through whatever
  * the client persisted there.
+ *
+ * Crash residue is tracked by NAME, not by watermark: every mutation
+ * allocates the ids it will create before it stages, and the intent blob
+ * records them ({new[], del[]}). Recovery deletes exactly the ids the intent
+ * names — new[] if the mutation never committed, del[] if it did — and never
+ * scans the store. So it cannot touch blobs another client allocated, even
+ * one that ran between a crash and this container's mc_open().
  */
 
-#ifndef MODEL_CONTAINER_H_
-#define MODEL_CONTAINER_H_
+#ifndef MODEL_CONTAINER_MAP_H_
+#define MODEL_CONTAINER_MAP_H_
 
 #include <stddef.h>
 #include <stdint.h>
@@ -54,12 +61,22 @@ int mc_get(const char *key, void *out, size_t out_sz, size_t *out_len);
 
 /* Insert or overwrite key -> value. `crash_at` injects a stop point (§5);
  * pass MC_STEP_NONE for a normal completed mutation. Returns 0 on completion,
- * MC_STOPPED if it stopped at the injected point, or a negative errno. */
+ * MC_STOPPED if it stopped at the injected point, or a negative errno.
+ *
+ * A step that fails without a power cut aborts through the same recovery a
+ * remount runs: before the commit the mutation is rolled back and the error
+ * returned; after it the mutation is finished and 0 returned, because the
+ * new state is already what readers see. */
 int mc_set(const char *key, const void *val, size_t vlen,
 	   enum mc_crash_point crash_at);
 
-/* Remove a key (and its blobs). `crash_at` as in mc_set. */
+/* Remove a key (and its blobs). `crash_at` and failures as in mc_set. */
 int mc_del(const char *key, enum mc_crash_point crash_at);
+
+/* Test hook: make the next mutation fail cleanly with `err` right after
+ * `step`, as if the following blob_db call had returned it, so it takes the
+ * abort path with no remount. One-shot; MC_STEP_NONE disarms. */
+void mc_fail_after(enum mc_crash_point step, int err);
 
 /* Tear the container down entirely: delete every key/value blob, the intent
  * blob, and finally the list root. After this the container does not exist —
@@ -78,4 +95,4 @@ int mc_destroy(void);
  * latter is how the tests prove "no permanent leak". */
 int mc_entry_count(size_t *out);
 
-#endif /* MODEL_CONTAINER_H_ */
+#endif /* MODEL_CONTAINER_MAP_H_ */

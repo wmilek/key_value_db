@@ -138,8 +138,10 @@ int      blob_db_unmount(void);
 /* Allocate a fresh id: never returned before, strictly greater than every
  * previously returned id, across all remounts and crashes (contract §2).
  * Never returns BLOB_DB_ROOT_ID (= 1).
- * RAM operation; returns 0 when not mounted (0 is never a valid id). Also
- * the watermark client crash-recovery is built on (l1_model_container.md §4). */
+ * RAM operation; returns 0 when not mounted (0 is never a valid id). Clients
+ * reserve ids before staging and name them in their intent; since an id is
+ * never reissued, recovery may delete a named, never-bound id safely
+ * (l1_model_container.md §4). */
 uint64_t blob_db_alloc_id(void);
 
 /* Bind (first write) or rebind (rewrite) the payload of an allocated id.

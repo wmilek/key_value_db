@@ -28,6 +28,11 @@ one-level container, with `fill` 4.52× faster than shards; reads and `put` cost
 1.3–1.7× more, all of it transaction count. The proposal's §13 `native_sim`
 timings do not transfer in either direction — see §5e.
 
+**§4c measures kvhash spilling person records (`VAL_INLINE_MAX=64`) on
+`native_sim`:** writes and erases drop by about a third, but reads get
+**5–6× slower**, because ~8 000 extra blobs lengthen blob_db's per-lookup slot
+walk for every map in the store. A net loss for this read-heavy app.
+
 **`blob_db` now defaults to the UBI backend; §4a, §5 and §5b are
 `flash_area`.** §5c measures the default's *timings* on the same board: reads
 cost ~1.9× more, `fill` is 1.10× *cheaper*, and the `A4` floor improves
@@ -312,6 +317,59 @@ Whole-run phases:
 | re-verify | 277 ms | same |
 
 
+## 4c. Spilled person records (`CONFIG_BLOB_CONTAINER_KVHASH_VAL_INLINE_MAX=64`)
+
+kvhash can store a value in a blob of its own instead of inside its bucket
+(`doc/proposals/2026-10-09-kvhash-spill.md`). With the value limit at 64 B,
+every person record (~380 B CBOR) is spilled and every credential (23 B) stays
+inline. Same app, same 8 000-person default, `native_sim`; only that one option
+differs. Both builds print `VERIFY PASS` twice and `bucket overflows: 0`, on the
+first run and on the rerun, and the map geometry is identical (784 + 256
+buckets). CI runs the 200-person form as `app.cbor_persondb.smoke.spill64`.
+
+Rerun (rev 1 → 2), flash I/O counters and `app_perf_l0/tools/l0_timing.py
+predict` over `models/mx25r64_nrf5340dk_full.json` (flash cost only):
+
+| phase | inline: reads / bytes | spill64: reads / bytes | flash-only prediction, DK | |
+|---|--:|--:|--:|--:|
+| `check` (200) | 24 267 / 1 644 441 | 148 937 / 2 400 770 | 2.097 → 10.920 s | **×5.2** |
+| `byid` (200)  | 11 693 / 1 079 101 |  84 107 / 1 208 358 | 1.083 → 6.130 s | **×5.7** |
+| `miss` (200)  | 12 524 /   550 664 |  65 948 / 1 191 752 | 1.007 → 4.868 s | **×4.8** |
+| `put` (200)   | 68 377 / 6 593 936 | 364 094 / 7 809 235 | 307.2 → 245.1 s | ×0.80 |
+
+`put` writes 4 458 243 → 3 049 455 B and erases 225 → 165 sectors: a record
+rewrite no longer repacks its whole bucket, so writes and erases drop by about
+a third. That is the win spilling was built for, and it is real.
+
+**Reads get five to six times slower, and not because of the extra read.** A
+spilled `get` costs one more blob read, which would make it ~1.33× slower
+(`app_perf_kvdb/RESULTS.md`). The `miss` row is the tell: it looks up cards that
+do not exist, never reaches a person record, and still costs 4.8× more. The
+cost is in blob_db. A `get` walks every slot header in its bucket, 12 B each
+(`doc/impl/l1_bucketlog.md` §1.5), and an id's bucket is `id % n_buckets`.
+Inline, this store is ~1 000 blobs (784 + 256 kvhash buckets, the directories,
+the registry); spilled it is ~9 000, so every blob_db bucket holds roughly 8×
+the slots, and **every lookup in the store pays for every spilled record**,
+whichever map it belongs to. Read operations rise 5.3–7.2×; bytes only
+1.1–2.2×, because the extra reads are 12-byte headers.
+
+So for this app, at this limit, spilling is a net loss: a `check` goes from
+≈10.5 ms to ≈55 ms of flash time on the DK, against a `put` 20 % cheaper, and
+an access-control store is read far more than it is written. Two conclusions
+carry beyond this app:
+
+- **A spilled blob is not free to the rest of the store.** Its cost is paid by
+  every lookup that shares its blob_db bucket, not only by its own `get`, so the
+  spill limit should sit well above a store's typical value size, not at it.
+  `app_perf_kvdb`'s value-blob runs did not show this, because they added only
+  768 blobs.
+- **The real limit is blob_db's linear slot walk.** An index from id to slot
+  inside blob_db would make blob count nearly irrelevant to lookups, and is
+  what would make spilling broadly worthwhile.
+
+Nothing here has run on the DK; the column is the flash-only model, a floor
+that leaves out UBI's per-transaction cost, which would widen the read gap.
+
 ## 4a. Footprint — nRF5340-DK (measured)
 
 Cross-built with Zephyr SDK 1.0.1 (`arm-zephyr-eabi`) for
@@ -417,7 +475,7 @@ so the delta is attributable to the backend and nothing else.
 | **UBI (default)** | **84 348 B** | **8.0 %** | **161 103 B** | **35.1 %** |
 | **Δ** | **+23 032 B** | +2.2 pp | **+3 408 B** | +0.7 pp |
 
-`app_perf/RESULTS.md` measures the same delta independently at **+23 036 /
+`app_perf_blob_db/RESULTS.md` measures the same delta independently at **+23 036 /
 +3 408 B** on a different application. Four bytes apart on ROM and exact on
 RAM, which is what it should be: the cost is the library, not the caller.
 
@@ -579,7 +637,7 @@ error is the per-transaction cost, which is far above 20 µs.
 
 ### This settles `FINDINGS.md` N1: a flash transaction costs ~65 µs
 
-`app_perf/RESULTS.md` fits two constants from the DK's `lg read` phases:
+`app_perf_blob_db/RESULTS.md` fits two constants from the DK's `lg read` phases:
 **~65 µs per flash read transaction and ~0.63 µs/B.** Applying them to this
 app's own counters, with no refitting:
 
@@ -590,7 +648,7 @@ app's own counters, with no refitting:
 | predicted 112.1 × 65.5 µs + 10 030 × 0.63 µs | **13.66 ms** |
 | measured, less the 0.95 ms of CBOR | **13.66 ms** |
 
-The constants fitted on `app_perf` predict a different application's decision
+The constants fitted on `app_perf_blob_db` predict a different application's decision
 cost to within a fraction of a percent. That is a single test point and two
 free parameters, so it is a cross-check rather than a proof — but it is a
 cross-check across two apps, two payload configurations and two access
@@ -614,7 +672,7 @@ overflows** — the `tools/sizing.py` geometry holds on hardware.
 
 `open` and `prepare` did not move, and could not have: both are pure 64 KB
 sector erase, a property of the MX25R6435F. The 1 100 ms per bucket here
-matches `app_perf`'s independently measured 1.06–1.09 s per sector.
+matches `app_perf_blob_db`'s independently measured 1.06–1.09 s per sector.
 
 **Fill gained only ×1.22 while the read-bound phases gained ×7.9.** That is
 the sharpest confirmation of §5's finding that fill is dominated by erase and
@@ -699,7 +757,7 @@ measurement changed.
 > and transaction count are the two terms that matter — and the arithmetic was
 > defensible from what was known. What it lacked was the one constant only the
 > board could give, which is precisely why N1 was raised. With that constant in
-> hand, `app_perf`'s independently fitted model reproduces this app's `check`
+> hand, `app_perf_blob_db`'s independently fitted model reproduces this app's `check`
 > cost to a fraction of a percent (§5).
 
 **The CBOR conclusion has to be restated.** This document previously said the
@@ -860,7 +918,7 @@ overflows, `VERIFY PASS` both times.
 
 ### The UBI cost model transfers between applications
 
-`app_perf/RESULTS.md` fits UBI at **178 µs per flash transaction and
+`app_perf_blob_db/RESULTS.md` fits UBI at **178 µs per flash transaction and
 0.616 µs/B**, from a different app with different payloads. Applied to this
 app's own counters for `check`, with no refitting:
 
@@ -872,7 +930,7 @@ app's own counters for `check`, with no refitting:
 | **measured** | **27.66 ms** |
 
 **0.3% apart.** Both backends' constants now predict this application's
-decision cost from `app_perf`'s numbers, which is the strongest evidence in
+decision cost from `app_perf_blob_db`'s numbers, which is the strongest evidence in
 either file that the model is real rather than fitted noise.
 
 It also moves `FINDINGS.md` N1 further: fixed transaction cost is now
@@ -942,7 +1000,7 @@ the scale it was checked at.
 
 ### Reads scale with transactions; writes scale with erase
 
-The `app_perf` UBI constants — 178 µs per flash transaction, 0.616 µs/B, fitted
+The `app_perf_blob_db` UBI constants — 178 µs per flash transaction, 0.616 µs/B, fitted
 on a different app at a different scale — applied to this run's own counters
 with no refitting:
 
@@ -1325,7 +1383,7 @@ Every run printed `VERIFY PASS` twice, with 0 bucket overflows and 2 479
 credentials; flash-operation counts are within 2 % of the old-fork run.
 
 - **Reads roughly halve** (`check`, `byid`, `miss`), because UBI's cost per
-  flash access fell from ~112 µs to 7–13 µs (`app_perf/RESULTS.md`).
+  flash access fell from ~112 µs to 7–13 µs (`app_perf_blob_db/RESULTS.md`).
 - **The format's erases moved, not vanished.** v0.1.0's format does not
   pre-erase blank blocks, so `open` drops from 146 s to 37 s and the erases
   happen in `prepare`, inside UBI's allocator on each bucket's first write.
@@ -1552,13 +1610,13 @@ west build -p always -b nrf5340dk/nrf5340/cpuapp app_cbor_persondb \
          -DCONFIG_APP_CBOR_PERSONDB_FRESH_START=y
 ```
 
-### A note on running this after `app_perf`
+### A note on running this after `app_perf_blob_db`
 
 This app does not enable `CONFIG_BLOB_DB_LARGE_PAYLOADS`, so it reads format
-major 1 only. `app_perf` does enable it and leaves a major-2 store, which this
+major 1 only. `app_perf_blob_db` does enable it and leaves a major-2 store, which this
 app refuses to mount with `-ENOTSUP` — and `FRESH_START` cannot save it, because
 mount runs first. Erase the partition before the run; see the "Downgrading"
-section of `app_perf/RESULTS.md`.
+section of `app_perf_blob_db/RESULTS.md`.
 
 ### Reproducing
 

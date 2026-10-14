@@ -5,3 +5,6 @@ common:
   build_only: true
 tests:
   perf.kvdb: {}
+  perf.kvdb.value_blobs:
+    extra_configs:
+      - CONFIG_APP_PERF_KVDB_VALUE_BLOBS=y

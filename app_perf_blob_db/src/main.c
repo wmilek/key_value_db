@@ -8,10 +8,13 @@
  *   - each node is one blob: { uint64_t next_id; uint8_t val[VAL_LEN]; }
  *   - the head id is stored at BLOB_DB_ROOT_ID (empty root == empty list)
  *
- * Four workloads are measured. Each phase runs erase_all() followed by
- * blob_db_prepare(N_OPS), so the timed loop measures the append-only write
- * path — the one-time sector-erase cost is paid up-front by prepare() and
- * reported separately.
+ * Phases, in run order:
+ *   mount empty — remount a store holding only the root: mount's floor
+ *
+ * Then twice, once building the list by prepending and once by appending.
+ * Each pass runs erase_all() followed by blob_db_prepare(N_OPS), so the timed
+ * insert loop measures the append-only write path — the one-time sector-erase
+ * cost is paid up-front by prepare() and reported separately.
  *   prepare — pre-format N_OPS buckets ahead of the alloc cursor (one 64 KB
  *             sector erase per bucket on mx25r64; the append/prepend loops
  *             below never trigger a bucket format because of this)
@@ -20,6 +23,8 @@
  *             (O(1) via a caller-side tail cache)
  *   read    — traverse from head, get() every node
  *   update  — rewrite the payload of every existing node in place
+ *
+ *   mount list — remount with the list in place; it must read back the same
  *
  * With CONFIG_BLOB_DB_LARGE_PAYLOADS a second group of phases exercises
  * objects too large for one slot — stored as segments plus an index record —
@@ -38,10 +43,29 @@
  *                us/op against "lg rewrite": that ratio is the whole reason
  *                blob_db_write exists, and it should grow with OBJ_LEN
  *                (rewrite) while staying flat (pwrite)
+ *   mount large — remount with the large objects' segments in every bucket
+ *
+ * Last, on the store as it stands:
+ *   churn       — CHURN_OPS updates of a small hot set, until its buckets
+ *                 fill and compact: the steady-state update cost, with plain
+ *                 and compacting updates reported apart (see bench_churn())
+ *   mount churn — remount after compaction; churn and large contents are
+ *                 then checked against what was written
+ *
+ * The run ends with "blob_db perf: all phases passed", or with an error and,
+ * on native_sim, a non-zero exit. Every remount is followed by a check that
+ * the data written before it reads back unchanged.
+ *
+ * With CONFIG_BLOB_DB_IOSTATS each phase also prints an `io` line (flash
+ * operations and bytes) and, when the phase wrote a master, formatted a
+ * bucket or compacted one, a `why` line counting those — the usual reasons
+ * behind its erases.
  *
  * Wall-clock is via k_uptime_delta(); ops/sec is derived at millisecond
  * resolution — for flash operations that costs less than 1 % vs a raw
- * cycle counter, and stays sane over runs measured in seconds.
+ * cycle counter, and stays sane over runs measured in seconds. The churn
+ * phase is the exception: it times each update alone, with the cycle
+ * counter, to separate the ones that compacted.
  *
  * CAVEAT for native_sim: the flash simulator does not model erase or program
  * latency unless CONFIG_FLASH_SIMULATOR_SIMULATE_TIMING is set with the
@@ -49,6 +73,9 @@
  * phases measure CPU and memcpy, not storage — which will flatter paths that
  * move fewer bytes and penalise paths that issue more transactions. Run on
  * hardware, or calibrate the simulator, before drawing conclusions.
+ * The I/O counters, by contrast, are exact on native_sim: boards/native_sim.
+ * overlay gives the simulated flash the DK's geometry, so they match the
+ * board's operation for operation.
  */
 
 #include <errno.h>
@@ -61,6 +88,7 @@
 #include <zephyr/sys/printk.h>
 
 #include <app/lib/blob_db.h>
+#include <app/lib/blob_db_iostats.h>
 
 #include <zephyr/app_version.h>
 
@@ -68,10 +96,10 @@
 #include "posix_board_if.h"   /* posix_exit() — end the sim run cleanly */
 #endif
 
-LOG_MODULE_REGISTER(app_perf, CONFIG_APP_PERF_LOG_LEVEL);
+LOG_MODULE_REGISTER(app_perf_blob_db, CONFIG_APP_PERF_BLOB_DB_LOG_LEVEL);
 
-#define N_OPS   CONFIG_APP_PERF_N_OPS
-#define VAL_LEN CONFIG_APP_PERF_VAL_LEN
+#define N_OPS   CONFIG_APP_PERF_BLOB_DB_N_OPS
+#define VAL_LEN CONFIG_APP_PERF_BLOB_DB_VAL_LEN
 
 struct __packed node {
 	uint64_t next_id;
@@ -189,6 +217,14 @@ static int list_traverse(uint32_t *checksum_out)
 
 /* --- benchmark harness ------------------------------------------------- */
 
+/* Deterministic offsets and choices, so runs are comparable and a regression
+ * is not masked by a different random walk. */
+static uint32_t lcg(uint32_t *state)
+{
+	*state = (*state * 1103515245u) + 12345u;
+	return *state >> 8;
+}
+
 static void bench_line(const char *what, int ops, int64_t ms)
 {
 	/* Print ops/s with three fractional digits so sub-1-op/s workloads
@@ -255,10 +291,33 @@ static void io_line(const char *what, size_t useful_bytes)
 		       (unsigned long long)((bwr * 100 / useful_bytes) % 100));
 	}
 	printk("\n");
+
+	/* What the erases above were for. Only printed when something happened:
+	 * a read phase has nothing to explain. Deliberately not an `io` line —
+	 * l0_timing.py parses those, and these are causes, not more cost. */
+	const uint32_t mw = now.master_writes - io_mark.master_writes;
+	const uint32_t bf = now.bucket_formats - io_mark.bucket_formats;
+	const uint32_t cp = now.compactions - io_mark.compactions;
+	const uint64_t bcp = now.bytes_compacted - io_mark.bytes_compacted;
+
+	if (mw || bf || cp) {
+		printk("  why %-10s: master writes %4u   bucket formats %4u   "
+		       "compactions %4u (%llu B live rewritten)\n",
+		       what, mw, bf, cp, (unsigned long long)bcp);
+	}
+}
+
+static uint32_t io_compactions(void)
+{
+	struct blob_db_iostats now;
+
+	blob_db_iostats_get(&now);
+	return now.compactions;
 }
 #else
 #define io_reset()            ((void)0)
 #define io_line(what, bytes)  ((void)0)
+#define io_compactions()      ((uint32_t)0)
 #endif
 
 /* Run every workload from an empty list (erase_all) so timings are
@@ -319,17 +378,48 @@ static int bench_phase_read_and_update(uint8_t *val, uint32_t *checksum)
 	return 0;
 }
 
+/* Mount is the one operation the contract lets read the whole partition (R4):
+ * it walks every bucket's slot headers to recover its write cursor and the id
+ * ceiling. Its cost is therefore set by what is on flash rather than by
+ * anything the caller does, so it is timed at several points of the run, each
+ * with a different store behind it. Unmount is not timed — it touches no
+ * flash. */
+static int bench_mount(const char *what)
+{
+	int rc = blob_db_unmount();
+
+	if (rc < 0) {
+		LOG_ERR("unmount before %s: %d", what, rc);
+		return rc;
+	}
+
+	io_reset();
+	int64_t t = k_uptime_get();
+
+	rc = blob_db_mount();
+
+	const int64_t ms = k_uptime_delta(&t);
+
+	if (rc < 0) {
+		LOG_ERR("%s: %d", what, rc);
+		return rc;
+	}
+	bench_line(what, 1, ms);
+	io_line(what, 0);
+	return 0;
+}
+
 /* --- large-object phases ----------------------------------------------- */
 #if defined(CONFIG_BLOB_DB_LARGE_PAYLOADS)
 
-#define OBJ_LEN   CONFIG_APP_PERF_OBJ_LEN
-#define N_LARGE   CONFIG_APP_PERF_N_LARGE
-#define N_PART    CONFIG_APP_PERF_N_PART
-#define PART_LEN  CONFIG_APP_PERF_PART_LEN
+#define OBJ_LEN   CONFIG_APP_PERF_BLOB_DB_OBJ_LEN
+#define N_LARGE   CONFIG_APP_PERF_BLOB_DB_N_LARGE
+#define N_PART    CONFIG_APP_PERF_BLOB_DB_N_PART
+#define PART_LEN  CONFIG_APP_PERF_BLOB_DB_PART_LEN
 
 BUILD_ASSERT(OBJ_LEN <= CONFIG_BLOB_DB_MAX_OBJECT_LEN,
-	     "APP_PERF_OBJ_LEN exceeds CONFIG_BLOB_DB_MAX_OBJECT_LEN");
-BUILD_ASSERT(PART_LEN <= OBJ_LEN, "APP_PERF_PART_LEN exceeds OBJ_LEN");
+	     "APP_PERF_BLOB_DB_OBJ_LEN exceeds CONFIG_BLOB_DB_MAX_OBJECT_LEN");
+BUILD_ASSERT(PART_LEN <= OBJ_LEN, "APP_PERF_BLOB_DB_PART_LEN exceeds OBJ_LEN");
 
 /* Static, not stack: OBJ_LEN is tens of kilobytes. */
 static uint8_t g_obj[OBJ_LEN];
@@ -348,14 +438,6 @@ static void bench_bytes(const char *what, int ops, size_t bytes, int64_t ms)
 	       "%6llu KB/s  (%9llu us/op)\n",
 	       what, ops, ms, (unsigned long long)kb_per_s,
 	       (unsigned long long)us_per_op);
-}
-
-/* Deterministic offsets, so runs are comparable and a regression is not
- * masked by a different random walk. */
-static uint32_t lcg(uint32_t *state)
-{
-	*state = (*state * 1103515245u) + 12345u;
-	return *state >> 8;
 }
 
 static void fill_obj(uint8_t seed)
@@ -506,7 +588,7 @@ static int bench_large(void)
 	/* Spell the comparison out, since it is the point of the phase. Two
 	 * decimals, because integer division reported the DK's real 1.95x as
 	 * "1x" — the truncation swallowed the entire result at these
-	 * parameters (app_perf/RESULTS.md). */
+	 * parameters (app_perf_blob_db/RESULTS.md). */
 	if (t_pwrite > 0 && N_PART > 0 && N_LARGE > 0) {
 		const uint64_t us_pw =
 			(uint64_t)t_pwrite * 1000ULL / (uint64_t)N_PART;
@@ -531,7 +613,263 @@ static int bench_large(void)
 	printk("lg objects intact (%u B each)\n", (unsigned)reported);
 	return 0;
 }
+
+/* Checksum of every large object's full contents. The churn phase compacts
+ * buckets these objects' segments live in, and remounts follow it, so this is
+ * taken before and compared after: compaction must carry them over untouched.
+ * One read per object, through the static object buffer — not timed. */
+static int large_checksum(uint32_t *out)
+{
+	uint32_t sum = 0;
+
+	for (int i = 0; i < N_LARGE; i++) {
+		size_t got = 0;
+		int rc = blob_db_read(g_ids[i], 0, g_obj, OBJ_LEN, &got);
+
+		if (rc < 0) {
+			LOG_ERR("lg checksum read %d: %d", i, rc);
+			return rc;
+		}
+		if (got != OBJ_LEN) {
+			LOG_ERR("lg checksum read %d: got %zu B", i, got);
+			return -EIO;
+		}
+		for (size_t b = 0; b < got; b++) {
+			sum = sum * 33u + g_obj[b];
+		}
+	}
+	*out = sum;
+	return 0;
+}
 #endif /* CONFIG_BLOB_DB_LARGE_PAYLOADS */
+
+/* --- churn: steady-state updates, compaction included ------------------- */
+
+#define CHURN_OPS  CONFIG_APP_PERF_BLOB_DB_CHURN_OPS
+#define CHURN_SET  CONFIG_APP_PERF_BLOB_DB_CHURN_SET
+#define CHURN_LEN  CONFIG_APP_PERF_BLOB_DB_CHURN_LEN
+
+BUILD_ASSERT(CHURN_LEN <= CONFIG_BLOB_DB_MAX_PAYLOAD_LEN,
+	     "APP_PERF_BLOB_DB_CHURN_LEN exceeds CONFIG_BLOB_DB_MAX_PAYLOAD_LEN");
+
+static uint64_t g_churn_ids[CHURN_SET];
+static uint16_t g_churn_ver[CHURN_SET];
+static uint8_t g_churn_buf[CHURN_LEN];
+static uint8_t g_churn_rd[CHURN_LEN];
+
+/* Contents are a function of (member, version), so the final state can be
+ * checked without keeping a copy of it. */
+static void churn_fill(int k, uint16_t ver)
+{
+	for (size_t j = 0; j < CHURN_LEN; j++) {
+		g_churn_buf[j] = (uint8_t)(k * 7u + ver * 13u + j * 3u);
+	}
+}
+
+struct churn_lat {
+	uint32_t n;
+	uint64_t sum_us;
+	uint64_t max_us;
+};
+
+static void churn_lat_line(const char *what, const struct churn_lat *l)
+{
+	printk("churn %-11s: %5u updates  avg %9llu us  max %9llu us\n", what,
+	       l->n, (unsigned long long)(l->n ? l->sum_us / l->n : 0),
+	       (unsigned long long)l->max_us);
+}
+
+static int churn_verify(const char *when)
+{
+	for (int k = 0; k < CHURN_SET; k++) {
+		size_t got = 0;
+		int rc = blob_db_get(g_churn_ids[k], g_churn_rd,
+				     sizeof(g_churn_rd), &got);
+
+		if (rc < 0) {
+			LOG_ERR("churn verify (%s) %d: %d", when, k, rc);
+			return rc;
+		}
+		churn_fill(k, g_churn_ver[k]);
+		if (got != CHURN_LEN ||
+		    memcmp(g_churn_rd, g_churn_buf, CHURN_LEN) != 0) {
+			LOG_ERR("churn verify (%s) %d: wrong contents "
+				"(got %zu B)", when, k, got);
+			return -EIO;
+		}
+	}
+	printk("churn contents verified %s (%u blobs)\n", when,
+	       (unsigned)CHURN_SET);
+	return 0;
+}
+
+/*
+ * Every other phase writes each blob once or twice into a fresh store, so no
+ * bucket ever fills and compaction never runs: their figures are the cost of
+ * an update with no garbage behind it. This phase is the other case. A small
+ * hot set is rewritten over and over, so the buckets it lives in fill with
+ * superseded slots and compact; the result is what an update costs in steady
+ * state, R3's "amortized" made concrete.
+ *
+ * It runs on the store as the earlier phases left it, not on an erased one.
+ * That is on purpose: with large payloads every bucket then already holds a
+ * segment or two of live data, which each compaction has to carry across —
+ * a compaction with nothing live to move would flatter it. It also means no
+ * bucket needs formatting first, which on 64 KB NOR would be a second per
+ * bucket of cost unrelated to what is being measured.
+ *
+ * Each update is timed alone, with the cycle counter, and classified by
+ * whether the compaction counter moved during it. Plain and compacting
+ * updates are reported apart, because an average over both describes neither:
+ * the first is what most calls cost, the second is the stall a caller has to
+ * budget for.
+ */
+static int bench_churn(void)
+{
+	printk("\n-- churn (CHURN_OPS=%u  CHURN_SET=%u  CHURN_LEN=%u) --\n",
+	       (unsigned)CHURN_OPS, (unsigned)CHURN_SET, (unsigned)CHURN_LEN);
+
+	int prepared = blob_db_prepare(CHURN_SET);
+
+	if (prepared < 0) {
+		LOG_ERR("churn prepare: %d", prepared);
+		return prepared;
+	}
+
+	for (int k = 0; k < CHURN_SET; k++) {
+		g_churn_ids[k] = blob_db_alloc_id();
+		if (g_churn_ids[k] == 0) {
+			LOG_ERR("churn alloc_id returned 0 at k=%d", k);
+			return -EIO;
+		}
+		g_churn_ver[k] = 0;
+		churn_fill(k, 0);
+
+		int rc = blob_db_update(g_churn_ids[k], g_churn_buf, CHURN_LEN);
+
+		if (rc < 0) {
+			LOG_ERR("churn bind %d: %d", k, rc);
+			return rc;
+		}
+	}
+
+	struct churn_lat plain = { 0 };
+	struct churn_lat comp = { 0 };
+	uint32_t rnd = 0xc0ffeeu;
+
+	io_reset();
+	int64_t t = k_uptime_get();
+
+	for (int op = 0; op < CHURN_OPS; op++) {
+		const int k = (int)(lcg(&rnd) % CHURN_SET);
+
+		g_churn_ver[k]++;
+		churn_fill(k, g_churn_ver[k]);
+
+		const uint32_t comp_before = io_compactions();
+		const uint32_t cyc0 = k_cycle_get_32();
+		int rc = blob_db_update(g_churn_ids[k], g_churn_buf, CHURN_LEN);
+		const uint64_t us = k_cyc_to_us_floor64(k_cycle_get_32() - cyc0);
+
+		if (rc < 0) {
+			LOG_ERR("churn update %d (member %d): %d", op, k, rc);
+			return rc;
+		}
+
+		struct churn_lat *l =
+			(io_compactions() != comp_before) ? &comp : &plain;
+
+		l->n++;
+		l->sum_us += us;
+		if (us > l->max_us) {
+			l->max_us = us;
+		}
+	}
+	bench_line("churn", CHURN_OPS, k_uptime_delta(&t));
+	io_line("churn", (size_t)CHURN_OPS * CHURN_LEN);
+
+	if (IS_ENABLED(CONFIG_BLOB_DB_IOSTATS)) {
+		churn_lat_line("plain", &plain);
+		churn_lat_line("compacting", &comp);
+
+		/* What compaction adds to the average update: the compacting
+		 * updates' excess over a plain one, spread over every update. */
+		const uint64_t plain_avg = plain.n ? plain.sum_us / plain.n : 0;
+		const uint64_t excess = comp.sum_us > comp.n * plain_avg
+						? comp.sum_us - comp.n * plain_avg
+						: 0;
+
+		printk("churn amortized compaction: %llu us per update\n",
+		       (unsigned long long)(excess / MAX(CHURN_OPS, 1)));
+
+		/* Not an error — the store is fine — but the phase has then
+		 * measured nothing it exists for. */
+		if (comp.n == 0) {
+			LOG_WRN("churn: no update compacted; raise CHURN_OPS "
+				"or CHURN_LEN, or lower CHURN_SET");
+		}
+	} else {
+		/* Without the counter the two kinds cannot be told apart. */
+		churn_lat_line("all", &plain);
+	}
+
+	return churn_verify("after churn");
+}
+
+/* One list-building phase: erase, prepare, insert N_OPS nodes, then read and
+ * update them. `append` picks the insert shape. */
+static int bench_list(bool append, uint8_t *val)
+{
+	const char *what = append ? "append" : "prepend";
+	int rc = blob_db_erase_all();
+
+	if (rc < 0) {
+		LOG_ERR("erase_all: %d", rc);
+		return rc;
+	}
+
+	io_reset();
+	int64_t tp = k_uptime_get();
+	int prepared = blob_db_prepare(N_OPS);
+
+	if (prepared < 0) {
+		LOG_ERR("prepare: %d", prepared);
+		return prepared;
+	}
+	bench_line("prepare", prepared, k_uptime_delta(&tp));
+	io_line("prepare", 0);
+
+	io_reset();
+	int64_t t0 = k_uptime_get();
+	uint64_t tail = 0;   /* caller-side tail cache; O(1) append */
+
+	for (int i = 0; i < N_OPS; i++) {
+		uint64_t id = blob_db_alloc_id();
+
+		if (id == 0) {
+			LOG_ERR("alloc_id returned 0 at i=%d", i);
+			return -EIO;
+		}
+		val[0] = (uint8_t)i;
+		rc = append ? list_append(id, tail, val) : list_prepend(id, val);
+		if (rc < 0) {
+			LOG_ERR("%s %d: %d", what, i, rc);
+			return rc;
+		}
+		tail = id;
+	}
+	bench_line(what, N_OPS, k_uptime_delta(&t0));
+	io_line(what, (size_t)N_OPS * sizeof(struct node));
+
+	uint32_t sum = 0;
+
+	rc = bench_phase_read_and_update(val, &sum);
+	if (rc < 0) {
+		return rc;
+	}
+	printk("%s checksum: 0x%08x\n", what, sum);
+	return 0;
+}
 
 int main(void)
 {
@@ -552,96 +890,109 @@ int main(void)
 		val[i] = (uint8_t)i;
 	}
 
-	/* ============ prepend phase ==================================== */
+	/* ============ mount, empty ===================================== */
+	/* The floor: a store holding nothing but the root. What the boot mount
+	 * above cost depends on whatever the previous run left behind, so it is
+	 * not reported. */
 	rc = blob_db_erase_all();
 	if (rc < 0) {
 		LOG_ERR("erase_all: %d", rc);
 		goto out;
 	}
-
-	int64_t tp = k_uptime_get();
-	int prepared = blob_db_prepare(N_OPS);
-
-	if (prepared < 0) {
-		LOG_ERR("prepare: %d", prepared);
-		goto out;
-	}
-	bench_line("prepare", prepared, k_uptime_delta(&tp));
-
-	int64_t t0 = k_uptime_get();
-
-	for (int i = 0; i < N_OPS; i++) {
-		uint64_t id = blob_db_alloc_id();
-
-		if (id == 0) {
-			LOG_ERR("alloc_id returned 0 at i=%d", i);
-			goto out;
-		}
-		val[0] = (uint8_t)i;
-		rc = list_prepend(id, val);
-		if (rc < 0) {
-			LOG_ERR("prepend %d: %d", i, rc);
-			goto out;
-		}
-	}
-	bench_line("prepend", N_OPS, k_uptime_delta(&t0));
-
-	uint32_t sum = 0;
-
-	rc = bench_phase_read_and_update(val, &sum);
+	rc = bench_mount("mount empty");
 	if (rc < 0) {
 		goto out;
 	}
-	printk("prepend checksum: 0x%08x\n", sum);
 
-	/* ============ append phase ===================================== */
-	rc = blob_db_erase_all();
-	if (rc < 0) {
-		LOG_ERR("erase_all: %d", rc);
-		goto out;
-	}
-
-	tp = k_uptime_get();
-	prepared = blob_db_prepare(N_OPS);
-	if (prepared < 0) {
-		LOG_ERR("prepare: %d", prepared);
-		goto out;
-	}
-	bench_line("prepare", prepared, k_uptime_delta(&tp));
-
-	int64_t t1 = k_uptime_get();
-	uint64_t tail = 0;   /* caller-side tail cache; O(1) append */
-
-	for (int i = 0; i < N_OPS; i++) {
-		uint64_t id = blob_db_alloc_id();
-
-		if (id == 0) {
-			LOG_ERR("alloc_id returned 0 at i=%d", i);
-			goto out;
-		}
-		val[0] = (uint8_t)i;
-		rc = list_append(id, tail, val);
-		if (rc < 0) {
-			LOG_ERR("append %d: %d", i, rc);
-			goto out;
-		}
-		tail = id;
-	}
-	bench_line("append", N_OPS, k_uptime_delta(&t1));
-
-	sum = 0;
-	rc = bench_phase_read_and_update(val, &sum);
+	/* ============ prepend, then append ============================= */
+	rc = bench_list(false, val);
 	if (rc < 0) {
 		goto out;
 	}
-	printk("append checksum:  0x%08x\n", sum);
+	rc = bench_list(true, val);
+	if (rc < 0) {
+		goto out;
+	}
+
+	/* ============ mount, list ====================================== */
+	/* The list must read back the same across the remount. */
+	uint32_t before = 0;
+	uint32_t after = 0;
+
+	rc = list_traverse(&before);
+	if (rc < 0) {
+		goto out;
+	}
+	rc = bench_mount("mount list");
+	if (rc < 0) {
+		goto out;
+	}
+	rc = list_traverse(&after);
+	if (rc < 0) {
+		goto out;
+	}
+	if (rc != N_OPS || after != before) {
+		LOG_ERR("list after remount: %d nodes, checksum 0x%08x "
+			"(was 0x%08x)", rc, after, before);
+		rc = -EIO;
+		goto out;
+	}
 
 #if defined(CONFIG_BLOB_DB_LARGE_PAYLOADS)
+	/* ============ large objects ==================================== */
 	rc = bench_large();
 	if (rc < 0) {
 		LOG_ERR("large-object phases: %d", rc);
+		goto out;
+	}
+
+	uint32_t lg_sum = 0;
+	uint32_t lg_now = 0;
+
+	rc = large_checksum(&lg_sum);
+	if (rc < 0) {
+		goto out;
+	}
+	rc = bench_mount("mount large");
+	if (rc < 0) {
+		goto out;
 	}
 #endif
+
+	/* ============ churn ============================================ */
+	if (CHURN_OPS > 0) {
+		rc = bench_churn();
+		if (rc < 0) {
+			goto out;
+		}
+		rc = bench_mount("mount churn");
+		if (rc < 0) {
+			goto out;
+		}
+		rc = churn_verify("after remount");
+		if (rc < 0) {
+			goto out;
+		}
+	}
+
+#if defined(CONFIG_BLOB_DB_LARGE_PAYLOADS)
+	/* Churn compacted buckets holding these objects' segments, and the
+	 * store has been remounted since they were written. */
+	rc = large_checksum(&lg_now);
+	if (rc < 0) {
+		goto out;
+	}
+	if (lg_now != lg_sum) {
+		LOG_ERR("large objects changed: checksum 0x%08x, was 0x%08x",
+			lg_now, lg_sum);
+		rc = -EIO;
+		goto out;
+	}
+	printk("lg objects unchanged by churn and remounts (0x%08x)\n", lg_sum);
+#endif
+
+	rc = 0;
+	printk("\nblob_db perf: all phases passed\n");
 
 out:
 	blob_db_unmount();
