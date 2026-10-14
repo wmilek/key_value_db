@@ -1,9 +1,9 @@
 # app_perf_mc — reference results
 
-Hardware-measured ops/sec for the model container (the L1 sufficiency-proof
-key->value map from `tests/lib/blob_db_contract/`), with its list root
-resolved through the root registry at id 1. Update this file when the
-benchmark shape changes or when regenerating on new hardware.
+Hardware-measured ops/sec for the model container map (`model_container_map`,
+the L1 sufficiency-proof key->value map from `tests/lib/blob_db_contract/`),
+with its list root resolved through the root registry at id 1. Update this
+file when the benchmark shape changes or when regenerating on new hardware.
 
 Regenerated on `e80f404` (main, after PR 10 merged). The previous numbers
 predated PR 2's lookup change; the "~59 reads/s (17 ms)" this file used to

@@ -1,4 +1,4 @@
-# L1 — Model Container: Sufficiency Proof for the `blob_db` Contract
+# L1 — Model Container Map: Sufficiency Proof for the `blob_db` Contract
 
 Status: v4 · Companion to `doc/layers/l1_blob_db.md` (the contract)
 · Governed by `doc/principles.md`
@@ -13,17 +13,28 @@ additional API or guarantee needed.
 
 ## 1. Purpose
 
-The **model container** is the smallest structure that exercises every
-element of the `blob_db` contract — stable ids as persistent references,
-single-operation atomicity, and the discipline that makes multi-i-node
-mutations crash-safe.
+The **model container map** (`model_container_map`, implemented in
+`tests/lib/blob_db_contract/src/model_container_map.c`) is the smallest
+structure that exercises every element of the `blob_db` contract: stable ids
+as persistent references, single-operation atomicity, and the discipline that
+makes multi-i-node mutations crash-safe.
+
+Model containers are teaching structures. Each one shows, in a typical
+situation, how i-nodes and an intent record turn a multi-step mutation into
+one that is atomic against power loss, and how recovery finishes or undoes
+it. They are kept free of every optimization — no payload inlined into the
+referencing i-node, no in-place shortcut where the full discipline can be
+shown — so that each step of the contract stays visible. Their use in a
+product is limited by design. The map is the first; any further model
+container follows the same discipline and registers under its own `'MC_x'`
+key.
 
 It is deliberately **not a usable container** (O(n) flash reads per lookup, one
 i-node per key and per value), and it is **without compromises**: it satisfies
 P7 in full, including *no permanent leak* — every crash residue is reclaimed
 by bounded, idempotent recovery. Three roles follow:
 
-- **Sufficiency proof.** If the model container works, the contract is
+- **Sufficiency proof.** If the model container map works, the contract is
   enough; conversely, any capability the model needs that the contract lacks
   is a contract gap (this is how `alloc_id` earned its place in §4 of the
   contract).
@@ -55,7 +66,8 @@ The client persists nothing but `list_id` (P5) — in a minimal build the list
 lives at id = 1 directly (id 1 always exists after mount; the client simply
 `update`s it, no allocation needed), or typically `list_id` is kept as an
 entry in the root registry helper (`l1_root_registry.md`), which itself
-occupies id = 1. Everything is reachable from it.
+occupies id = 1 — `model_container_map` registers under the key `('MC_M', 0)`.
+Everything is reachable from it.
 
 ## 3. The basic flow
 
