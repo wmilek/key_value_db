@@ -25,8 +25,8 @@
  * one that ran between a crash and this container's mc_open().
  */
 
-#ifndef MODEL_CONTAINER_HASH_H_
-#define MODEL_CONTAINER_HASH_H_
+#ifndef MODEL_CONTAINER_MAP_H_
+#define MODEL_CONTAINER_MAP_H_
 
 #include <stddef.h>
 #include <stdint.h>
@@ -85,4 +85,4 @@ int mc_destroy(void);
  * latter is how the tests prove "no permanent leak". */
 int mc_entry_count(size_t *out);
 
-#endif /* MODEL_CONTAINER_HASH_H_ */
+#endif /* MODEL_CONTAINER_MAP_H_ */

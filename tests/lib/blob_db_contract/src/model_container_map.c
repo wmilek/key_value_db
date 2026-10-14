@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  *
  * Model container — executable form of doc/layers/l1_model_container.md.
- * Built on nothing but the blob_db L1 contract. See model_container_hash.h.
+ * Built on nothing but the blob_db L1 contract. See model_container_map.h.
  */
 
 #include <errno.h>
@@ -13,9 +13,9 @@
 
 #include <app/lib/blob_db.h>
 
-#include "model_container_hash.h"
+#include "model_container_map.h"
 
-LOG_MODULE_REGISTER(model_container_hash, LOG_LEVEL_INF);
+LOG_MODULE_REGISTER(model_container_map, LOG_LEVEL_INF);
 
 #define MC_MAX_ENTRIES  15   /* (256 - 12) / 16, one payload */
 #define MC_MAX_NEW       2   /* insert: key + value blob */

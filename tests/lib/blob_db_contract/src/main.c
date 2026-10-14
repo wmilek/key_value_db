@@ -29,11 +29,11 @@
 #include <app/lib/blob_db.h>
 #include <app/lib/rootreg.h>
 
-#include "model_container_hash.h"
+#include "model_container_map.h"
 
 /* This suite is the container's CLIENT — it owns root-id persistence
  * (l1_root_registry.md §2) and registers the container under its key. */
-#define MC_ROOTREG_KEY  ROOTREG_KEY(0x4d434853 /* 'MCHS': model container hash */, 0)
+#define MC_ROOTREG_KEY  ROOTREG_KEY(0x4d434d50 /* 'MCMP': model container map */, 0)
 
 /* Structural blob floor: the root registry (id = 1) + the list root + the
  * intent blob. Each live entry adds exactly two blobs (key + value). "No

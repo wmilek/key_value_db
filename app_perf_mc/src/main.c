@@ -5,7 +5,7 @@
  * Model-container performance benchmark.
  *
  * Measures the L1 sufficiency-proof container (tests/lib/blob_db_contract/
- * src/model_container_hash.c) — a key->value map where every key, every value,
+ * src/model_container_map.c) — a key->value map where every key, every value,
  * and the pair list are separate blobs, the list root is resolved through
  * the root registry (id 1), and every mutation runs the full 5-step
  * crash-safe discipline (stage intent / prepare / commit / cleanup / clear).
@@ -38,7 +38,7 @@
 
 #include <zephyr/app_version.h>
 
-#include "model_container_hash.h"
+#include "model_container_map.h"
 
 #ifdef CONFIG_ARCH_POSIX
 #include "posix_board_if.h"   /* posix_exit() — end the sim run cleanly */
@@ -48,7 +48,7 @@ LOG_MODULE_REGISTER(app_perf_mc, CONFIG_APP_PERF_MC_LOG_LEVEL);
 
 /* This app is the container's CLIENT — it owns root-id persistence and
  * registers the container's root under its own key. */
-#define MC_ROOTREG_KEY  ROOTREG_KEY(0x4d434853 /* 'MCHS': model container hash */, 0)
+#define MC_ROOTREG_KEY  ROOTREG_KEY(0x4d434d50 /* 'MCMP': model container map */, 0)
 
 #define N_KEYS  CONFIG_APP_PERF_MC_N_KEYS
 #define N_GET   CONFIG_APP_PERF_MC_N_GET
