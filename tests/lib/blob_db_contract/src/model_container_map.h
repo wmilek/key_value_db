@@ -61,12 +61,22 @@ int mc_get(const char *key, void *out, size_t out_sz, size_t *out_len);
 
 /* Insert or overwrite key -> value. `crash_at` injects a stop point (§5);
  * pass MC_STEP_NONE for a normal completed mutation. Returns 0 on completion,
- * MC_STOPPED if it stopped at the injected point, or a negative errno. */
+ * MC_STOPPED if it stopped at the injected point, or a negative errno.
+ *
+ * A step that fails without a power cut aborts through the same recovery a
+ * remount runs: before the commit the mutation is rolled back and the error
+ * returned; after it the mutation is finished and 0 returned, because the
+ * new state is already what readers see. */
 int mc_set(const char *key, const void *val, size_t vlen,
 	   enum mc_crash_point crash_at);
 
-/* Remove a key (and its blobs). `crash_at` as in mc_set. */
+/* Remove a key (and its blobs). `crash_at` and failures as in mc_set. */
 int mc_del(const char *key, enum mc_crash_point crash_at);
+
+/* Test hook: make the next mutation fail cleanly with `err` right after
+ * `step`, as if the following blob_db call had returned it, so it takes the
+ * abort path with no remount. One-shot; MC_STEP_NONE disarms. */
+void mc_fail_after(enum mc_crash_point step, int err);
 
 /* Tear the container down entirely: delete every key/value blob, the intent
  * blob, and finally the list root. After this the container does not exist —

@@ -82,6 +82,7 @@ static void fresh_container(void)
 static void before(void *f)
 {
 	ARG_UNUSED(f);
+	mc_fail_after(MC_STEP_NONE, 0);
 	blob_db_unmount();
 	zassert_ok(blob_db_mount());
 	fresh_container();
@@ -358,8 +359,8 @@ ZTEST(blob_db_contract, test_rollback_spares_other_store)
 		      STRUCT_BLOBS + 1);
 }
 
-/* A set that fails cleanly — here a full list — leaves nothing behind, with
- * no remount in between: the error path is the same rollback recovery runs. */
+/* A full list is refused before anything is written: nothing to undo, and
+ * nothing left behind. */
 ZTEST(blob_db_contract, test_failed_set_leaks_nothing)
 {
 	char key[8];
@@ -378,6 +379,83 @@ ZTEST(blob_db_contract, test_failed_set_leaks_nothing)
 	zassert_ok(mc_del("k0", MC_STEP_NONE));
 	zassert_ok(mc_set("late", "v", 1, MC_STEP_NONE));
 	assert_no_leak();
+}
+
+/* --- clean failures (§5 abort path), no remount ----------------------- */
+
+/* A step that fails without a power cut aborts through the same recovery a
+ * remount runs: rolled back (error returned) before COMMIT, finished (0
+ * returned) after it. Either way nothing leaks, without remounting. */
+ZTEST(blob_db_contract, test_failed_mutation_aborts_cleanly)
+{
+	const struct crash_case cases[] = {
+		{ MC_STEP_STAGE,   false },
+		{ MC_STEP_PREPARE, false },
+		{ MC_STEP_COMMIT,  true  },
+		{ MC_STEP_CLEANUP, true  },
+	};
+	char buf[16];
+
+	for (size_t i = 0; i < ARRAY_SIZE(cases); i++) {
+		const bool done = cases[i].committed;
+
+		/* Insert. */
+		fresh_container();
+		mc_fail_after(cases[i].cp, -EIO);
+		zassert_equal(mc_set("foo", "bar", 3, MC_STEP_NONE),
+			      done ? 0 : -EIO, "insert case %zu", i);
+		if (done) {
+			zassert_ok(get_str("foo", buf, sizeof(buf)));
+			zassert_str_equal(buf, "bar");
+		} else {
+			zassert_equal(get_str("foo", buf, sizeof(buf)), -ENOENT);
+		}
+		assert_no_leak();
+
+		/* Overwrite. */
+		fresh_container();
+		zassert_ok(mc_set("foo", "bar", 3, MC_STEP_NONE));
+		mc_fail_after(cases[i].cp, -EIO);
+		zassert_equal(mc_set("foo", "bazzz", 5, MC_STEP_NONE),
+			      done ? 0 : -EIO, "overwrite case %zu", i);
+		zassert_ok(get_str("foo", buf, sizeof(buf)));
+		zassert_str_equal(buf, done ? "bazzz" : "bar");
+		assert_no_leak();
+
+		/* Delete. */
+		fresh_container();
+		zassert_ok(mc_set("foo", "bar", 3, MC_STEP_NONE));
+		mc_fail_after(cases[i].cp, -EIO);
+		zassert_equal(mc_del("foo", MC_STEP_NONE),
+			      done ? 0 : -EIO, "delete case %zu", i);
+		zassert_equal(get_str("foo", buf, sizeof(buf)),
+			      done ? -ENOENT : 0);
+		assert_no_leak();
+
+		/* The container keeps working after the abort. */
+		zassert_ok(mc_set("next", "v", 1, MC_STEP_NONE));
+		assert_no_leak();
+	}
+}
+
+/* An interrupted mutation that nobody recovered yet (no remount) is
+ * finished by the next mutation before it stages, and by destroy before it
+ * deletes, so its prepared blobs are never stranded. */
+ZTEST(blob_db_contract, test_staged_intent_finished_before_next_mutation)
+{
+	zassert_equal(mc_set("foo", "bar", 3, MC_STEP_PREPARE), MC_STOPPED);
+	zassert_ok(mc_set("other", "v", 1, MC_STEP_NONE));
+
+	char buf[16];
+
+	zassert_equal(get_str("foo", buf, sizeof(buf)), -ENOENT);
+	assert_no_leak();
+
+	zassert_equal(mc_set("foo", "bar", 3, MC_STEP_PREPARE), MC_STOPPED);
+	zassert_ok(mc_destroy());
+	zassert_ok(rootreg_unregister(MC_ROOTREG_KEY));
+	zassert_equal(blob_db_count(), 1,
+		      "want registry only, got %zu blobs", blob_db_count());
 }
 
 /* §8.3 Delete: committed once the entry is unlinked (COMMIT). */

@@ -48,10 +48,10 @@ struct mc_intent {
 
 static bool mc_ready;
 
-/* A clean failure whose rollback could not finish either: the intent is
- * still staged. The next mutation must finish recovery before it stages,
- * or its STAGE would overwrite the only record of those ids. */
-static bool mc_pending;
+/* Test hook (mc_fail_after): the next mutation fails cleanly right after
+ * this step with this error, as if the following blob_db call returned it. */
+static enum mc_crash_point mc_fail_step;
+static int mc_fail_rc;
 
 /* ---- (de)serialization ------------------------------------------------ */
 
@@ -198,12 +198,16 @@ static int list_find(const struct mc_list *l, const char *key, size_t klen)
 /* Finish or undo the mutation the intent records. Reads one blob when
  * nothing is in flight; otherwise deletes at most the ids the intent names
  * and never looks at the rest of the store. Idempotent: a crash in here
- * re-enters the same branch, deletes tolerate -ENOENT, CLEAR is last. */
-static int mc_recover(const struct mc_list *l)
+ * re-enters the same branch, deletes tolerate -ENOENT, CLEAR is last.
+ * `committed` (optional) reports which way it went. */
+static int mc_recover(const struct mc_list *l, bool *committed_out)
 {
 	struct mc_intent in;
 	int rc = intent_load(l->intent_id, &in);
 
+	if (committed_out != NULL) {
+		*committed_out = false;
+	}
 	if (rc < 0) {
 		return rc;
 	}
@@ -220,6 +224,9 @@ static int mc_recover(const struct mc_list *l)
 
 	LOG_INF("recover: interrupted mutation nnew=%u ndel=%u -> roll %s",
 		in.nnew, in.ndel, committed ? "forward" : "back");
+	if (committed_out != NULL) {
+		*committed_out = committed;
+	}
 
 	for (uint16_t i = 0; i < n; i++) {
 		/* -ENOENT: already deleted, or allocated and never written. */
@@ -232,31 +239,21 @@ static int mc_recover(const struct mc_list *l)
 	return intent_clear(l->intent_id);   /* CLEAR — last, idempotent */
 }
 
-/* Abort path for a mutation that failed without a power cut: run the same
- * recovery against what is actually on flash, then report the original
- * error. If recovery fails too, remember it so the next mutation finishes
- * it before staging its own intent. */
-static int mc_abort(int err)
+/* Abort path for a mutation that failed without a power cut: reload the
+ * list into the caller's buffer (the commit may or may not have landed) and
+ * run the same recovery a remount would. A mutation that already committed
+ * is finished and reported as success, since its new state is what readers
+ * see; one that did not is rolled back and the error returned. If recovery
+ * fails too, the intent stays staged and the next mutation, mc_destroy() or
+ * mc_open() finishes it before doing anything else. */
+static int mc_abort(struct mc_list *l, int err)
 {
-	struct mc_list l;
+	bool committed;
 
-	mc_pending = list_load(&l) < 0 || mc_recover(&l) < 0;
-	return err;
-}
-
-/* Run before a mutation stages: finish an earlier failed abort. */
-static int mc_settle(const struct mc_list *l)
-{
-	if (!mc_pending) {
-		return 0;
+	if (list_load(l) < 0 || mc_recover(l, &committed) < 0) {
+		return err;
 	}
-
-	int rc = mc_recover(l);
-
-	if (rc == 0) {
-		mc_pending = false;
-	}
-	return rc;
+	return committed ? 0 : err;
 }
 
 /* ---- create (virgin store, basic flow §3.1 + registry §7) ------------- */
@@ -288,7 +285,6 @@ int mc_open(uint64_t root_id)
 		return -EINVAL;
 	}
 	mc_root = root_id;
-	mc_pending = false;
 
 	uint8_t probe[4];
 	size_t got;
@@ -316,7 +312,7 @@ int mc_open(uint64_t root_id)
 	if (rc < 0) {
 		return rc;
 	}
-	rc = mc_recover(&l);
+	rc = mc_recover(&l, NULL);
 	if (rc < 0) {
 		return rc;
 	}
@@ -357,9 +353,35 @@ int mc_entry_count(size_t *out)
 	return 0;
 }
 
-/* Stop at the injected crash point, leaving the intent staged as a power
- * cut would. Not an abort: the caller remounts and mc_open() recovers. */
-#define STOP_IF(cp)  do { if (crash_at == (cp)) { return MC_STOPPED; } } while (0)
+/* End of a step. At the injected crash point, stop and leave the intent
+ * staged as a power cut would: the caller remounts and mc_open() recovers.
+ * At the injected failure point, take the abort path as a clean blob_db
+ * error would. */
+#define CHECKPOINT(cp) do {						\
+	if (crash_at == (cp)) {						\
+		return MC_STOPPED;					\
+	}								\
+	if (mc_fail_step == (cp)) {					\
+		mc_fail_step = MC_STEP_NONE;				\
+		return mc_abort(&l, mc_fail_rc);			\
+	}								\
+} while (0)
+
+void mc_fail_after(enum mc_crash_point step, int err)
+{
+	mc_fail_step = step;
+	mc_fail_rc = err;
+}
+
+/* Every mutation starts here: finish whatever an earlier failed abort left
+ * staged, before this mutation's STAGE overwrites the intent. One read when
+ * nothing is in flight. */
+static int mc_begin(struct mc_list *l)
+{
+	int rc = list_load(l);
+
+	return rc < 0 ? rc : mc_recover(l, NULL);
+}
 
 int mc_set(const char *key, const void *val, size_t vlen,
 	   enum mc_crash_point crash_at)
@@ -374,12 +396,8 @@ int mc_set(const char *key, const void *val, size_t vlen,
 	}
 
 	struct mc_list l;
-	int rc = list_load(&l);
+	int rc = mc_begin(&l);
 
-	if (rc < 0) {
-		return rc;
-	}
-	rc = mc_settle(&l);
 	if (rc < 0) {
 		return rc;
 	}
@@ -393,39 +411,39 @@ int mc_set(const char *key, const void *val, size_t vlen,
 
 	/* step 0: allocate every id this mutation will create (RAM only). */
 	struct mc_intent in = { 0 };
-	uint64_t vid2 = blob_db_alloc_id();
 	uint64_t kid = idx < 0 ? blob_db_alloc_id() : 0;
+	uint64_t vid2 = blob_db_alloc_id();
 
 	if (vid2 == 0 || (idx < 0 && kid == 0)) {
 		return -EIO;
 	}
-	in.new_ids[in.nnew++] = vid2;
 	if (idx < 0) {
 		in.new_ids[in.nnew++] = kid;
 	} else {
 		/* overwrite: the old value blob dies on commit (§8.2). */
 		in.del[in.ndel++] = l.e[idx].vid;
 	}
+	in.new_ids[in.nnew++] = vid2;
 
 	/* step 1: STAGE — name the new ids and the doomed ones. */
 	rc = intent_store(l.intent_id, &in);
 	if (rc < 0) {
 		return rc;   /* atomic: the intent is still empty */
 	}
-	STOP_IF(MC_STEP_STAGE);
+	CHECKPOINT(MC_STEP_STAGE);
 
 	/* step 2: PREPARE — bind the new blobs, unreferenced so far. */
-	rc = blob_db_update(vid2, val, vlen);
-	if (rc < 0) {
-		return mc_abort(rc);
-	}
 	if (idx < 0) {
 		rc = blob_db_update(kid, key, klen);
 		if (rc < 0) {
-			return mc_abort(rc);
+			return mc_abort(&l, rc);
 		}
 	}
-	STOP_IF(MC_STEP_PREPARE);
+	rc = blob_db_update(vid2, val, vlen);
+	if (rc < 0) {
+		return mc_abort(&l, rc);
+	}
+	CHECKPOINT(MC_STEP_PREPARE);
 
 	/* step 3: COMMIT — swap the list image (linearization point). */
 	if (idx >= 0) {
@@ -437,22 +455,22 @@ int mc_set(const char *key, const void *val, size_t vlen,
 	}
 	rc = list_store(&l);
 	if (rc < 0) {
-		return mc_abort(rc);
+		return mc_abort(&l, rc);
 	}
-	STOP_IF(MC_STEP_COMMIT);
+	CHECKPOINT(MC_STEP_COMMIT);
 
 	/* step 4: CLEANUP — delete superseded blobs. */
 	for (uint16_t i = 0; i < in.ndel; i++) {
 		rc = blob_db_delete(in.del[i]);
 		if (rc < 0 && rc != -ENOENT) {
-			return mc_abort(rc);
+			return mc_abort(&l, rc);
 		}
 	}
-	STOP_IF(MC_STEP_CLEANUP);
+	CHECKPOINT(MC_STEP_CLEANUP);
 
 	/* step 5: CLEAR. */
 	rc = intent_clear(l.intent_id);
-	return rc < 0 ? mc_abort(rc) : 0;
+	return rc < 0 ? mc_abort(&l, rc) : 0;
 }
 
 int mc_destroy(void)
@@ -465,6 +483,14 @@ int mc_destroy(void)
 	int rc = list_load(&l);
 
 	if (rc < 0) {
+		return rc;
+	}
+
+	/* Finish a staged mutation first: its new[] blobs are not in the list,
+	 * so the deletes below would never reach them. -ENOENT: the intent is
+	 * already gone (a rerun of an interrupted destroy). */
+	rc = mc_recover(&l, NULL);
+	if (rc < 0 && rc != -ENOENT) {
 		return rc;
 	}
 
@@ -502,12 +528,8 @@ int mc_del(const char *key, enum mc_crash_point crash_at)
 	}
 
 	struct mc_list l;
-	int rc = list_load(&l);
+	int rc = mc_begin(&l);
 
-	if (rc < 0) {
-		return rc;
-	}
-	rc = mc_settle(&l);
 	if (rc < 0) {
 		return rc;
 	}
@@ -529,30 +551,30 @@ int mc_del(const char *key, enum mc_crash_point crash_at)
 	if (rc < 0) {
 		return rc;   /* atomic: the intent is still empty */
 	}
-	STOP_IF(MC_STEP_STAGE);
+	CHECKPOINT(MC_STEP_STAGE);
 
 	/* (delete creates nothing — no PREPARE.) */
-	STOP_IF(MC_STEP_PREPARE);
+	CHECKPOINT(MC_STEP_PREPARE);
 
 	/* step 2: COMMIT — unlink the entry. */
 	l.e[idx] = l.e[l.count - 1];
 	l.count--;
 	rc = list_store(&l);
 	if (rc < 0) {
-		return mc_abort(rc);
+		return mc_abort(&l, rc);
 	}
-	STOP_IF(MC_STEP_COMMIT);
+	CHECKPOINT(MC_STEP_COMMIT);
 
 	/* step 3/4: CLEANUP — delete the now-unlinked blobs. */
 	for (uint16_t i = 0; i < in.ndel; i++) {
 		rc = blob_db_delete(in.del[i]);
 		if (rc < 0 && rc != -ENOENT) {
-			return mc_abort(rc);
+			return mc_abort(&l, rc);
 		}
 	}
-	STOP_IF(MC_STEP_CLEANUP);
+	CHECKPOINT(MC_STEP_CLEANUP);
 
 	/* step 5: CLEAR. */
 	rc = intent_clear(l.intent_id);
-	return rc < 0 ? mc_abort(rc) : 0;
+	return rc < 0 ? mc_abort(&l, rc) : 0;
 }

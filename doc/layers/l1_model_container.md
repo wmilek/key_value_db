@@ -248,14 +248,15 @@ zero leak; real containers may amortize it (§9) but the model pays it plainly.
 
 **Failure without power loss (abort path).** If a step fails cleanly — e.g.
 `-EIO` during PREPARE — the mutation aborts by running recovery (§6) against
-what is on flash: before the commit that deletes `new[]`, after it `del[]`,
-then CLEAR. The visible state is whichever the commit left. A crash *during*
-the abort is indistinguishable from a crash during the mutation itself, so
-abort needs no new machinery. If the abort's own recovery fails, the intent
-stays staged and the next mutation must finish recovery before it stages —
-its STAGE would otherwise overwrite the only record of those ids. Checks
-that need no write (a full list, an oversized key) run before STAGE, so they
-cost nothing to undo.
+what is on flash. Before the commit that deletes `new[]` and the error is
+returned; after it, the mutation is finished (`del[]` deleted) and reported
+as success, because the new state is already what readers see. A crash
+*during* the abort is indistinguishable from a crash during the mutation
+itself, so abort needs no new machinery. If the abort's own recovery fails,
+the intent stays staged; so every mutation, and destroy, starts by running
+recovery (one read when nothing is in flight) — a STAGE must never overwrite
+the only record of another mutation's ids. Checks that need no write (a full
+list, an oversized key) run before STAGE, so they cost nothing to undo.
 
 ## 6. Recovery — bounded and idempotent
 
