@@ -27,7 +27,8 @@ referencing i-node, no in-place shortcut where the full discipline can be
 shown — so that each step of the contract stays visible. Their use in a
 product is limited by design. The map is the first; any further model
 container follows the same discipline and registers under its own `'MC_x'`
-key.
+key. The second is the doubly linked list (`l1_model_container_list.md`,
+`'MC_L'`), whose mutations each write two existing i-nodes.
 
 It is deliberately **not a usable container** (O(n) flash reads per lookup, one
 i-node per key and per value), and it is **without compromises**: it satisfies
@@ -388,7 +389,9 @@ which may weaken §4.1:
 A mutation that cannot be expressed as *one atomic update* (§3) or as
 *stage → prepare → one commit → cleanup → clear* (§5) — e.g. one needing two
 commits — is outside the contract and requires its own crash analysis against
-P7.
+P7. A mutation that writes several existing i-nodes is not necessarily such a
+case: if all but one of the writes restore derived state, they become repair
+steps after the single commit (`l1_model_container_list.md` §9).
 
 A coarser alternative to the intent record is a **global sweep** (mark
 reachable from id = 1, `blob_db_iterate` everything, delete the difference).

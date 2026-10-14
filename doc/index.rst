@@ -29,6 +29,7 @@ instructions live in the repository ``README.md``.
    layers/l0_flash
    layers/l1_blob_db
    layers/l1_model_container
+   layers/l1_model_container_list
    layers/l1_root_registry
    layers/l2_containers
    layers/l3_interfaces

@@ -1,5 +1,6 @@
 common:
-  tags: [storage, blob_db, contract, model_container_map]
+  tags: [storage, blob_db, contract, model_container_map,
+         model_container_list]
   platform_allow: native_sim
 tests:
   lib.blob_db_contract: {}

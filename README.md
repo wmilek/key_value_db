@@ -121,7 +121,10 @@ chunked bodies land.
 map* (`model_container_map`) of `doc/layers/l1_model_container.md`: an
 unoptimized reference key/value structure built purely on the L1 contract,
 with crash injection at every mutation step. It is the proof that the
-`blob_db` contract is sufficient to carry the layers above.
+`blob_db` contract is sufficient to carry the layers above. The same suite
+drives the *model container list* (`model_container_list`,
+`doc/layers/l1_model_container_list.md`), a doubly linked list whose inserts
+and removes each write two existing i-nodes under one commit.
 
 ## Getting started
 
@@ -343,6 +346,7 @@ contracts and must never be depended on from above.
 | [`doc/layers/l0_flash.md`](doc/layers/l0_flash.md) | L0 — flash translation and the `blob_db_store` contract |
 | [`doc/layers/l1_blob_db.md`](doc/layers/l1_blob_db.md) | L1 — `blob_db` contract & requirements |
 | [`doc/layers/l1_model_container.md`](doc/layers/l1_model_container.md) | L1 — sufficiency proof + acceptance-test blueprint |
+| [`doc/layers/l1_model_container_list.md`](doc/layers/l1_model_container_list.md) | L1 — second model container: doubly linked list, one commit + a repaired back link |
 | [`doc/layers/l1_root_registry.md`](doc/layers/l1_root_registry.md) | L1½ — root registry: key → structure root |
 | [`doc/layers/l2_containers.md`](doc/layers/l2_containers.md) | L2 — containers: seq, kvlist, kvhash, kvtree |
 | [`doc/layers/l3_interfaces.md`](doc/layers/l3_interfaces.md) | L3 — access interfaces: kvdb, blobfs, settings |

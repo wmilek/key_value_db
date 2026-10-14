@@ -13,6 +13,7 @@ Status: v2 · Top-level document; per-layer detail lives in `doc/layers/`
 | `doc/layers/l0_flash.md` | L0 — flash translation: the `blob_db_store` seam its providers must implement |
 | `doc/layers/l1_blob_db.md` | L1 — `blob_db` **contract & requirements** (implementation-agnostic) |
 | `doc/layers/l1_model_container.md` | L1 — the model container: **sufficiency proof** that the blob_db contract can carry the layers above; reference pattern + acceptance-test blueprint |
+| `doc/layers/l1_model_container_list.md` | L1 — the second model container, a doubly linked list: a mutation that writes two existing i-nodes keeps one commit by repairing a derived link |
 | `doc/layers/l1_root_registry.md` | L1½ — root registry (optional helper): key → structure-root map; owns id = 1 when enabled |
 | `doc/layers/l2_containers.md` | L2 — containers: seq, kvlist, kvhash, kvtree, logring |
 | `doc/layers/l3_interfaces.md` | L3 — access interfaces: kvdb, blobfs, settings |
@@ -31,8 +32,9 @@ implemented** against the current contract — `alloc_id` + bind/rebind
 `update`, durable leading id ceiling (impl §13.1) — and validated on
 `native_sim` by a unit suite (`tests/lib/blob_db`) and the model-container
 acceptance suite (`tests/lib/blob_db_contract`: `model_container_map`, the
-sufficiency proof of `l1_model_container.md`, with crash injection at every
-mutation step).
+sufficiency proof of `l1_model_container.md`, and `model_container_list`, the
+doubly linked list of `l1_model_container_list.md`, both with crash injection
+at every mutation step).
 
 **L0 ships two providers behind a seam inside L1.** `blob_db` addresses
 storage as an array of erase blocks through `lib/blob_db/blob_db_store.h`, and
