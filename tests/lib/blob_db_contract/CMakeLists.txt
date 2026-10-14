@@ -10,6 +10,6 @@ project(blob_db_contract_test)
 # it is a test/proof artifact, not shipped code.
 target_sources(app PRIVATE
 	src/main.c
-	src/model_container.c
+	src/model_container_hash.c
 )
 target_include_directories(app PRIVATE src)

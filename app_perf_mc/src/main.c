@@ -5,7 +5,7 @@
  * Model-container performance benchmark.
  *
  * Measures the L1 sufficiency-proof container (tests/lib/blob_db_contract/
- * src/model_container.c) — a key->value map where every key, every value,
+ * src/model_container_hash.c) — a key->value map where every key, every value,
  * and the pair list are separate blobs, the list root is resolved through
  * the root registry (id 1), and every mutation runs the full 5-step
  * crash-safe discipline (stage intent / prepare / commit / cleanup / clear).
@@ -38,7 +38,7 @@
 
 #include <zephyr/app_version.h>
 
-#include "model_container.h"
+#include "model_container_hash.h"
 
 #ifdef CONFIG_ARCH_POSIX
 #include "posix_board_if.h"   /* posix_exit() — end the sim run cleanly */

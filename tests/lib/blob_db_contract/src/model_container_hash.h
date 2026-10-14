@@ -16,10 +16,17 @@
  * via rootreg_get_or_create() — and passes it to mc_open(). Everything is
  * still reachable from the single integer id = 1 (P5), through whatever
  * the client persisted there.
+ *
+ * Crash residue is tracked by NAME, not by watermark: every mutation
+ * allocates the ids it will create before it stages, and the intent blob
+ * records them ({new[], del[]}). Recovery deletes exactly the ids the intent
+ * names — new[] if the mutation never committed, del[] if it did — and never
+ * scans the store. So it cannot touch blobs another client allocated, even
+ * one that ran between a crash and this container's mc_open().
  */
 
-#ifndef MODEL_CONTAINER_H_
-#define MODEL_CONTAINER_H_
+#ifndef MODEL_CONTAINER_HASH_H_
+#define MODEL_CONTAINER_HASH_H_
 
 #include <stddef.h>
 #include <stdint.h>
@@ -78,4 +85,4 @@ int mc_destroy(void);
  * latter is how the tests prove "no permanent leak". */
 int mc_entry_count(size_t *out);
 
-#endif /* MODEL_CONTAINER_H_ */
+#endif /* MODEL_CONTAINER_HASH_H_ */

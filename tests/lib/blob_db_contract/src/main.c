@@ -29,7 +29,7 @@
 #include <app/lib/blob_db.h>
 #include <app/lib/rootreg.h>
 
-#include "model_container.h"
+#include "model_container_hash.h"
 
 /* This suite is the container's CLIENT — it owns root-id persistence
  * (l1_root_registry.md §2) and registers the container under its key. */
@@ -313,6 +313,70 @@ ZTEST(blob_db_contract, test_destroy_empty_container)
 	zassert_equal(blob_db_count(), 1);
 
 	open_container();           /* fresh container, fresh id */
+	assert_no_leak();
+}
+
+/* --- recovery touches only the ids the intent names -------------------- */
+
+/* A second structure in the same store, registered under its own key. */
+#define OTHER_ROOTREG_KEY  ROOTREG_KEY(0x4f544852 /* 'OTHR' */, 0)
+
+/* Firmware opens stores lazily, so after a reboot another client may
+ * allocate and bind blobs BEFORE this container's mc_open() runs recovery.
+ * Those blobs have ids above anything the interrupted mutation allocated,
+ * and the container's list does not reference them. Rolling back must still
+ * leave them alone: recovery deletes only what its intent named. */
+ZTEST(blob_db_contract, test_rollback_spares_other_store)
+{
+	zassert_equal(mc_set("foo", "bar", 3, MC_STEP_PREPARE), MC_STOPPED);
+
+	/* Reboot, but let another store come up and write first. */
+	zassert_ok(blob_db_unmount());
+	zassert_ok(blob_db_mount());
+	zassert_ok(rootreg_init());
+
+	uint64_t other;
+
+	zassert_ok(rootreg_get_or_create(OTHER_ROOTREG_KEY, &other));
+	zassert_ok(blob_db_update(other, "cfg", 3));
+
+	/* Only now is the container opened, and its insert rolled back. */
+	open_container();
+
+	char buf[16];
+	size_t got;
+
+	zassert_equal(get_str("foo", buf, sizeof(buf)), -ENOENT);
+	zassert_ok(blob_db_get(other, buf, sizeof(buf), &got),
+		   "recovery deleted another store's blob");
+	zassert_equal(got, 3);
+	zassert_mem_equal(buf, "cfg", 3);
+
+	/* No leak either: the container's floor plus the other store's root. */
+	zassert_equal(blob_db_count(), STRUCT_BLOBS + 1,
+		      "live blobs=%zu, expected=%d", blob_db_count(),
+		      STRUCT_BLOBS + 1);
+}
+
+/* A set that fails cleanly — here a full list — leaves nothing behind, with
+ * no remount in between: the error path is the same rollback recovery runs. */
+ZTEST(blob_db_contract, test_failed_set_leaks_nothing)
+{
+	char key[8];
+	int rc;
+	size_t n = 0;
+
+	do {
+		snprintk(key, sizeof(key), "k%zu", n++);
+		rc = mc_set(key, "v", 1, MC_STEP_NONE);
+	} while (rc == 0);
+
+	zassert_equal(rc, -ENOSPC);
+	assert_no_leak();
+
+	/* The container still works, and a later mutation leaks nothing. */
+	zassert_ok(mc_del("k0", MC_STEP_NONE));
+	zassert_ok(mc_set("late", "v", 1, MC_STEP_NONE));
 	assert_no_leak();
 }
 
