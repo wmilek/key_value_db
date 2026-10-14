@@ -1,6 +1,6 @@
 # L2 containers — test suite
 
-Two ztest suites, both in `src/main.c`.
+Two ztest suites in `src/main.c`, plus the `logring/` subdir suite.
 
 ## `map_contract`
 
@@ -63,6 +63,15 @@ the key must be wholly old or wholly new, progress must be monotonic,
 neighbours intact, count must equal a full walk, a retry must succeed, and
 destroy must leave no more unreferenced blobs than the scenario allows (none
 without a cut).
+
+## `logring/`
+
+A separate suite under `logring/` for the per-entry log container, which has
+its own append/scan API rather than the Map shape: append/drain order and
+increasing ids, pre-reservation, tail rebuild and exact counts across
+unmount/mount, soft-budget eviction and evicted-position detection, cursor
+resume via a portable moniker, a per-log epoch rejecting stale/foreign
+monikers, zero-length/binary records, reset and destroy.
 
 ## Running
 
