@@ -5,7 +5,7 @@ menu "Containers (L2)"
 	depends on BLOB_DB
 
 config BLOB_CONTAINERS_INTENT
-	bool "Shared intent/watermark helper"
+	bool "Shared intent helper (named new[] / del[] ids)"
 	help
 	  Reusable stage->commit->clear intent mechanism (model container §4/§5)
 	  shared by the reference-graph mutations of the real containers.

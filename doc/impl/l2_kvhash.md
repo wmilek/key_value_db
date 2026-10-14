@@ -147,7 +147,7 @@ still there, so an interrupted release can finish.
 
 ### 3.2 Why no intent blob
 
-§2.2's watermark exists because *prepare* creates i-nodes that nothing
+§2.2's intent record exists because *prepare* creates i-nodes that nothing
 references yet: after a crash they are unfindable, so their ids must be recorded
 out of band. `destroy` is the mirror — everything it releases is named by the
 root, and the root is still there. The delete set is re-read rather than

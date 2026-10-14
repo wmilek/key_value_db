@@ -117,10 +117,11 @@ one); `rename` stays within one directory (`-EXDEV` across), `statvfs`
 reports `-ENOTSUP`, and `CONFIG_BLOB_DB_MAX_PAYLOAD_LEN` caps file size until
 chunked bodies land.
 
-`tests/lib/blob_db_contract` is the acceptance suite for the *model container*
-of `doc/layers/l1_model_container.md`: a reference key/value structure built
-purely on the L1 contract, with crash injection at every mutation step. It is
-the proof that the `blob_db` contract is sufficient to carry the layers above.
+`tests/lib/blob_db_contract` is the acceptance suite for the *model container
+map* (`model_container_map`) of `doc/layers/l1_model_container.md`: an
+unoptimized reference key/value structure built purely on the L1 contract,
+with crash injection at every mutation step. It is the proof that the
+`blob_db` contract is sufficient to carry the layers above.
 
 ## Getting started
 

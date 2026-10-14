@@ -627,7 +627,8 @@ ZTEST(blob_db, test_iterate_visits_each_live_blob_once)
 /* 16. Durable id allocation (contract §2 / impl §13.1): an id that was
  *     allocated but never bound must NEVER be handed out again after a
  *     remount — otherwise a client that durably recorded that id (a root
- *     registry entry, a mutation watermark) would collide with a new owner. */
+ *     registry entry, an id named in a mutation intent) would collide with
+ *     a new owner. */
 ZTEST(blob_db, test_allocated_unbound_id_survives_remount)
 {
 	/* Bind one real blob so the store isn't trivially empty. */

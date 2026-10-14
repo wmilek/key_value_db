@@ -44,9 +44,10 @@ The protocol every container mutation must follow is defined — with full call
 traces, per-crash-point residue tables, and the recovery procedure — by the
 **model container** (`doc/layers/l1_model_container.md`). Summary:
 
-1. **Stage** — record the mutation in the container's intent blob
-   (id watermark `W` + delete set);
-2. **Prepare** — N × (`alloc_id` + bind `update`) of every new object, still unreferenced;
+1. **Stage** — record the mutation in the container's intent blob: the ids
+   of every new object, reserved with `alloc_id` beforehand (`new[]`), and
+   the delete set (`del[]`);
+2. **Prepare** — N × bind `update` of every new object, still unreferenced;
 3. **Commit** — exactly **one** `update` of the i-node that makes them
    reachable: the single linearization point;
 4. **Cleanup** — M × `delete` of the superseded objects;
