@@ -17,12 +17,13 @@
  * updates + 1 delete, so expect roughly 1/5th of raw blob_db update
  * throughput. Lookup is an O(n) key scan.
  *
- *   set       — insert N_KEYS fresh keys
- *   get       — N_GET lookups cycling over the keys (read-only)
- *   overwrite — N_OVW value replacements cycling over the keys
- *   delete    — remove all N_KEYS keys
- *   cleanup   — full teardown: mc_destroy() + rootreg_unregister(), leaving
- *               the store at the absolute floor (the empty registry alone)
+ *   map.insert    — mc_set() of N_KEYS fresh keys
+ *   map.get       — N_GET lookups cycling over the keys (read-only)
+ *   map.overwrite — N_OVW value replacements cycling over the keys
+ *   map.remove    — mc_del() of all N_KEYS keys
+ *   map.cleanup   — full teardown: mc_destroy() + rootreg_unregister(),
+ *                   leaving the store at the absolute floor (the empty
+ *                   registry alone)
  *
  * The list (model_container_list.c): a doubly linked list addressed by node
  * handle; 6 steps (stage / prepare / commit / repair / cleanup / clear).
@@ -30,15 +31,20 @@
  * against the map this isolates what the discipline costs from what the
  * map's key scan costs.
  *
- *   l.insert  — append N_NODES nodes at the back (mcl_insert_before(0))
- *   l.get     — N_GET value reads by handle, cycling over the nodes
- *   l.set     — N_OVW in-place value overwrites by handle (no intent)
- *   l.next    — N_GET forward steps (mcl_next), wrapping through the root;
- *               the authoritative chain, never recovers, never writes
- *   l.prev    — the same backwards (mcl_prev), which checks for a staged
- *               intent first
- *   l.remove  — remove all N_NODES nodes from the front
- *   l.cleanup — mcl_destroy() + rootreg_unregister(), back to the floor
+ *   list.insert    — append N_NODES nodes at the back (mcl_insert_before(0))
+ *   list.get       — N_GET value reads by handle, cycling over the nodes
+ *   list.overwrite — N_OVW in-place value overwrites by handle (mcl_set(),
+ *                    no intent)
+ *   list.next      — N_GET forward steps (mcl_next), wrapping through the
+ *                    root; the authoritative chain, never recovers, never
+ *                    writes
+ *   list.prev      — the same backwards (mcl_prev), which checks for a
+ *                    staged intent first
+ *   list.remove    — remove all N_NODES nodes from the front
+ *   list.cleanup   — mcl_destroy() + rootreg_unregister(), back to the floor
+ *
+ * Phases that do the same thing to both containers carry the same name
+ * after the prefix, so their lines compare directly.
  *
  * With CONFIG_BLOB_DB_IOSTATS every bench line is followed by an `io` line
  * with the phase's flash operations, in the shape
@@ -91,7 +97,7 @@ static void bench_line(const char *what, int ops, int64_t ms)
 	uint64_t us_per_op =
 		(ops > 0) ? (uint64_t)ms * 1000ULL / (uint64_t)ops : 0;
 
-	printk("bench %-9s: %4d ops in %7" PRId64 " ms  -> "
+	printk("bench %-14s: %4d ops in %7" PRId64 " ms  -> "
 	       "%4u.%03u ops/s  (%9llu us/op)\n",
 	       what, ops, ms,
 	       (unsigned)(milli_ops_per_s / 1000),
@@ -116,7 +122,7 @@ static void io_line(const char *what)
 	struct blob_db_iostats now;
 
 	blob_db_iostats_get(&now);
-	printk("   io %-9s: rd %6u ops/%8llu B   wr %5u ops/%8llu B   "
+	printk("   io %-14s: rd %6u ops/%8llu B   wr %5u ops/%8llu B   "
 	       "er %4u ops/%8llu B\n",
 	       what, now.reads - io_mark.reads,
 	       (unsigned long long)(now.bytes_read - io_mark.bytes_read),
@@ -190,20 +196,20 @@ static int bench_map(uint32_t *sum_out)
 	char key[8];
 	int64_t t;
 
-	/* ============ set (fresh inserts) ============================== */
+	/* ============ map.insert (fresh keys) ========================== */
 	t = phase_begin();
 	for (int i = 0; i < N_KEYS; i++) {
 		key_name(key, sizeof(key), i);
 		val[0] = (uint8_t)i;
 		rc = mc_set(key, val, sizeof(val), MC_STEP_NONE);
 		if (rc < 0) {
-			LOG_ERR("set %d: %d", i, rc);
+			LOG_ERR("map.insert %d: %d", i, rc);
 			return rc;
 		}
 	}
-	phase_end("set", N_KEYS, &t);
+	phase_end("map.insert", N_KEYS, &t);
 
-	/* ============ get (lookups, cycling keys) ====================== */
+	/* ============ map.get (lookups, cycling keys) ================== */
 	uint32_t sum = 0;
 	uint8_t rbuf[VAL_LEN];
 
@@ -214,48 +220,48 @@ static int bench_map(uint32_t *sum_out)
 		key_name(key, sizeof(key), i % N_KEYS);
 		rc = mc_get(key, rbuf, sizeof(rbuf), &got);
 		if (rc < 0) {
-			LOG_ERR("get %d: %d", i, rc);
+			LOG_ERR("map.get %d: %d", i, rc);
 			return rc;
 		}
 		sum = sum * 33u + rbuf[0];   /* defeat dead-read elision */
 	}
-	phase_end("get", N_GET, &t);
+	phase_end("map.get", N_GET, &t);
 
-	/* ============ overwrite (value replacement) ==================== */
+	/* ============ map.overwrite (value replacement) ================ */
 	t = phase_begin();
 	for (int i = 0; i < N_OVW; i++) {
 		key_name(key, sizeof(key), i % N_KEYS);
 		val[0] = (uint8_t)(0x80 | i);
 		rc = mc_set(key, val, sizeof(val), MC_STEP_NONE);
 		if (rc < 0) {
-			LOG_ERR("overwrite %d: %d", i, rc);
+			LOG_ERR("map.overwrite %d: %d", i, rc);
 			return rc;
 		}
 	}
-	phase_end("overwrite", N_OVW, &t);
+	phase_end("map.overwrite", N_OVW, &t);
 
-	/* ============ delete =========================================== */
+	/* ============ map.remove ======================================= */
 	t = phase_begin();
 	for (int i = 0; i < N_KEYS; i++) {
 		key_name(key, sizeof(key), i);
 		rc = mc_del(key, MC_STEP_NONE);
 		if (rc < 0) {
-			LOG_ERR("del %d: %d", i, rc);
+			LOG_ERR("map.remove %d: %d", i, rc);
 			return rc;
 		}
 	}
-	phase_end("delete", N_KEYS, &t);
+	phase_end("map.remove", N_KEYS, &t);
 
 	size_t entries;
 
 	rc = mc_entry_count(&entries);
 	if (rc == 0 && entries != 0) {
-		LOG_ERR("expected empty container after delete, got %zu",
+		LOG_ERR("expected empty map after map.remove, got %zu",
 			entries);
 		return -EIO;
 	}
 
-	/* ============ cleanup (unset everything) ======================= */
+	/* ============ map.cleanup (unset everything) =================== */
 	t = phase_begin();
 	rc = mc_destroy();   /* unsets all keys + structure blobs */
 	if (rc < 0) {
@@ -267,7 +273,7 @@ static int bench_map(uint32_t *sum_out)
 		LOG_ERR("unregister: %d", rc);
 		return rc;
 	}
-	phase_end("cleanup", 1, &t);
+	phase_end("map.cleanup", 1, &t);
 
 	*sum_out = sum;
 	return 0;
@@ -301,18 +307,18 @@ static int bench_list(uint32_t *sum_out)
 
 	int64_t t;
 
-	/* ============ l.insert (append at the back) ==================== */
+	/* ============ list.insert (append at the back) ==================== */
 	t = phase_begin();
 	for (int i = 0; i < N_NODES; i++) {
 		val[0] = (uint8_t)i;
 		rc = mcl_insert_before(0, val, sizeof(val), &node_ids[i],
 				       MCL_STEP_NONE);
 		if (rc < 0) {
-			LOG_ERR("l.insert %d: %d", i, rc);
+			LOG_ERR("list.insert %d: %d", i, rc);
 			return rc;
 		}
 	}
-	phase_end("l.insert", N_NODES, &t);
+	phase_end("list.insert", N_NODES, &t);
 
 	size_t count;
 
@@ -323,7 +329,7 @@ static int bench_list(uint32_t *sum_out)
 		return rc < 0 ? rc : -EIO;
 	}
 
-	/* ============ l.get (value reads by handle) ==================== */
+	/* ============ list.get (value reads by handle) ==================== */
 	uint32_t sum = 0;
 	uint8_t rbuf[VAL_LEN];
 
@@ -333,26 +339,26 @@ static int bench_list(uint32_t *sum_out)
 
 		rc = mcl_get(node_ids[i % N_NODES], rbuf, sizeof(rbuf), &got);
 		if (rc < 0) {
-			LOG_ERR("l.get %d: %d", i, rc);
+			LOG_ERR("list.get %d: %d", i, rc);
 			return rc;
 		}
 		sum = sum * 33u + rbuf[0];   /* defeat dead-read elision */
 	}
-	phase_end("l.get", N_GET, &t);
+	phase_end("list.get", N_GET, &t);
 
-	/* ============ l.set (in-place value overwrite) ================= */
+	/* ============ list.overwrite (in-place value overwrite) ======== */
 	t = phase_begin();
 	for (int i = 0; i < N_OVW; i++) {
 		val[0] = (uint8_t)(0x80 | i);
 		rc = mcl_set(node_ids[i % N_NODES], val, sizeof(val));
 		if (rc < 0) {
-			LOG_ERR("l.set %d: %d", i, rc);
+			LOG_ERR("list.overwrite %d: %d", i, rc);
 			return rc;
 		}
 	}
-	phase_end("l.set", N_OVW, &t);
+	phase_end("list.overwrite", N_OVW, &t);
 
-	/* ============ l.next / l.prev (walks) ========================== */
+	/* ============ list.next / list.prev (walks) ========================== */
 	/* N_GET single steps, wrapping through the root (0) at the ends, so
 	 * the root's own read is in the count once per lap. The order is
 	 * checked against the handles as it goes: a compare per step, noise
@@ -364,16 +370,16 @@ static int bench_list(uint32_t *sum_out)
 	for (int i = 0; i < N_GET; i++) {
 		rc = mcl_next(cur, &cur);
 		if (rc < 0) {
-			LOG_ERR("l.next %d: %d", i, rc);
+			LOG_ERR("list.next %d: %d", i, rc);
 			return rc;
 		}
 		pos = (pos + 1 == N_NODES) ? -1 : pos + 1;
 		if (cur != (pos < 0 ? 0 : node_ids[pos])) {
-			LOG_ERR("l.next %d: out of order", i);
+			LOG_ERR("list.next %d: out of order", i);
 			return -EIO;
 		}
 	}
-	phase_end("l.next", N_GET, &t);
+	phase_end("list.next", N_GET, &t);
 
 	cur = 0;
 	pos = N_NODES;
@@ -381,27 +387,27 @@ static int bench_list(uint32_t *sum_out)
 	for (int i = 0; i < N_GET; i++) {
 		rc = mcl_prev(cur, &cur);
 		if (rc < 0) {
-			LOG_ERR("l.prev %d: %d", i, rc);
+			LOG_ERR("list.prev %d: %d", i, rc);
 			return rc;
 		}
 		pos = (pos == 0) ? N_NODES : pos - 1;
 		if (cur != (pos == N_NODES ? 0 : node_ids[pos])) {
-			LOG_ERR("l.prev %d: out of order", i);
+			LOG_ERR("list.prev %d: out of order", i);
 			return -EIO;
 		}
 	}
-	phase_end("l.prev", N_GET, &t);
+	phase_end("list.prev", N_GET, &t);
 
-	/* ============ l.remove (from the front) ======================== */
+	/* ============ list.remove (from the front) ======================== */
 	t = phase_begin();
 	for (int i = 0; i < N_NODES; i++) {
 		rc = mcl_remove(node_ids[i], MCL_STEP_NONE);
 		if (rc < 0) {
-			LOG_ERR("l.remove %d: %d", i, rc);
+			LOG_ERR("list.remove %d: %d", i, rc);
 			return rc;
 		}
 	}
-	phase_end("l.remove", N_NODES, &t);
+	phase_end("list.remove", N_NODES, &t);
 
 	rc = mcl_check(&count);
 	if (rc < 0 || count != 0) {
@@ -410,7 +416,7 @@ static int bench_list(uint32_t *sum_out)
 		return rc < 0 ? rc : -EIO;
 	}
 
-	/* ============ l.cleanup ======================================== */
+	/* ============ list.cleanup ======================================== */
 	t = phase_begin();
 	rc = mcl_destroy();
 	if (rc < 0) {
@@ -422,7 +428,7 @@ static int bench_list(uint32_t *sum_out)
 		LOG_ERR("unregister: %d", rc);
 		return rc;
 	}
-	phase_end("l.cleanup", 1, &t);
+	phase_end("list.cleanup", 1, &t);
 
 	*sum_out = sum;
 	return 0;
@@ -474,7 +480,7 @@ int main(void)
 	if (rc < 0) {
 		goto out;
 	}
-	printk("get checksum: 0x%08x\n", map_sum);
+	printk("map.get checksum: 0x%08x\n", map_sum);
 	printk("live blobs after map: %zu (expect 1 — the empty registry alone)\n",
 	       blob_db_count());
 
@@ -482,7 +488,7 @@ int main(void)
 	if (rc < 0) {
 		goto out;
 	}
-	printk("l.get checksum: 0x%08x\n", list_sum);
+	printk("list.get checksum: 0x%08x\n", list_sum);
 	printk("live blobs at end: %zu (expect 1 — the empty registry alone)\n",
 	       blob_db_count());
 
