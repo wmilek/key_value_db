@@ -3,7 +3,7 @@
 Status: **exploration** · 2026-10-15 · nothing implemented
 · Target contract: `doc/layers/l1_blob_db.md` (§2 stability contract: one new error meaning; §3 cost bounds)
 · Target implementation design: `doc/impl/l1_bucketlog.md` (§3.3 slot format, §3.1 master body, §5.4 read path)
-· Related: `doc/impl/l0_backends.md` ("Authenticated metadata"), zephyr-ubi `docs/security.md`
+· Related: `doc/impl/l0_backends.md` ("Authenticated metadata"), zephyr-ubi `docs/security.md`, `library/ubi_key.c`, `library/ubi_header.c` (algorithms aligned with these, §4.7)
 · New dependency: none beyond what the UBI backend already selects (`PSA_CRYPTO`), but now needed on both backends
 · Governed by `doc/principles.md`
 
@@ -27,6 +27,9 @@ because it copies slots byte for byte. A **bucket seal** cannot be the main
 mechanism: it brings back the problem that sank the UBI attempt (§3.2).
 Bucket-level and store-level state does matter for one thing, **freshness**
 (rollback). §6 shows what an anchor can achieve and where the limit is.
+The primitives are the ones zephyr-ubi already uses: HKDF-SHA256 from the same
+key handle, AES-128, AES-CMAC for an authenticate-only mode, and the same
+CRC-then-MAC verdicts (§4.7).
 
 ---
 
@@ -173,8 +176,8 @@ protected  slot_hdr(4) | id(8) | nonce(12) | ct[val_len] | tag(T) | crc16(2)
   a key or a cipher call, so compaction and the walk keep their crash
   behaviour. A CRC that passes over a tag that fails means tampering, which
   can be told apart from damage (§4.6).
-- `val_len` is the plaintext length. AES-CCM and ChaCha20-Poly1305 are stream
-  modes, so the ciphertext is the same length.
+- `val_len` is the plaintext length. AES-CCM is a stream mode, so the
+  ciphertext is the same length.
 - A tombstone has `val_len = 0` and still carries a nonce and tag, so it
   cannot be forged.
 
@@ -214,17 +217,31 @@ protects little and is left out of the first cut.
 
 ### 4.3 Keys
 
-- The application provides input keying material through a hook shaped like
-  `blob_db_ubi_ikm_key()`, for example
-  `blob_db_protect_ikm_key(psa_key_id_t *)`, with a `BUILTIN` development
-  key as the alternative, the same choice `BLOB_DB_UBI_KEY` offers. With the
-  UBI backend the same IKM can feed both: the derivations below use their own
-  `info` label, so nothing extra has to be provisioned.
-- Slot key = HKDF-SHA256(IKM, salt = `store_uuid`, info = `"blob_db/slot/v1" ‖ suite`).
-  `store_uuid` holds 16 random bytes written into the master at format. It
-  separates partitions and incarnations: a reformat changes the key, so slots
-  from before the format cannot be spliced back in (row 4), and seq may start
-  again from zero.
+- **One IKM for both layers.** Today's `blob_db_ubi_ikm_key()` and the
+  `BLOB_DB_UBI_KEY` choice (`BUILTIN` | `APP`) become backend-neutral, for
+  example `blob_db_ikm_key()` and `BLOB_DB_KEY`. On the UBI backend the same
+  handle keeps feeding UBI. On `flash_area` it feeds only `blob_db`. Nothing
+  extra has to be provisioned.
+- **The same derivation as UBI** (`ubi_key.c`): HKDF-SHA256 with a fixed
+  compile-time salt, `info = label ‖ context`, and output into a volatile
+  AES-128 key. UBI uses salt `"zephyr-ubi/v1"` and labels
+  `"zephyr-ubi/header/v1"` and `"zephyr-ubi/volume-table/v1"`. `blob_db` uses
+  salt `"blob_db/v1"`, and labels `"blob_db/slot-aead/v1"` and
+  `"blob_db/slot-mac/v1"` (one per mode, §4.5). Different salts and labels
+  give independent keys from the same IKM.
+- **Context = `store_uuid`.** These are 16 random bytes drawn with
+  `psa_generate_random()` at format and stored in the master, the counterpart
+  of UBI's `image_seq`. This is the one place `blob_db` deliberately departs
+  from UBI. UBI's context is a constant from the application
+  (`key_context`, `"blob_db"` in our backend), and its salt is a constant
+  "because anything read from the flash would have to be trusted before it
+  could be verified." UBI can do that because its MAC needs no nonce. `blob_db`
+  AEAD's counter nonce starts again from zero after a reformat, so the key has
+  to change with each store incarnation, or nonces would repeat under one key.
+  Reading the uuid from flash is safe in the sense UBI cares about: a forged
+  uuid only produces a key under which nothing verifies, so the store is
+  refused, never accepted. The salt stays constant, as in UBI. A fresh uuid
+  also stops slots from before a format being spliced back in (row 4).
 - The derived key is a volatile PSA key, created at mount and destroyed at
   unmount. It is not kept in RAM in usable form beyond what PSA holds.
 - With the `BUILTIN` key, AUTH catches damage only and AEAD only obfuscates.
@@ -258,17 +275,22 @@ choice BLOB_DB_PROTECT
     BLOB_DB_PROTECT_NONE   (default)   today's format; CRC only
     BLOB_DB_PROTECT_AUTH               payload in clear, tag over AAD ‖ payload
     BLOB_DB_PROTECT_AEAD               payload encrypted and tagged
-choice BLOB_DB_PROTECT_ALG             (AUTH, AEAD)
-    AES_CCM            tag 8 (default) / 12 / 16 — uses AES hardware where PSA has it
-    CHACHA20_POLY1305  tag 16 — faster in pure software (§7)
-choice BLOB_DB_PROTECT_KEY             BUILTIN | APP
+BLOB_DB_PROTECT_TAG_LEN               int, 8 (default) or 16 (= UBI_MAC_SIZE)
+    # AUTH: AES-CMAC-128, UBI's algorithm, truncated with
+    #       PSA_ALG_TRUNCATED_MAC(PSA_ALG_CMAC, 8) at 8
+    # AEAD: AES-CCM-128 under an HKDF key from the same IKM
+choice BLOB_DB_KEY                     BUILTIN | APP — replaces BLOB_DB_UBI_KEY, feeds both layers
 BLOB_DB_PROTECT_ANCHOR                 bool — §6.1 hooks
 BLOB_DB_SEQ_STEP                       int, default 1024
 ```
 
-AUTH fits a product that needs tamper evidence but not secrecy. It keeps
-`blob_db dump` readable and has the same nonce and format machinery, so it is
-nearly free to offer. AES-CCM is preferred to GCM: a repeated nonce under GCM
+AUTH fits a product that needs tamper evidence but not secrecy. It uses
+**exactly UBI's primitive**, AES-CMAC through `psa_mac_compute` and
+`psa_mac_verify`. On the UBI backend it adds no crypto code, and it keeps
+`blob_db dump` readable. CMAC is deterministic, so an AUTH slot carries **no
+nonce**:
+`slot_hdr ‖ id ‖ payload ‖ tag ‖ crc16`, +8 B over today at an 8 B tag. With
+no nonce, AUTH also needs neither the seq ceiling nor the mount salt. AES-CCM is preferred to GCM: a repeated nonce under GCM
 reveals the authentication key, while under CCM it reveals the XOR of the two
 plaintexts. CCM also allows an 8 B tag, which is enough here, because each
 forgery attempt needs physical access and a reboot.
@@ -311,6 +333,59 @@ data" error (§2, "No partial reads"). The contract gains a sentence: in a
 protected build, `-EIO` also covers an authentication failure. The per-slot
 payload cap drops by the extra overhead, from `(sector − 16)/2 − 14` to
 `(sector − 16)/2 − 34`: 2026 → 2006 B on 4 KB sectors.
+
+### 4.7 Same algorithms as zephyr-ubi
+
+On the UBI backend the stack runs two integrity layers, one on top of the
+other. They should share their primitives, key handling and failure
+vocabulary, so the product has one crypto story and one set of code. The
+table maps what UBI does (`library/ubi_key.c`, `library/ubi_header.c`,
+`docs/security.md`) to what `blob_db` does:
+
+| Aspect | zephyr-ubi | `blob_db` (this proposal) |
+|---|---|---|
+| Keying material | PSA key handle with `PSA_KEY_USAGE_DERIVE`, from `blob_db_ubi_ikm_key()` | **the same handle**, from a backend-neutral `blob_db_ikm_key()` (§4.3) |
+| KDF | HKDF-SHA256, fixed salt `"zephyr-ubi/v1"`, info = label ‖ `key_context` | HKDF-SHA256, fixed salt `"blob_db/v1"`, info = label ‖ `store_uuid` (§4.3 says why the context differs) |
+| Derived keys | volatile AES-128, one per purpose (header, volume table) | volatile AES-128, one per mode (slot-mac, slot-aead) |
+| MAC | AES-CMAC-128, 16 B, `psa_mac_compute` and `psa_mac_verify` | **AES-CMAC** in AUTH. AEAD uses AES-CCM, whose MAC is CBC-MAC under the same AES. Tag 8 B by default, 16 B to match UBI |
+| Encryption | none: "protect data with an AEAD of your own" | AES-CCM, the AEAD UBI's security doc asks the layer above for |
+| What is bound | `pnum` at the front of the MAC message; the doc asks the layer above to bind `vol_id` and `lnum` | the id, which fixes the bucket (= `lnum`, since one bucket is one LEB). `vol_id` and the partition are covered by `store_uuid` in the key |
+| Nonce rule from UBI's doc | "a new nonce for every version of a block"; never offset alone, because `ubi_leb_change()` restarts at offset 0 | a new nonce per slot version, from the seq counter and the mount salt (§4.2), never position alone; §5 B adds a fresh base per compaction, i.e. per `ubi_leb_change()` |
+| Layout | MAC, then CRC32 over everything before it, MAC included | tag, then CRC16 over everything before it, tag included |
+| Check order | erased → magic → CRC → MAC; never `memcmp` a MAC | erased → flags and length → CRC → tag, compared in constant time by `psa_mac_verify` or `psa_aead_decrypt` |
+| Verdicts | `UBI_EVENT_HDR_CORRUPT` (CRC fails), `UBI_EVENT_HDR_TAMPERED` (CRC passes, MAC fails) | **the same two**, for slots (§4.6) |
+| Randomness | `image_seq` from `psa_generate_random()` at format | `store_uuid` at format and `mount_salt` at mount, from the same call |
+| Rollback | `state_cb` at attach and every N writes, given `image_seq`, `revision`, `max_sqnum`, returns TRUSTED or UNTRUSTED | anchor check (§6.1) on `store_uuid` and the seq ceiling, the counterparts of `image_seq` and `max_sqnum` |
+| Verify on read | optional: `CONFIG_UBI_VERIFY_ON_READ` (header only) | always: every `get` checks the tag of the slot it returns |
+| Seal over rewritten data | `ubi_leb_change()` stores `data_crc` in the MAC'd header, checked at attach only | §5: a shared nonce at compaction; a region seal only as variant C |
+
+Three places where the alignment should become shared code, not just matching
+choices:
+
+1. **One event sink.** `blob_db_store_ubi.c` already receives UBI's events in
+   `on_event()`. Slot verdicts should go to the same application hook with the
+   same two kinds, tagged with their layer, so an application handles
+   "corrupt" and "tampered" once.
+2. **One trust decision.** Merge the §6.1 anchor into the existing
+   `blob_db_ubi_state_check()`. It becomes `blob_db_state_check()`, given UBI's
+   `ubi_device_info` when the backend has one, plus `store_uuid` and the seq
+   ceiling, with the same TRUSTED or UNTRUSTED verdict and the same `-EROFS`
+   outcome. On `flash_area` it gets the `blob_db` fields only.
+3. **One key path.** `key_acquire()` in `blob_db_store_ubi.c` moves into
+   `blob_db` core. It runs once at mount, hands the IKM to UBI when the
+   backend is UBI, and derives the slot key from it.
+
+**UBI already seals a rewritten block, but with a CRC.** When compaction
+replaces a bucket through `ubi_leb_change()`, UBI writes `data_crc` over the
+new contents into the volume identifier header, which carries its CMAC. That
+is the region seal from §5 variant C, built one layer down, and it follows
+C's verify-once model ("data checksums are checked at attach only"). A CRC32
+is linear and unkeyed, though, so an attacker who rewrites the data can make
+its CRC32 match. It catches damage, not tampering. If zephyr-ubi ever stored a
+keyed MAC there in place of the CRC, `blob_db` on UBI would get variant C's
+saving with no extra bytes. It would also inherit C's limits: the check runs
+at attach, not per read. That change belongs in zephyr-ubi, and it does
+nothing on `flash_area`. Variant B does not depend on it.
 
 ## 5. Re-sealing at compaction to save space
 
@@ -373,6 +448,8 @@ time, against 460 µs today. Two ways to soften it:
 
 Slots appended after compaction keep the full form in all three variants:
 they have no shared base, and they are written one at a time.
+In AUTH mode (CMAC, no nonce, §4.5) there is no nonce to share, so B saves
+nothing there. Only C's shared seal would.
 
 **Recommendation: B.** It keeps 60 % of the saving (12 of the 20 B), and reads
 cost what they do in the base design. C saves the remaining 8 B by making
@@ -440,8 +517,8 @@ and 8 as the limit and leave this for a product that brings such hardware.
 
 ## 7. Costs
 
-**Space.** +20 B per slot with AES-CCM and T = 8, +28 B with
-ChaCha20-Poly1305:
+**Space.** AEAD (AES-CCM, T = 8): +20 B per slot. AUTH (AES-CMAC, T = 8):
++8 B, because there is no nonce. AEAD:
 
 | payload | slot today | protected, CCM-8 | overhead |
 |---|---|---|---|
@@ -465,7 +542,8 @@ faster. The single read is worth doing on its own, protection or not.
 Mbed TLS in software (no CryptoCell driver upstream). **These figures are
 estimates, not measured:** AES-CCM in software on a Cortex-M33 at 128 MHz
 should be on the order of 100–200 µs for a 256 B payload, including PSA call
-overhead. ChaCha20-Poly1305 should be several times cheaper. Against measured
+overhead. CCM makes two AES passes. AUTH's CMAC makes one, about half the
+cost. Against measured
 costs (`get` 460 µs, `update` 2.4–15 ms, compacting update 0.69 s):
 
 | Op | Estimated added cost (software CCM) | Relative |
@@ -475,18 +553,21 @@ costs (`get` 460 µs, `update` 2.4–15 ms, compacting update 0.69 s):
 | compaction | 0 in the base design; a few ms with re-sealing (§5 B) | ≤ 1 % |
 | mount | one HKDF and key import | negligible |
 
-Reads are the only place this is visible. It is the first thing to measure
-with `app_perf_blob_db` before choosing between CCM and ChaCha20-Poly1305 per
-board. Hardware AES (CryptoCell through nRF Connect SDK, CRACEN on nRF54)
-reduces it to call overhead.
+Reads are the only place this is visible, and they are the first thing to
+measure with `app_perf_blob_db`. Hardware AES (CryptoCell through nRF Connect
+SDK, CRACEN on nRF54) reduces it to call overhead, and benefits UBI's CMAC as
+much as it does `blob_db`. ChaCha20-Poly1305 would probably be faster in
+software, but it would bring a second cipher family next to UBI's AES (§4.7).
+It is the fallback only if measurements show AES-CCM in software to be
+unacceptable.
 
 **RAM and stack.** No new static buffers: encryption goes into the staged slot
 in `g_bbuf_new`, and decryption into `g_bbuf`, where `get` stages its payload
 today. PSA one-shot AEAD uses a few hundred bytes of stack, within R7's 4 KB.
 A mount adds one volatile PSA key slot.
 
-**Footprint.** On the UBI backend PSA Crypto is already linked, so this adds
-the CCM or ChaCha code paths. On `flash_area` builds this is the first PSA
+**Footprint.** On the UBI backend PSA Crypto, AES, CMAC and HKDF are already
+linked for UBI. AUTH adds no crypto code, and AEAD adds only the CCM module. On `flash_area` builds this is the first PSA
 dependency, which is a real cost for the backend that exists to be small. It
 is one more reason protection stays opt-in.
 
@@ -502,7 +583,7 @@ and AUTH and AEAD modes. Tests, per P8:
 - nonce uniqueness across crash points (crash hooks around the ceiling write);
 - the full blob_db, container, kvdb and blobfs suites rerun with protection
   on, using the same scenario approach as `.slot_index`;
-- `app_perf_blob_db` on the DK with CCM and with ChaCha20-Poly1305.
+- `app_perf_blob_db` on the DK in AUTH (CMAC) and AEAD (CCM) modes.
 
 **Phase 1b (re-sealing, §5 B).** Compaction re-encrypts the region it writes
 under one nonce base kept in the bucket header. It is a format change of its
@@ -522,7 +603,8 @@ measurements show the 8 B per-slot tag matters.
 1. **Confidentiality, or integrity only?** If only tamper evidence is needed,
    AUTH is enough and the CPU cost on reads roughly halves with CCM.
 2. **Target hardware crypto.** Upstream Zephyr on the nRF5340 has no
-   CryptoCell driver, so everything is software. That decides CCM against
+   CryptoCell driver, so everything is software. The plan is AES throughout,
+   matching UBI. Only a poor software measurement would reopen
    ChaCha20-Poly1305.
 3. **Is rollback in scope?** If not, stop after phase 1. If whole-image
    restore matters, phase 2 is cheap. If per-blob rollback matters, it needs
