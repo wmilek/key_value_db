@@ -7,11 +7,13 @@ key->value) and, since v1.1.0, the model container list
 has its root resolved through the root registry at id 1. Update this file when
 the benchmark shape changes or when regenerating on new hardware.
 
-**The map's figures below are hardware-measured (v1.0.0). The list's are not
-yet:** v1.1.0 adds the list phases and per-phase I/O counters, and the list
-section that follows gives those counters and what the DK timing model
-predicts from them. When a v1.1.0 DK capture exists, it replaces the
-prediction columns.
+**v1.1.0 is measured on the DK, map and list, on both backends, with and
+without the slot index; see the next section.** Those runs used the MX25R in
+high-performance mode, which main does not set yet (see "Setup"). The
+v1.0.0 sections further down are the map's earlier captures. They predate
+both that mode and word-aligned buffers (PR 55), so their absolute figures
+are stale. They are kept for the record and for the UBI `prepare`
+measurement.
 
 ## v1.1.0: the list, and I/O counters per phase
 
@@ -33,108 +35,163 @@ checksum, and `mcl_check` runs after `l.insert` and `l.remove`. Every phase
 prints an `io` line after its `bench` line when `CONFIG_BLOB_DB_IOSTATS=y`,
 which `boards/native_sim.conf` sets. The native_sim board now also takes the
 DK's geometry (64 KB erase blocks, 4 B writes, the same 8 MB partition), as
-`app_perf_blob_db` does, so the counters are the ones the board issues: 124
-buckets on `flash_area`, as on the DK.
+`app_perf_blob_db` does, so the counters are the ones the board issues.
 
-### No board yet: I/O counters, and what they predict
+### Setup
 
-`native_sim`, DK geometry, `flash_area` backend, on `e78f04c` plus this
-change. "Flash reads" and "writes" are flash transactions per op, not blob
-operations: one blob read walks the 12-byte slot headers of its bucket, so
-it costs several. The prediction is `app_perf_l0/tools/l0_timing.py predict`
-over `models/mx25r64_nrf5340dk_full.json`. It covers flash cost only, with no
-CPU time and no UBI per-transaction cost.
+- **Target**: nRF5340-DK, cpuapp core, `storage_partition` on the on-board
+  MX25R6435F QSPI NOR (8 MB, 64 KB sectors).
+- **Code**: `aef48ea` on main (`e78f04c`), **plus PR 49's driver patch**,
+  which puts the MX25R in high-performance mode. Every blob_db buffer is
+  word-aligned (PR 55, checked with `nm`).
+- **Builds**: six. The UBI and `flash_area` backends, each plain, with
+  `CONFIG_BLOB_DB_IOSTATS=y`, and with `CONFIG_BLOB_DB_SLOT_INDEX=y` (default
+  2048 entries). The tables use the plain and slot-index builds. IOSTATS
+  moves timings by 1–2% (2–13% on `l.remove` and `l.cleanup`, which are 10
+  ops and 1 op).
+- One `erase_all` + `blob_db_prepare(150)` up front. `prepare` costs 520 ms
+  per block in every build, against 1.09 s in the v1.0.0 captures.
 
-The map rows give the model a check against the v1.0.0 DK capture further
-down:
+**PR 49 is not on main.** A build from main leaves the part in its power-up
+ultra-low-power mode. These runs cannot say how much of the change since
+v1.0.0 that mode accounts for and how much is alignment.
 
-| phase       | flash reads / op | writes / op | predicted, DK | measured, DK (v1.0.0) | ratio |
-| ----------- | ---------------: | ----------: | ------------: | --------------------: | ----: |
-| `set`       |             82.5 |           5 |       9.60 ms |              13.60 ms |  0.71 |
-| `get`       |             47.5 |           0 |       3.46 ms |               3.53 ms |  0.98 |
-| `overwrite` |            330.5 |           5 |      28.38 ms |              29.10 ms |  0.98 |
-| `delete`    |            561.0 |           5 |      43.65 ms |              37.00 ms |  1.18 |
-| `cleanup`   |              452 |           3 |      33.83 ms |              23.00 ms |  1.47 |
+### Correctness on hardware
 
-`get` and `overwrite`, the two phases with the most ops, land within 3%.
-`delete` and `cleanup` are 10 ops and 1 op, run late on a store whose
-bucket histories changed since `e80f404` (PR 55 word-aligns every slot), and
-the model overshoots them. So this is a check, not a calibration. The list:
+All six builds pass:
 
-| phase       | flash reads / op | writes / op | predicted, DK |  ops/s | against the map               |
-| ----------- | ---------------: | ----------: | ------------: | -----: | ----------------------------- |
-| `l.insert`  |            101.2 |           6 |      11.71 ms |   85.4 | `set` 9.60 ms                 |
-| `l.get`     |             10.9 |           0 |       0.79 ms |   1264 | `get` 3.46 ms: **×4.4 less**  |
-| `l.set`     |             58.9 |           1 |       4.92 ms |    203 | `overwrite` 28.38 ms: **×5.8 less** |
-| `l.next`    |              6.9 |           0 |       0.50 ms |   1996 | —                             |
-| `l.prev`    |             47.9 |           0 |       3.47 ms |    288 | `l.next`: **×6.9 more**       |
-| `l.remove`  |            236.9 |           6 |      20.94 ms |   47.8 | `delete` 43.65 ms: ×2.1 less  |
-| `l.cleanup` |              187 |           3 |      14.70 ms |      — | `cleanup` 33.83 ms            |
+- no `<err>` lines;
+- `get checksum` and `l.get checksum` both `0xac6a5f02`;
+- `mcl_check` passes after `l.insert` and `l.remove`;
+- 1 live blob after the map and at the end.
 
-The UBI build issues the same counters for every timed phase, map and list,
-transaction for transaction; only `prepare` differs (117 buckets against
-124). On the DK, UBI cost the map ×1.5–2.4 (see "On the UBI backend"); expect
-the list to fall in the same band, read-heavy phases at the top of it.
+The DK's `io` lines equal the native_sim capture below for every map and list
+phase, transaction for transaction. UBI issues the same counters as
+`flash_area`; only `prepare` differs (117 blocks against 124). So a native_sim
+run on this board's overlay reproduces the board's I/O exactly.
 
-What the counters show:
+### Numbers
+
+ms per op, measured on the DK. "Flash reads" and "writes" are flash
+transactions per op from the `io` lines, not blob operations. One blob read
+walks the 12-byte slot headers of its bucket, so it costs several
+transactions.
+
+| phase       | flash reads / op | writes / op | `flash_area` |      UBI | UBI / fa |
+| ----------- | ---------------: | ----------: | -----------: | -------: | -------: |
+| `set`       |             82.5 |           5 |         7.40 |     8.40 |    ×1.14 |
+| `get`       |             47.5 |           0 |         3.41 |     3.90 |    ×1.14 |
+| `overwrite` |            330.5 |           5 |        23.38 |    27.08 |    ×1.16 |
+| `delete`    |            561.0 |           5 |        37.20 |    43.20 |    ×1.16 |
+| `cleanup`   |              452 |           3 |         29.0 |     34.0 |    ×1.17 |
+| `l.insert`  |            101.2 |           6 |         8.90 |    10.20 |    ×1.15 |
+| `l.get`     |             10.9 |           0 |         0.77 |     0.89 |    ×1.16 |
+| `l.set`     |             58.9 |           1 |         4.22 |     4.90 |    ×1.16 |
+| `l.next`    |              6.9 |           0 |         0.48 |     0.55 |    ×1.15 |
+| `l.prev`    |             47.9 |           0 |         3.14 |     3.66 |    ×1.17 |
+| `l.remove`  |            236.9 |           6 |        17.30 |    20.40 |    ×1.18 |
+| `l.cleanup` |              187 |           3 |         12.0 |     15.0 |    ×1.25 |
+
+UBI costs ×1.14–×1.18 over `flash_area` in every phase except the
+single-op `l.cleanup`, where a 1 ms tick is 8%. The v1.0.0 captures put that
+band at ×1.5–2.4. Those builds were unaligned and in low-power mode, so that
+band no longer describes a current build.
+
+What the numbers show:
 
 - **The list's handle accesses are O(1); the map's key lookups are not.**
-  `l.get` is two blob reads (node, then value) against the map's ~7. That
-  gap grows with population, because the map scans its pair list. The list's
-  own price shows up elsewhere: there is no lookup by key, and the client
-  holds the handles.
+  `l.get` is two blob reads (node, then value) against the map's ~7, and
+  measures **×4.4 cheaper** than `get`. That gap grows with population,
+  because the map scans its pair list. The list's own price shows up
+  elsewhere: there is no lookup by key, and the client holds the handles.
 - **`l.set` has no intent.** It changes no references, so it is one atomic
   `update` of the value blob after a membership check (`node_linked`).
   The map's `overwrite` replaces the value blob through the full discipline
-  (4 updates + 1 delete). At 1 write against 5, the list overwrites ×5.8
-  cheaper.
+  (4 updates + 1 delete). At 1 write against 5, `l.set` is **×5.5 cheaper**.
 - **An insert costs one more write than a map `set`.** That is the REPAIR
   step: 6 writes (stage, value, node, commit, repair, clear) against the
   map's 5. Most of the reads are read-modify-writes: every link write
   reloads the blob it changes. With `mcl_begin()`'s recovery check on top,
-  an append at the back reads the root four times.
-- **`l.prev` costs ×6.9 an `l.next`**, while both read one node. `mcl_prev`
+  an append at the back reads the root four times. `l.insert` measures
+  ×1.2 a map `set`.
+- **`l.prev` costs ×6.5 an `l.next`**, while both read one node. `mcl_prev`
   first runs recovery to rule out a staged mutation, which reads the root and
-  the intent: two extra blob reads (the header comment in
-  `model_container_list.h` says one). Those two blobs are the most rewritten
-  in the store, since every mutation updates the intent twice (stage and
-  clear). So each read walks a long slot history in its bucket. The cost
-  comes from the store's history, not from the list.
+  the intent. Those two blobs are the most rewritten in the store, since every
+  mutation updates the intent twice (stage and clear). So each read walks a
+  long slot history in its bucket. The cost comes from the store's history,
+  not from the list.
 - **Every phase ends at the floor.** The map, then the list, each leave 1
   live blob (the empty registry), and `l.get checksum` equals the map's
   `0xac6a5f02` because both read the same value sequence.
 
 ### With `CONFIG_BLOB_DB_SLOT_INDEX=y`
 
-The slot index (PR 54) is opt-in. It removes exactly the slot-header walk that
-dominates the rows above. Same run, `flash_area`, default index size (2048
-entries):
+The slot index (PR 54) is opt-in. It removes the slot-header walk that
+dominates the reads above. Writes per op are unchanged.
 
-| phase       | flash reads / op | predicted, DK | without index |     Δ |
-| ----------- | ---------------: | ------------: | ------------: | ----: |
-| `set`       |             24.5 |       5.40 ms |       9.60 ms | ×1.8  |
-| `get`       |             22.5 |       1.64 ms |       3.46 ms | ×2.1  |
-| `overwrite` |             30.5 |       6.68 ms |      28.38 ms | ×4.2  |
-| `delete`    |             26.0 |       4.97 ms |      43.65 ms | ×8.8  |
-| `cleanup`   |               18 |       2.45 ms |      33.83 ms | ×13.8 |
-| `l.insert`  |             24.0 |       6.12 ms |      11.71 ms | ×1.9  |
-| `l.get`     |              6.0 |       0.43 ms |       0.79 ms | ×1.8  |
-| `l.set`     |             13.0 |       1.59 ms |       4.92 ms | ×3.1  |
-| `l.next`    |              3.0 |       0.22 ms |       0.50 ms | ×2.3  |
-| `l.prev`    |              9.0 |       0.66 ms |       3.47 ms | ×5.3  |
-| `l.remove`  |             33.0 |       6.19 ms |      20.94 ms | ×3.4  |
-| `l.cleanup` |               21 |       2.69 ms |      14.70 ms | ×5.5  |
+| phase       | flash reads / op | `flash_area` |  UBI | speed-up, fa |
+| ----------- | ---------------: | -----------: | ---: | -----------: |
+| `set`       |             24.5 |         3.70 | 4.10 |         ×2.0 |
+| `get`       |             22.5 |         1.74 | 1.98 |         ×2.0 |
+| `overwrite` |             30.5 |         4.52 | 4.96 |         ×5.2 |
+| `delete`    |             26.0 |         3.50 | 4.50 |        ×10.6 |
+| `cleanup`   |               18 |          1.0 |  3.0 |          ×29 |
+| `l.insert`  |             24.0 |         4.00 | 4.40 |         ×2.2 |
+| `l.get`     |              6.0 |         0.43 | 0.50 |         ×1.8 |
+| `l.set`     |             13.0 |         1.30 | 1.46 |         ×3.2 |
+| `l.next`    |              3.0 |         0.22 | 0.25 |         ×2.2 |
+| `l.prev`    |              9.0 |         0.66 | 0.75 |         ×4.8 |
+| `l.remove`  |             33.0 |         4.40 | 4.90 |         ×3.9 |
+| `l.cleanup` |               21 |          2.0 |  2.0 |         ×6.0 |
 
-Writes per op are unchanged. With the index, a blob read costs 3 flash reads
-wherever it lives, so `l.prev` falls to exactly three blob reads (root,
-intent, node) against `l.next`'s one. The gains grow down the table as the
-blobs touched get older, which is where the walk was longest.
-Checksums and end state are identical.
+With the index a blob read costs 3 flash reads wherever it lives, so `l.prev`
+falls to exactly three blob reads (root, intent, node) against `l.next`'s one.
+The gains grow as the blobs touched get older, which is where the walk was
+longest. The `cleanup` rows are single ops timed to 1 ms, so their multiples
+are rough.
+
+### The timing model, checked
+
+Before the board run, this section predicted the DK from the native_sim
+counters with `app_perf_l0/tools/l0_timing.py predict` over
+`models/mx25r64_nrf5340dk_full.json`. That covers flash time only, with no
+CPU time and no UBI per-transaction cost. Against `flash_area`:
+
+| phase       | predicted | measured | measured / predicted | predicted, index | measured, index | measured / predicted |
+| ----------- | --------: | -------: | -------------------: | ---------------: | --------------: | -------------------: |
+| `set`       |      9.60 |     7.40 |                 0.77 |             5.40 |            3.70 |                 0.69 |
+| `get`       |      3.46 |     3.41 |                 0.99 |             1.64 |            1.74 |                 1.06 |
+| `overwrite` |     28.38 |    23.38 |                 0.82 |             6.68 |            4.52 |                 0.68 |
+| `delete`    |     43.65 |    37.20 |                 0.85 |             4.97 |            3.50 |                 0.70 |
+| `cleanup`   |     33.83 |     29.0 |                 0.86 |             2.45 |             1.0 |                 0.41 |
+| `l.insert`  |     11.71 |     8.90 |                 0.76 |             6.12 |            4.00 |                 0.65 |
+| `l.get`     |      0.79 |     0.77 |                 0.97 |             0.43 |            0.43 |                 0.99 |
+| `l.set`     |      4.92 |     4.22 |                 0.86 |             1.59 |            1.30 |                 0.82 |
+| `l.next`    |      0.50 |     0.48 |                 0.96 |             0.22 |            0.22 |                 1.01 |
+| `l.prev`    |      3.47 |     3.14 |                 0.91 |             0.66 |            0.66 |                 1.01 |
+| `l.remove`  |     20.94 |    17.30 |                 0.83 |             6.19 |            4.40 |                 0.71 |
+| `l.cleanup` |     14.70 |     12.0 |                 0.82 |             2.69 |             2.0 |                 0.74 |
+
+The model gets reads right and writes too high:
+
+- **Read-only phases** (`get`, `l.get`, `l.next`, `l.prev`) land within
+  1–10%. With the index, `l.get`, `l.next` and `l.prev` land within 1% and
+  `get` within 6%.
+- **Phases with writes** measure 14–24% under the prediction, and 18–59%
+  under it with the index, where writes are a larger share of the time.
+
+The model was fitted from `app_perf_l0` captures taken before PR 55, in the
+part's low-power mode. Unaligned buffers made `nrf_qspi_nor` program 4 bytes
+at a time, and low-power mode programs and erases more slowly. Either could
+explain why writes are now cheaper than the model says, and these runs cannot
+separate the two. Refitting the model from an aligned `app_perf_l0` run in
+the same mode as the board should close the gap.
 
 ### Raw native_sim capture (`flash_area`, DK geometry)
 
 Wall clock is 0 ms throughout because the flash simulator models no latency.
-The `io` lines are the result.
+The `io` lines are the result, and the DK's IOSTATS build prints the same
+ones.
 
 ```
 model-container perf 1.1.0  (N_KEYS=10  N_NODES=10  N_GET=100  N_OVW=50  VAL_LEN=24)
@@ -171,6 +228,12 @@ live blobs at end: 1 (expect 1 — the empty registry alone)
 ```
 
 ## The map on hardware (v1.0.0)
+
+**Stale: superseded by the v1.1.0 numbers above.** The captures below
+predate word-aligned buffers (PR 55) and ran the MX25R in low-power mode. For
+example, `set` measured 13.60 ms here and 7.40 ms in v1.1.0, and UBI cost
+×1.5–2.4 here against ×1.14–×1.18 now. What still holds is the shape: what
+each operation is made of, and the two values of UBI `prepare`.
 
 Regenerated on `e80f404` (main, after PR 10 merged). The previous numbers
 predated PR 2's lookup change; the "~59 reads/s (17 ms)" this file used to
@@ -398,7 +461,9 @@ nrfutil device program --firmware build/mc/zephyr/zephyr.hex \
 ```
 
 That build takes the UBI backend from the Kconfig default, with the PEB pool
-sized for this geometry in `boards/nrf5340dk_nrf5340_cpuapp.conf`. The DK build
+sized for this geometry in `boards/nrf5340dk_nrf5340_cpuapp.conf`. The v1.1.0
+figures also need PR 49's driver patch (`west patch apply`) for the MX25R's
+high-performance mode. Without it, expect slower writes and erases. The DK build
 leaves `CONFIG_BLOB_DB_IOSTATS` off, so its timings stay comparable with the
 v1.0.0 captures above. A v1.1.0 capture prints the list phases after the map's. For the
 `flash_area` column add `-DCONFIG_BLOB_DB_BACKEND_FLASH_AREA=y`, and **erase
