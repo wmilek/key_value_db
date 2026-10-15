@@ -56,6 +56,7 @@ instructions live in the repository ``README.md``.
    proposals/2026-10-08-logring
    proposals/2026-10-09-kvhash-spill
    proposals/2026-10-15-data-protection
+   proposals/2026-10-15-blob-db-protection
 
 .. toctree::
    :maxdepth: 1

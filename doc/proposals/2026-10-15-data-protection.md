@@ -1,6 +1,7 @@
 # Design exploration — encrypting and authenticating data in `blob_db`
 
-Status: **exploration** · 2026-10-15 · nothing implemented
+Status: **exploration** · 2026-10-15 · nothing implemented · the decisions are in
+`doc/proposals/2026-10-15-blob-db-protection.md`; this document keeps the reasoning, the alternatives and the cost estimates
 · Target contract: `doc/layers/l1_blob_db.md` (§2 stability contract: one new error meaning; §3 cost bounds)
 · Target implementation design: `doc/impl/l1_bucketlog.md` (§3.3 slot format, §3.1 master body, §5.4 read path)
 · Related: `doc/impl/l0_backends.md` ("Authenticated metadata"), zephyr-ubi `docs/security.md`, `library/ubi_key.c`, `library/ubi_header.c` (algorithms aligned with these, §4.7)
@@ -338,6 +339,59 @@ protected build, `-EIO` also covers an authentication failure. The per-slot
 payload cap drops by the extra overhead, from `(sector − 16)/2 − 14` to
 `(sector − 16)/2 − 34`: 2026 → 2006 B on 4 KB sectors.
 
+### 4.7 Same algorithms as zephyr-ubi
+
+On the UBI backend the stack runs two integrity layers, one on top of the
+other. They should share their primitives, key handling and failure
+vocabulary, so the product has one crypto story and one set of code. The
+table maps what UBI does (`library/ubi_key.c`, `library/ubi_header.c`,
+`docs/security.md`) to what `blob_db` does:
+
+| Aspect | zephyr-ubi | `blob_db` (this proposal) |
+|---|---|---|
+| Keying material | PSA key handle with `PSA_KEY_USAGE_DERIVE`, from `blob_db_ubi_ikm_key()` | **the same handle**, from a backend-neutral `blob_db_ikm_key()` (§4.3) |
+| KDF | HKDF-SHA256, fixed salt `"zephyr-ubi/v1"`, info = label ‖ `key_context` | HKDF-SHA256, fixed salt `"blob_db/v1"`, info = label ‖ `store_uuid` (§4.3 says why the context differs) |
+| Derived keys | volatile AES-128, one per purpose (header, volume table) | volatile AES-128, one per purpose (slot-mac or slot-aead, meta) |
+| MAC | AES-CMAC-128, 16 B, `psa_mac_compute` and `psa_mac_verify` | **AES-CMAC** in AUTH. AEAD uses AES-CCM, whose MAC is CBC-MAC under the same AES. Tag 8 B by default, 16 B to match UBI |
+| Encryption | none: "protect data with an AEAD of your own" | AES-CCM, the AEAD UBI's security doc asks the layer above for |
+| What is bound | `pnum` at the front of the MAC message; the doc asks the layer above to bind `vol_id` and `lnum` | the id, which fixes the bucket (= `lnum`, since one bucket is one LEB). `vol_id` and the partition are covered by `store_uuid` in the key |
+| Nonce rule from UBI's doc | "a new nonce for every version of a block"; never offset alone, because `ubi_leb_change()` restarts at offset 0 | a new nonce per slot version, from the seq counter and the mount salt (§4.2), never position alone; §5 B adds a fresh base per compaction, i.e. per `ubi_leb_change()` |
+| Layout | MAC, then CRC32 over everything before it, MAC included | tag, then CRC16 over everything before it, tag included |
+| Check order | erased → magic → CRC → MAC; never `memcmp` a MAC | erased → flags and length → CRC → tag, compared in constant time by `psa_mac_verify` or `psa_aead_decrypt` |
+| Verdicts | `UBI_EVENT_HDR_CORRUPT` (CRC fails), `UBI_EVENT_HDR_TAMPERED` (CRC passes, MAC fails) | **the same two**, for slots (§4.6) |
+| Randomness | `image_seq` from `psa_generate_random()` at format | `store_uuid` at format and `mount_salt` at mount, from the same call |
+| Rollback | `state_cb` at attach and every N writes, given `image_seq`, `revision`, `max_sqnum`, returns TRUSTED or UNTRUSTED | anchor check (§6.1) on `store_uuid` and the seq ceiling, the counterparts of `image_seq` and `max_sqnum` |
+| Verify on read | optional: `CONFIG_UBI_VERIFY_ON_READ` (header only) | always: every `get` checks the tag of the slot it returns |
+| Seal over rewritten data | `ubi_leb_change()` stores `data_crc` in the MAC'd header, checked at attach only | §5: a shared nonce at compaction; a region seal only as variant C |
+
+Three places where the alignment should become shared code, not just matching
+choices:
+
+1. **One event sink.** `blob_db_store_ubi.c` already receives UBI's events in
+   `on_event()`. Slot verdicts should go to the same application hook with the
+   same two kinds, tagged with their layer, so an application handles
+   "corrupt" and "tampered" once.
+2. **One trust decision.** Merge the §6.1 anchor into the existing
+   `blob_db_ubi_state_check()`. It becomes `blob_db_state_check()`, given UBI's
+   `ubi_device_info` when the backend has one, plus `store_uuid` and the seq
+   ceiling, with the same TRUSTED or UNTRUSTED verdict and the same `-EROFS`
+   outcome. On `flash_area` it gets the `blob_db` fields only.
+3. **One key path.** `key_acquire()` in `blob_db_store_ubi.c` moves into
+   `blob_db` core. It runs once at mount, hands the IKM to UBI when the
+   backend is UBI, and derives the slot key from it.
+
+**UBI already seals a rewritten block, but with a CRC.** When compaction
+replaces a bucket through `ubi_leb_change()`, UBI writes `data_crc` over the
+new contents into the volume identifier header, which carries its CMAC. That
+is the region seal from §5 variant C, built one layer down, and it follows
+C's verify-once model ("data checksums are checked at attach only"). A CRC32
+is linear and unkeyed, though, so an attacker who rewrites the data can make
+its CRC32 match. It catches damage, not tampering. If zephyr-ubi ever stored a
+keyed MAC there in place of the CRC, `blob_db` on UBI would get variant C's
+saving with no extra bytes. It would also inherit C's limits: the check runs
+at attach, not per read. That change belongs in zephyr-ubi, and it does
+nothing on `flash_area`. Variant B does not depend on it.
+
 ### 4.8 Remapping below `blob_db`: making UBI's header MAC a second line
 
 UBI authenticates its headers so that an attacker cannot change the mapping
@@ -417,59 +471,6 @@ known UBI key and a secret `blob_db` key would still never serve forged or
 displaced data. It would only be easier to deny service to and to roll back.
 `CONFIG_UBI_VERIFY_ON_READ`, which re-checks the UBI header on every read,
 becomes redundant with `blob_db`'s per-read checks and can stay off.
-
-### 4.7 Same algorithms as zephyr-ubi
-
-On the UBI backend the stack runs two integrity layers, one on top of the
-other. They should share their primitives, key handling and failure
-vocabulary, so the product has one crypto story and one set of code. The
-table maps what UBI does (`library/ubi_key.c`, `library/ubi_header.c`,
-`docs/security.md`) to what `blob_db` does:
-
-| Aspect | zephyr-ubi | `blob_db` (this proposal) |
-|---|---|---|
-| Keying material | PSA key handle with `PSA_KEY_USAGE_DERIVE`, from `blob_db_ubi_ikm_key()` | **the same handle**, from a backend-neutral `blob_db_ikm_key()` (§4.3) |
-| KDF | HKDF-SHA256, fixed salt `"zephyr-ubi/v1"`, info = label ‖ `key_context` | HKDF-SHA256, fixed salt `"blob_db/v1"`, info = label ‖ `store_uuid` (§4.3 says why the context differs) |
-| Derived keys | volatile AES-128, one per purpose (header, volume table) | volatile AES-128, one per purpose (slot-mac or slot-aead, meta) |
-| MAC | AES-CMAC-128, 16 B, `psa_mac_compute` and `psa_mac_verify` | **AES-CMAC** in AUTH. AEAD uses AES-CCM, whose MAC is CBC-MAC under the same AES. Tag 8 B by default, 16 B to match UBI |
-| Encryption | none: "protect data with an AEAD of your own" | AES-CCM, the AEAD UBI's security doc asks the layer above for |
-| What is bound | `pnum` at the front of the MAC message; the doc asks the layer above to bind `vol_id` and `lnum` | the id, which fixes the bucket (= `lnum`, since one bucket is one LEB). `vol_id` and the partition are covered by `store_uuid` in the key |
-| Nonce rule from UBI's doc | "a new nonce for every version of a block"; never offset alone, because `ubi_leb_change()` restarts at offset 0 | a new nonce per slot version, from the seq counter and the mount salt (§4.2), never position alone; §5 B adds a fresh base per compaction, i.e. per `ubi_leb_change()` |
-| Layout | MAC, then CRC32 over everything before it, MAC included | tag, then CRC16 over everything before it, tag included |
-| Check order | erased → magic → CRC → MAC; never `memcmp` a MAC | erased → flags and length → CRC → tag, compared in constant time by `psa_mac_verify` or `psa_aead_decrypt` |
-| Verdicts | `UBI_EVENT_HDR_CORRUPT` (CRC fails), `UBI_EVENT_HDR_TAMPERED` (CRC passes, MAC fails) | **the same two**, for slots (§4.6) |
-| Randomness | `image_seq` from `psa_generate_random()` at format | `store_uuid` at format and `mount_salt` at mount, from the same call |
-| Rollback | `state_cb` at attach and every N writes, given `image_seq`, `revision`, `max_sqnum`, returns TRUSTED or UNTRUSTED | anchor check (§6.1) on `store_uuid` and the seq ceiling, the counterparts of `image_seq` and `max_sqnum` |
-| Verify on read | optional: `CONFIG_UBI_VERIFY_ON_READ` (header only) | always: every `get` checks the tag of the slot it returns |
-| Seal over rewritten data | `ubi_leb_change()` stores `data_crc` in the MAC'd header, checked at attach only | §5: a shared nonce at compaction; a region seal only as variant C |
-
-Three places where the alignment should become shared code, not just matching
-choices:
-
-1. **One event sink.** `blob_db_store_ubi.c` already receives UBI's events in
-   `on_event()`. Slot verdicts should go to the same application hook with the
-   same two kinds, tagged with their layer, so an application handles
-   "corrupt" and "tampered" once.
-2. **One trust decision.** Merge the §6.1 anchor into the existing
-   `blob_db_ubi_state_check()`. It becomes `blob_db_state_check()`, given UBI's
-   `ubi_device_info` when the backend has one, plus `store_uuid` and the seq
-   ceiling, with the same TRUSTED or UNTRUSTED verdict and the same `-EROFS`
-   outcome. On `flash_area` it gets the `blob_db` fields only.
-3. **One key path.** `key_acquire()` in `blob_db_store_ubi.c` moves into
-   `blob_db` core. It runs once at mount, hands the IKM to UBI when the
-   backend is UBI, and derives the slot key from it.
-
-**UBI already seals a rewritten block, but with a CRC.** When compaction
-replaces a bucket through `ubi_leb_change()`, UBI writes `data_crc` over the
-new contents into the volume identifier header, which carries its CMAC. That
-is the region seal from §5 variant C, built one layer down, and it follows
-C's verify-once model ("data checksums are checked at attach only"). A CRC32
-is linear and unkeyed, though, so an attacker who rewrites the data can make
-its CRC32 match. It catches damage, not tampering. If zephyr-ubi ever stored a
-keyed MAC there in place of the CRC, `blob_db` on UBI would get variant C's
-saving with no extra bytes. It would also inherit C's limits: the check runs
-at attach, not per read. That change belongs in zephyr-ubi, and it does
-nothing on `flash_area`. Variant B does not depend on it.
 
 ## 5. Re-sealing at compaction to save space
 
