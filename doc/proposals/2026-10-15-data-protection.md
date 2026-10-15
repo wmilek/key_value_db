@@ -128,6 +128,10 @@ buy?
   every payload. It still misses the real attack: an attacker who can erase
   writes back any earlier prefix of the chain, which is a valid chain.
 
+Compaction is still the right moment to make the region **smaller**: it can
+share one nonce across the whole region, and with more trade-offs share one
+seal. §5 works through that.
+
 What a bucket-level summary is useful for is **freshness**: checking whether
 the bucket in flash is the latest one. That takes trusted state outside the
 flash (§6). Without it, a bucket seal says "authentic", not "current", and
@@ -241,11 +245,11 @@ protects little and is left out of the first cut.
 | Segment sweep (mount after a crash) | `blob_db_seg_hdr` (`owner_id`, `seq`) has to be readable without a full decrypt. Keep those 12 B in **clear text and in the AAD**, the same treatment as the slot header | 0 to find, 1 to confirm |
 | `inspect` / shell `dump` | shows ciphertext unless a decrypting variant is added (debug builds only) | — |
 
-Compaction needing no crypto is the main property of this design. Compaction
-is already the most expensive operation (0.69 s per compacting update on the
-DK with atomic replace), and this adds nothing to it. It would have to
-re-encrypt if position were in the AAD or the nonce, and it would have to
-re-MAC if a bucket seal were used.
+In the base design compaction needs no crypto. Compaction is already the most
+expensive operation (0.69 s per compacting update on the DK with atomic
+replace), and the base design adds nothing to it. §5 gives that up on purpose:
+a few milliseconds of re-encryption per compaction buys back 12 B per
+compacted slot.
 
 ### 4.5 Modes, as one Kconfig choice
 
@@ -308,17 +312,87 @@ protected build, `-EIO` also covers an authentication failure. The per-slot
 payload cap drops by the extra overhead, from `(sector − 16)/2 − 14` to
 `(sector − 16)/2 − 34`: 2026 → 2006 B on 4 KB sectors.
 
-## 5. A bucket-level mechanism that is worth having
+## 5. Re-sealing at compaction to save space
 
-Only one bucket-wide check pays for itself: **optional verification at
-compaction**. Compaction already holds the whole bucket in RAM and spends
-hundreds of milliseconds on erase and program. Running the AEAD over each
-surviving slot adds a few milliseconds in software (§7), and it means a
-tampered slot is found at maintenance time, not at the next read of that id.
-It does not change what is caught (row 2 is caught at read anyway), only
-when. It also brings back a question this proposal avoids so far: what
-compaction should keep when the winning slot fails. So it is an option to
-measure later, not part of the first cut.
+Most of a bucket's live data sits in the region compaction wrote. Slots
+appended since then are the churn. In the base design every slot in that
+region keeps its own 12 B nonce and 8 B tag. Compaction rewrites the region
+as a whole anyway, so it can re-encrypt it in a more compact form. Moving to
+that form costs a decrypt and an encrypt per surviving slot: about 4 KB × 2
+AEAD passes, a few milliseconds in software per 4 KB bucket, against the
+0.69 s a compacting update already takes on the DK.
+
+```
+base     [bhdr][n|ct|tag|crc][n|ct|tag|crc][n|ct|tag|crc] … appended slots …
+B        [bhdr+nbase][ct|tag|crc][ct|tag|crc][ct|tag|crc]  … appended slots …
+C        [bhdr+nbase][ct|crc][ct|crc][ct|crc][SEAL]         … appended slots …
+          └──────────── compacted region ─────────────┘
+```
+
+(Each slot also keeps `slot_hdr ‖ id` at its start, so the walk is unchanged.
+A COMPACTED flag in `slot_hdr` tells the two forms apart.)
+
+**The nonce can be shared. This is where most of the saving is.** Compaction
+takes one fresh value from the seq counter (§4.2), stores it once in the
+bucket header with the mount salt, and gives each compacted slot the nonce
+`salt ‖ seq_base ‖ offset`. The offset is known whenever the slot is read: the
+walk and the slot index both locate slots by it. Every nonce stays unique.
+`seq_base` is new at every compaction, and appended slots draw their own seq
+values from the same counter. A bucket rolled back to an old image does not
+lead to a repeat either, because the device never encrypts under an old
+image's base again. That repeat is what ruled out position-derived nonces in
+§4.2, and a fresh base per compaction avoids it. Saving: 12 B per compacted
+slot.
+
+**The tag can be shared too, but reads pay for it.** Variant C replaces the
+per-slot tags with one MAC over the whole compacted region, written at its
+end. That saves another 8 B per slot. The cost is §1 again: a `get` that lands
+in the region can trust its slot only after reading and MACing the whole
+region. On the DK's 64 KB sectors that is the 23 ms full-sector read the
+header walk replaced (RESULTS.md), plus about as much again in software MAC
+time, against 460 µs today. Two ways to soften it:
+
+- **Verify once per boot.** Keep one RAM bit per bucket (256 B for 2045
+  buckets) set by the first successful region check. Later reads in that
+  bucket trust the bit. The first read of each bucket after boot still pays
+  the full cost. The guarantee also gets weaker: flash changed after the check
+  (an attacker with a clip on the external QSPI chip while the device runs) is
+  no longer caught. Variants A and B check the bytes they return on every
+  read.
+- **Seal in chunks.** One tag per ~512 B of the region sits between B (one
+  tag per slot) and C (one per region). A read verifies the chunks its slot
+  overlaps. Space and read cost both scale with the chunk size.
+
+| Per compacted slot | A (base) | **B: shared nonce** | C: shared nonce and seal |
+|---|---|---|---|
+| Overhead vs today's 14 B | +20 B | **+8 B** | +0 B (+~24 B per bucket) |
+| 256 B payload | +7.4 % | **+3.0 %** | ~0 % |
+| `get` on a compacted slot | 1 AEAD over the slot | **1 AEAD over the slot** | whole region read and MAC, or a per-boot RAM bit |
+| Compaction | copy only | decrypt and re-encrypt, ~ms | same as B, plus the region MAC |
+| Tamper caught at read | yes | **yes** | only on the first read since boot, with the RAM bit |
+
+Slots appended after compaction keep the full form in all three variants:
+they have no shared base, and they are written one at a time.
+
+**Recommendation: B.** It keeps 60 % of the saving (12 of the 20 B), and reads
+cost what they do in the base design. C saves the remaining 8 B by making
+reads slower or checks weaker, which is the trade the UBI attempt already
+failed on.
+
+B affects four places:
+- **Compaction verifies, and must decide what happens on failure.** It cannot
+  re-encrypt a slot without decrypting it, so every survivor is checked. A
+  slot that fails is copied unchanged in its full form, not converted. Reads
+  of it then still return `-EIO` (§4.6), and compaction never makes up a
+  verdict of its own.
+- **Recovery stays crypto-free.** The re-encrypted image is staged and sealed
+  exactly as today (scratch with trailer, or atomic replace), and recovery
+  copies it byte for byte.
+- **The bucket header grows** by `seq_base` and the salt, 12 B once per
+  bucket. Its CRC can stay a CRC. A forged base only makes the region's tags
+  fail.
+- **The slot index is unaffected.** It already stores offsets, which is all
+  B's nonce needs.
 
 ## 6. Freshness and rollback
 
@@ -398,7 +472,7 @@ costs (`get` 460 µs, `update` 2.4–15 ms, compacting update 0.69 s):
 |---|---|---|
 | `get` (256 B) | +100–200 µs, less ~50 µs saved I/O | roughly +10–35 % |
 | `update` | +100–200 µs | ~1–8 % |
-| compaction | 0, or a few ms with verification | ≤ 1 % |
+| compaction | 0 in the base design; a few ms with re-sealing (§5 B) | ≤ 1 % |
 | mount | one HKDF and key import | negligible |
 
 Reads are the only place this is visible. It is the first thing to measure
@@ -430,11 +504,19 @@ and AUTH and AEAD modes. Tests, per P8:
   on, using the same scenario approach as `.slot_index`;
 - `app_perf_blob_db` on the DK with CCM and with ChaCha20-Poly1305.
 
+**Phase 1b (re-sealing, §5 B).** Compaction re-encrypts the region it writes
+under one nonce base kept in the bucket header. It is a format change of its
+own, so it is better shipped with phase 1 than after it. Tests: compaction of
+a bucket that holds a tampered slot (the slot survives unconverted and still
+reads `-EIO`); crash at every compaction point with the re-encrypted image;
+nonce uniqueness across repeated compactions of one bucket.
+
 **Phase 2 (anchor).** The §6.1 hooks and a sample that anchors in PSA ITS.
 
-**Later, if needed.** A key epoch in `slot_hdr.reserved`, for rotation in
-which compaction re-encrypts slots under an old epoch. Length padding, if
-`val_len` leaking is a concern. Verification at compaction (§5).
+**Later, if needed.** A key epoch in `slot_hdr.reserved`, for key rotation.
+Re-sealing at compaction is the natural place to move slots to the new key.
+Length padding, if `val_len` leaking is a concern. Chunked seals (§5), if
+measurements show the 8 B per-slot tag matters.
 
 **Questions that decide the design:**
 1. **Confidentiality, or integrity only?** If only tamper evidence is needed,
