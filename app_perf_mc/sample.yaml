@@ -1,5 +1,5 @@
 sample:
-  description: model-container (L1 contract) performance benchmark
+  description: model containers (L1 contract map and list) performance benchmark
   name: model-container-perf
 common:
   build_only: true

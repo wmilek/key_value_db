@@ -90,7 +90,8 @@ int mcl_get(uint64_t id, void *out, size_t out_sz, size_t *out_len);
 /* Walk the list. mcl_next(0) is the head, mcl_prev(0) the tail; 0 comes
  * back past either end. mcl_next follows the authoritative chain and never
  * writes. mcl_prev follows the derived chain, so it first finishes a
- * mutation an earlier failed abort left staged (one read when none is). */
+ * mutation an earlier failed abort left staged (two reads, the root and
+ * the intent, when none is). */
 int mcl_next(uint64_t id, uint64_t *out);
 int mcl_prev(uint64_t id, uint64_t *out);
 

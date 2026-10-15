@@ -1,6 +1,18 @@
 /*
- * Same 16 MB sim-flash / 8 MB storage_partition layout as the main app,
- * so the benchmark exercises multi-bucket geometry on native_sim too.
+ * native_sim, shaped like the nRF5340-DK's on-board MX25R6435F: 64 KB erase
+ * blocks, 4 B write alignment, and the same 8 MB storage_partition at the same
+ * offset the DK overlay uses.
+ *
+ * blob_db derives its bucket count, slot alignment and segment size from the
+ * geometry it finds at mount, so on the simulator's native 4 KB / 1 B geometry
+ * this app would issue a different number of flash operations than the board
+ * whose RESULTS.md figures it is compared against: 2041 buckets instead of
+ * ~120, so every blob in its own nearly empty bucket. With this geometry a
+ * native_sim run reproduces the DK's I/O counters, which is what
+ * app_perf_l0/tools/l0_timing.py predicts from.
+ *
+ * Same values as app_perf_l0/geometry/mx25r64.overlay and
+ * app_perf_blob_db/boards/native_sim.overlay.
  */
 
 &flashcontroller0 {
@@ -9,6 +21,8 @@
 
 &flash0 {
 	reg = <0x00000000 DT_SIZE_M(16)>;
+	erase-block-size = <65536>;
+	write-block-size = <4>;
 };
 
 &storage_partition {
