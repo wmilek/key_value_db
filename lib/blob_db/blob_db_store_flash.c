@@ -127,3 +127,11 @@ bool blob_db_store_replace_is_atomic(void)
 {
 	return false;
 }
+
+/* One copy of every sector, so damage reads as damage and nothing older can
+ * stand in for it. */
+bool blob_db_store_open_found_damage(off_t off)
+{
+	ARG_UNUSED(off);
+	return false;
+}

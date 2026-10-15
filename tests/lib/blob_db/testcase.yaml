@@ -22,13 +22,6 @@ tests:
       - CONFIG_BLOB_DB_BACKEND_FLASH_AREA=y
       - CONFIG_SHELL=y
       - CONFIG_BLOB_DB_SHELL=y
-  # Production policy for an unparseable-but-not-erased master: refuse with
-  # -EIO instead of reformatting. Exercises the other half of the recovery
-  # branch in blob_db_mount().
-  lib.blob_db.no_autoformat:
-    extra_configs:
-      - CONFIG_BLOB_DB_BACKEND_FLASH_AREA=y
-      - CONFIG_BLOB_DB_AUTOFORMAT_ON_CORRUPT=n
   # Segmented large objects. Bumps the on-flash format major, so this config
   # also covers that older software refuses such a store.
   lib.blob_db.large_payloads:

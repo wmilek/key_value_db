@@ -38,6 +38,7 @@ static int recover_compaction(uint16_t bid);
 static int compact_bucket(uint16_t bid);
 static int persist_next_id_hint(uint64_t new_hint);
 static int bind_root_empty(void);
+static int invalidate_buckets(int skip_bid);
 static bool bucket_hdr_valid(const uint8_t *buf, uint16_t bid);
 
 /* The on-flash prefix of a slot: header then id, contiguous. These 12 bytes
@@ -329,8 +330,9 @@ static int write_master(uint8_t slot, uint32_t gen, uint8_t state,
 
 /* Persist a raised leading id ceiling by committing a fresh CLEAN master on
  * the inactive slot (double-buffered: a torn write leaves the old ceiling,
- * which is still a safe — if lower — bound; mount re-raises it from the
- * scan). On success the new master is active. */
+ * which is still a safe — if lower — bound, and leaves only one valid master,
+ * so mount re-raises it from the scan). On success the new master is
+ * active. */
 static int persist_next_id_hint(uint64_t new_hint)
 {
 	const uint8_t inactive = !st.active_master;
@@ -437,12 +439,27 @@ static int scan_bucket(uint16_t bid, uint64_t *max_id_inout)
 
 /* Mount / unmount ------------------------------------------------------- */
 
+/* Format a partition whose masters both read erased.
+ *
+ * Erased masters do not mean erased buckets: blob_db_format() erases from
+ * offset 0 up, so a power cut part way leaves blank masters in front of
+ * buckets that still hold blobs — under ids the fresh counter is about to
+ * hand out again. Invalidate them first, root bucket included, and only then
+ * write the master: a cut before that point leaves the masters blank and the
+ * next mount repeats this; after it, nothing is left to collide with. This is
+ * what lets mount trust a valid master's ceiling without scanning. */
 static int format_masters_fresh(void)
 {
+	int rc = invalidate_buckets(-1);
+
+	if (rc < 0) {
+		return rc;
+	}
+
 	/* Root id (=1) is consumed at format time (see @blob_db_root in
 	 * blob_db.h), so the leading ceiling starts at 2. */
-	int rc = write_master(BLOB_DB_MASTER_A_SECTOR, 1,
-			      BLOB_DB_STATE_CLEAN, 0, 2);
+	rc = write_master(BLOB_DB_MASTER_A_SECTOR, 1,
+			  BLOB_DB_STATE_CLEAN, 0, 2);
 	if (rc < 0) {
 		return rc;
 	}
@@ -551,8 +568,8 @@ int blob_db_mount(void)
 		return rc;
 	}
 
-	/* Rebuilt by the bucket scan below, at no flash cost of its own: the
-	 * scan reads every slot header anyway. */
+	/* Starts empty and fills as buckets are walked. When mount does scan
+	 * the buckets (below), the scan fills it at no flash cost of its own. */
 	blob_db_sidx_reset(st.n_buckets);
 
 	/* Pick the authoritative master. */
@@ -583,24 +600,47 @@ int blob_db_mount(void)
 		goto err_close;
 	}
 
+	/* Whether the adopted master's ceiling has to be checked against the
+	 * buckets. Every master write carries the highest ceiling saved so far,
+	 * and alloc_id saves a ceiling before handing out any id below it, so
+	 * when both masters are valid the newer one's ceiling exceeds every id
+	 * on flash (§13.1) and mount trusts it. With only one valid master we
+	 * may be falling back past a newer one — lost to bit rot, or to a torn
+	 * write of the ceiling this very scan raised last time — so scan. That
+	 * also covers a store formatted but not yet written to since, whose
+	 * second master is still blank; its buckets are nearly all empty.
+	 *
+	 * A backend that keeps old copies (UBI) can hide the loss: it answers a
+	 * newest master that fails its seal by standing the previous copy back
+	 * up, valid but with an older ceiling, beside a valid other master. So
+	 * damage the store found on either master sector also means scan. */
+	bool scan_ids = false;
+
 	if (ca != MASTER_OK && cb != MASTER_OK) {
-		if (ca == MASTER_ERASED && cb == MASTER_ERASED) {
-			LOG_INF("virgin partition; formatting");
-		} else if (IS_ENABLED(CONFIG_BLOB_DB_AUTOFORMAT_ON_CORRUPT)) {
-			LOG_WRN("both masters unreadable (A=%s B=%s); "
-				"reformatting per CONFIG_BLOB_DB_AUTOFORMAT_ON_CORRUPT",
-				master_class_str[ca], master_class_str[cb]);
-		} else {
-			LOG_ERR("both masters unreadable (A=%s B=%s); refusing",
+		/* Only a partition whose masters are both blank is formatted.
+		 * Anything else — bit rot, a power cut while the first master
+		 * was written, another backend's substrate (doc/impl/
+		 * l0_backends.md §4) — may be data, and discarding it is the
+		 * caller's call, via blob_db_format(). */
+		if (ca != MASTER_ERASED || cb != MASTER_ERASED) {
+			LOG_ERR("no usable master (A=%s B=%s); refusing — "
+				"blob_db_format() discards the store",
 				master_class_str[ca], master_class_str[cb]);
 			rc = -EIO;
 			goto err_close;
 		}
+		LOG_INF("virgin partition; formatting");
 		rc = format_masters_fresh();
 		if (rc < 0) {
 			goto err_close;
 		}
 	} else {
+		scan_ids = ca != MASTER_OK || cb != MASTER_OK ||
+			   blob_db_store_open_found_damage(
+				   peb_offset(BLOB_DB_MASTER_A_SECTOR)) ||
+			   blob_db_store_open_found_damage(
+				   peb_offset(BLOB_DB_MASTER_B_SECTOR));
+
 		bool pick_a;
 
 		if (ca == MASTER_OK && cb != MASTER_OK) {
@@ -630,26 +670,29 @@ int blob_db_mount(void)
 		}
 	}
 
-	/* Defensive: the leading ceiling should already exceed every bound id,
-	 * but scan anyway so a store written by an older (lagging-hint) format,
-	 * or one with a corrupt/rolled-back master, cannot re-issue a live id.
-	 * If the scan out-runs the ceiling, raise it AND persist the new ceiling
-	 * before any allocation can hand the id back out. */
-	uint64_t max_id = (st.next_id == 0) ? 0 : (st.next_id - 1);
-	for (uint16_t bid = 0; bid < st.n_buckets; bid++) {
-		rc = scan_bucket(bid, &max_id);
-		if (rc < 0) {
-			LOG_ERR("scan_bucket(%u): %d", bid, rc);
-			goto err_close;
+	/* The adopted ceiling is in doubt: find the highest id on flash. If it
+	 * out-runs the ceiling, raise the ceiling AND persist it before any
+	 * allocation can hand the id back out. */
+	if (scan_ids) {
+		uint64_t max_id = (st.next_id == 0) ? 0 : (st.next_id - 1);
+
+		for (uint16_t bid = 0; bid < st.n_buckets; bid++) {
+			rc = scan_bucket(bid, &max_id);
+			if (rc < 0) {
+				LOG_ERR("scan_bucket(%u): %d", bid, rc);
+				goto err_close;
+			}
 		}
-	}
-	if (max_id + 1 > st.next_id_hint) {
-		LOG_WRN("bucket scan out-ran ceiling (%llu >= %llu); raising",
-			(unsigned long long)max_id, st.next_id_hint);
-		st.next_id = max_id + 1;
-		rc = persist_next_id_hint(max_id + 1 + BLOB_DB_ID_HINT_STEP);
-		if (rc < 0) {
-			goto err_close;
+		if (max_id + 1 > st.next_id_hint) {
+			LOG_WRN("bucket scan out-ran ceiling (%llu >= %llu); "
+				"raising", (unsigned long long)max_id,
+				st.next_id_hint);
+			st.next_id = max_id + 1;
+			rc = persist_next_id_hint(max_id + 1 +
+						  BLOB_DB_ID_HINT_STEP);
+			if (rc < 0) {
+				goto err_close;
+			}
 		}
 	}
 
@@ -3533,6 +3576,59 @@ static int bind_root_empty(void)
 	return rc;
 }
 
+/* Invalidate the header of every bucket that has one, except @p skip_bid
+ * (-1: none).
+ *
+ * BUCKET_MAGIC is 'B'/'D'/'B'/'H' = 0x42/0x44/0x42/0x48; overwriting it with
+ * 0x00 only flips 1→0 bits — no erase needed, and every scan afterwards treats
+ * the sector as unformatted. format_bucket() replaces the whole sector before
+ * the bucket is used again, so nothing behind the header can resurface. The
+ * write covers at least the 4 magic bytes, rounded up to the device's
+ * write-block-size; the extra bytes land inside the bucket header and
+ * programming them to 0x00 is equally legal. Buckets that already look
+ * unformatted are skipped, so fresh sectors cost one 4-byte read each.
+ *
+ * Not in place when the backend replaces atomically: there a bucket last
+ * written by blob_db_store_replace() carries a checksum over its header
+ * (ubi_leb_change), and the block it replaced is still on flash awaiting
+ * reclaim. Zeroing the magic under that checksum makes the next attach
+ * reject the newest copy and stand the older one back up — bringing back
+ * the blobs this call deleted. Replacing the bucket with the zeroed header
+ * instead leaves a newest copy that verifies, at no erase. */
+static int invalidate_buckets(int skip_bid)
+{
+	uint8_t __aligned(4) zeros[BLOB_DB_MAX_WRITE_ALIGN];
+	const size_t zlen = MAX(sizeof(uint32_t),
+				MIN(st.write_align, sizeof(zeros)));
+
+	memset(zeros, 0, sizeof(zeros));
+
+	for (uint16_t bid = 0; bid < st.n_buckets; bid++) {
+		if ((int)bid == skip_bid) {
+			continue;
+		}
+		const off_t off = peb_offset(BLOB_DB_FIRST_BUCKET + bid);
+		uint8_t peek[4];
+		int rc = blob_db_store_read(off, peek, sizeof(peek));
+
+		if (rc < 0) {
+			LOG_ERR("invalidate: peek bid %u: %d", bid, rc);
+			return rc;
+		}
+		if (memcmp(peek, BUCKET_MAGIC, 4) != 0) {
+			continue;
+		}
+		rc = blob_db_store_replace_is_atomic()
+			     ? blob_db_store_replace(off, zeros, zlen)
+			     : blob_db_store_write(off, zeros, zlen);
+		if (rc < 0) {
+			LOG_ERR("invalidate: bid %u: %d", bid, rc);
+			return rc;
+		}
+	}
+	return 0;
+}
+
 int blob_db_erase_all(void)
 {
 	if (!st.mounted) {
@@ -3550,58 +3646,16 @@ int blob_db_erase_all(void)
 	IDX_INVALIDATE();
 	blob_db_sidx_reset(st.n_buckets);
 
-	const uint16_t root_bid = (uint16_t)(BLOB_DB_ROOT_ID % st.n_buckets);
-	uint8_t __aligned(4) zeros[BLOB_DB_MAX_WRITE_ALIGN];
-	const size_t zlen = MAX(sizeof(uint32_t),
-				MIN(st.write_align, sizeof(zeros)));
+	/* Every bucket but the root, which is reformatted just below. */
+	int rc = invalidate_buckets((int)(BLOB_DB_ROOT_ID % st.n_buckets));
 
-	memset(zeros, 0, sizeof(zeros));
-
-	/* Invalidate every non-root bucket's magic in place (BUCKET_MAGIC is
-	 * 'B'/'D'/'B'/'H' = 0x42/0x44/0x42/0x48; overwriting with 0x00 only
-	 * flips 1→0 bits — no erase needed, and every scan afterwards treats
-	 * the sector as unformatted). The write covers at least the 4 magic
-	 * bytes, rounded up to the device's write-block-size; the extra bytes
-	 * land inside the bucket header and programming them to 0x00 is
-	 * equally legal. Skip buckets that already look unformatted so we do
-	 * not touch fresh sectors.
-	 *
-	 * Not in place when the backend replaces atomically: there a bucket last
-	 * written by blob_db_store_replace() carries a checksum over its header
-	 * (ubi_leb_change), and the block it replaced is still on flash awaiting
-	 * reclaim. Zeroing the magic under that checksum makes the next attach
-	 * reject the newest copy and stand the older one back up — bringing
-	 * back the blobs this call deleted. Replacing the bucket with the zeroed
-	 * header instead leaves a newest copy that verifies, at no erase. */
-	for (uint16_t bid = 0; bid < st.n_buckets; bid++) {
-		if (bid == root_bid) {
-			continue;
-		}
-		uint8_t peek[4];
-		int rc = blob_db_store_read(
-					 peb_offset(BLOB_DB_FIRST_BUCKET + bid),
-					 peek, sizeof(peek));
-		if (rc < 0) {
-			LOG_ERR("erase_all: peek bid %u: %d", bid, rc);
-			return rc;
-		}
-		if (memcmp(peek, BUCKET_MAGIC, 4) != 0) {
-			continue;
-		}
-		const off_t off = peb_offset(BLOB_DB_FIRST_BUCKET + bid);
-
-		rc = blob_db_store_replace_is_atomic()
-			     ? blob_db_store_replace(off, zeros, zlen)
-			     : blob_db_store_write(off, zeros, zlen);
-		if (rc < 0) {
-			LOG_ERR("erase_all: invalidate bid %u: %d", bid, rc);
-			return rc;
-		}
+	if (rc < 0) {
+		return rc;
 	}
 
 	/* Reformat the root bucket (single sector erase) and bind an empty
 	 * root slot so BLOB_DB_ROOT_ID is live before this call returns. */
-	int rc = bind_root_empty();
+	rc = bind_root_empty();
 	if (rc < 0) {
 		return rc;
 	}

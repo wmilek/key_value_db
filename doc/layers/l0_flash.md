@@ -109,13 +109,11 @@ per-board configuration each provider needs are implementation matters:
 The two providers write **incompatible on-flash layouts**. Switching an
 existing device between backends requires erasing the partition deliberately.
 
-Mount does not reliably refuse the mismatch. One direction is refused cleanly
-before `blob_db` mounts; the other is currently **destructive** — a
-`flash_area` build reformats a UBI store rather than rejecting it, because a
-foreign substrate is indistinguishable from a corrupt store at the point where
-mount decides. Until that is closed, production builds should set
-`CONFIG_BLOB_DB_AUTOFORMAT_ON_CORRUPT=n`, which turns the destructive case into
-`-EIO` with nothing written.
+Mount refuses the mismatch in both directions without writing, but not with
+the same error. A UBI build refuses before `blob_db` mounts, with `-ENOTSUP`; a
+`flash_area` build returns `-EIO`, because a foreign substrate is
+indistinguishable from a corrupt store at the point where mount decides, and
+mount formats only a partition whose masters are both blank.
 
 This is a gap against the L1 contract's D1 rule — "distinct on-flash magic so a
 mismatched mount fails cleanly with `-ENOTSUP`" — which was written for the

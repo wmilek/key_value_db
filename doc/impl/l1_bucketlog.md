@@ -109,7 +109,7 @@ Costs achieved by this design (satisfying contract §3):
 
 | Op | Flash reads | Flash writes | RAM (transient) |
 |---|---|---|---|
-| `mount` | 2 (master A + B) + 2045 (bucket scan)¹ | 0 (or format if first ever) | O(1) |
+| `mount` | 2 (master A + B) + root bucket walk; + 2045 (bucket scan) with a master in doubt¹ | 0 (or format if first ever) | O(1) |
 | `alloc_id()` | 0 | 0 (occasional id-hint persist) | O(1) |
 | `get(id)` | 1 bucket header + 12 B per slot + 1 payload | 0 | O(1) |
 | `update(id, …)` | 1 bucket header + 12 B per slot² | 1 (slot; on rebind the old slot becomes garbage) + occasional compact | O(1) |
@@ -118,9 +118,10 @@ Costs achieved by this design (satisfying contract §3):
 | `count` / `iterate` | 2045 (full scan) | 0 | O(1) |
 | `compact_bucket` | 1 + master writes | 1 scratch + 1 bucket restore + 2 master | O(1) |
 
-¹ Mount scans all buckets to recover write cursors and the max id — ~8 MB of
-reads, ≈100–200 ms on typical NOR (full sectors are read because each slot's
-`val_len` is needed to skip to the next slot).
+¹ With both masters valid, mount trusts the newer one's id ceiling and reads
+no other bucket. With a master in doubt (§5.1) it scans all buckets for the max
+id — up to ~8 MB of reads, ≈100–200 ms on typical NOR (each slot's header
+is read because its `val_len` is needed to skip to the next slot).
 ² Release builds perform no existence check — `update` on a dead id is UB
 (contract §2). A debug build may spend one bucket read to verify and assert
 (§13.5).
@@ -189,7 +190,7 @@ write to flash:
 
 | Sector reads as | Class | Mount |
 |---|---|---|
-| all `0xff` across the header window | erased | virgin — format |
+| all `0xff` across the header window | erased | virgin — format, if the other is erased too |
 | prefix CRC fails | corrupt | ignore it; the other master may be good |
 | prefix verifies, foreign magic or unknown major | **foreign** | `-ENOTSUP`, touch nothing |
 | prefix and body verify | ok | candidate; highest generation wins |
@@ -197,11 +198,15 @@ write to flash:
 A foreign sector on *either* slot refuses the whole store, before generation
 is considered: an interrupted upgrade can leave the old format on one slot and
 a newer one on the other, and falling back to the older would silently mount a
-stale view. When neither master is usable and neither is erased,
-`BLOB_DB_AUTOFORMAT_ON_CORRUPT` decides between reformatting (development) and
-`-EIO` (production). Recovering that way rewrites the masters but does not
-erase buckets, so surviving blobs stay readable and mount's defensive scan
-(§5.1) re-raises the id ceiling past them.
+stale view. When neither master is usable, mount formats only if both read
+erased; any other pair — bit rot, a power cut while a format wrote the first
+master, another backend's substrate (§13.7) — is refused with `-EIO` and
+nothing written, and `blob_db_format()` is the deliberate discard. Blank
+masters do not imply blank buckets: `blob_db_format()` erases from offset 0 up,
+so a power cut part way leaves live buckets behind blank masters. Formatting
+therefore first invalidates every bucket header still present, then writes the
+master; a cut before that write leaves the masters blank and the next mount
+repeats it.
 
 ### 3.2 Bucket layout (one sector)
 
@@ -297,15 +302,38 @@ Multiple slots may exist for one id (rebinds, tombstone); `get` takes the
 ### 5.1 Mount
 
 ```
-read master A, B → pick higher valid generation
-if state == COMPACTING: finish/abort per crash table (§6.1), write CLEAN master
+read master A, B
+if neither valid:
+    if both erased: invalidate every bucket header; write master; bind root
+    else: return -EIO                                     # §3.1
+else:
+    pick higher valid generation
+    if state == COMPACTING: finish/abort per crash table (§6.1), write CLEAN master
+next_id = next_id_hint                                    # §13.1
 
-max_id_seen = next_id_hint
-for bid in [0..N):
-    walk slots: max_id_seen = max(max_id_seen, slot.id)   # tombstones count too
-    write_cursor[bid] = end of log
-next_id = max_id_seen + 1                                  # but see §13.1
+if exactly one master valid, or the store reports damage on a master sector:
+    max_id_seen = next_id - 1
+    for bid in [0..N):
+        walk slots: max_id_seen = max(max_id_seen, slot.id)   # tombstones count too
+    if max_id_seen >= next_id: next_id = max_id_seen + 1; persist a new ceiling
 ```
+
+Every master write carries the highest ceiling saved so far, and `alloc_id`
+saves a ceiling before handing out any id below it, so when both masters are
+valid the newer one's ceiling already exceeds every id on flash, and mount
+trusts it. With only one valid master the newer may be the one lost — to bit
+rot, or to a torn write of a ceiling this scan raised — and the two cannot be
+told apart, so mount scans. That also covers a store formatted and not yet
+written since, whose second master is still blank; its buckets are nearly all
+unformatted, one header read each.
+
+A store that keeps old copies of a block can hide that loss. Under UBI, a
+newest master that fails its data seal at attach is replaced by its previous
+copy if reclaim has not taken it yet — a valid master with an older ceiling,
+beside a valid other one, which the generations cannot tell from a healthy
+pair. UBI reports the damage it acted on, and the backend passes it on through
+`blob_db_store_open_found_damage()`; damage on either master sector, or damage
+UBI could not attribute to a block, makes mount scan too.
 
 ### 5.2 `alloc_id`
 
@@ -368,7 +396,7 @@ its append cursor from the index instead of walking.
 |---|---|---|
 | `get` (hit) | 1 + slots + 2 reads | 3 reads |
 | `update` (cursor known) | 1 + slots reads, then the append | the append |
-| `mount` | full scan | the same scan, which also fills the index |
+| `mount` | no scan with both masters valid (§5.1) | the same; a scanning mount also fills the index, otherwise each bucket's first walk does |
 | RAM | none | 12 B per table cell + 6 B per bucket, fixed by Kconfig |
 
 **Why it can be trusted.** The index is a hint, and it is built so that the one
@@ -382,7 +410,7 @@ error no check could catch, naming an *older* slot of an id, cannot arise:
 - Anything that rewrites a bucket other than by appending forgets it or rebuilds
   it: `format_bucket()` starts it empty, compaction re-indexes the image it just
   wrote (still in RAM), and `erase_all`, `format`, mount and unmount reset the
-  whole table. Mount-time compaction recovery runs before the scan that fills
+  whole table. Mount-time compaction recovery runs before any scan that fills
   the index.
 - A hit is still checked against flash: the slot must be sealed, carry the same
   id, fit below the cursor and pass its CRC. Anything else, and every miss,
@@ -625,7 +653,6 @@ BLOB_DB                        bool, select FLASH, FLASH_MAP, CRC
 BLOB_DB_PARTITION_LABEL        string, default "storage"
 BLOB_DB_MAX_PAYLOAD_LEN        int, default 256, range 1 65535  # geometry checked at mount
 BLOB_DB_SECTOR_BUF_SIZE        int, default 4096
-BLOB_DB_AUTOFORMAT_ON_CORRUPT  bool, default y   # see §3.1
 BLOB_DB_LARGE_PAYLOADS         bool, default n   # segmented objects (§3.5)
 BLOB_DB_MAX_OBJECT_LEN         int, default 131072   # validated at mount
 BLOB_DB_MAX_SEGMENTS           int, default 128      # 16 B of .bss each
@@ -714,8 +741,9 @@ draft implementation and will be reworked against the final API; the
    `next_id_hint` on the master is now a **leading ceiling**: an exclusive
    upper bound on every id ever returned by `alloc_id`. `alloc_id` persists a
    fresh ceiling `BLOB_DB_ID_HINT_STEP` (256) ids ahead whenever the current
-   one is reached, and mount takes `next_id = next_id_hint` (the bucket scan
-   only ever *raises* it defensively, never lowers it). This protects
+   one is reached, and mount takes `next_id = next_id_hint` (the bucket scan,
+   run only when a master is in doubt, may *raise* it, never lower it —
+   §5.1). This protects
    allocated-but-unbound ids across a crash — the property the model
    container's intent recovery and (future) root-registry `get_or_create`
    depend on. It subsumes both earlier monotonicity patches (tombstones toward
@@ -753,16 +781,17 @@ draft implementation and will be reworked against the final API; the
    another *allocator* and refuse it (D1). It does not reach the *backend*
    axis added by the `blob_db_store` seam: booting a `flash_area` build on a
    partition holding a UBI volume fails the prefix CRC before the magic is
-   ever compared, so both masters land in `CORRUPT` — and
-   `BLOB_DB_AUTOFORMAT_ON_CORRUPT` (default `y`) then reformats a perfectly
-   good store of the other kind. Measured, both directions, in
-   `doc/impl/l0_backends.md` §4; the reverse direction is safe because UBI's
-   own attach refuses first. Candidate fix: a backend-id byte inside the
-   frozen prefix so a substrate mismatch classifies as `FOREIGN` (never
-   formatted). That is an on-flash format change — cheap now, since the
-   prefix already carries `hdr_len` and reserved space, and it needs a
-   `format_minor` bump at most. Until then, production builds should set
-   `BLOB_DB_AUTOFORMAT_ON_CORRUPT=n`.
+   ever compared, so both masters land in `CORRUPT` and mount refuses with
+   `-EIO` — nothing is written, but the error reads as damage rather than as
+   a store of the other kind. (Until `BLOB_DB_AUTOFORMAT_ON_CORRUPT` was
+   removed, its default `y` reformatted the store instead.) Measured, both
+   directions, in `doc/impl/l0_backends.md` §4; the reverse direction refuses
+   with `-ENOTSUP` because UBI's own attach refuses first. Candidate fix: a
+   backend-id byte inside the frozen prefix so a substrate mismatch
+   classifies as `FOREIGN` and is refused with `-ENOTSUP`. That is an
+   on-flash format change — cheap now, since the prefix already carries
+   `hdr_len` and reserved space, and it needs a `format_minor` bump at
+   most.
 
 ---
 

@@ -204,12 +204,11 @@ Two things to know before switching a real device:
   read — a `flash_area` store, or one written by the UBI release used before
   zephyr-ubi v0.1.0 — with `-ENOTSUP`, and leaves it untouched;
   `blob_db_format()` discards it.
-- The two layouts are **not interchangeable**, and mount does not reliably
-  refuse the wrong one — booting a `flash_area` build on a UBI store currently
-  reformats it. Erase the partition deliberately when switching, and set
-  `CONFIG_BLOB_DB_AUTOFORMAT_ON_CORRUPT=n` in production. The measured
-  behavior in both directions is in
-  [`doc/impl/l0_backends.md`](doc/impl/l0_backends.md) §4.
+- The two layouts are **not interchangeable**. Mount refuses the wrong one
+  without writing to it — `-ENOTSUP` from a UBI build, `-EIO` from a
+  `flash_area` build, which cannot tell a UBI store from a corrupt one. Erase
+  the partition deliberately when switching. The measured behavior in both
+  directions is in [`doc/impl/l0_backends.md`](doc/impl/l0_backends.md) §4.
 
 ### Test
 
@@ -308,7 +307,6 @@ Frequently adjusted options (see the module `Kconfig` files for the rest):
 | `CONFIG_BLOB_DB_PARTITION_LABEL` | fixed-partition label to store blobs in (default `storage`) |
 | `CONFIG_BLOB_DB_UBI_KEY_APP` | UBI's metadata key comes from the application, not the built-in development key (UBI backend) |
 | `CONFIG_BLOB_DB_UBI_HEAP_SIZE` | heap reserved for UBI's bookkeeping; defaults from the partition size (UBI backend) |
-| `CONFIG_BLOB_DB_AUTOFORMAT_ON_CORRUPT` | reformat when both master blocks are unreadable (default `y`; set `n` in production) |
 | `CONFIG_BLOB_DB_MAX_PAYLOAD_LEN` | largest blob payload; also caps the kvhash bucket directory |
 | `CONFIG_BLOB_DB_SECTOR_BUF_SIZE` | upper bound on supported flash sector size (64 KB for mx25r64) |
 | `CONFIG_ROOTREG_MAX_ROOTS` | how many structure roots the registry can hold |
