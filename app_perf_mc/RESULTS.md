@@ -1,9 +1,176 @@
 # app_perf_mc — reference results
 
-Hardware-measured ops/sec for the model container map (`model_container_map`,
-the L1 sufficiency-proof key->value map from `tests/lib/blob_db_contract/`),
-with its list root resolved through the root registry at id 1. Update this
-file when the benchmark shape changes or when regenerating on new hardware.
+Ops/sec for the two L1 sufficiency-proof containers from
+`tests/lib/blob_db_contract/`: the model container map (`model_container_map`,
+key->value) and, since v1.1.0, the model container list
+(`model_container_list`, a doubly linked list addressed by node handle). Each
+has its root resolved through the root registry at id 1. Update this file when
+the benchmark shape changes or when regenerating on new hardware.
+
+**The map's figures below are hardware-measured (v1.0.0). The list's are not
+yet:** v1.1.0 adds the list phases and per-phase I/O counters, and the list
+section that follows gives those counters and what the DK timing model
+predicts from them. When a v1.1.0 DK capture exists, it replaces the
+prediction columns.
+
+## v1.1.0: the list, and I/O counters per phase
+
+v1.1.0 runs the map exactly as before, then the list on the same store
+(`MC_L` in the registry, `N_NODES = 10`, the same 24 B values):
+
+| phase       | ops        | what it does                                                         |
+| ----------- | ---------- | -------------------------------------------------------------------- |
+| `l.insert`  | `N_NODES`  | append at the back, `mcl_insert_before(0)`: the 6-step discipline     |
+| `l.get`     | `N_GET`    | value read by handle, cycling over the nodes                          |
+| `l.set`     | `N_OVW`    | in-place value overwrite by handle: one `update`, no intent           |
+| `l.next`    | `N_GET`    | one forward step, wrapping through the root: never recovers or writes |
+| `l.prev`    | `N_GET`    | one backward step: checks for a staged intent first                   |
+| `l.remove`  | `N_NODES`  | remove from the front: the 6-step discipline                          |
+| `l.cleanup` | 1          | `mcl_destroy()` + `rootreg_unregister()`                              |
+
+Both walks check the order against the handles as they go, `l.get` keeps a
+checksum, and `mcl_check` runs after `l.insert` and `l.remove`. Every phase
+prints an `io` line after its `bench` line when `CONFIG_BLOB_DB_IOSTATS=y`,
+which `boards/native_sim.conf` sets. The native_sim board now also takes the
+DK's geometry (64 KB erase blocks, 4 B writes, the same 8 MB partition), as
+`app_perf_blob_db` does, so the counters are the ones the board issues: 124
+buckets on `flash_area`, as on the DK.
+
+### No board yet: I/O counters, and what they predict
+
+`native_sim`, DK geometry, `flash_area` backend, on `e78f04c` plus this
+change. "Flash reads" and "writes" are flash transactions per op, not blob
+operations: one blob read walks the 12-byte slot headers of its bucket, so
+it costs several. The prediction is `app_perf_l0/tools/l0_timing.py predict`
+over `models/mx25r64_nrf5340dk_full.json`. It covers flash cost only, with no
+CPU time and no UBI per-transaction cost.
+
+The map rows give the model a check against the v1.0.0 DK capture further
+down:
+
+| phase       | flash reads / op | writes / op | predicted, DK | measured, DK (v1.0.0) | ratio |
+| ----------- | ---------------: | ----------: | ------------: | --------------------: | ----: |
+| `set`       |             82.5 |           5 |       9.60 ms |              13.60 ms |  0.71 |
+| `get`       |             47.5 |           0 |       3.46 ms |               3.53 ms |  0.98 |
+| `overwrite` |            330.5 |           5 |      28.38 ms |              29.10 ms |  0.98 |
+| `delete`    |            561.0 |           5 |      43.65 ms |              37.00 ms |  1.18 |
+| `cleanup`   |              452 |           3 |      33.83 ms |              23.00 ms |  1.47 |
+
+`get` and `overwrite`, the two phases with the most ops, land within 3%.
+`delete` and `cleanup` are 10 ops and 1 op, run late on a store whose
+bucket histories changed since `e80f404` (PR 55 word-aligns every slot), and
+the model overshoots them. So this is a check, not a calibration. The list:
+
+| phase       | flash reads / op | writes / op | predicted, DK |  ops/s | against the map               |
+| ----------- | ---------------: | ----------: | ------------: | -----: | ----------------------------- |
+| `l.insert`  |            101.2 |           6 |      11.71 ms |   85.4 | `set` 9.60 ms                 |
+| `l.get`     |             10.9 |           0 |       0.79 ms |   1264 | `get` 3.46 ms: **×4.4 less**  |
+| `l.set`     |             58.9 |           1 |       4.92 ms |    203 | `overwrite` 28.38 ms: **×5.8 less** |
+| `l.next`    |              6.9 |           0 |       0.50 ms |   1996 | —                             |
+| `l.prev`    |             47.9 |           0 |       3.47 ms |    288 | `l.next`: **×6.9 more**       |
+| `l.remove`  |            236.9 |           6 |      20.94 ms |   47.8 | `delete` 43.65 ms: ×2.1 less  |
+| `l.cleanup` |              187 |           3 |      14.70 ms |      — | `cleanup` 33.83 ms            |
+
+The UBI build issues the same counters for every timed phase, map and list,
+transaction for transaction; only `prepare` differs (117 buckets against
+124). On the DK, UBI cost the map ×1.5–2.4 (see "On the UBI backend"); expect
+the list to fall in the same band, read-heavy phases at the top of it.
+
+What the counters show:
+
+- **The list's handle accesses are O(1); the map's key lookups are not.**
+  `l.get` is two blob reads (node, then value) against the map's ~7. That
+  gap grows with population, because the map scans its pair list. The list's
+  own price shows up elsewhere: there is no lookup by key, and the client
+  holds the handles.
+- **`l.set` has no intent.** It changes no references, so it is one atomic
+  `update` of the value blob after a membership check (`node_linked`).
+  The map's `overwrite` replaces the value blob through the full discipline
+  (4 updates + 1 delete). At 1 write against 5, the list overwrites ×5.8
+  cheaper.
+- **An insert costs one more write than a map `set`.** That is the REPAIR
+  step: 6 writes (stage, value, node, commit, repair, clear) against the
+  map's 5. Most of the reads are read-modify-writes: every link write
+  reloads the blob it changes. With `mcl_begin()`'s recovery check on top,
+  an append at the back reads the root four times.
+- **`l.prev` costs ×6.9 an `l.next`**, while both read one node. `mcl_prev`
+  first runs recovery to rule out a staged mutation, which reads the root and
+  the intent: two extra blob reads (the header comment in
+  `model_container_list.h` says one). Those two blobs are the most rewritten
+  in the store, since every mutation updates the intent twice (stage and
+  clear). So each read walks a long slot history in its bucket. The cost
+  comes from the store's history, not from the list.
+- **Every phase ends at the floor.** The map, then the list, each leave 1
+  live blob (the empty registry), and `l.get checksum` equals the map's
+  `0xac6a5f02` because both read the same value sequence.
+
+### With `CONFIG_BLOB_DB_SLOT_INDEX=y`
+
+The slot index (PR 54) is opt-in. It removes exactly the slot-header walk that
+dominates the rows above. Same run, `flash_area`, default index size (2048
+entries):
+
+| phase       | flash reads / op | predicted, DK | without index |     Δ |
+| ----------- | ---------------: | ------------: | ------------: | ----: |
+| `set`       |             24.5 |       5.40 ms |       9.60 ms | ×1.8  |
+| `get`       |             22.5 |       1.64 ms |       3.46 ms | ×2.1  |
+| `overwrite` |             30.5 |       6.68 ms |      28.38 ms | ×4.2  |
+| `delete`    |             26.0 |       4.97 ms |      43.65 ms | ×8.8  |
+| `cleanup`   |               18 |       2.45 ms |      33.83 ms | ×13.8 |
+| `l.insert`  |             24.0 |       6.12 ms |      11.71 ms | ×1.9  |
+| `l.get`     |              6.0 |       0.43 ms |       0.79 ms | ×1.8  |
+| `l.set`     |             13.0 |       1.59 ms |       4.92 ms | ×3.1  |
+| `l.next`    |              3.0 |       0.22 ms |       0.50 ms | ×2.3  |
+| `l.prev`    |              9.0 |       0.66 ms |       3.47 ms | ×5.3  |
+| `l.remove`  |             33.0 |       6.19 ms |      20.94 ms | ×3.4  |
+| `l.cleanup` |               21 |       2.69 ms |      14.70 ms | ×5.5  |
+
+Writes per op are unchanged. With the index, a blob read costs 3 flash reads
+wherever it lives, so `l.prev` falls to exactly three blob reads (root,
+intent, node) against `l.next`'s one. The gains grow down the table as the
+blobs touched get older, which is where the walk was longest.
+Checksums and end state are identical.
+
+### Raw native_sim capture (`flash_area`, DK geometry)
+
+Wall clock is 0 ms throughout because the flash simulator models no latency.
+The `io` lines are the result.
+
+```
+model-container perf 1.1.0  (N_KEYS=10  N_NODES=10  N_GET=100  N_OVW=50  VAL_LEN=24)
+bench prepare  :  124 ops in       0 ms  ->    0.000 ops/s  (        0 us/op)
+   io prepare  : rd    124 ops/    1984 B   wr   124 ops/    1984 B   er  124 ops/ 8126464 B
+bench set      :   10 ops in       0 ms  ->    0.000 ops/s  (        0 us/op)
+   io set      : rd    825 ops/   10035 B   wr    50 ops/    2320 B   er    0 ops/       0 B
+bench get      :  100 ops in       0 ms  ->    0.000 ops/s  (        0 us/op)
+   io get      : rd   4750 ops/   65850 B   wr     0 ops/       0 B   er    0 ops/       0 B
+bench overwrite:   50 ops in       0 ms  ->    0.000 ops/s  (        0 us/op)
+   io overwrite: rd  16525 ops/  202825 B   wr   250 ops/   15000 B   er    0 ops/       0 B
+bench delete   :   10 ops in       0 ms  ->    0.000 ops/s  (        0 us/op)
+   io delete   : rd   5610 ops/   67660 B   wr    50 ops/    1880 B   er    0 ops/       0 B
+bench cleanup  :    1 ops in       0 ms  ->    0.000 ops/s  (        0 us/op)
+   io cleanup  : rd    452 ops/    5394 B   wr     3 ops/      56 B   er    0 ops/       0 B
+get checksum: 0xac6a5f02
+live blobs after map: 1 (expect 1 — the empty registry alone)
+bench l.insert :   10 ops in       0 ms  ->    0.000 ops/s  (        0 us/op)
+   io l.insert : rd   1012 ops/   12864 B   wr    60 ops/    2800 B   er    0 ops/       0 B
+bench l.get    :  100 ops in       0 ms  ->    0.000 ops/s  (        0 us/op)
+   io l.get    : rd   1090 ops/   14280 B   wr     0 ops/       0 B   er    0 ops/       0 B
+bench l.set    :   50 ops in       0 ms  ->    0.000 ops/s  (        0 us/op)
+   io l.set    : rd   2945 ops/   37340 B   wr    50 ops/    2000 B   er    0 ops/       0 B
+bench l.next   :  100 ops in       0 ms  ->    0.000 ops/s  (        0 us/op)
+   io l.next   : rd    691 ops/    8892 B   wr     0 ops/       0 B   er    0 ops/       0 B
+bench l.prev   :  100 ops in       0 ms  ->    0.000 ops/s  (        0 us/op)
+   io l.prev   : rd   4791 ops/   60492 B   wr     0 ops/       0 B   er    0 ops/       0 B
+bench l.remove :   10 ops in       0 ms  ->    0.000 ops/s  (        0 us/op)
+   io l.remove : rd   2369 ops/   29248 B   wr    60 ops/    2320 B   er    0 ops/       0 B
+bench l.cleanup:    1 ops in       0 ms  ->    0.000 ops/s  (        0 us/op)
+   io l.cleanup: rd    187 ops/    2308 B   wr     3 ops/      56 B   er    0 ops/       0 B
+l.get checksum: 0xac6a5f02
+live blobs at end: 1 (expect 1 — the empty registry alone)
+```
+
+## The map on hardware (v1.0.0)
 
 Regenerated on `e80f404` (main, after PR 10 merged). The previous numbers
 predated PR 2's lookup change; the "~59 reads/s (17 ms)" this file used to
@@ -231,7 +398,9 @@ nrfutil device program --firmware build/mc/zephyr/zephyr.hex \
 ```
 
 That build takes the UBI backend from the Kconfig default, with the PEB pool
-sized for this geometry in `boards/nrf5340dk_nrf5340_cpuapp.conf`. For the
+sized for this geometry in `boards/nrf5340dk_nrf5340_cpuapp.conf`. The DK build
+leaves `CONFIG_BLOB_DB_IOSTATS` off, so its timings stay comparable with the
+v1.0.0 captures above. A v1.1.0 capture prints the list phases after the map's. For the
 `flash_area` column add `-DCONFIG_BLOB_DB_BACKEND_FLASH_AREA=y`, and **erase
 the partition raw when switching between backends** — the two layouts are not
 interchangeable, and UBI only formats a partition it finds erased.
@@ -252,3 +421,16 @@ partition the whole run is **~4 s** (0.15 s prepare + ~3.8 s of timed phases);
 on a volume already in use it is **~2.2 min**, of which prepare is 98%. Both
 are in the captures above. Erase the partition first if you want the numbers
 to be comparable between sessions.
+
+For the I/O counters without a board, on the DK's flash geometry:
+
+```bash
+west build -p always -b native_sim -d build/mc_sim app_perf_mc -- \
+    -DCONFIG_BLOB_DB_BACKEND_FLASH_AREA=y
+./build/mc_sim/zephyr/zephyr.exe --flash=mc.bin --flash_erase | tee mc.log
+python3 app_perf_l0/tools/l0_timing.py predict \
+    -m app_perf_l0/models/mx25r64_nrf5340dk_full.json mc.log
+```
+
+Drop the `-DCONFIG_BLOB_DB_BACKEND_FLASH_AREA=y` for the UBI build; add
+`-DCONFIG_BLOB_DB_SLOT_INDEX=y` for the slot-index rows.

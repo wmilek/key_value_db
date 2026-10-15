@@ -1,7 +1,7 @@
 # `app_perf_l0` — what `flash_area` costs, and what that predicts
 
 Every other benchmark in this repository measures a stack. `app_perf_blob_db` measures
-`blob_db`, `app_perf_mc` measures the model container, `app_cbor_persondb`
+`blob_db`, `app_perf_mc` measures the model containers, `app_cbor_persondb`
 measures a product-shaped workload. All of them bottom out in three L0 calls —
 `flash_area_read()`, `flash_area_write()`, `flash_area_erase()` — and none of
 them can say what those calls cost. So every question of the form *"is this

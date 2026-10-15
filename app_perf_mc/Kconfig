@@ -16,13 +16,27 @@ config APP_PERF_MC_N_KEYS
 	  Keys inserted by the set phase and cycled by the get/overwrite
 	  phases. Hard-capped by the model container's MC_MAX_ENTRIES (15).
 
+config APP_PERF_MC_N_NODES
+	int "Number of list nodes"
+	default 10
+	range 1 1024
+	help
+	  Nodes the l.insert phase appends and the l.get/l.set/walk phases
+	  cycle over. The list has no entry cap of its own (only
+	  model_container_list.c's MCL_MAX_NODES cycle guard in mcl_check);
+	  the default matches N_KEYS so the two containers run the same
+	  population.
+
 config APP_PERF_MC_N_GET
 	int "Number of lookups in the get phase"
 	default 100
 	range 1 10000
+	help
+	  Also the number of single steps in each of the list's l.next and
+	  l.prev walks.
 
 config APP_PERF_MC_N_OVW
-	int "Number of overwrites in the overwrite phase"
+	int "Number of overwrites in the overwrite and l.set phases"
 	default 50
 	range 1 10000
 
