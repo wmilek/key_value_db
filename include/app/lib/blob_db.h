@@ -109,13 +109,15 @@ extern "C" {
  * formatted automatically; any buckets left behind by an interrupted format are
  * discarded with it. If neither master is usable and they are not both erased —
  * bit rot, or a power loss while a format wrote the first master — mount
- * refuses with `-EIO` and writes nothing; `blob_db_format()` discards the
- * store.
+ * refuses with `-EIO` and writes nothing, and `blob_db_format()` discards the
+ * store; with `CONFIG_BLOB_DB_AUTOFORMAT_ON_CORRUPT` (default `n`) mount does
+ * that itself, erasing every blob.
  *
  * @retval 0       success
  * @retval -EALREADY already mounted
  * @retval -EIO    flash I/O error, partition not found, or no usable master
- *                 on a partition that is not blank
+ *                 on a partition that is not blank (unless
+ *                 `CONFIG_BLOB_DB_AUTOFORMAT_ON_CORRUPT`)
  * @retval -ENOTSUP foreign on-flash format, a sector larger than
  *                 `CONFIG_BLOB_DB_SECTOR_BUF_SIZE`, or a payload cap the
  *                 partition geometry cannot sustain

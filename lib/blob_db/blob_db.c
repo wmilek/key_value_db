@@ -39,6 +39,7 @@ static int compact_bucket(uint16_t bid);
 static int persist_next_id_hint(uint64_t new_hint);
 static int bind_root_empty(void);
 static int invalidate_buckets(int skip_bid);
+static int format_whole_store(void);
 static bool bucket_hdr_valid(const uint8_t *buf, uint16_t bid);
 
 /* The on-flash prefix of a slot: header then id, contiguous. These 12 bytes
@@ -617,20 +618,27 @@ int blob_db_mount(void)
 	bool scan_ids = false;
 
 	if (ca != MASTER_OK && cb != MASTER_OK) {
-		/* Only a partition whose masters are both blank is formatted.
+		/* A partition whose masters are both blank is formatted.
 		 * Anything else — bit rot, a power cut while the first master
 		 * was written, another backend's substrate (doc/impl/
-		 * l0_backends.md §4) — may be data, and discarding it is the
-		 * caller's call, via blob_db_format(). */
-		if (ca != MASTER_ERASED || cb != MASTER_ERASED) {
+		 * l0_backends.md §4) — may be data, so discarding it is opt-in:
+		 * CONFIG_BLOB_DB_AUTOFORMAT_ON_CORRUPT does what
+		 * blob_db_format() would, erasing every bucket with the masters
+		 * so no surviving blob can meet a reset id counter. */
+		if (ca == MASTER_ERASED && cb == MASTER_ERASED) {
+			LOG_INF("virgin partition; formatting");
+			rc = format_masters_fresh();
+		} else if (IS_ENABLED(CONFIG_BLOB_DB_AUTOFORMAT_ON_CORRUPT)) {
+			LOG_WRN("no usable master (A=%s B=%s); erasing the "
+				"store per CONFIG_BLOB_DB_AUTOFORMAT_ON_CORRUPT",
+				master_class_str[ca], master_class_str[cb]);
+			rc = format_whole_store();
+		} else {
 			LOG_ERR("no usable master (A=%s B=%s); refusing — "
 				"blob_db_format() discards the store",
 				master_class_str[ca], master_class_str[cb]);
 			rc = -EIO;
-			goto err_close;
 		}
-		LOG_INF("virgin partition; formatting");
-		rc = format_masters_fresh();
 		if (rc < 0) {
 			goto err_close;
 		}
@@ -3483,6 +3491,37 @@ int blob_db_write(uint64_t id, size_t offset, const void *buf, size_t len)
 			   (uint16_t)need);
 }
 
+/* Erase the whole open store and rebuild it empty: masters, root, nothing
+ * else. Shared by blob_db_format() and by mount's opt-in recovery from
+ * unusable masters (CONFIG_BLOB_DB_AUTOFORMAT_ON_CORRUPT). */
+static int format_whole_store(void)
+{
+	IDX_INVALIDATE();
+	blob_db_sidx_reset(st.n_buckets);
+	st.wedged = false;   /* the whole store, scratch included, goes away */
+
+	int rc = blob_db_store_erase(0, st.fa_size);
+
+	if (rc < 0) {
+		LOG_ERR("format: erase: %d", rc);
+		return rc;
+	}
+
+	/* Root id (=1) is consumed at format time — see bind_root_empty(). */
+	rc = write_master(BLOB_DB_MASTER_A_SECTOR, 1, BLOB_DB_STATE_CLEAN, 0, 2);
+	if (rc < 0) {
+		return rc;
+	}
+
+	st.active_master = BLOB_DB_MASTER_A_SECTOR;
+	st.master_gen    = 1;
+	st.next_id       = 2;
+	st.next_id_hint  = 2;
+	st.seg_owner     = 0;
+
+	return bind_root_empty();
+}
+
 int blob_db_format(void)
 {
 	bool opened_here = false;
@@ -3502,29 +3541,7 @@ int blob_db_format(void)
 		opened_here = true;
 	}
 
-	IDX_INVALIDATE();
-	blob_db_sidx_reset(st.n_buckets);
-	st.wedged = false;   /* the whole store, scratch included, goes away */
-
-	rc = blob_db_store_erase(0, st.fa_size);
-	if (rc < 0) {
-		LOG_ERR("format: erase: %d", rc);
-		goto err;
-	}
-
-	/* Root id (=1) is consumed at format time — see bind_root_empty(). */
-	rc = write_master(BLOB_DB_MASTER_A_SECTOR, 1, BLOB_DB_STATE_CLEAN, 0, 2);
-	if (rc < 0) {
-		goto err;
-	}
-
-	st.active_master = BLOB_DB_MASTER_A_SECTOR;
-	st.master_gen    = 1;
-	st.next_id       = 2;
-	st.next_id_hint  = 2;
-	st.seg_owner     = 0;
-
-	rc = bind_root_empty();
+	rc = format_whole_store();
 	if (rc < 0) {
 		goto err;
 	}

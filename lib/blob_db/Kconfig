@@ -288,6 +288,26 @@ config BLOB_DB_SHELL
 	  use these while the application is not calling blob_db. A full-store
 	  scan reads every bucket sector, which takes a while on large parts.
 
+config BLOB_DB_AUTOFORMAT_ON_CORRUPT
+	bool "Format when no master is usable (destroys the store)"
+	help
+	  What mount does when neither master can be used and they are not
+	  both erased — bit rot, a power loss while a format wrote the first
+	  master, or a store of the other backend (doc/impl/l0_backends.md
+	  §4).
+
+	  n (default): return -EIO and write nothing, so the caller decides
+	  whether to discard the store with blob_db_format().
+
+	  y: do what blob_db_format() does — erase the whole partition and
+	  start empty — so the device comes up without intervention. Every
+	  blob is lost, and erasing the partition takes as long as a format.
+
+	  A partition whose masters are both erased is formatted either way.
+	  A store written in a format this build does not understand is
+	  always refused with -ENOTSUP and never formatted, regardless of this
+	  option.
+
 config BLOB_DB_SECTOR_BUF_SIZE
 	int "Max flash sector size in bytes"
 	default 4096

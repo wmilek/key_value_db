@@ -113,7 +113,9 @@ Mount refuses the mismatch in both directions without writing, but not with
 the same error. A UBI build refuses before `blob_db` mounts, with `-ENOTSUP`; a
 `flash_area` build returns `-EIO`, because a foreign substrate is
 indistinguishable from a corrupt store at the point where mount decides, and
-mount formats only a partition whose masters are both blank.
+mount formats only a partition whose masters are both blank. Enabling
+`CONFIG_BLOB_DB_AUTOFORMAT_ON_CORRUPT` (default `n`) makes that case
+destructive again: the UBI store is erased.
 
 This is a gap against the L1 contract's D1 rule — "distinct on-flash magic so a
 mismatched mount fails cleanly with `-ENOTSUP`" — which was written for the

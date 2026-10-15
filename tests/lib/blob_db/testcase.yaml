@@ -22,6 +22,13 @@ tests:
       - CONFIG_BLOB_DB_BACKEND_FLASH_AREA=y
       - CONFIG_SHELL=y
       - CONFIG_BLOB_DB_SHELL=y
+  # Opt-in recovery from unusable masters: mount erases the whole store, as
+  # blob_db_format() would, instead of refusing with -EIO (the default the
+  # other flash_area scenarios exercise).
+  lib.blob_db.autoformat:
+    extra_configs:
+      - CONFIG_BLOB_DB_BACKEND_FLASH_AREA=y
+      - CONFIG_BLOB_DB_AUTOFORMAT_ON_CORRUPT=y
   # Segmented large objects. Bumps the on-flash format major, so this config
   # also covers that older software refuses such a store.
   lib.blob_db.large_payloads:

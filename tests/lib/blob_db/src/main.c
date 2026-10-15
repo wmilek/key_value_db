@@ -1222,12 +1222,15 @@ static void master_erase_raw(uint8_t slot)
 	flash_area_close(fa);
 }
 
-/* Neither master parses and neither is erased: refuse with -EIO and write
- * nothing. Only a partition whose masters are both blank is formatted;
- * discarding anything else is the caller's call, via blob_db_format(). */
+/* Neither master parses and neither is erased: by default refuse with -EIO
+ * and write nothing. Only a partition whose masters are both blank is
+ * formatted unasked; discarding anything else is the caller's call, via
+ * blob_db_format(). */
 ZTEST(blob_db, test_both_masters_corrupt_are_refused)
 {
 	SKIP_UNLESS_RAW_PARTITION();
+
+	Z_TEST_SKIP_IFDEF(CONFIG_BLOB_DB_AUTOFORMAT_ON_CORRUPT);
 
 	put_blob("STALE", 5);
 	zassert_ok(blob_db_unmount());
@@ -1267,6 +1270,8 @@ ZTEST(blob_db, test_corrupt_master_beside_blank_one_is_refused)
 {
 	SKIP_UNLESS_RAW_PARTITION();
 
+	Z_TEST_SKIP_IFDEF(CONFIG_BLOB_DB_AUTOFORMAT_ON_CORRUPT);
+
 	zassert_ok(blob_db_unmount());
 
 	struct master_img torn;
@@ -1285,6 +1290,49 @@ ZTEST(blob_db, test_corrupt_master_beside_blank_one_is_refused)
 			  "refused mount modified master A");
 
 	masters_erase();
+}
+
+/* The same state with CONFIG_BLOB_DB_AUTOFORMAT_ON_CORRUPT: mount does what
+ * blob_db_format() would. Every bucket goes with the masters — a surviving
+ * blob would otherwise sit under an id the reset counter hands out again. */
+ZTEST(blob_db, test_both_masters_corrupt_autoformat_erases_store)
+{
+	SKIP_UNLESS_RAW_PARTITION();
+
+	Z_TEST_SKIP_IFNDEF(CONFIG_BLOB_DB_AUTOFORMAT_ON_CORRUPT);
+
+	const uint64_t stale = put_blob("STALE", 5);
+
+	zassert_ok(blob_db_update(BLOB_DB_ROOT_ID, "ROOT", 4));
+	zassert_ok(blob_db_unmount());
+
+	for (uint8_t slot = 0; slot < 2; slot++) {
+		struct master_img m;
+
+		master_read_raw(slot, &m);
+		memcpy(m.magic, "BDMS", 4);
+		m.hdr_len = sizeof(m);
+		master_seal(&m);
+		m.prefix_crc16 ^= 0xffff;
+		master_write_raw(slot, &m);
+	}
+
+	zassert_ok(blob_db_mount(), "opted in: must format, not refuse");
+	zassert_equal(blob_db_count(), 1, "blobs survived: count=%zu",
+		      blob_db_count());
+
+	uint8_t buf[8];
+	size_t got = 42;
+
+	zassert_ok(blob_db_get(BLOB_DB_ROOT_ID, buf, sizeof(buf), &got));
+	zassert_equal(got, 0, "root kept its old payload (%zu B)", got);
+
+	const uint64_t id = put_blob("FRESH", 5);
+
+	zassert_ok(blob_db_get(id, buf, sizeof(buf), &got));
+	zassert_mem_equal(buf, "FRESH", 5);
+	zassert_true(id <= stale, "counter was not reset: %llu",
+		     (unsigned long long)id);
 }
 
 /* blob_db_format() erases from offset 0 up, so a power cut part way leaves

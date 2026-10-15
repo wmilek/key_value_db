@@ -226,7 +226,7 @@ written by the previous UBI backend, `wmilek/ubi`):
 | Build | Meets | Result |
 |---|---|---|
 | UBI | a `flash_area` store, or one the previous UBI backend wrote | **Clean refusal.** `ubi_device_init()` finds no UBI device it can read and returns `-ENODEV`. The partition is not blank, so the backend refuses with `-ENOTSUP` and `blob_db_mount()` never proceeds. The partition is left byte-identical; `blob_db_format()` discards it deliberately. |
-| `flash_area` | a UBI store | **Refusal as corruption.** Both master blocks classify as *corrupt*, and mount, which formats only a partition whose masters are both blank, returns `-EIO` with nothing written. The classification is the observed part; the refusal follows from it and was not re-measured. Observed before that refusal existed: `CONFIG_BLOB_DB_AUTOFORMAT_ON_CORRUPT` (default `y`, since removed) formatted the partition, destroying the UBI volume. |
+| `flash_area` | a UBI store | **Refusal as corruption.** Both master blocks classify as *corrupt*, and mount, which formats only a partition whose masters are both blank, returns `-EIO` with nothing written. The classification is the observed part; the refusal follows from it and was not re-measured. With `CONFIG_BLOB_DB_AUTOFORMAT_ON_CORRUPT=y` (default `n`; observed when it defaulted to `y`) the partition is formatted instead, destroying the UBI volume. |
 
 zephyr-ubi answers `-ENODEV` for a blank partition and for one holding
 someone else's bytes alike, and documents `-ENODEV` as the one error that may
@@ -249,7 +249,8 @@ So D1's rule — distinct on-flash magic, mismatched mount fails cleanly with
 `-ENOTSUP` — holds on the *allocator* axis, where a foreign store still carries
 a parseable prefix, but does not reach the *backend* axis the seam introduced:
 there the refusal is `-EIO`, which reads as damage rather than as a store of
-the other kind. Switching an existing device between backends therefore still
+the other kind — or, with `CONFIG_BLOB_DB_AUTOFORMAT_ON_CORRUPT=y`, no
+refusal at all. Switching an existing device between backends therefore still
 means erasing the partition deliberately.
 
 The candidate fix — a backend-id byte inside the frozen prefix, so a substrate

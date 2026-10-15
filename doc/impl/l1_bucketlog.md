@@ -201,7 +201,10 @@ a newer one on the other, and falling back to the older would silently mount a
 stale view. When neither master is usable, mount formats only if both read
 erased; any other pair — bit rot, a power cut while a format wrote the first
 master, another backend's substrate (§13.7) — is refused with `-EIO` and
-nothing written, and `blob_db_format()` is the deliberate discard. Blank
+nothing written, and `blob_db_format()` is the deliberate discard.
+`BLOB_DB_AUTOFORMAT_ON_CORRUPT` (default `n`) makes mount do that discard
+itself: it erases the whole partition, buckets included, so no surviving blob
+can meet the reset id counter. Blank
 masters do not imply blank buckets: `blob_db_format()` erases from offset 0 up,
 so a power cut part way leaves live buckets behind blank masters. Formatting
 therefore first invalidates every bucket header still present, then writes the
@@ -305,6 +308,7 @@ Multiple slots may exist for one id (rebinds, tombstone); `get` takes the
 read master A, B
 if neither valid:
     if both erased: invalidate every bucket header; write master; bind root
+    elif AUTOFORMAT_ON_CORRUPT: erase everything; write master; bind root
     else: return -EIO                                     # §3.1
 else:
     pick higher valid generation
@@ -653,6 +657,7 @@ BLOB_DB                        bool, select FLASH, FLASH_MAP, CRC
 BLOB_DB_PARTITION_LABEL        string, default "storage"
 BLOB_DB_MAX_PAYLOAD_LEN        int, default 256, range 1 65535  # geometry checked at mount
 BLOB_DB_SECTOR_BUF_SIZE        int, default 4096
+BLOB_DB_AUTOFORMAT_ON_CORRUPT  bool, default n   # erase on unusable masters (§3.1)
 BLOB_DB_LARGE_PAYLOADS         bool, default n   # segmented objects (§3.5)
 BLOB_DB_MAX_OBJECT_LEN         int, default 131072   # validated at mount
 BLOB_DB_MAX_SEGMENTS           int, default 128      # 16 B of .bss each
@@ -783,8 +788,8 @@ draft implementation and will be reworked against the final API; the
    partition holding a UBI volume fails the prefix CRC before the magic is
    ever compared, so both masters land in `CORRUPT` and mount refuses with
    `-EIO` — nothing is written, but the error reads as damage rather than as
-   a store of the other kind. (Until `BLOB_DB_AUTOFORMAT_ON_CORRUPT` was
-   removed, its default `y` reformatted the store instead.) Measured, both
+   a store of the other kind. (`BLOB_DB_AUTOFORMAT_ON_CORRUPT=y` erases it
+   instead; the option used to default to `y`.) Measured, both
    directions, in `doc/impl/l0_backends.md` §4; the reverse direction refuses
    with `-ENOTSUP` because UBI's own attach refuses first. Candidate fix: a
    backend-id byte inside the frozen prefix so a substrate mismatch

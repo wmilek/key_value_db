@@ -206,8 +206,9 @@ Two things to know before switching a real device:
   `blob_db_format()` discards it.
 - The two layouts are **not interchangeable**. Mount refuses the wrong one
   without writing to it — `-ENOTSUP` from a UBI build, `-EIO` from a
-  `flash_area` build, which cannot tell a UBI store from a corrupt one. Erase
-  the partition deliberately when switching. The measured behavior in both
+  `flash_area` build, which cannot tell a UBI store from a corrupt one (with
+  `CONFIG_BLOB_DB_AUTOFORMAT_ON_CORRUPT=y` it erases it instead). Erase the
+  partition deliberately when switching. The measured behavior in both
   directions is in [`doc/impl/l0_backends.md`](doc/impl/l0_backends.md) §4.
 
 ### Test
@@ -307,6 +308,7 @@ Frequently adjusted options (see the module `Kconfig` files for the rest):
 | `CONFIG_BLOB_DB_PARTITION_LABEL` | fixed-partition label to store blobs in (default `storage`) |
 | `CONFIG_BLOB_DB_UBI_KEY_APP` | UBI's metadata key comes from the application, not the built-in development key (UBI backend) |
 | `CONFIG_BLOB_DB_UBI_HEAP_SIZE` | heap reserved for UBI's bookkeeping; defaults from the partition size (UBI backend) |
+| `CONFIG_BLOB_DB_AUTOFORMAT_ON_CORRUPT` | when no master is usable and the partition is not blank, erase it and start empty instead of returning `-EIO` (default `n`; destroys every blob) |
 | `CONFIG_BLOB_DB_MAX_PAYLOAD_LEN` | largest blob payload; also caps the kvhash bucket directory |
 | `CONFIG_BLOB_DB_SECTOR_BUF_SIZE` | upper bound on supported flash sector size (64 KB for mx25r64) |
 | `CONFIG_ROOTREG_MAX_ROOTS` | how many structure roots the registry can hold |
