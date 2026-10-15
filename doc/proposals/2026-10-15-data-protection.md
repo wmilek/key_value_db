@@ -77,6 +77,8 @@ anyone who can write the flash can erase it.
 | 7 | Roll back one bucket to an older authentic image | open | open | **open** (§6.2) |
 | 8 | Clear bits in a blob's newest slot so reads fall back to the previous version | open | open, same class as 7 (§4.6) | open |
 | 9 | Infer ids, sizes, write frequency | open | open: header and id stay in clear | — |
+| 10 | Remap a bucket's LEB onto another bucket's PEB, or swap two (forged UBI headers, or a raw-partition copy) | UBI: caught by its header MAC; `flash_area`: the bucket's blobs silently read as absent, then are erased by the next write | caught, `-EIO`, nothing erased (§4.8) | — |
+| 11 | Forge the master: lower the id ceiling, or set COMPACTING over a chosen scratch | open | caught by a master MAC (§4.8) | replaying an older authentic master is caught (§6.1) |
 
 Rows 7 and 8 mark the limit. They are the per-block rollback that zephyr-ubi
 also leaves open (its row 9) and that UBIFS authentication leaves open too.
@@ -203,7 +205,8 @@ has to be right.** Nonce = `mount_salt(4) ‖ seq(8)`, stored in the slot:
   used before. With the salt, a repeat needs that **and** a 2⁻³² collision on
   the same mount. That way rollback, which cannot always be detected, does not
   also become a confidentiality break. It is also why the master needs no MAC
-  for nonce safety: a forged master cannot pick the salt.
+  for nonce safety: a forged master cannot pick the salt. It needs one for
+  other reasons (§4.8).
 - **Rejected: deriving the nonce from the position** (bucket, generation,
   offset). It would save storing 12 B per slot. But a rolled-back bucket would
   have the device append new data at old (bucket, generation, offset) triples,
@@ -227,8 +230,9 @@ protects little and is left out of the first cut.
   AES-128 key. UBI uses salt `"zephyr-ubi/v1"` and labels
   `"zephyr-ubi/header/v1"` and `"zephyr-ubi/volume-table/v1"`. `blob_db` uses
   salt `"blob_db/v1"`, and labels `"blob_db/slot-aead/v1"` and
-  `"blob_db/slot-mac/v1"` (one per mode, §4.5). Different salts and labels
-  give independent keys from the same IKM.
+  `"blob_db/slot-mac/v1"` (one per mode, §4.5), plus `"blob_db/meta/v1"` for
+  the master, bucket headers and scratch seal (§4.8). Different salts and
+  labels give independent keys from the same IKM.
 - **Context = `store_uuid`.** These are 16 random bytes drawn with
   `psa_generate_random()` at format and stored in the master, the counterpart
   of UBI's `image_seq`. This is the one place `blob_db` deliberately departs
@@ -334,6 +338,86 @@ protected build, `-EIO` also covers an authentication failure. The per-slot
 payload cap drops by the extra overhead, from `(sector − 16)/2 − 14` to
 `(sector − 16)/2 − 34`: 2026 → 2006 B on 4 KB sectors.
 
+### 4.8 Remapping below `blob_db`: making UBI's header MAC a second line
+
+UBI authenticates its headers so that an attacker cannot change the mapping
+from logical blocks (LEBs, one per `blob_db` sector) to physical blocks
+(PEBs). The question is whether `blob_db` can check what it reads well enough
+that a remap does not matter to it. Then UBI's MAC becomes defence in depth.
+The same checks also cover `flash_area`, where nothing protects the layout at
+all. An attacker there can copy one sector's bytes over another, which is the
+raw-partition version of a remap.
+
+**What a remap can do to `blob_db` today:**
+
+| Remapped sector | Today | Why |
+|---|---|---|
+| A bucket gets another bucket's PEB | its blobs read as `-ENOENT`, and the next `update` there **reformats it** | `bucket_hdr_valid()` fails on `bucket_id`, and every caller treats an invalid header as "never formatted" |
+| A bucket header forged to match | same: the slots' ids do not hash to this bucket, so no lookup matches | the header has only a CRC |
+| A master, or the scratch sector | the id ceiling can be lowered, so `alloc_id` reissues ids, breaking contract §2 "no reuse"; or a COMPACTING master can make recovery copy a chosen scratch image over a bucket | the master and the scratch seal have only CRCs |
+
+Per-slot AEAD (§4.1) already makes sure a remap can never get **wrong data**
+served: the id is in every slot's AAD, so a slot read from the wrong place, or
+from another store, fails its tag. What is still missing is that `blob_db`
+cannot tell **"empty" from "replaced"**, and it trusts its own metadata. Four
+changes, all in protected builds only, close the gap:
+
+1. **MAC the bucket header.** Bind `bucket_id`, `gen` and `store_uuid` with
+   AES-CMAC under a third label (`"blob_db/meta/v1"`), as UBI binds `pnum`
+   into its header MAC. A 16 B header becomes 32 B, written once per erase.
+2. **Only an erased header means unformatted.** Today any header that fails
+   its check counts as unformatted. Split that, exactly as UBI's
+   `header_verify()` does (erased → magic → CRC → MAC):
+
+   | Header reads as | Meaning | `get` | `update` |
+   |---|---|---|---|
+   | all `0xff` | never formatted | `-ENOENT` | format it |
+   | CRC fails | damage | `-EIO` | `-EIO`, no format |
+   | CRC passes, MAC fails, or the MAC passes for another `bucket_id` | **remapped or forged** | `-EIO`, tampered event | `-EIO`, **no format** |
+
+   A store that has lost a bucket header then says so loudly, where today it
+   silently forgets those blobs and later erases them. The current
+   behaviour of reformatting over damage has its uses in development, so the
+   unprotected build keeps it, the same split `BLOB_DB_AUTOFORMAT_ON_CORRUPT`
+   already makes for masters.
+3. **MAC the master body** under the meta key: generation, state,
+   `compacting_bid`, both ceilings, `seg_owner`, uuid and suite. The frozen
+   compatibility prefix keeps its own CRC, so foreign-store detection
+   (`l1_bucketlog.md` §3.1) still works without a key. A forged lower ceiling
+   or a forged COMPACTING state then fails the MAC. Replaying an older
+   *authentic* master is still possible, and §6.1's anchor is what catches it,
+   as long as it anchors the **id ceiling** as well as the seq ceiling.
+4. **MAC the scratch seal** under the meta key, with `compacting_bid` and the
+   new bucket `gen` added. Recovery then copies over a bucket only an image
+   that this store produced for that bucket.
+
+With these four, every sector `blob_db` reads (master, scratch, bucket header
+and slots) is checked against `blob_db`'s own key and its own idea of what
+belongs where. A remap or a raw copy turns into `-EIO`, or, on the master,
+into the other master winning. It never becomes wrong data, a reissued id or
+an erased bucket. That holds on both backends and does not depend on UBI's
+key.
+
+**What UBI's header MAC still adds** once `blob_db` checks its own data:
+
+- **Availability.** Without it, forged UBI headers could still make the device
+  fail mounts or reads, and could steer UBI's own wear levelling and erase
+  counters. That is denial of service. The threat model excludes it, but it
+  costs nothing to keep.
+- **A narrower rollback.** To roll a bucket back to an old copy UBI still
+  holds, an attacker must first erase the newer PEBs, because the sequence
+  number that decides between copies is under UBI's MAC. Without the MAC the
+  attacker would just raise the old copy's number. Either way it is row 7,
+  which is open, so this is defence in depth, not a guarantee.
+- **The volume table.** Volume sizes and names belong to UBI alone.
+
+So keep UBI keyed. It shares the IKM (§4.3), so it costs nothing extra. The
+worry about remapping no longer rests on it: a store with a builtin, publicly
+known UBI key and a secret `blob_db` key would still never serve forged or
+displaced data. It would only be easier to deny service to and to roll back.
+`CONFIG_UBI_VERIFY_ON_READ`, which re-checks the UBI header on every read,
+becomes redundant with `blob_db`'s per-read checks and can stay off.
+
 ### 4.7 Same algorithms as zephyr-ubi
 
 On the UBI backend the stack runs two integrity layers, one on top of the
@@ -346,7 +430,7 @@ table maps what UBI does (`library/ubi_key.c`, `library/ubi_header.c`,
 |---|---|---|
 | Keying material | PSA key handle with `PSA_KEY_USAGE_DERIVE`, from `blob_db_ubi_ikm_key()` | **the same handle**, from a backend-neutral `blob_db_ikm_key()` (§4.3) |
 | KDF | HKDF-SHA256, fixed salt `"zephyr-ubi/v1"`, info = label ‖ `key_context` | HKDF-SHA256, fixed salt `"blob_db/v1"`, info = label ‖ `store_uuid` (§4.3 says why the context differs) |
-| Derived keys | volatile AES-128, one per purpose (header, volume table) | volatile AES-128, one per mode (slot-mac, slot-aead) |
+| Derived keys | volatile AES-128, one per purpose (header, volume table) | volatile AES-128, one per purpose (slot-mac or slot-aead, meta) |
 | MAC | AES-CMAC-128, 16 B, `psa_mac_compute` and `psa_mac_verify` | **AES-CMAC** in AUTH. AEAD uses AES-CCM, whose MAC is CBC-MAC under the same AES. Tag 8 B by default, 16 B to match UBI |
 | Encryption | none: "protect data with an AEAD of your own" | AES-CCM, the AEAD UBI's security doc asks the layer above for |
 | What is bound | `pnum` at the front of the MAC message; the doc asks the layer above to bind `vol_id` and `lnum` | the id, which fixes the bucket (= `lnum`, since one bucket is one LEB). `vol_id` and the partition are covered by `store_uuid` in the key |
@@ -479,12 +563,15 @@ The seq ceiling in the master only grows, which makes it a usable **store
 clock**. Optional hooks, shaped like `blob_db_ubi_state_check()`, would work
 like this:
 
-- `blob_db_anchor_commit(store_uuid, seq_ceiling)` is called **after** every
-  ceiling master write: once every `BLOB_DB_SEQ_STEP` slot writes, to PSA ITS,
-  a monotonic counter or a secure element.
-- `blob_db_anchor_check(store_uuid, seq_ceiling)` runs at mount. If the master
-  ceiling is below the anchored one, the partition was rolled back, and mount
-  fails with `-EROFS`. A different uuid without a format the application asked
+- `blob_db_anchor_commit(store_uuid, seq_ceiling, id_ceiling)` is called
+  **after** every ceiling master write: once every `BLOB_DB_SEQ_STEP` slot
+  writes, or `BLOB_DB_ID_HINT_STEP` allocations, to PSA ITS, a monotonic
+  counter or a secure element.
+- `blob_db_anchor_check(store_uuid, seq_ceiling, id_ceiling)` runs at mount.
+  If either master ceiling is below the anchored one, the partition or its
+  master was rolled back, and mount fails with `-EROFS`. Anchoring the id
+  ceiling is what stops a replayed master from making `alloc_id` reissue ids
+  (§4.8). A different uuid without a format the application asked
   for is refused too, using the same rule as UBI's sample (`image_seq`).
 - The weak default trusts everything, so "no rollback detection" is a choice
   that shows in the code, as with UBI.
@@ -575,7 +662,13 @@ is one more reason protection stays opt-in.
 
 **Phase 1 (per-slot AEAD).** The slot format, the seq ceiling and mount salt
 in the master, key derivation, the suite byte, the failure policy in §4.6,
-and AUTH and AEAD modes. Tests, per P8:
+AUTH and AEAD modes, and the metadata MACs and erased-only formatting from
+§4.8. Tests, per P8:
+- remap cases on both backends: one bucket sector copied over another, two
+  swapped, a master with a lowered ceiling. Each gives `-EIO`, or the other
+  master winning, and erases nothing. On UBI, the same with the builtin UBI
+  key and forged UBI headers, to show that `blob_db` does not depend on UBI's
+  MAC;
 - tamper cases in `tests/lib/blob_db`, using its existing raw-offset fault
   injection: a payload byte changed with the CRC recomputed gives `-EIO`; a
   slot copied onto another id's bucket gives `-EIO`; a slot from another store
