@@ -203,3 +203,106 @@ ZTEST(blob_db_ubi, test_trust_withdrawn_at_run_time_stops_writes)
 	zassert_mem_equal(buf, pl, sizeof(pl));
 #endif
 }
+
+/* Erase-block size of the simulated partition (boards/native_sim.overlay). */
+#define RAW_PEB_SZ 4096
+
+/* Find the newest copy of a blob_db master anywhere on the raw partition, and
+ * whether the copy two generations older — the one that master's slot held
+ * before — is still on flash too. Masters are found by their magic; their
+ * generation follows the 12-byte compatibility prefix. */
+static off_t newest_master_copy(bool *older_copy_present)
+{
+	static uint8_t peb[RAW_PEB_SZ];
+	const struct flash_area *fa;
+	uint32_t newest_gen = 0;
+	off_t newest_off = -1;
+	uint32_t gens_seen[8];
+	size_t n_seen = 0;
+
+	zassert_ok(flash_area_open(PARTITION_ID_UNDER_TEST, &fa));
+	for (off_t base = 0; base < (off_t)fa->fa_size; base += RAW_PEB_SZ) {
+		zassert_ok(flash_area_read(fa, base, peb, sizeof(peb)));
+		for (size_t at = 0; at + 16 <= sizeof(peb); at += 4) {
+			if (memcmp(&peb[at], "BDMS", 4) != 0) {
+				continue;
+			}
+			uint32_t gen;
+
+			memcpy(&gen, &peb[at + 12], sizeof(gen));
+			if (n_seen < ARRAY_SIZE(gens_seen)) {
+				gens_seen[n_seen++] = gen;
+			}
+			if (gen > newest_gen) {
+				newest_gen = gen;
+				newest_off = base + (off_t)at;
+			}
+		}
+	}
+	flash_area_close(fa);
+
+	*older_copy_present = false;
+	for (size_t i = 0; i < n_seen; i++) {
+		if (newest_gen >= 2 && gens_seen[i] == newest_gen - 2) {
+			*older_copy_present = true;
+		}
+	}
+	return newest_off;
+}
+
+/* UBI answers a change whose data fails its seal by standing the block's
+ * previous copy back up, if reclaim has not taken it yet. When that block is
+ * the newest master, both masters then read valid, the newer of them with a
+ * ceiling that trails ids already on flash — a rollback the master headers
+ * cannot show. The damage UBI reports at attach must make mount scan. */
+ZTEST(blob_db_ubi, test_rolled_back_master_still_raises_ceiling)
+{
+	Z_TEST_SKIP_IFNDEF(CONFIG_BLOB_DB_UBI_ATOMIC_REPLACE);
+
+	/* After format the first master sits in LEB 0 and the second is
+	 * unmapped. The first alloc_id persists a ceiling 256 ahead to LEB 1,
+	 * and the allocation that reaches it persists the next to LEB 0 — so
+	 * 300 allocations leave LEB 0 newest, its previous copy awaiting
+	 * reclaim, and LEB 1's ceiling below the last id. */
+	uint64_t id = 0;
+
+	for (int i = 0; i < 300; i++) {
+		id = blob_db_alloc_id();
+		zassert_not_equal(id, 0);
+	}
+	zassert_ok(blob_db_update(id, "HIGH", 4));
+	blob_db_unmount();
+
+	bool older_present;
+	const off_t newest = newest_master_copy(&older_present);
+
+	zassert_true(newest >= 0, "setup: no master copy found");
+	zassert_true(older_present,
+		     "setup: the newest master's previous copy was reclaimed");
+
+	/* Clear one bit of the magic: NOR-legal, and enough to fail UBI's
+	 * data seal over the whole copy. */
+	const struct flash_area *fa;
+	uint8_t byte;
+
+	zassert_ok(flash_area_open(PARTITION_ID_UNDER_TEST, &fa));
+	zassert_ok(flash_area_read(fa, newest, &byte, 1));
+	byte &= (uint8_t)~0x02;
+	zassert_ok(flash_area_write(fa, newest, &byte, 1));
+	flash_area_close(fa);
+
+	zassert_ok(blob_db_mount());
+
+	uint8_t buf[8];
+	size_t got;
+
+	zassert_ok(blob_db_get(id, buf, sizeof(buf), &got));
+	zassert_mem_equal(buf, "HIGH", 4);
+	zassert_ok(blob_db_update(id, "HIGH", 4),
+		   "bound id above the adopted ceiling refused");
+
+	const uint64_t next = blob_db_alloc_id();
+
+	zassert_true(next > id, "re-issued a bound id: next=%llu id=%llu",
+		     (unsigned long long)next, (unsigned long long)id);
+}

@@ -105,16 +105,19 @@ extern "C" {
  * another allocator's magic — mount returns `-ENOTSUP` and writes nothing;
  * discarding it is the caller's decision, via `blob_db_format()`, which for
  * that reason does not itself require a mount. Only a
- * partition whose master sectors read as erased is treated as virgin and
- * formatted automatically. (If both masters are unreadable but *not* erased —
- * bit rot, or a power loss during the first format —
- * `CONFIG_BLOB_DB_AUTOFORMAT_ON_CORRUPT` chooses between reformatting and
- * `-EIO`.)
+ * partition whose master sectors both read as erased is treated as virgin and
+ * formatted automatically; any buckets left behind by an interrupted format are
+ * discarded with it. If neither master is usable and they are not both erased —
+ * bit rot, or a power loss while a format wrote the first master — mount
+ * refuses with `-EIO` and writes nothing, and `blob_db_format()` discards the
+ * store; with `CONFIG_BLOB_DB_AUTOFORMAT_ON_CORRUPT` (default `n`) mount does
+ * that itself, erasing every blob.
  *
  * @retval 0       success
  * @retval -EALREADY already mounted
- * @retval -EIO    flash I/O error, partition not found, or both masters
- *                 unreadable with `BLOB_DB_AUTOFORMAT_ON_CORRUPT` disabled
+ * @retval -EIO    flash I/O error, partition not found, or no usable master
+ *                 on a partition that is not blank (unless
+ *                 `CONFIG_BLOB_DB_AUTOFORMAT_ON_CORRUPT`)
  * @retval -ENOTSUP foreign on-flash format, a sector larger than
  *                 `CONFIG_BLOB_DB_SECTOR_BUF_SIZE`, or a payload cap the
  *                 partition geometry cannot sustain
@@ -366,8 +369,8 @@ int blob_db_iterate(blob_db_iter_cb_t cb, void *user);
  *
  * **Does not require a mount.** This is the deliberate-discard path
  * `blob_db_mount()`'s `-ENOTSUP` refers to, so it must work on precisely the
- * store that cannot be mounted — an unrecognized format, or one whose masters
- * are both unreadable under `CONFIG_BLOB_DB_AUTOFORMAT_ON_CORRUPT=n`. Called
+ * store that cannot be mounted — an unrecognized format, or one with no usable
+ * master. Called
  * while unmounted it opens the partition itself, applies the same geometry
  * checks a mount does, and on success leaves the DB **mounted** and usable, in
  * the state a virgin mount would have produced. Called while mounted it

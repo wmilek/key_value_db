@@ -289,22 +289,24 @@ config BLOB_DB_SHELL
 	  scan reads every bucket sector, which takes a while on large parts.
 
 config BLOB_DB_AUTOFORMAT_ON_CORRUPT
-	bool "Format when both master sectors are unreadable"
-	default y
+	bool "Format when no master is usable (destroys the store)"
 	help
-	  Controls what mount does when neither master can be parsed AND the
-	  sectors are not erased — bit rot, or a power loss during the very
-	  first format.
+	  What mount does when neither master can be used and they are not
+	  both erased — bit rot, a power loss while a format wrote the first
+	  master, or a store of the other backend (doc/impl/l0_backends.md
+	  §4).
 
-	  y (development): format and carry on, so a bad first boot is not a
-	  device needing manual intervention.
+	  n (default): return -EIO and write nothing, so the caller decides
+	  whether to discard the store with blob_db_format().
 
-	  n (production): return -EIO and leave the partition untouched, so the
-	  caller decides whether to discard it with blob_db_format().
+	  y: do what blob_db_format() does — erase the whole partition and
+	  start empty — so the device comes up without intervention. Every
+	  blob is lost, and erasing the partition takes as long as a format.
 
-	  This does NOT apply to a store written in a format this build does not
-	  understand. That is always refused with -ENOTSUP and never formatted,
-	  regardless of this option.
+	  A partition whose masters are both erased is formatted either way.
+	  A store written in a format this build does not understand is
+	  always refused with -ENOTSUP and never formatted, regardless of this
+	  option.
 
 config BLOB_DB_SECTOR_BUF_SIZE
 	int "Max flash sector size in bytes"
@@ -336,8 +338,11 @@ config BLOB_DB_SLOT_INDEX
 	  - RAM is fixed by BLOB_DB_SLOT_INDEX_ENTRIES (12 B each) and
 	    BLOB_DB_SLOT_INDEX_MAX_BUCKETS (6 B each), in .bss. It does not
 	    grow with the store; ids beyond capacity are looked up by walking.
-	  - It is built during the bucket scan mount already performs, so
-	    mount reads nothing extra.
+	  - It is built as buckets are walked, not by a mount-time scan: on a
+	    healthy store mount walks only the root's bucket, so each other
+	    bucket's first lookup walks it once and fills its entries. The
+	    rare mount that scans every bucket (a master in doubt) fills it
+	    in passing.
 	  - It is a hint. Every hit is checked against the slot it names
 	    (sealed, same id, CRC), and anything it cannot vouch for falls
 	    back to the walk, so a crash, a torn write or bit-rot never turns

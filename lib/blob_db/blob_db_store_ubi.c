@@ -60,6 +60,15 @@ static uint32_t g_vol_id = UBI_VOL_ID_INVALID;
 static uint32_t g_leb_size;
 static psa_key_id_t g_key_id;
 
+/* Damage reported since the last open, for blob_db_store_open_found_damage():
+ * a bit per LEB below 32 whose copy failed its header or its seal — UBI then
+ * stands an older copy back up if one awaits reclaim — and whether a damaged
+ * block could not be attributed to a LEB at all, which may have been the
+ * newest copy of any of them. Coarse on purpose: any volume's LEB sets its
+ * bit, and a false alarm costs blob_db one mount-time scan. */
+static uint32_t g_damaged_lebs;
+static bool g_damaged_unplaced;
+
 static const char *event_name(enum ubi_event_type type)
 {
 	switch (type) {
@@ -88,6 +97,20 @@ static const char *event_name(enum ubi_event_type type)
 static void on_event(const struct ubi_event *event, void *user_context)
 {
 	ARG_UNUSED(user_context);
+
+	switch (event->type) {
+	case UBI_EVENT_HDR_CORRUPT:
+	case UBI_EVENT_HDR_TAMPERED:
+	case UBI_EVENT_DATA_CORRUPT:
+		if (event->vol_id == UBI_VOL_ID_INVALID) {
+			g_damaged_unplaced = true;
+		} else if (event->lnum < 32) {
+			g_damaged_lebs |= BIT(event->lnum);
+		}
+		break;
+	default:
+		break;
+	}
 
 	LOG_WRN("ubi: %s (PEB %u, vol %d, LEB %u)", event_name(event->type),
 		event->pnum,
@@ -331,6 +354,9 @@ int blob_db_store_open(struct blob_db_store_geom *geom, bool discard)
 	}
 	g_key_id = config.ikm_key_id;
 
+	g_damaged_lebs = 0;
+	g_damaged_unplaced = false;
+
 	g_ubi = k_calloc(1, ubi_device_size());
 	if (g_ubi == NULL) {
 		LOG_ERR("no heap for the UBI handle");
@@ -479,4 +505,12 @@ int blob_db_store_replace(off_t off, const void *buf, size_t len)
 bool blob_db_store_replace_is_atomic(void)
 {
 	return IS_ENABLED(CONFIG_BLOB_DB_UBI_ATOMIC_REPLACE);
+}
+
+bool blob_db_store_open_found_damage(off_t off)
+{
+	const uint32_t lnum = (uint32_t)((size_t)off / g_leb_size);
+
+	return g_damaged_unplaced ||
+	       (lnum < 32 && (g_damaged_lebs & BIT(lnum)) != 0);
 }

@@ -1213,47 +1213,20 @@ ZTEST(blob_db, test_future_minor_is_tolerated)
 	zassert_mem_equal(buf, "MINOR", 5);
 }
 
-/* Neither master parses and neither is erased. With the development default
- * this is recoverable — the store is reformatted rather than left dead. */
-ZTEST(blob_db, test_both_masters_corrupt_autoformats)
+static void master_erase_raw(uint8_t slot)
 {
-	SKIP_UNLESS_RAW_PARTITION();
+	const struct flash_area *fa;
 
-	Z_TEST_SKIP_IFNDEF(CONFIG_BLOB_DB_AUTOFORMAT_ON_CORRUPT);
-
-	uint64_t survivor = put_blob("STALE", 5);
-
-	zassert_ok(blob_db_unmount());
-
-	for (uint8_t slot = 0; slot < 2; slot++) {
-		struct master_img m;
-
-		master_read_raw(slot, &m);
-		/* Ensure the sector is non-erased even if it never held a
-		 * master, so this is "corrupt", not "virgin". */
-		memcpy(m.magic, "BDMS", 4);
-		m.hdr_len = sizeof(m);
-		master_seal(&m);
-		m.prefix_crc16 ^= 0xffff;
-		master_write_raw(slot, &m);
-	}
-
-	zassert_ok(blob_db_mount(), "development default should reformat");
-
-	/* Recovery rewrites the masters; it does NOT erase the buckets, so
-	 * whatever they still hold stays readable. That is deliberate — the
-	 * caller asked to recover, not to destroy — but it puts already-issued
-	 * ids back in front of a freshly reset id counter, so the invariant
-	 * that actually matters is that mount's defensive scan re-raised the
-	 * ceiling past them. */
-	zassert_true(blob_db_exists(BLOB_DB_ROOT_ID), "root must be live");
-	zassert_true(blob_db_alloc_id() > survivor,
-		     "reset id space must not re-issue a surviving id");
+	zassert_ok(flash_area_open(BLOB_DB_TEST_PARTITION_ID, &fa));
+	zassert_ok(flash_area_erase(fa, (off_t)slot * TEST_SECTOR_SZ, TEST_SECTOR_SZ));
+	flash_area_close(fa);
 }
 
-/* Same state, production policy: refuse and leave the partition for the
- * caller to deal with. Covered by the lib.blob_db.no_autoformat config. */
-ZTEST(blob_db, test_both_masters_corrupt_refused_when_configured)
+/* Neither master parses and neither is erased: by default refuse with -EIO
+ * and write nothing. Only a partition whose masters are both blank is
+ * formatted unasked; discarding anything else is the caller's call, via
+ * blob_db_format(). */
+ZTEST(blob_db, test_both_masters_corrupt_are_refused)
 {
 	SKIP_UNLESS_RAW_PARTITION();
 
@@ -1268,6 +1241,8 @@ ZTEST(blob_db, test_both_masters_corrupt_refused_when_configured)
 		struct master_img m;
 
 		master_read_raw(slot, &m);
+		/* Ensure the sector is non-erased even if it never held a
+		 * master, so this is "corrupt", not "virgin". */
 		memcpy(m.magic, "BDMS", 4);
 		m.hdr_len = sizeof(m);
 		master_seal(&m);
@@ -1276,8 +1251,7 @@ ZTEST(blob_db, test_both_masters_corrupt_refused_when_configured)
 		before[slot] = m;
 	}
 
-	zassert_equal(blob_db_mount(), -EIO,
-		      "production policy must refuse, not reformat");
+	zassert_equal(blob_db_mount(), -EIO, "must refuse, not reformat");
 
 	for (uint8_t slot = 0; slot < 2; slot++) {
 		struct master_img after;
@@ -1288,6 +1262,195 @@ ZTEST(blob_db, test_both_masters_corrupt_refused_when_configured)
 	}
 
 	masters_erase();
+}
+
+/* A power cut while the first master of a format is written leaves it torn
+ * beside a blank one. Not blank, so not formatted: refused like the above. */
+ZTEST(blob_db, test_corrupt_master_beside_blank_one_is_refused)
+{
+	SKIP_UNLESS_RAW_PARTITION();
+
+	Z_TEST_SKIP_IFDEF(CONFIG_BLOB_DB_AUTOFORMAT_ON_CORRUPT);
+
+	zassert_ok(blob_db_unmount());
+
+	struct master_img torn;
+
+	master_read_raw(0, &torn);
+	torn.prefix_crc16 ^= 0xffff;
+	master_write_raw(0, &torn);
+	master_erase_raw(1);
+
+	zassert_equal(blob_db_mount(), -EIO, "must refuse, not reformat");
+
+	struct master_img after;
+
+	master_read_raw(0, &after);
+	zassert_mem_equal(&after, &torn, sizeof(after),
+			  "refused mount modified master A");
+
+	masters_erase();
+}
+
+/* The same state with CONFIG_BLOB_DB_AUTOFORMAT_ON_CORRUPT: mount does what
+ * blob_db_format() would. Every bucket goes with the masters — a surviving
+ * blob would otherwise sit under an id the reset counter hands out again. */
+ZTEST(blob_db, test_both_masters_corrupt_autoformat_erases_store)
+{
+	SKIP_UNLESS_RAW_PARTITION();
+
+	Z_TEST_SKIP_IFNDEF(CONFIG_BLOB_DB_AUTOFORMAT_ON_CORRUPT);
+
+	const uint64_t stale = put_blob("STALE", 5);
+
+	zassert_ok(blob_db_update(BLOB_DB_ROOT_ID, "ROOT", 4));
+	zassert_ok(blob_db_unmount());
+
+	for (uint8_t slot = 0; slot < 2; slot++) {
+		struct master_img m;
+
+		master_read_raw(slot, &m);
+		memcpy(m.magic, "BDMS", 4);
+		m.hdr_len = sizeof(m);
+		master_seal(&m);
+		m.prefix_crc16 ^= 0xffff;
+		master_write_raw(slot, &m);
+	}
+
+	zassert_ok(blob_db_mount(), "opted in: must format, not refuse");
+	zassert_equal(blob_db_count(), 1, "blobs survived: count=%zu",
+		      blob_db_count());
+
+	uint8_t buf[8];
+	size_t got = 42;
+
+	zassert_ok(blob_db_get(BLOB_DB_ROOT_ID, buf, sizeof(buf), &got));
+	zassert_equal(got, 0, "root kept its old payload (%zu B)", got);
+
+	const uint64_t id = put_blob("FRESH", 5);
+
+	zassert_ok(blob_db_get(id, buf, sizeof(buf), &got));
+	zassert_mem_equal(buf, "FRESH", 5);
+	zassert_true(id <= stale, "counter was not reset: %llu",
+		     (unsigned long long)id);
+}
+
+/* blob_db_format() erases from offset 0 up, so a power cut part way leaves
+ * blank masters in front of buckets that still hold blobs. A fresh id counter
+ * would hand their ids out again; formatting the blank masters must discard
+ * the buckets instead, root bucket included. */
+ZTEST(blob_db, test_blank_masters_discard_leftover_buckets)
+{
+	SKIP_UNLESS_RAW_PARTITION();
+
+	put_blob("STALE", 5);
+	zassert_ok(blob_db_update(BLOB_DB_ROOT_ID, "ROOT", 4));
+	zassert_ok(blob_db_unmount());
+
+	masters_erase();
+	zassert_ok(blob_db_mount());
+
+	zassert_equal(blob_db_count(), 1, "leftover blobs survived: count=%zu",
+		      blob_db_count());
+
+	uint8_t buf[8];
+	size_t got = 42;
+
+	zassert_ok(blob_db_get(BLOB_DB_ROOT_ID, buf, sizeof(buf), &got));
+	zassert_equal(got, 0, "root kept its old payload (%zu B)", got);
+
+	uint64_t id = put_blob("FRESH", 5);
+
+	zassert_ok(blob_db_get(id, buf, sizeof(buf), &got));
+	zassert_equal(got, 5);
+	zassert_mem_equal(buf, "FRESH", 5);
+}
+
+/* Leave the two masters holding different ceilings, with an id bound above
+ * the older one; return that id and which slot holds the newer master.
+ *
+ * After format, A holds ceiling 2 and B is blank. The first alloc_id persists
+ * a ceiling 256 ahead to B, and the allocation that reaches it persists the
+ * next to A — so 300 allocations put A ahead with B's ceiling below the last
+ * id. */
+static uint64_t bind_above_older_ceiling(uint8_t *newer)
+{
+	uint64_t id = 0;
+
+	for (int i = 0; i < 300; i++) {
+		id = blob_db_alloc_id();
+		zassert_not_equal(id, 0);
+	}
+	zassert_ok(blob_db_update(id, "HIGH", 4));
+	zassert_ok(blob_db_unmount());
+
+	struct master_img a, b;
+
+	master_read_raw(0, &a);
+	master_read_raw(1, &b);
+	*newer = (a.generation > b.generation) ? 0 : 1;
+
+	const struct master_img *older = *newer ? &a : &b;
+
+	zassert_true(older->next_id_hint <= id,
+		     "setup: older ceiling %llu does not trail id %llu",
+		     (unsigned long long)older->next_id_hint,
+		     (unsigned long long)id);
+	return id;
+}
+
+static void assert_high_id_survived(uint64_t id)
+{
+	uint8_t buf[8];
+	size_t got;
+
+	zassert_ok(blob_db_get(id, buf, sizeof(buf), &got));
+	zassert_equal(got, 4);
+	zassert_mem_equal(buf, "HIGH", 4);
+
+	/* Below a ceiling that trails it, the id reads as never allocated. */
+	zassert_ok(blob_db_update(id, "HIGH", 4),
+		   "bound id above the adopted ceiling refused");
+
+	uint64_t next = blob_db_alloc_id();
+
+	zassert_true(next > id, "re-issued a bound id: next=%llu id=%llu",
+		     (unsigned long long)next, (unsigned long long)id);
+}
+
+/* The newer master rots after it was completely written: mount falls back to
+ * the older one, whose ceiling trails ids already on flash. With only one
+ * valid master mount must scan the buckets and raise the ceiling past them. */
+ZTEST(blob_db, test_fallback_past_corrupt_master_raises_ceiling)
+{
+	SKIP_UNLESS_RAW_PARTITION();
+
+	uint8_t newer;
+	const uint64_t id = bind_above_older_ceiling(&newer);
+	struct master_img m;
+
+	master_read_raw(newer, &m);
+	m.prefix_crc16 ^= 0xffff;
+	master_write_raw(newer, &m);
+
+	zassert_ok(blob_db_mount());
+	assert_high_id_survived(id);
+}
+
+/* The same fallback where the newer master reads blank — the ceiling the scan
+ * above raised, torn after its sector was erased. Blank beside valid must be
+ * scanned too, or the next mount would quietly lose what the last one found. */
+ZTEST(blob_db, test_fallback_past_blank_master_raises_ceiling)
+{
+	SKIP_UNLESS_RAW_PARTITION();
+
+	uint8_t newer;
+	const uint64_t id = bind_above_older_ceiling(&newer);
+
+	master_erase_raw(newer);
+
+	zassert_ok(blob_db_mount());
+	assert_high_id_survived(id);
 }
 
 /* --- compaction crash recovery: the scratch seal --------------------------

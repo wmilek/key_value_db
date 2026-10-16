@@ -217,15 +217,16 @@ the DK board files do. Too little shows up as `-ENOMEM` from
 ## 4. Cross-backend mounting
 
 The two layouts are incompatible (`doc/layers/l0_flash.md` §4). What happens
-when a build meets the other one is **asymmetric**, and only one direction is
-safe. Both rows below were observed on `native_sim` by formatting a store with
-one backend and booting `app` on the other (the UBI row also with a store
+when a build meets the other one is **asymmetric**: both directions refuse and
+write nothing, but only one says why. Both rows below were observed on
+`native_sim` by formatting a store with one backend and booting `app` on the
+other (the UBI row also with a store
 written by the previous UBI backend, `wmilek/ubi`):
 
 | Build | Meets | Result |
 |---|---|---|
 | UBI | a `flash_area` store, or one the previous UBI backend wrote | **Clean refusal.** `ubi_device_init()` finds no UBI device it can read and returns `-ENODEV`. The partition is not blank, so the backend refuses with `-ENOTSUP` and `blob_db_mount()` never proceeds. The partition is left byte-identical; `blob_db_format()` discards it deliberately. |
-| `flash_area` | a UBI store | **Destructive.** Both master blocks classify as *corrupt*, and `CONFIG_BLOB_DB_AUTOFORMAT_ON_CORRUPT` (default `y`) reformats the partition. The UBI volume is gone. |
+| `flash_area` | a UBI store | **Refusal as corruption.** Both master blocks classify as *corrupt*, and mount, which formats only a partition whose masters are both blank, returns `-EIO` with nothing written. The classification is the observed part; the refusal follows from it and was not re-measured. With `CONFIG_BLOB_DB_AUTOFORMAT_ON_CORRUPT=y` (default `n`; observed when it defaulted to `y`) the partition is formatted instead, destroying the UBI volume. |
 
 zephyr-ubi answers `-ENODEV` for a blank partition and for one holding
 someone else's bytes alike, and documents `-ENODEV` as the one error that may
@@ -246,14 +247,11 @@ recover from bit rot and cannot tell bit rot from a different substrate.
 
 So D1's rule — distinct on-flash magic, mismatched mount fails cleanly with
 `-ENOTSUP` — holds on the *allocator* axis, where a foreign store still carries
-a parseable prefix, but does not reach the *backend* axis the seam introduced.
-
-Until it is closed:
-
-- switching an existing device between backends requires erasing the partition
-  deliberately — do not rely on mount to refuse;
-- production builds should set `CONFIG_BLOB_DB_AUTOFORMAT_ON_CORRUPT=n`, which
-  turns the destructive row into `-EIO` with nothing written.
+a parseable prefix, but does not reach the *backend* axis the seam introduced:
+there the refusal is `-EIO`, which reads as damage rather than as a store of
+the other kind — or, with `CONFIG_BLOB_DB_AUTOFORMAT_ON_CORRUPT=y`, no
+refusal at all. Switching an existing device between backends therefore still
+means erasing the partition deliberately.
 
 The candidate fix — a backend-id byte inside the frozen prefix, so a substrate
 mismatch classifies `FOREIGN` and is never formatted — is an L1 format change

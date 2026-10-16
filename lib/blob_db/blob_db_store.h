@@ -80,6 +80,16 @@ int blob_db_store_replace(off_t off, const void *buf, size_t len);
  * through the scratch sector. */
 bool blob_db_store_replace_is_atomic(void);
 
+/*
+ * Whether the last blob_db_store_open() found the PEB at off damaged, or found
+ * damage it could not attribute to any PEB. A backend that keeps more than one
+ * copy of a block may answer damage to the newest by standing an older copy
+ * back up, which then reads as valid but stale, so blob_db re-derives from
+ * the rest of the store what it would otherwise trust that block for.
+ * Over-reporting costs blob_db work; under-reporting is not allowed.
+ */
+bool blob_db_store_open_found_damage(off_t off);
+
 /* I/O accounting, counted here so it covers both backends and every caller
  * uniformly (CONFIG_BLOB_DB_IOSTATS; compiles to nothing when disabled). */
 #if defined(CONFIG_BLOB_DB_IOSTATS)
