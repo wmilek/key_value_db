@@ -58,6 +58,9 @@ struct bucket_scan {
 	struct slot_head target;        /* the target's on-flash bytes         */
 	bool             from_index;    /* cursor is the slot index's, not a
 					 * walk's: see confirm_cursor()       */
+	bool             tail_torn;     /* the walk stopped at a programmed
+					 * header it could not trust: a torn
+					 * slot sits at write_cursor          */
 };
 
 static int read_bucket_hdr(uint16_t bid, bool *valid);
@@ -988,6 +991,7 @@ static int scan_bucket_for(uint16_t bid, uint64_t target_id, off_t limit,
 
 	out->target_off = -1;
 	out->from_index = false;
+	out->tail_torn = false;
 
 	for (;;) {
 		if (cursor + (off_t)BLOB_DB_SLOT_OVERHEAD > (off_t)st.peb_size) {
@@ -1004,12 +1008,16 @@ static int scan_bucket_for(uint16_t bid, uint64_t target_id, off_t limit,
 		    !(sh.hdr.flags & BLOB_DB_SLOT_F_SEALED) ||
 		    (sh.hdr.flags & ~(uint8_t)BLOB_DB_SLOT_F_KNOWN) ||
 		    sh.hdr.val_len > CONFIG_BLOB_DB_MAX_PAYLOAD_LEN) {
+			/* A slot is programmed from its first byte on, so a
+			 * programmed flags byte here means a torn append. */
+			out->tail_torn = sh.hdr.flags != 0xff;
 			break;
 		}
 
 		const size_t ssz = slot_size_for(sh.hdr.val_len);
 
 		if (cursor + (off_t)ssz > (off_t)st.peb_size) {
+			out->tail_torn = true;
 			break;
 		}
 		if (sh.id == target_id && cursor < limit) {
@@ -1109,6 +1117,7 @@ static int bucket_cursor(uint16_t bid, uint64_t id, struct bucket_scan *sc)
 		sc->write_cursor = cursor;
 		sc->target_off = -1;
 		sc->from_index = true;
+		sc->tail_torn = false;
 		return 0;
 	}
 
@@ -1120,19 +1129,39 @@ static int bucket_cursor(uint16_t bid, uint64_t id, struct bucket_scan *sc)
 	return rc;
 }
 
-/* Called by every writer before it appends at sc->write_cursor. A cursor the
- * walk found is where the log ends by definition. One the slot index supplied
- * is where the log ended after the last append blob_db made, and flash could
- * only differ if something else wrote it. That cannot happen while mounted, but
- * programming over non-erased bytes is the one failure an index must never
- * cause, so the 12 bytes a slot head would occupy are checked to be erased
- * first. One read per write; reads do not pay it. */
+/* Report the bucket full when the log ends at a torn slot. Its bytes are
+ * programmed, so an append there would be programmed over them and fail its
+ * own CRC -- lost although the writer reported success. Full makes the writer
+ * compact first, and compaction keeps only intact slots. */
+static void cursor_past_torn_tail(uint16_t bid, struct bucket_scan *sc)
+{
+	LOG_WRN("bucket %u: torn slot at %ld; compacting before the next append",
+		bid, (long)sc->write_cursor);
+	blob_db_sidx_forget(bid);
+	sc->write_cursor = (off_t)st.peb_size;
+}
+
+/* Called by every writer before it appends at sc->write_cursor.
+ *
+ * A cursor the walk found is where the log ends, but not necessarily where
+ * erased flash begins: a power cut inside an append leaves a torn slot there,
+ * and the walk says so (tail_torn).
+ *
+ * One the slot index supplied is where the log ended after the last append
+ * blob_db made, and flash could only differ if something else wrote it. That
+ * cannot happen while mounted, but programming over non-erased bytes is the one
+ * failure an index must never cause, so the 12 bytes a slot head would occupy
+ * are checked to be erased first. One read per write; reads do not pay it. */
 static int confirm_cursor(uint16_t bid, uint64_t id, struct bucket_scan *sc)
 {
-#if defined(CONFIG_BLOB_DB_SLOT_INDEX)
 	if (!sc->from_index) {
+		if (sc->tail_torn) {
+			sc->tail_torn = false;
+			cursor_past_torn_tail(bid, sc);
+		}
 		return 0;
 	}
+#if defined(CONFIG_BLOB_DB_SLOT_INDEX)
 	sc->from_index = false;
 
 	const off_t at = sc->write_cursor;
@@ -1159,6 +1188,9 @@ static int confirm_cursor(uint16_t bid, uint64_t id, struct bucket_scan *sc)
 					return rc;
 				}
 				sc->write_cursor = walk.write_cursor;
+				if (walk.tail_torn) {
+					cursor_past_torn_tail(bid, sc);
+				}
 				return 0;
 			}
 		}
@@ -1221,6 +1253,7 @@ static int find_indexed_slot(uint16_t bid, uint64_t id,
 	sc->target_off = off;
 	sc->target = sh;
 	sc->from_index = true;
+	sc->tail_torn = false;
 
 	rc = slot_verify(bid, sc, dst);
 	if (rc == -EBADMSG) {
