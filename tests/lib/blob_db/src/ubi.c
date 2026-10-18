@@ -260,13 +260,14 @@ ZTEST(blob_db_ubi, test_rolled_back_master_still_raises_ceiling)
 	Z_TEST_SKIP_IFNDEF(CONFIG_BLOB_DB_UBI_ATOMIC_REPLACE);
 
 	/* After format the first master sits in LEB 0 and the second is
-	 * unmapped. The first alloc_id persists a ceiling 256 ahead to LEB 1,
-	 * and the allocation that reaches it persists the next to LEB 0 — so
-	 * 300 allocations leave LEB 0 newest, its previous copy awaiting
-	 * reclaim, and LEB 1's ceiling below the last id. */
+	 * unmapped. The first alloc_id persists a ceiling one step
+	 * (CONFIG_BLOB_DB_ID_HINT_STEP) ahead to LEB 1, and the allocation that
+	 * reaches it persists the next to LEB 0 — so a step and a quarter of
+	 * allocations leave LEB 0 newest, its previous copy awaiting reclaim,
+	 * and LEB 1's ceiling below the last id. */
 	uint64_t id = 0;
 
-	for (int i = 0; i < 300; i++) {
+	for (int i = 0; i < CONFIG_BLOB_DB_ID_HINT_STEP + CONFIG_BLOB_DB_ID_HINT_STEP / 4; i++) {
 		id = blob_db_alloc_id();
 		zassert_not_equal(id, 0);
 	}

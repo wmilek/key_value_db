@@ -319,6 +319,108 @@ config BLOB_DB_SECTOR_BUF_SIZE
 	  target flash's largest sector — e.g. 65536 for the mx25r64 QSPI
 	  NOR on the nRF5340-DK.
 
+config BLOB_DB_ID_HINT_STEP
+	int "Ids allocated per persisted id ceiling"
+	default 256
+	range 1 1048576
+	help
+	  alloc_id persists a new id ceiling (one master write, which on UBI is a
+	  block erase) every this many allocations. The id space is 64-bit, so a
+	  larger step costs nothing but ids skipped after a crash.
+
+config BLOB_DB_SKIP_IDENTICAL
+	bool "Skip an update whose payload equals the live one"
+	depends on BLOB_DB_LARGE_PAYLOADS
+	help
+	  update() already reads the live slot (to learn whether it is a
+	  segmented index). When the new payload is byte-identical, nothing is
+	  written: latest-wins makes the append a no-op anyway.
+
+config BLOB_DB_WALK_CHUNK
+	int "Bytes read per step of a bucket walk (0 = one 12 B read per slot)"
+	default 0
+	range 0 4096
+	help
+	  A walk reads every slot head of a bucket. With 0 that is one small
+	  read per slot, each paying the flash's fixed per-command cost. A
+	  non-zero value reads this many bytes at a time and parses the slot
+	  heads in RAM.
+
+config BLOB_DB_FRESH_BIND_FAST
+	bool "No lookup before the first write of an id allocated this mount"
+	depends on BLOB_DB_LARGE_PAYLOADS
+	help
+	  An id allocated since mount and never written has no slot, so the
+	  first update needs only the append cursor, not a search of the bucket.
+
+config BLOB_DB_READ_WINDOW
+	int "Bytes read at once when fetching a slot whose offset is known (0 = head, payload, CRC apart)"
+	default 0
+	range 0 2048
+	help
+	  With the slot index (or a delta chain) the offset of a slot is known
+	  before its length. A non-zero window reads this many bytes at the
+	  offset in one call, so a slot that fits costs one flash read instead
+	  of three; a longer one costs two.
+
+config BLOB_DB_ALLOC_FILL
+	bool "alloc_id targets the least-filled bucket"
+	help
+	  A blob lives in bucket id % N, and alloc_id is free to hand out any
+	  id above the last one. With this option it keeps handing out ids of
+	  one target bucket until that bucket's log is nearly full, then moves
+	  to the least-filled bucket it knows of. New blobs then pack together
+	  instead of spreading over every bucket: written-once data (log
+	  entries) dies together and its appends trigger no compactions. Ids
+	  stay strictly increasing but are no longer dense.
+
+config BLOB_DB_ALLOC_FILL_RESERVE
+	int "Bytes a target bucket keeps free for later tombstones and rewrites"
+	depends on BLOB_DB_ALLOC_FILL
+	default 640
+
+config BLOB_DB_DELTA
+	bool "Store a small change to a blob as a delta slot"
+	depends on BLOB_DB_LARGE_PAYLOADS
+	help
+	  An update that changes one contiguous part of the live value is
+	  appended as a DELTA slot -- the previous slot's offset, how many
+	  leading and trailing bytes are kept, and the bytes in between --
+	  instead of the whole value. Reads follow the chain back to a full
+	  slot; compaction writes the materialized value as a full slot.
+	  On-flash format change.
+
+config BLOB_DB_DELTA_MAX_CHAIN
+	int "Longest chain of deltas before a full rewrite"
+	depends on BLOB_DB_DELTA
+	default 8
+	range 1 32
+
+config BLOB_DB_DELTA_REBASE_AGE
+	int "A get rewrites a delta in full once this many bytes followed it in its bucket (0 = never)"
+	depends on BLOB_DB_DELTA
+	default 0
+	help
+	  A delta costs a read on every get until its bucket is compacted. A
+	  get that finds a delta with at least this many bytes appended after
+	  it -- a value that has stopped changing -- appends the value as a
+	  full slot when that needs no compaction.
+
+config BLOB_DB_DELTA_BASE
+	bool "Diff against the full slot, not the previous delta"
+	depends on BLOB_DB_DELTA
+	help
+	  Each delta describes the change from the id's last full slot, so a
+	  read never follows more than one delta, however many updates there
+	  were. A delta that grows past BLOB_DB_DELTA_BASE_PCT of the value is
+	  replaced by a full slot.
+
+config BLOB_DB_DELTA_BASE_PCT
+	int "A base delta is written only while smaller than this % of the value"
+	depends on BLOB_DB_DELTA_BASE
+	default 50
+	range 1 100
+
 config BLOB_DB_SLOT_INDEX
 	bool "RAM index from blob id to its newest slot (opt-in; departs from P3)"
 	help

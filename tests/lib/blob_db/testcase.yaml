@@ -130,3 +130,61 @@ tests:
       - CONFIG_BLOB_DB_SLOT_INDEX_ENTRIES=64
       - CONFIG_BLOB_DB_SLOT_INDEX_VERIFY=y
       - CONFIG_ASSERT=y
+  # Delta slots (CONFIG_BLOB_DB_DELTA), chained: src/delta.c checks values
+  # against a model and cuts the power inside delta appends and inside
+  # compactions that rewrite chains; the rest of the suite runs unchanged with
+  # deltas being written underneath it.
+  lib.blob_db.delta:
+    extra_configs:
+      - CONFIG_BLOB_DB_BACKEND_FLASH_AREA=y
+      - CONFIG_BLOB_DB_LARGE_PAYLOADS=y
+      - CONFIG_MAIN_STACK_SIZE=32768
+      - CONFIG_BLOB_DB_TEST_CRASH_HOOKS=y
+      - CONFIG_BLOB_DB_DELTA=y
+      - CONFIG_BLOB_DB_DELTA_MAX_CHAIN=3
+      - CONFIG_ASSERT=y
+  # Deltas against the base slot, rewritten on read once cold, with the read
+  # paths they lean on and every slot-index answer checked against a walk.
+  lib.blob_db.delta.base:
+    extra_configs:
+      - CONFIG_BLOB_DB_BACKEND_FLASH_AREA=y
+      - CONFIG_BLOB_DB_LARGE_PAYLOADS=y
+      - CONFIG_MAIN_STACK_SIZE=32768
+      - CONFIG_BLOB_DB_TEST_CRASH_HOOKS=y
+      - CONFIG_BLOB_DB_DELTA=y
+      - CONFIG_BLOB_DB_DELTA_BASE=y
+      - CONFIG_BLOB_DB_DELTA_BASE_PCT=50
+      - CONFIG_BLOB_DB_DELTA_REBASE_AGE=512
+      - CONFIG_BLOB_DB_READ_WINDOW=256
+      - CONFIG_BLOB_DB_WALK_CHUNK=512
+      - CONFIG_BLOB_DB_SKIP_IDENTICAL=y
+      - CONFIG_BLOB_DB_FRESH_BIND_FAST=y
+      - CONFIG_BLOB_DB_SLOT_INDEX=y
+      - CONFIG_BLOB_DB_SLOT_INDEX_MAX_BUCKETS=2048
+      - CONFIG_BLOB_DB_SLOT_INDEX_VERIFY=y
+      - CONFIG_ASSERT=y
+  # The same on the shipped backend. Five large-object cases fail here
+  # (pwrite_rewrites_only_touched_segments, segments_are_invisible_to_count_
+  # and_iterate, large_object_{delete_releases,rebind_releases_old}_segments,
+  # large_object_roundtrip); they fail identically with deltas off and on
+  # main, whenever LARGE_PAYLOADS runs on UBI.
+  lib.blob_db.delta.ubi:
+    extra_configs:
+      - CONFIG_BLOB_DB_BACKEND_UBI=y
+      - CONFIG_UBI_SELF_CHECKS=y
+      - CONFIG_BLOB_DB_LARGE_PAYLOADS=y
+      # Deltas need LARGE_PAYLOADS; on UBI's 3968 B LEB a rebind caps the
+      # payload at 1962 B (see lib.blob_db.ubi above).
+      - CONFIG_BLOB_DB_MAX_PAYLOAD_LEN=1960
+      # 992 B segments then need 133 of them for the default 128 KiB object;
+      # the index record holds up to 243.
+      - CONFIG_BLOB_DB_MAX_SEGMENTS=140
+      - CONFIG_MAIN_STACK_SIZE=32768
+      - CONFIG_BLOB_DB_DELTA=y
+      - CONFIG_BLOB_DB_DELTA_BASE=y
+      - CONFIG_BLOB_DB_DELTA_REBASE_AGE=512
+      - CONFIG_BLOB_DB_READ_WINDOW=256
+      - CONFIG_BLOB_DB_SLOT_INDEX=y
+      - CONFIG_BLOB_DB_SLOT_INDEX_MAX_BUCKETS=2048
+      - CONFIG_BLOB_DB_SLOT_INDEX_VERIFY=y
+      - CONFIG_ASSERT=y
