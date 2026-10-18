@@ -1556,11 +1556,19 @@ static int slot_crc_ok_on_flash(uint16_t bid, off_t off,
  * unknown flags is whole, out->foreign says so, and the bucket answers and
  * takes nothing (slot_foreign_head()).
  */
+#if CONFIG_BLOB_DB_WALK_CHUNK > 0
+static uint8_t __aligned(4) g_walk_win[CONFIG_BLOB_DB_WALK_CHUNK];
+#endif
+
 static int scan_bucket_for(uint16_t bid, uint64_t target_id, off_t limit,
 			   struct bucket_scan *out)
 {
 	const off_t base = bucket_offset(bid);
 	off_t cursor = BLOB_DB_BUCKET_DATA_OFF;
+#if CONFIG_BLOB_DB_WALK_CHUNK > 0
+	off_t win_off = 0;
+	size_t win_len = 0;
+#endif
 
 	out->target_off = -1;
 	out->from_index = false;
@@ -1573,11 +1581,30 @@ static int scan_bucket_for(uint16_t bid, uint64_t target_id, off_t limit,
 		}
 
 		struct slot_head sh;
-		int rc = blob_db_store_read(base + cursor, &sh, sizeof(sh));
+		int rc;
+#if CONFIG_BLOB_DB_WALK_CHUNK > 0
+		/* Serve the head from the window when it is wholly inside it,
+		 * else read a fresh window starting at the head. */
+		if (cursor < win_off ||
+		    cursor + (off_t)sizeof(sh) > win_off + (off_t)win_len) {
+			win_off = cursor;
+			win_len = MIN((size_t)CONFIG_BLOB_DB_WALK_CHUNK,
+				      st.peb_size - (size_t)cursor);
+			rc = blob_db_store_read(base + win_off, g_walk_win,
+						win_len);
+
+			if (rc < 0) {
+				return rc;
+			}
+		}
+		memcpy(&sh, g_walk_win + (cursor - win_off), sizeof(sh));
+#else
+		rc = blob_db_store_read(base + cursor, &sh, sizeof(sh));
 
 		if (rc < 0) {
 			return rc;
 		}
+#endif
 		if (sh.hdr.flags == 0xff ||
 		    !(sh.hdr.flags & BLOB_DB_SLOT_F_SEALED) ||
 		    (sh.hdr.flags & ~(uint8_t)BLOB_DB_SLOT_F_KNOWN) ||
