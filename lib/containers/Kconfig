@@ -70,6 +70,15 @@ config BLOB_CONTAINER_KVHASH
 
 if BLOB_CONTAINER_KVHASH
 
+config BLOB_CONTAINER_KVHASH_MIN_BUCKET_BYTES
+	int "Declared bytes per bucket a two-level kvhash aims for"
+	depends on BLOB_CONTAINER_KVHASH
+	default 4096
+	help
+	  A two-level map gets about expected_entries * typical_entry_bytes /
+	  this many buckets (at least 255). A set rewrites one whole bucket, so
+	  a smaller value means smaller rewrites and more bucket blobs.
+
 config BLOB_CONTAINER_KVHASH_KEY_INLINE_MAX
 	int "Longest key stored inside its bucket"
 	default 32767
