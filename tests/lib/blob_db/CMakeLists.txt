@@ -13,6 +13,7 @@ target_sources(app PRIVATE src/main.c)
 # Power cuts during a compaction, injected under the store seam by the flash
 # simulator, so they hold on every backend.
 target_sources(app PRIVATE src/power_cut.c)
+target_sources(app PRIVATE src/torn_append.c)
 # The UBI backend's own behaviour: refusing a substrate it cannot read, and the
 # application hooks of <app/lib/blob_db_ubi.h>.
 target_sources_ifdef(CONFIG_BLOB_DB_BACKEND_UBI app PRIVATE src/ubi.c)
