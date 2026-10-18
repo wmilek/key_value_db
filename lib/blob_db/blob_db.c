@@ -1078,6 +1078,14 @@ static int slot_verify(uint16_t bid, const struct bucket_scan *sc, void *dst)
 	uint16_t stored;
 	int rc;
 
+#if CONFIG_BLOB_DB_READ_WINDOW > 0
+	/* Every caller stages into a sector buffer, so the CRC fits behind. */
+	rc = blob_db_store_read(poff, dst, (size_t)val_len + sizeof(stored));
+	if (rc < 0) {
+		return rc;
+	}
+	memcpy(&stored, (uint8_t *)dst + val_len, sizeof(stored));
+#else
 	if (val_len > 0) {
 		rc = blob_db_store_read(poff, dst, val_len);
 		if (rc < 0) {
@@ -1088,6 +1096,7 @@ static int slot_verify(uint16_t bid, const struct bucket_scan *sc, void *dst)
 	if (rc < 0) {
 		return rc;
 	}
+#endif
 	if (slot_crc16(&sc->target.hdr, sc->target.id, dst, val_len) != stored) {
 		return -EBADMSG;
 	}
@@ -1248,6 +1257,57 @@ static int confirm_cursor(uint16_t bid, uint64_t id, struct bucket_scan *sc)
 	return 0;
 }
 
+#if CONFIG_BLOB_DB_READ_WINDOW > 0 && defined(CONFIG_BLOB_DB_SLOT_INDEX)
+#define HAVE_SLOT_FETCH 1
+static uint8_t __aligned(4) g_win[CONFIG_BLOB_DB_READ_WINDOW];
+
+/* Fetch the slot at @p off of bucket @p bid -- head, payload and CRC -- with one
+ * windowed read (two when it is longer than the window), check it names @p id
+ * and verify its CRC. The payload goes to @p out (room for val_len + 2).
+ * Returns -EAGAIN for anything that is not an intact slot of @p id there. */
+static int slot_fetch(uint16_t bid, uint64_t id, uint32_t off, uint32_t limit,
+		      struct slot_head *sh, uint8_t *out)
+{
+	const size_t n = MIN((size_t)CONFIG_BLOB_DB_READ_WINDOW, st.peb_size - off);
+
+	if (n < sizeof(*sh) || off + BLOB_DB_SLOT_OVERHEAD > limit) {
+		return -EAGAIN;
+	}
+	int rc = blob_db_store_read(bucket_offset(bid) + off, g_win, n);
+
+	if (rc < 0) {
+		return rc;
+	}
+	memcpy(sh, g_win, sizeof(*sh));
+	if (sh->id != id || sh->hdr.flags == 0xff ||
+	    !(sh->hdr.flags & BLOB_DB_SLOT_F_SEALED) ||
+	    (sh->hdr.flags & ~(uint8_t)BLOB_DB_SLOT_F_KNOWN) ||
+	    sh->hdr.val_len > CONFIG_BLOB_DB_MAX_PAYLOAD_LEN ||
+	    off + slot_size_for(sh->hdr.val_len) > limit) {
+		return -EAGAIN;
+	}
+	const size_t need = (size_t)sh->hdr.val_len + sizeof(uint16_t);
+	const size_t have = n - sizeof(*sh);
+
+	if (need <= have) {
+		memcpy(out, g_win + sizeof(*sh), need);
+	} else {
+		memcpy(out, g_win + sizeof(*sh), have);
+		rc = blob_db_store_read(bucket_offset(bid) + off + n, out + have, need - have);
+		if (rc < 0) {
+			return rc;
+		}
+	}
+	uint16_t stored;
+
+	memcpy(&stored, out + sh->hdr.val_len, sizeof(stored));
+	if (slot_crc16(&sh->hdr, sh->id, out, sh->hdr.val_len) != stored) {
+		return -EAGAIN;
+	}
+	return 0;
+}
+#endif
+
 #if defined(CONFIG_BLOB_DB_SLOT_INDEX)
 /* The slot index's answer for @p id, checked against the slot it names: one
  * 12-byte read in place of the walk. -EAGAIN when the index has no answer, or
@@ -1264,6 +1324,21 @@ static int find_indexed_slot(uint16_t bid, uint64_t id,
 	struct slot_head sh;
 	int rc;
 
+#if defined(HAVE_SLOT_FETCH)
+	rc = slot_fetch(bid, id, off, cursor, &sh, dst);
+	if (rc == -EAGAIN) {
+		goto stale;
+	}
+	if (rc < 0) {
+		return rc;
+	}
+	sc->write_cursor = cursor;
+	sc->target_off = off;
+	sc->target = sh;
+	sc->from_index = true;
+	sc->tail_torn = false;
+	return (sh.hdr.flags & BLOB_DB_SLOT_F_TOMBSTONE) ? -ENOENT : 0;
+#endif
 	if (off + BLOB_DB_SLOT_OVERHEAD > cursor) {
 		goto stale;
 	}

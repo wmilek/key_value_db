@@ -353,6 +353,16 @@ config BLOB_DB_FRESH_BIND_FAST
 	  An id allocated since mount and never written has no slot, so the
 	  first update needs only the append cursor, not a search of the bucket.
 
+config BLOB_DB_READ_WINDOW
+	int "Bytes read at once when fetching a slot whose offset is known (0 = head, payload, CRC apart)"
+	default 0
+	range 0 2048
+	help
+	  With the slot index (or a delta chain) the offset of a slot is known
+	  before its length. A non-zero window reads this many bytes at the
+	  offset in one call, so a slot that fits costs one flash read instead
+	  of three; a longer one costs two.
+
 config BLOB_DB_SLOT_INDEX
 	bool "RAM index from blob id to its newest slot (opt-in; departs from P3)"
 	help
