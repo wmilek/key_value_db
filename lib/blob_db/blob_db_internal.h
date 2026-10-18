@@ -55,7 +55,7 @@
  * after a crash. Every record raises the ceiling to this many ids past the
  * next one (D14), so alloc_id needs a record of its own only when no other
  * record has carried the ceiling forward within the step. */
-#define BLOB_DB_ID_HINT_STEP      256
+#define BLOB_DB_ID_HINT_STEP      CONFIG_BLOB_DB_ID_HINT_STEP
 
 /* Slot flags. After erase the flags byte is 0xff, which trivially fails
  * the "is sealed" check. A slot is considered valid when it has the
