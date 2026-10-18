@@ -79,6 +79,15 @@ config BLOB_CONTAINER_KVHASH_MIN_BUCKET_BYTES
 	  this many buckets (at least 255). A set rewrites one whole bucket, so
 	  a smaller value means smaller rewrites and more bucket blobs.
 
+config BLOB_CONTAINER_KVHASH_REPLACE_IN_PLACE
+	bool "Replace an inline value of the same length where it is"
+	depends on BLOB_CONTAINER_KVHASH
+	help
+	  A set of an existing key with an inline value of the same length
+	  overwrites the value bytes in the bucket instead of moving the entry
+	  to the end, and writes nothing at all when the value is unchanged.
+	  Enumeration order does not depend on position within a bucket.
+
 config BLOB_CONTAINER_KVHASH_KEY_INLINE_MAX
 	int "Longest key stored inside its bucket"
 	default 32767

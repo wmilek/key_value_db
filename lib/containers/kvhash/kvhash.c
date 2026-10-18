@@ -995,6 +995,18 @@ static int kvhash_set(uint64_t root, const void *key, size_t klen,
 				return kv_update(old_vid, val, vlen);
 			}
 
+#if defined(CONFIG_BLOB_CONTAINER_KVHASH_REPLACE_IN_PLACE)
+			if (!old.kspill && !old.vspill && !kspill && !vspill &&
+			    old.len == ENTRY_HDR_LEN + klen + vlen) {
+				uint8_t *v = &bkt_buf[old.vpos];
+
+				if (vlen == 0 || memcmp(v, val, vlen) == 0) {
+					return 0;   /* unchanged */
+				}
+				memcpy(v, val, vlen);
+				return kv_update(bid, bkt_buf, used);
+			}
+#endif
 			/* Drop the old entry (in-place compaction). */
 			memmove(&bkt_buf[off], &bkt_buf[off + old.len],
 				used - off - old.len);
