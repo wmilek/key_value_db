@@ -363,6 +363,22 @@ config BLOB_DB_READ_WINDOW
 	  offset in one call, so a slot that fits costs one flash read instead
 	  of three; a longer one costs two.
 
+config BLOB_DB_ALLOC_FILL
+	bool "alloc_id targets the least-filled bucket"
+	help
+	  A blob lives in bucket id % N, and alloc_id is free to hand out any
+	  id above the last one. With this option it keeps handing out ids of
+	  one target bucket until that bucket's log is nearly full, then moves
+	  to the least-filled bucket it knows of. New blobs then pack together
+	  instead of spreading over every bucket: written-once data (log
+	  entries) dies together and its appends trigger no compactions. Ids
+	  stay strictly increasing but are no longer dense.
+
+config BLOB_DB_ALLOC_FILL_RESERVE
+	int "Bytes a target bucket keeps free for later tombstones and rewrites"
+	depends on BLOB_DB_ALLOC_FILL
+	default 640
+
 config BLOB_DB_DELTA
 	bool "Store a small change to a blob as a delta slot"
 	depends on BLOB_DB_LARGE_PAYLOADS

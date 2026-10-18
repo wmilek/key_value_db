@@ -122,8 +122,51 @@ static struct {
 	uint64_t  seg_owner;       /* segmented write in flight; 0 = none */
 	bool      wedged;          /* a torn compaction makes further writes unsafe */
 	uint64_t  fresh_floor;     /* next_id at mount: ids >= it were not on flash then */
+	uint16_t  alloc_target;    /* CONFIG_BLOB_DB_ALLOC_FILL: bucket new ids go to */
 	uint64_t  max_appended;    /* highest id given a slot since mount */
 } st;
+
+#if defined(CONFIG_BLOB_DB_ALLOC_FILL)
+/* Append cursor per bucket as last seen; 0 = not known yet. */
+static uint16_t g_fill[CONFIG_BLOB_DB_SLOT_INDEX_MAX_BUCKETS];
+
+static inline void fill_note(uint16_t bid, size_t cursor)
+{
+	if (bid < ARRAY_SIZE(g_fill)) {
+		g_fill[bid] = (uint16_t)cursor;
+	}
+}
+
+/* Room a new blob can count on in @p bid. */
+static inline bool fill_has_room(uint16_t bid)
+{
+	const size_t limit = st.peb_size - CONFIG_BLOB_DB_ALLOC_FILL_RESERVE - 160;
+
+	return g_fill[bid] != 0 && g_fill[bid] < limit;
+}
+
+/* The bucket the next id goes to: the current target while it has room,
+ * else the least-filled bucket known. -1 when nothing known has room. */
+static int fill_target(void)
+{
+	if (st.alloc_target < st.n_buckets && fill_has_room(st.alloc_target)) {
+		return st.alloc_target;
+	}
+	int best = -1;
+
+	for (uint16_t b = 0; b < MIN(st.n_buckets, ARRAY_SIZE(g_fill)); b++) {
+		if (fill_has_room(b) && (best < 0 || g_fill[b] < g_fill[best])) {
+			best = b;
+		}
+	}
+	if (best >= 0) {
+		st.alloc_target = (uint16_t)best;
+	}
+	return best;
+}
+#else
+#define fill_note(bid, cursor) do { } while (0)
+#endif
 
 static inline off_t peb_offset(uint16_t peb)
 {
@@ -935,6 +978,7 @@ static int format_bucket(uint16_t bid)
 		blob_db_sidx_forget(bid);
 	} else {
 		blob_db_sidx_begin(bid, BLOB_DB_BUCKET_DATA_OFF);
+		fill_note(bid, BLOB_DB_BUCKET_DATA_OFF);
 	}
 	return rc;
 }
@@ -1059,6 +1103,7 @@ static int scan_bucket_for(uint16_t bid, uint64_t target_id, off_t limit,
 	}
 
 	out->write_cursor = cursor;
+	fill_note(bid, cursor);
 	return 0;
 }
 
@@ -1763,6 +1808,7 @@ static int append_slot2(uint16_t bid, off_t write_cursor, uint64_t id,
 
 		blob_db_sidx_note(bid, id, (uint32_t)write_cursor,
 				  (uint32_t)total, tomb);
+		fill_note(bid, write_cursor + total);
 	}
 	return rc;
 }
@@ -2054,6 +2100,9 @@ static int compact_bucket(uint16_t bid)
 	IO_CAUSE_BYTES(bytes_compacted, new_len);
 
 	rc = compact_commit(bid, g_bbuf_new, new_len);
+	if (rc == 0) {
+		fill_note(bid, new_len);
+	}
 
 	/* Every slot moved. The image is still in RAM, so re-index it from
 	 * there rather than leave the bucket's lookups to walk. */
@@ -3027,16 +3076,23 @@ uint64_t blob_db_alloc_id(void)
 	/* Guarantee durability before returning: the id we hand out must be
 	 * strictly below a persisted ceiling, so a crash before it is ever
 	 * bound cannot let a later mount re-issue it (contract §2, §13.1). */
-	if (st.next_id >= st.next_id_hint) {
-		int rc = persist_next_id_hint(st.next_id + 1 +
-					      BLOB_DB_ID_HINT_STEP);
+	uint64_t id = st.next_id;
+
+#if defined(CONFIG_BLOB_DB_ALLOC_FILL)
+	const int target = fill_target();
+
+	if (target >= 0) {
+		id += ((uint64_t)target + st.n_buckets - id % st.n_buckets) %
+		      st.n_buckets;
+	}
+#endif
+	if (id >= st.next_id_hint) {
+		int rc = persist_next_id_hint(id + 1 + BLOB_DB_ID_HINT_STEP);
 		if (rc < 0) {
 			LOG_ERR("alloc_id: cannot persist ceiling: %d", rc);
 			return 0;
 		}
 	}
-
-	const uint64_t id = st.next_id;
 
 	st.next_id = id + 1;
 	LOG_DBG("alloc_id -> %llu (ceiling %llu)",
