@@ -112,6 +112,10 @@ static inline void idx_invalidate(void);
  * (CONFIG_NORDIC_QSPI_NOR_STACK_WRITE_BUFFER_SIZE), one program per word.
  * On the nRF5340-DK an unaligned staging buffer made writes 4.3x slower. */
 static uint8_t __aligned(4) g_bbuf[BLOB_DB_SECTOR_BUF_MAX];
+#if defined(CONFIG_BLOB_DB_DELTA)
+/* Compaction's untouched copy of the old image (see build_compacted_image). */
+static uint8_t __aligned(4) g_cbuf[BLOB_DB_SECTOR_BUF_MAX];
+#endif
 
 /* Largest slot append_slot2() can stage: the biggest payload, its overhead,
  * padded to the largest write unit open accepts. Every write_align open
@@ -1879,7 +1883,7 @@ static int walk_cursor(uint16_t bid, uint64_t id, off_t *cursor)
 }
 #endif
 
-#if CONFIG_BLOB_DB_READ_WINDOW > 0 && defined(CONFIG_BLOB_DB_SLOT_INDEX)
+#if CONFIG_BLOB_DB_READ_WINDOW > 0 && (defined(CONFIG_BLOB_DB_SLOT_INDEX) || defined(CONFIG_BLOB_DB_DELTA))
 #define HAVE_SLOT_FETCH 1
 static uint8_t __aligned(4) g_win[CONFIG_BLOB_DB_READ_WINDOW];
 
@@ -2021,6 +2025,243 @@ stale:
 }
 #endif
 
+#if defined(CONFIG_BLOB_DB_DELTA)
+/* What find_live_slot() last found when the newest slot was a delta (else the
+ * newest slot itself): chain length, and the full slot at the bottom. After a
+ * delta was materialized, g_delta_tmp still holds that base value. */
+static uint8_t g_found_depth;
+static off_t g_found_base_off;
+static uint16_t g_found_base_len;
+static uint8_t __aligned(4) g_delta_tmp[CONFIG_BLOB_DB_MAX_PAYLOAD_LEN + 16];
+
+/* Delta payload: [u16 prev_off][varint pre][varint suf][changed bytes]. The
+ * value's length is pre + suf + changed; the chain's depth is counted, not
+ * stored. */
+struct delta {
+	uint16_t prev_off;
+	uint16_t pre, suf;
+	const uint8_t *mid;
+	uint16_t mid_len;
+};
+
+static size_t varint_put(uint8_t *p, uint32_t v)
+{
+	size_t n = 0;
+
+	while (v >= 0x80) {
+		p[n++] = (uint8_t)(v | 0x80);
+		v >>= 7;
+	}
+	p[n++] = (uint8_t)v;
+	return n;
+}
+
+static int varint_get(const uint8_t *p, size_t len, size_t *at, uint16_t *out)
+{
+	uint32_t v = 0;
+
+	for (int shift = 0; shift <= 14; shift += 7) {
+		if (*at >= len) {
+			return -EIO;
+		}
+		const uint8_t b = p[(*at)++];
+
+		v |= (uint32_t)(b & 0x7f) << shift;
+		if (!(b & 0x80)) {
+			if (v > 0xffff) {
+				return -EIO;
+			}
+			*out = (uint16_t)v;
+			return 0;
+		}
+	}
+	return -EIO;
+}
+
+static size_t delta_hdr_put(uint8_t *p, uint16_t prev_off, uint16_t pre, uint16_t suf)
+{
+	sys_put_le16(prev_off, p);
+	size_t n = 2;
+
+	n += varint_put(p + n, pre);
+	n += varint_put(p + n, suf);
+	return n;
+}
+
+static int delta_parse(const uint8_t *p, uint16_t len, struct delta *d)
+{
+	size_t at = 2;
+
+	if (len < 4) {
+		return -EIO;
+	}
+	d->prev_off = sys_get_le16(p);
+	if (varint_get(p, len, &at, &d->pre) || varint_get(p, len, &at, &d->suf)) {
+		return -EIO;
+	}
+	d->mid = p + at;
+	d->mid_len = (uint16_t)(len - at);
+	return 0;
+}
+
+/* Apply one delta to the value in @p val (room for MAX_PAYLOAD_LEN). */
+static int delta_apply(uint8_t *val, uint16_t *len, const struct delta *d)
+{
+	const uint32_t new_len = (uint32_t)d->pre + d->suf + d->mid_len;
+
+	if ((uint32_t)d->pre + d->suf > *len || new_len > CONFIG_BLOB_DB_MAX_PAYLOAD_LEN) {
+		return -EIO;
+	}
+	if (d->suf > 0) {
+		memmove(val + d->pre + d->mid_len, val + *len - d->suf, d->suf);
+	}
+	if (d->mid_len > 0) {
+		memcpy(val + d->pre, d->mid, d->mid_len);
+	}
+	*len = (uint16_t)new_len;
+	return 0;
+}
+
+#if !defined(HAVE_SLOT_FETCH)
+/* The slot at @p off of bucket @p bid, read whole into g_delta_tmp and checked. */
+static int slot_fetch(uint16_t bid, uint64_t id, uint32_t off, uint32_t limit,
+		      struct slot_head *sh, uint8_t *out)
+{
+	int rc = blob_db_store_read(bucket_offset(bid) + off, sh, sizeof(*sh));
+
+	if (rc < 0) {
+		return rc;
+	}
+	if (sh->id != id || !(sh->hdr.flags & BLOB_DB_SLOT_F_SEALED) ||
+	    (sh->hdr.flags & ~(uint8_t)BLOB_DB_SLOT_F_KNOWN) ||
+	    sh->hdr.val_len > CONFIG_BLOB_DB_MAX_PAYLOAD_LEN ||
+	    off + slot_size_for(sh->hdr.val_len) > limit) {
+		return -EAGAIN;
+	}
+	rc = blob_db_store_read(bucket_offset(bid) + off + sizeof(*sh), out,
+				sh->hdr.val_len + sizeof(uint16_t));
+	if (rc < 0) {
+		return rc;
+	}
+	uint16_t stored;
+
+	memcpy(&stored, out + sh->hdr.val_len, sizeof(stored));
+	return slot_crc16(&sh->hdr, sh->id, out, sh->hdr.val_len) == stored ? 0 : -EAGAIN;
+}
+#endif
+
+/* @p sc names a verified DELTA slot whose payload is in @p dst: rebuild the
+ * value it describes into @p dst by following the chain to a full slot.
+ *
+ * Each link is fetched once. Delta payloads are kept, newest first, in the
+ * compaction copy (g_cbuf, free outside compaction) and
+ * applied oldest first onto the full value fetched into @p dst. */
+static int delta_materialize(uint16_t bid, uint64_t id, struct bucket_scan *sc,
+			     uint8_t *dst)
+{
+	struct { uint16_t at; uint16_t len; } link[CONFIG_BLOB_DB_DELTA_MAX_CHAIN + 1];
+	uint8_t *cache = g_cbuf;
+	size_t used;
+	int n = 0;
+	uint16_t len = 0;
+	uint32_t at = (uint32_t)sc->target_off;
+	const uint16_t plen = sc->target.hdr.val_len;
+	struct delta d;
+
+	if (delta_parse(dst, plen, &d) < 0) {
+		return -EIO;
+	}
+	memcpy(cache, dst, plen);
+	link[n].at = 0;
+	link[n++].len = plen;
+	used = plen;
+
+	for (;;) {
+		if (d.prev_off >= at || n > CONFIG_BLOB_DB_DELTA_MAX_CHAIN) {
+			return -EIO;
+		}
+		at = d.prev_off;
+
+		struct slot_head sh;
+		int rc = slot_fetch(bid, id, at, st.peb_size, &sh, g_delta_tmp);
+
+		IO_CAUSE(delta_links);
+		if (rc == -EAGAIN) {
+			return -EIO;
+		}
+		if (rc < 0) {
+			return rc;
+		}
+		if (sh.hdr.flags & BLOB_DB_SLOT_F_TOMBSTONE) {
+			return -EIO;
+		}
+		if (!(sh.hdr.flags & BLOB_DB_SLOT_F_DELTA)) {
+			memcpy(dst, g_delta_tmp, sh.hdr.val_len);
+			len = sh.hdr.val_len;
+			g_found_base_off = at;
+			g_found_base_len = len;
+			break;
+		}
+		if (used + sh.hdr.val_len > st.peb_size ||
+		    delta_parse(g_delta_tmp, sh.hdr.val_len, &d) < 0) {
+			return -EIO;
+		}
+		memcpy(cache + used, g_delta_tmp, sh.hdr.val_len);
+		link[n].at = (uint16_t)used;
+		link[n++].len = sh.hdr.val_len;
+		used += sh.hdr.val_len;
+	}
+	g_found_depth = (uint8_t)n;
+
+	for (int i = n - 1; i >= 0; i--) {
+		if (delta_parse(cache + link[i].at, link[i].len, &d) < 0 ||
+		    delta_apply(dst, &len, &d) < 0) {
+			return -EIO;
+		}
+	}
+	sc->target.hdr.val_len = len;
+	return 0;
+}
+
+/* The same over a bucket image in RAM: rebuild the value of the DELTA slot at
+ * @p off into @p out. */
+static int delta_materialize_ram(const uint8_t *buf, off_t off, uint8_t *out, uint16_t *len)
+{
+	uint32_t chain[CONFIG_BLOB_DB_DELTA_MAX_CHAIN + 1];
+	int n = 0;
+	struct slot_view sv;
+	off_t at = off;
+	struct delta d;
+
+	for (;;) {
+		if (n > CONFIG_BLOB_DB_DELTA_MAX_CHAIN || !slot_view_at(buf, at, &sv)) {
+			return -EIO;
+		}
+		chain[n++] = (uint32_t)at;
+		const uint8_t *p = buf + at + sizeof(struct blob_db_slot_hdr) + sizeof(uint64_t);
+
+		if (!(sv.flags & BLOB_DB_SLOT_F_DELTA)) {
+			memcpy(out, p, sv.val_len);
+			*len = sv.val_len;
+			break;
+		}
+		if (delta_parse(p, sv.val_len, &d) < 0 || d.prev_off >= (uint32_t)at) {
+			return -EIO;
+		}
+		at = d.prev_off;
+	}
+	for (int i = n - 2; i >= 0; i--) {
+		slot_view_at(buf, chain[i], &sv);
+		const uint8_t *p = buf + chain[i] + sizeof(struct blob_db_slot_hdr) + sizeof(uint64_t);
+
+		if (delta_parse(p, sv.val_len, &d) < 0 || delta_apply(out, len, &d) < 0) {
+			return -EIO;
+		}
+	}
+	return 0;
+}
+#endif /* CONFIG_BLOB_DB_DELTA */
+
 /* Find the newest *intact* slot for `id`, staging its payload in `dst`.
  *
  * Retries below a slot that fails its CRC, so the visible value is the newest
@@ -2033,14 +2274,23 @@ stale:
 static int find_live_slot(uint16_t bid, uint64_t id, struct bucket_scan *sc,
 			  void *dst)
 {
-#if defined(CONFIG_BLOB_DB_SLOT_INDEX)
-	int irc = find_indexed_slot(bid, id, sc, dst);
+	int rc = -EAGAIN;
 
-	if (irc != -EAGAIN) {
-		return irc;
+#if defined(CONFIG_BLOB_DB_SLOT_INDEX)
+	rc = find_indexed_slot(bid, id, sc, dst);
+#endif
+	if (rc == -EAGAIN) {
+		rc = walk_live_slot(bid, id, sc, dst, true);
+	}
+#if defined(CONFIG_BLOB_DB_DELTA)
+	g_found_depth = 0;
+	g_found_base_off = sc->target_off;
+	g_found_base_len = sc->target.hdr.val_len;
+	if (rc == 0 && (sc->target.hdr.flags & BLOB_DB_SLOT_F_DELTA)) {
+		rc = delta_materialize(bid, id, sc, dst);
 	}
 #endif
-	return walk_live_slot(bid, id, sc, dst, true);
+	return rc;
 }
 
 /* Build and write a slot at bucket+write_cursor. Slot size on flash is
@@ -2161,12 +2411,17 @@ static int append_slot2(uint16_t bid, off_t write_cursor, uint64_t id,
  * The old image is gone from RAM afterwards, but it is still on flash: the
  * caller commits through the scratch sector or an atomic replace, and on any
  * error before that the bucket is unchanged and buf is just scratch. */
-static size_t build_compacted_image(uint8_t *buf, uint16_t bid, off_t *stop)
+/* src is the image to walk; it is buf itself (in place) unless delta slots
+ * are on, where a chain is materialized from the untouched copy in src: a
+ * full value can be longer than the delta it replaces, and a chain's base
+ * sits behind it, where the in-place rewrite has already written. */
+static size_t build_compacted_image(const uint8_t *src, uint8_t *buf,
+				    uint16_t bid, off_t *stop)
 {
 	struct blob_db_bucket_hdr *bhdr = (struct blob_db_bucket_hdr *)buf;
 
 	/* The header is rewritten in place, so take the old generation first. */
-	const uint32_t old_gen = bhdr->gen;
+	const uint32_t old_gen = ((const struct blob_db_bucket_hdr *)src)->gen;
 
 	off_t new_cursor = BLOB_DB_BUCKET_DATA_OFF;
 	off_t cursor     = BLOB_DB_BUCKET_DATA_OFF;
@@ -2175,14 +2430,53 @@ static size_t build_compacted_image(uint8_t *buf, uint16_t bid, off_t *stop)
 		struct slot_view sv;
 		bool intact;
 
-		if (!slot_walk_at(buf, cursor, &sv, &intact)) {
+		if (!slot_walk_at(src, cursor, &sv, &intact)) {
 			break;
 		}
 
 		if (intact && !(sv.flags & BLOB_DB_SLOT_F_TOMBSTONE) &&
-		    !slot_superseded(buf, cursor, &sv)) {
-			if (new_cursor != cursor) {
-				memmove(buf + new_cursor, buf + cursor,
+		    !slot_superseded(src, cursor, &sv)) {
+#if defined(CONFIG_BLOB_DB_DELTA)
+			if (sv.flags & BLOB_DB_SLOT_F_DELTA) {
+				/* Write the value the chain describes as one
+				 * full slot; the chain dies with this image. */
+				uint8_t *slot = buf + new_cursor;
+				uint8_t *val = slot + sizeof(struct blob_db_slot_hdr) +
+					       sizeof(uint64_t);
+				uint16_t len = 0;
+
+				if (delta_materialize_ram(src, cursor, g_delta_tmp,
+							  &len) == 0) {
+					struct blob_db_slot_hdr *h =
+						(struct blob_db_slot_hdr *)slot;
+
+					h->flags = BLOB_DB_SLOT_F_SEALED;
+					h->reserved = 0;
+					h->val_len = len;
+					memcpy(slot + sizeof(*h), &sv.id, sizeof(sv.id));
+					memcpy(val, g_delta_tmp, len);
+
+					uint16_t crc = slot_crc16(h, sv.id, val, len);
+
+					memcpy(val + len, &crc, sizeof(crc));
+					const size_t total = slot_size_for(len);
+					const size_t base = BLOB_DB_SLOT_OVERHEAD + len;
+
+					if (total > base) {
+						memset(slot + base, 0xff, total - base);
+					}
+					new_cursor += total;
+				} else {
+					LOG_ERR("compact bid=%u: delta chain of id %llu "
+						"broken; dropped", bid,
+						(unsigned long long)sv.id);
+				}
+				cursor += sv.total_size;
+				continue;
+			}
+#endif
+			if (new_cursor != cursor || src != buf) {
+				memmove(buf + new_cursor, src + cursor,
 					sv.total_size);
 			}
 			new_cursor += sv.total_size;
@@ -2386,10 +2680,16 @@ static int compact_bucket(uint16_t bid)
 	}
 
 	off_t stop;
-	const size_t new_len = build_compacted_image(g_bbuf, bid, &stop);
+#if defined(CONFIG_BLOB_DB_DELTA)
+	memcpy(g_cbuf, g_bbuf, st.peb_size);
+	const uint8_t *src = g_cbuf;
+#else
+	const uint8_t *src = g_bbuf;
+#endif
+	const size_t new_len = build_compacted_image(src, g_bbuf, bid, &stop);
 
 	/* Reads only from stop on, which the in-place rewrite left alone. */
-	rc = compaction_may_drop_tail(bid, g_bbuf, stop);
+	rc = compaction_may_drop_tail(bid, src, stop);
 	if (rc < 0) {
 		return rc;
 	}
@@ -3500,6 +3800,21 @@ static int get_impl(uint64_t id, void *out, size_t out_sz, size_t *out_len)
 	if (out_len) {
 		*out_len = sc.target.hdr.val_len;
 	}
+#if defined(CONFIG_BLOB_DB_DELTA) && CONFIG_BLOB_DB_DELTA_REBASE_AGE > 0
+	/* A delta nobody has rewritten for a while is read for nothing on every
+	 * get: write the value it describes as a full slot, while there is room
+	 * without a compaction. Best effort; the read already succeeded. */
+	if (g_found_depth > 0 && !st.wedged &&
+	    sc.write_cursor - sc.target_off >= CONFIG_BLOB_DB_DELTA_REBASE_AGE &&
+	    sc.write_cursor + slot_size_for(sc.target.hdr.val_len) <= st.peb_size &&
+	    confirm_cursor(bid, id, &sc) == 0 &&
+	    sc.write_cursor + slot_size_for(sc.target.hdr.val_len) <= st.peb_size) {
+		if (append_slot(bid, sc.write_cursor, id, 0, g_bbuf,
+				sc.target.hdr.val_len) == 0) {
+			IO_CAUSE(delta_rebased_on_read);
+		}
+	}
+#endif
 	return 0;
 }
 
@@ -3567,6 +3882,12 @@ static int update_impl(uint64_t id, const void *payload, size_t len)
 	uint16_t old_k = 0;
 #endif
 
+#if defined(CONFIG_BLOB_DB_DELTA)
+	bool delta_ok = false;
+	uint16_t old_len = 0;
+	off_t old_off = -1;
+	const uint8_t *delta_from = NULL;
+#endif
 	if (!formatted) {
 		rc = format_bucket(bid);
 		if (rc < 0) {
@@ -3613,6 +3934,23 @@ static int update_impl(uint64_t id, const void *payload, size_t len)
 		    (sc.target.hdr.flags & BLOB_DB_SLOT_F_SEGMENT)) {
 			return -EINVAL;   /* an internal id — see §6.6 */
 		}
+#if defined(CONFIG_BLOB_DB_DELTA)
+		delta_ok = rc == 0 && len <= CONFIG_BLOB_DB_MAX_PAYLOAD_LEN &&
+			!(sc.target.hdr.flags & BLOB_DB_SLOT_F_INDEXED);
+#if defined(CONFIG_BLOB_DB_DELTA_BASE)
+		/* Against the full slot at the bottom: never more than one
+		 * delta to read. g_delta_tmp holds it when the newest was a
+		 * delta; else the newest is the base and sits in g_bbuf. */
+		delta_from = (g_found_depth > 0) ? g_delta_tmp : g_bbuf;
+		old_len = g_found_base_len;
+		old_off = g_found_base_off;
+#else
+		delta_ok = delta_ok && g_found_depth < CONFIG_BLOB_DB_DELTA_MAX_CHAIN;
+		delta_from = g_bbuf;
+		old_len = sc.target.hdr.val_len;
+		old_off = sc.target_off;
+#endif
+#endif
 #if defined(CONFIG_BLOB_DB_SKIP_IDENTICAL)
 		if (rc == 0 && len <= CONFIG_BLOB_DB_MAX_PAYLOAD_LEN &&
 		    !(sc.target.hdr.flags & BLOB_DB_SLOT_F_INDEXED) &&
@@ -3660,6 +3998,39 @@ static int update_impl(uint64_t id, const void *payload, size_t len)
 	}
 #endif
 
+#if defined(CONFIG_BLOB_DB_DELTA)
+	/* Before any compaction: the old value is still staged, and a delta
+	 * that fits needs no room the full slot would. */
+	if (delta_ok && old_off >= 0 && old_off < write_cursor) {
+		const uint8_t *nv = payload;
+		const uint8_t *ov = delta_from;
+		uint16_t pre = 0, suf = 0;
+		const uint16_t lim = MIN(old_len, (uint16_t)len);
+
+		while (pre < lim && ov[pre] == nv[pre]) {
+			pre++;
+		}
+		while (suf < lim - pre && ov[old_len - 1 - suf] == nv[len - 1 - suf]) {
+			suf++;
+		}
+		const uint16_t mid = (uint16_t)(len - pre - suf);
+		uint8_t hdr[8];
+		const size_t hlen = delta_hdr_put(hdr, (uint16_t)old_off, pre, suf);
+		const size_t dsz = hlen + mid;
+#if defined(CONFIG_BLOB_DB_DELTA_BASE)
+		const bool pays = dsz * 100 < (size_t)CONFIG_BLOB_DB_DELTA_BASE_PCT * len;
+#else
+		const bool pays = dsz + 8 < len;
+#endif
+
+		if (pays && write_cursor + slot_size_for((uint16_t)dsz) <= st.peb_size) {
+			IO_CAUSE(delta_slots);
+			return append_slot2(bid, write_cursor, id, BLOB_DB_SLOT_F_DELTA,
+					    hdr, (uint16_t)hlen, nv + pre, (uint16_t)dsz);
+		}
+		IO_CAUSE(delta_rebased);
+	}
+#endif
 	const size_t ssz = slot_size_for((uint16_t)len);
 
 	if (write_cursor + ssz > st.peb_size) {
@@ -3908,7 +4279,18 @@ static int for_each_live_slot(const uint8_t *buf,
 			const uint8_t *payload = buf + cursor +
 						 sizeof(struct blob_db_slot_hdr) +
 						 sizeof(uint64_t);
-			int r = cb(sv.id, payload, sv.val_len, user);
+			uint16_t plen = sv.val_len;
+#if defined(CONFIG_BLOB_DB_DELTA)
+			/* Report the value a chain describes, not the delta. */
+			if (sv.flags & BLOB_DB_SLOT_F_DELTA) {
+				if (delta_materialize_ram(buf, cursor, g_delta_tmp, &plen) < 0) {
+					cursor += sv.total_size;
+					continue;
+				}
+				payload = g_delta_tmp;
+			}
+#endif
+			int r = cb(sv.id, payload, plen, user);
 
 			if (r) {
 				return r;

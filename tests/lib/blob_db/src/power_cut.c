@@ -276,6 +276,14 @@ static void scenario_build(void)
 	sc.gen = bs.gen;
 	val_make(sc.old_val, "old", n);
 	val_make(sc.new_val, "new", 0);
+	/* Differ in every byte, so the update is a full slot that has to
+	 * compact even where small changes are stored as deltas
+	 * (CONFIG_BLOB_DB_DELTA). */
+	for (int i = 0; i < VAL_LEN; i++) {
+		if (sc.new_val[i] == sc.old_val[i]) {
+			sc.new_val[i] ^= 0xa5;
+		}
+	}
 
 	zassert_ok(blob_db_unmount());
 	flash_save();
