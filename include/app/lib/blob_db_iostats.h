@@ -65,6 +65,10 @@ struct blob_db_iostats {
 				  *   atomically, the scratch block twice) */
 	uint64_t bytes_compacted;/**< live bytes those compactions rewrote —
 				  *   the write amplification garbage costs */
+	uint32_t delta_slots;  /**< updates written as a delta slot */
+	uint32_t delta_rebased; /**< updates a delta did not pay for: written full */
+	uint32_t delta_rebased_on_read; /**< deltas a get rewrote in full */
+	uint32_t delta_links;  /**< older chain slots read to rebuild a value */
 	uint32_t skipped_identical; /**< updates not written: payload equal to the live one */
 };
 

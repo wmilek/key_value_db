@@ -363,6 +363,48 @@ config BLOB_DB_READ_WINDOW
 	  offset in one call, so a slot that fits costs one flash read instead
 	  of three; a longer one costs two.
 
+config BLOB_DB_DELTA
+	bool "Store a small change to a blob as a delta slot"
+	depends on BLOB_DB_LARGE_PAYLOADS
+	help
+	  An update that changes one contiguous part of the live value is
+	  appended as a DELTA slot -- the previous slot's offset, how many
+	  leading and trailing bytes are kept, and the bytes in between --
+	  instead of the whole value. Reads follow the chain back to a full
+	  slot; compaction writes the materialized value as a full slot.
+	  On-flash format change.
+
+config BLOB_DB_DELTA_MAX_CHAIN
+	int "Longest chain of deltas before a full rewrite"
+	depends on BLOB_DB_DELTA
+	default 8
+	range 1 32
+
+config BLOB_DB_DELTA_REBASE_AGE
+	int "A get rewrites a delta in full once this many bytes followed it in its bucket (0 = never)"
+	depends on BLOB_DB_DELTA
+	default 0
+	help
+	  A delta costs a read on every get until its bucket is compacted. A
+	  get that finds a delta with at least this many bytes appended after
+	  it -- a value that has stopped changing -- appends the value as a
+	  full slot when that needs no compaction.
+
+config BLOB_DB_DELTA_BASE
+	bool "Diff against the full slot, not the previous delta"
+	depends on BLOB_DB_DELTA
+	help
+	  Each delta describes the change from the id's last full slot, so a
+	  read never follows more than one delta, however many updates there
+	  were. A delta that grows past BLOB_DB_DELTA_BASE_PCT of the value is
+	  replaced by a full slot.
+
+config BLOB_DB_DELTA_BASE_PCT
+	int "A base delta is written only while smaller than this % of the value"
+	depends on BLOB_DB_DELTA_BASE
+	default 50
+	range 1 100
+
 config BLOB_DB_SLOT_INDEX
 	bool "RAM index from blob id to its newest slot (opt-in; departs from P3)"
 	help

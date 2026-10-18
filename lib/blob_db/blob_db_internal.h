@@ -81,6 +81,10 @@
  * introducing them is a MAJOR format change. */
 #define BLOB_DB_SLOT_F_INDEXED    (1u << 2)
 #define BLOB_DB_SLOT_F_SEGMENT    (1u << 3)
+/* CONFIG_BLOB_DB_DELTA: the payload is [u16 prev_off][varint pre][varint suf] and the
+ * changed bytes, applied to the id's previous slot in the same bucket. */
+#define BLOB_DB_SLOT_F_DELTA      (1u << 4)
+
 
 /* Every flag bit this version understands. A slot carrying a bit outside this
  * mask was written by software we do not understand, and its payload must not
@@ -91,7 +95,11 @@
  * refuses the store before any slot is read (§ format version above). The mask
  * covers the case where that discipline is broken.
  */
-#ifdef CONFIG_BLOB_DB_LARGE_PAYLOADS
+#if defined(CONFIG_BLOB_DB_DELTA)
+#define BLOB_DB_SLOT_F_KNOWN                                                   \
+	(BLOB_DB_SLOT_F_SEALED | BLOB_DB_SLOT_F_TOMBSTONE |                    \
+	 BLOB_DB_SLOT_F_INDEXED | BLOB_DB_SLOT_F_SEGMENT | BLOB_DB_SLOT_F_DELTA)
+#elif defined(CONFIG_BLOB_DB_LARGE_PAYLOADS)
 #define BLOB_DB_SLOT_F_KNOWN                                                   \
 	(BLOB_DB_SLOT_F_SEALED | BLOB_DB_SLOT_F_TOMBSTONE |                    \
 	 BLOB_DB_SLOT_F_INDEXED | BLOB_DB_SLOT_F_SEGMENT)
