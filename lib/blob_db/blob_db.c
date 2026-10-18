@@ -2804,6 +2804,15 @@ int blob_db_update(uint64_t id, const void *payload, size_t len)
 		    (sc.target.hdr.flags & BLOB_DB_SLOT_F_SEGMENT)) {
 			return -EINVAL;   /* an internal id — see §6.6 */
 		}
+#if defined(CONFIG_BLOB_DB_SKIP_IDENTICAL)
+		if (rc == 0 && len <= CONFIG_BLOB_DB_MAX_PAYLOAD_LEN &&
+		    !(sc.target.hdr.flags & BLOB_DB_SLOT_F_INDEXED) &&
+		    sc.target.hdr.val_len == len &&
+		    (len == 0 || memcmp(g_bbuf, payload, len) == 0)) {
+			IO_CAUSE(skipped_identical);
+			return 0;   /* latest-wins would make the append a no-op */
+		}
+#endif
 
 		const bool indexed =
 			(rc == 0) &&

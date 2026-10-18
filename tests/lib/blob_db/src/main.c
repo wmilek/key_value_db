@@ -2988,8 +2988,11 @@ ZTEST(blob_db, test_inspect_compaction_reclaims_garbage)
 	uint64_t id = put_blob(v, sizeof(v));
 	const uint16_t bid = id % in.n_buckets;
 
-	/* Rebind until the bucket has compacted at least once. */
+	/* Rebind until the bucket has compacted at least once. Each rebind
+	 * changes a byte: an identical one may be skipped
+	 * (CONFIG_BLOB_DB_SKIP_IDENTICAL) and would never fill the bucket. */
 	do {
+		v[0]++;
 		zassert_ok(blob_db_update(id, v, sizeof(v)));
 		zassert_ok(blob_db_inspect_bucket_get(bid, &bs, NULL, NULL));
 	} while (bs.gen == 1);

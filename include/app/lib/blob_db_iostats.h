@@ -65,6 +65,7 @@ struct blob_db_iostats {
 				  *   atomically, the scratch block twice) */
 	uint64_t bytes_compacted;/**< live bytes those compactions rewrote —
 				  *   the write amplification garbage costs */
+	uint32_t skipped_identical; /**< updates not written: payload equal to the live one */
 };
 
 /** @brief Snapshot the counters. */
