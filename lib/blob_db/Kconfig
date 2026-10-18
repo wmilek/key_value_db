@@ -336,6 +336,16 @@ config BLOB_DB_SKIP_IDENTICAL
 	  segmented index). When the new payload is byte-identical, nothing is
 	  written: latest-wins makes the append a no-op anyway.
 
+config BLOB_DB_WALK_CHUNK
+	int "Bytes read per step of a bucket walk (0 = one 12 B read per slot)"
+	default 0
+	range 0 4096
+	help
+	  A walk reads every slot head of a bucket. With 0 that is one small
+	  read per slot, each paying the flash's fixed per-command cost. A
+	  non-zero value reads this many bytes at a time and parses the slot
+	  heads in RAM.
+
 config BLOB_DB_SLOT_INDEX
 	bool "RAM index from blob id to its newest slot (opt-in; departs from P3)"
 	help
