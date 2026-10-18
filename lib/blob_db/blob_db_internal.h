@@ -67,7 +67,7 @@
  * next_id = next_id_hint, so an allocated-but-unbound id is never re-issued
  * after a crash. alloc_id persists a fresh ceiling this many ids ahead
  * whenever the current one is reached, amortizing the master write. */
-#define BLOB_DB_ID_HINT_STEP      256
+#define BLOB_DB_ID_HINT_STEP      CONFIG_BLOB_DB_ID_HINT_STEP
 
 /* Slot flags. After erase the flags byte is 0xff, which trivially fails
  * the "is sealed" check. A slot is considered valid when it has the

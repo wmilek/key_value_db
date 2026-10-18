@@ -319,6 +319,15 @@ config BLOB_DB_SECTOR_BUF_SIZE
 	  target flash's largest sector — e.g. 65536 for the mx25r64 QSPI
 	  NOR on the nRF5340-DK.
 
+config BLOB_DB_ID_HINT_STEP
+	int "Ids allocated per persisted id ceiling"
+	default 256
+	range 1 1048576
+	help
+	  alloc_id persists a new id ceiling (one master write, which on UBI is a
+	  block erase) every this many allocations. The id space is 64-bit, so a
+	  larger step costs nothing but ids skipped after a crash.
+
 config BLOB_DB_SLOT_INDEX
 	bool "RAM index from blob id to its newest slot (opt-in; departs from P3)"
 	help
