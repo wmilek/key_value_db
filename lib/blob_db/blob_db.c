@@ -120,6 +120,8 @@ static struct {
 	uint64_t  next_id_hint;    /* durable leading ceiling (see internal.h) */
 	uint64_t  seg_owner;       /* segmented write in flight; 0 = none */
 	bool      wedged;          /* a torn compaction makes further writes unsafe */
+	uint64_t  fresh_floor;     /* next_id at mount: ids >= it were not on flash then */
+	uint64_t  max_appended;    /* highest id given a slot since mount */
 } st;
 
 static inline off_t peb_offset(uint16_t peb)
@@ -772,6 +774,8 @@ int blob_db_mount(void)
 	}
 #endif
 
+	st.fresh_floor = st.next_id;
+	st.max_appended = 0;
 	LOG_INF("mount ok; next_id=%llu", st.next_id);
 	return 0;
 
@@ -1417,6 +1421,10 @@ static int append_slot2(uint16_t bid, off_t write_cursor, uint64_t id,
 		LOG_ERR("write_align %zu exceeds BLOB_DB_MAX_WRITE_ALIGN=%u",
 			st.write_align, BLOB_DB_MAX_WRITE_ALIGN);
 		return -ENOTSUP;
+	}
+
+	if (id > st.max_appended) {
+		st.max_appended = id;
 	}
 
 	int rc = blob_db_store_write(bucket_offset(bid) + write_cursor,
@@ -2821,7 +2829,19 @@ int blob_db_update(uint64_t id, const void *payload, size_t len)
 		 * There is no outgoing generation then, and write_cursor is
 		 * still the append point either way.
 		 */
-		rc = find_live_slot(bid, id, &sc, g_bbuf);
+#if defined(CONFIG_BLOB_DB_FRESH_BIND_FAST)
+		if (id >= st.fresh_floor && id > st.max_appended) {
+			/* Allocated since mount and never written: no slot. */
+			rc = bucket_cursor(bid, id, &sc);
+			if (rc < 0) {
+				return rc;
+			}
+			rc = -ENOENT;
+		} else
+#endif
+		{
+			rc = find_live_slot(bid, id, &sc, g_bbuf);
+		}
 		if (rc < 0 && rc != -ENOENT) {
 			return rc;
 		}

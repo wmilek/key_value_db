@@ -346,6 +346,13 @@ config BLOB_DB_WALK_CHUNK
 	  non-zero value reads this many bytes at a time and parses the slot
 	  heads in RAM.
 
+config BLOB_DB_FRESH_BIND_FAST
+	bool "No lookup before the first write of an id allocated this mount"
+	depends on BLOB_DB_LARGE_PAYLOADS
+	help
+	  An id allocated since mount and never written has no slot, so the
+	  first update needs only the append cursor, not a search of the bucket.
+
 config BLOB_DB_SLOT_INDEX
 	bool "RAM index from blob id to its newest slot (opt-in; departs from P3)"
 	help
