@@ -57,7 +57,6 @@ if BLOB_DB_BACKEND_UBI
 
 config BLOB_DB_UBI_KEY_APP
 	bool "Application-provisioned key (deprecated: BLOB_DB_KEY_APP)"
-	select DEPRECATED
 	help
 	  Kept for one release so existing configurations still build: it
 	  makes BLOB_DB_KEY_APP the default. The application may keep defining

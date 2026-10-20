@@ -27,6 +27,27 @@
 /* native_sim overlay geometry: 8 MB of 4 KB sectors. */
 #define TEST_SECTOR_SZ  4096
 
+/* The slot stream as this build writes it, for the helpers that walk raw
+ * flash: a protected store (CONFIG_BLOB_DB_PROTECT) has a 48 B bucket header,
+ * a tag on every slot and, on an appended AEAD slot (not COMPACTED, 0x10), a
+ * 12 B nonce. */
+#if defined(CONFIG_BLOB_DB_PROTECTED)
+#define TEST_DATA_OFF   48
+#define TEST_TAG_LEN    CONFIG_BLOB_DB_PROTECT_TAG_LEN
+#else
+#define TEST_DATA_OFF   16
+#define TEST_TAG_LEN    0
+#endif
+#define TEST_SLOT_MIN   (14 + TEST_TAG_LEN)
+
+static inline size_t test_slot_bytes(uint8_t flags, uint16_t val_len)
+{
+	const size_t nonce = (IS_ENABLED(CONFIG_BLOB_DB_PROTECT_AEAD) &&
+			      !(flags & 0x10)) ? 12 : 0;
+
+	return TEST_SLOT_MIN + nonce + val_len;
+}
+
 /*
  * Several cases here inject faults by writing or erasing the storage partition
  * directly, at offsets derived from blob_db's own on-flash layout — a torn
@@ -1790,7 +1811,7 @@ static void count_segment_slots(int *out_live, int *out_tombs)
 			continue;
 		}
 
-		off_t cursor = 16;
+		off_t cursor = TEST_DATA_OFF;
 
 		for (;;) {
 			struct __packed {
@@ -1800,7 +1821,7 @@ static void count_segment_slots(int *out_live, int *out_tombs)
 				uint64_t id;
 			} head;
 
-			if (cursor + 14 > TEST_SECTOR_SZ) {
+			if (cursor + TEST_SLOT_MIN > TEST_SECTOR_SZ) {
 				break;
 			}
 			zassert_ok(flash_area_read(fa, base + cursor, &head,
@@ -1810,7 +1831,7 @@ static void count_segment_slots(int *out_live, int *out_tombs)
 				break;
 			}
 
-			size_t ssz = 14 + head.val_len;
+			size_t ssz = test_slot_bytes(head.flags, head.val_len);
 
 			ssz = (ssz + align - 1) & ~(align - 1);
 			if (cursor + (off_t)ssz > TEST_SECTOR_SZ) {
@@ -2707,12 +2728,12 @@ static off_t bucket_write_cursor(uint16_t bid)
 
 	const size_t align = flash_area_align(fa);
 	const off_t base = (off_t)(3 + bid) * TEST_SECTOR_SZ;
-	off_t cursor = 16;
+	off_t cursor = TEST_DATA_OFF;
 
 	for (;;) {
 		struct test_slot_head head;
 
-		if (cursor + 14 > TEST_SECTOR_SZ) {
+		if (cursor + TEST_SLOT_MIN > TEST_SECTOR_SZ) {
 			break;
 		}
 		zassert_ok(flash_area_read(fa, base + cursor, &head,
@@ -2722,7 +2743,7 @@ static off_t bucket_write_cursor(uint16_t bid)
 			break;
 		}
 
-		size_t ssz = 14 + head.val_len;
+		size_t ssz = test_slot_bytes(head.flags, head.val_len);
 
 		ssz = (ssz + align - 1) & ~(align - 1);
 		if (cursor + (off_t)ssz > TEST_SECTOR_SZ) {
@@ -2777,12 +2798,12 @@ static uint64_t first_segment_id(void)
 			continue;
 		}
 
-		off_t cursor = 16;
+		off_t cursor = TEST_DATA_OFF;
 
 		for (;;) {
 			struct test_slot_head head;
 
-			if (cursor + 14 > TEST_SECTOR_SZ) {
+			if (cursor + TEST_SLOT_MIN > TEST_SECTOR_SZ) {
 				break;
 			}
 			zassert_ok(flash_area_read(fa, base + cursor, &head,
@@ -2798,7 +2819,7 @@ static uint64_t first_segment_id(void)
 				break;
 			}
 
-			size_t ssz = 14 + head.val_len;
+			size_t ssz = test_slot_bytes(head.flags, head.val_len);
 
 			ssz = (ssz + align - 1) & ~(align - 1);
 			if (cursor + (off_t)ssz > TEST_SECTOR_SZ) {
