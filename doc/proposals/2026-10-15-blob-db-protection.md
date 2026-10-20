@@ -1,6 +1,7 @@
 # Design change proposal — authenticated and encrypted storage in `blob_db`
 
-Status: **proposed** · 2026-10-15
+Status: **phases 0 and 1 implemented** (§12 lists where the build differs
+from the text below); phase 2 open · 2026-10-15
 · Target contract: `doc/layers/l1_blob_db.md` (§2 error meanings, R6 payload cap, a new optional hook header)
 · Target implementation design: `doc/impl/l1_bucketlog.md` (§3 on-flash format, §5.4 read path, §5.6 compaction, §6 crash table)
 · Also changes: `doc/impl/l0_backends.md` ("Authenticated metadata"), `lib/blob_db/blob_db_store_ubi.c` (key and event path)
@@ -423,3 +424,49 @@ the reseal never needs a second format change.
 5. **zephyr-ubi**: a keyed MAC in place of `data_crc` on `ubi_leb_change()`
    blocks would give the stack an attach-time image seal for free [E §4.7].
    That change belongs in zephyr-ubi and is not needed here.
+
+## 12. Implementation notes (phases 0 and 1)
+
+Built as specified in §1–§9, with these differences. The format as built is
+recorded in `doc/impl/l1_bucketlog.md` §3.2 (phase 0) and §3.6 (phase 1).
+
+1. **Major 3 or 4.** A protected build declares major 3, or 4 with
+   `LARGE_PAYLOADS`, and reads [3, its own]: the same reasoning that gives
+   unprotected large-payload builds major 2, so a protected build without
+   segments refuses a store that holds them.
+2. **AAD is every clear byte before the ciphertext.** For an appended slot
+   that is `slot_hdr ‖ id ‖ nonce [‖ seg_hdr]`, as §3.3 writes; a compacted
+   slot stores no nonce, so its AAD is `slot_hdr ‖ id [‖ seg_hdr]`. Its
+   derived nonce is still bound, as the CCM nonce.
+3. **Where the bucket header MAC is checked.** Since PR #59, mount scans the
+   buckets only when a master is in doubt, so §3.6's "mount checks every
+   bucket header during the scan it already makes" holds only for that scan.
+   Every writer checks the header before it appends or formats, and the slot
+   index keeps no "verified since mount" state: one 48-byte read and one CMAC
+   over 28 bytes per write, against 2.4–15 ms of write. Reads behave as §3.6
+   says.
+4. **Unformatted, precisely** (phase 0). A bucket is unformatted when its
+   header is erased, or when a bad header sits over an erased first slot —
+   what a format torn inside its header write leaves, where nothing can be
+   lost. An unprotected store also honours a zeroed magic (erase_all's
+   retirement mark). A protected store does not, since anyone can clear bits,
+   so its `erase_all` erases each bucket it retires.
+5. **AUTH compaction** copies kept slots byte for byte, as §3.4 says, but
+   drops a tombstone only after its tag verifies: a forged tombstone would
+   otherwise let compaction delete a blob.
+6. **Compaction's nonce range** is reserved, and its ceiling persisted when
+   needed, by a CLEAN master write of its own before the image is built, on
+   both compaction paths. Riding the COMPACTING master write (§3.4 step 1)
+   would save that write once every `SEQ_STEP / peb_size` compactions.
+7. **Two authentic masters of different stores** (different uuids) refuse
+   the mount with `-EIO` and TAMPERED: a format erases the other master, so
+   this happens only if one was put there.
+8. **`iterate`** visits every bucket it can read, skips a slot or bucket it
+   cannot authenticate, and returns `-EIO` at the end. `count` reads clear
+   headers only, as §3.7 says.
+9. **Tests**: §9 items 1–7 are in `tests/lib/blob_db/src/protect.c` and the
+   protected scenarios of every suite's `testcase.yaml`. Item 6 records every
+   nonce across remounts and repeated compactions; a power cut at each
+   ceiling write is covered by the crash argument of §5, not by injection.
+   Item 9 (DK measurements) is not done, so §11.1 and §11.2 stay open.
+
