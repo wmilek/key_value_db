@@ -161,7 +161,8 @@ size_t   blob_db_count(void);
 /* Iterate all bound blobs; order unspecified. Intended for diagnostics and
  * fsck-like repair, not as a data path. Zephyr iterator convention: the
  * callback returns 0 to continue or non-zero to stop early — iterate
- * returns that value (0 if it ran to the end). The callback MUST NOT
+ * returns that value (0 if it ran to the end, or -EIO if it ran to the
+ * end past a part of the store it could not read). The callback MUST NOT
  * mutate the store (alloc_id/update/delete): undefined behavior, a debug
  * build may assert. Supported pattern: collect ids in the callback,
  * mutate after iteration ends. */

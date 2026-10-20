@@ -223,6 +223,27 @@ offset 0x010   entry slot stream (append-only)
 The header is written once per erase (first format or each compact); inserts
 append slots after it.
 
+Only a bucket with nothing to lose counts as **unformatted**, and only that
+one is formatted by the next write to it:
+
+| Header reads as | Meaning | Every operation |
+|---|---|---|
+| erased (all `0xff`) | never written, or erased by a format | unformatted: `get` → `-ENOENT`; a write formats it |
+| magic zeroed | retired by `erase_all`, or by a format of blank masters (§3.1) | unformatted |
+| bad, first slot behind it erased | a format torn inside its header write | unformatted |
+| magic and CRC verify, `bucket_id` matches | ok | read and append |
+| CRC fails, over a programmed slot | damaged | `-EIO`; never formatted |
+| CRC verifies, another `bucket_id`, over a programmed slot | displaced (a sector remapped onto this one) | `-EIO`; never formatted |
+
+A damaged or displaced bucket used to read as unformatted: one bit flip in its
+header hid its blobs as absent, and the next write formatted over them. It now
+answers `-EIO` to `get`, `size`, `read`, `update`, `write` and `delete`;
+`exists` is false; `count` leaves it out; `iterate` visits every other bucket
+and then returns `-EIO`; `prepare` and mount leave it alone. Mount still
+succeeds. `BLOB_DB_AUTOFORMAT_ON_CORRUPT=y` restores the old behaviour for
+such a bucket as well as for the masters: it reads as unformatted, and the
+next write to it formats it.
+
 ### 3.3 Entry slot
 
 Variable length, write-block aligned (`W = flash_area_align()`):

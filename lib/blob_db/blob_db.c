@@ -368,15 +368,10 @@ static int scan_bucket(uint16_t bid, uint64_t *max_id_inout)
 		return rc;
 	}
 
-	if (memcmp(bhdr.magic, BUCKET_MAGIC, 4) != 0) {
-		return 0; /* unformatted — no entries */
-	}
-	if (bhdr.hdr_crc32 != hdr_crc32(&bhdr, sizeof(bhdr))) {
-		LOG_WRN("bucket %u header CRC bad; ignoring", bid);
-		return 0;
-	}
-	if (bhdr.bucket_id != bid) {
-		LOG_WRN("bucket %u header claims bid %u; ignoring", bid, bhdr.bucket_id);
+	/* Unformatted, or a header that cannot be trusted: no ids to count.
+	 * The latter is never formatted over (bucket_check()), so its ids
+	 * cannot meet the counter again either. */
+	if (!bucket_hdr_valid((const uint8_t *)&bhdr, bid)) {
 		return 0;
 	}
 
@@ -716,22 +711,29 @@ int blob_db_mount(void)
 		const uint16_t root_bid =
 			(uint16_t)(BLOB_DB_ROOT_ID % st.n_buckets);
 		bool formatted = false;
-
-		rc = read_bucket_hdr(root_bid, &formatted);
-		if (rc < 0) {
-			goto err_close;
-		}
 		bool root_live = false;
 
-		if (formatted) {
+		rc = read_bucket_hdr(root_bid, &formatted);
+		if (rc == 0 && formatted) {
 			struct bucket_scan sc;
 
 			rc = find_live_slot(root_bid, BLOB_DB_ROOT_ID, &sc,
 					    g_bbuf);
-			if (rc < 0 && rc != -ENOENT) {
-				goto err_close;
-			}
 			root_live = (rc == 0);
+			if (rc == -ENOENT) {
+				rc = 0;
+			}
+		}
+		if (rc == -EIO) {
+			/* A root we cannot read is not a root we may rebind:
+			 * that formats its bucket over whatever is in it. Mount,
+			 * and let the root answer -EIO like the rest of that
+			 * bucket. */
+			LOG_ERR("root bucket %u unreadable; root left as it is",
+				root_bid);
+			root_live = true;
+		} else if (rc < 0) {
+			goto err_close;
 		}
 		if (!root_live) {
 			LOG_WRN("root not bound; binding empty root");
@@ -849,6 +851,91 @@ static bool bucket_hdr_valid(const uint8_t *buf, uint16_t bid)
 	return true;
 }
 
+static bool all_erased(const uint8_t *p, size_t n)
+{
+	for (size_t i = 0; i < n; i++) {
+		if (p[i] != 0xff) {
+			return false;
+		}
+	}
+	return true;
+}
+
+/* How a bucket sector presents itself. Only UNFORMATTED may be formatted. */
+enum bucket_class {
+	BUCKET_UNFORMATTED, /* nothing a format could destroy                */
+	BUCKET_OK,          /* a header for this bucket that verifies         */
+	BUCKET_CORRUPT,     /* a header that fails its CRC, over slots        */
+	BUCKET_DISPLACED,   /* a header for another bucket, over slots        */
+};
+
+/* What the slot stream needs to judge a header: the header, and the head of
+ * the first slot behind it. */
+#define BUCKET_PEEK_LEN  (BLOB_DB_BUCKET_DATA_OFF + sizeof(struct slot_head))
+
+/* Classify the BUCKET_PEEK_LEN bytes at the start of bucket @p bid.
+ *
+ * A header that cannot be trusted used to mean "unformatted", so one bit flip
+ * in it hid the bucket's blobs as absent and the next write to the bucket
+ * formatted over them. It no longer does: a bucket is unformatted only when
+ * nothing a format would erase is in it --
+ *  - its header is erased (never written, or erased by format);
+ *  - its magic is zeroed: invalidate_buckets() retired it on purpose;
+ *  - or the first slot behind a bad header is erased, which is what a format
+ *    torn inside its header write leaves: the sector was erased just before.
+ * Anything else is a bucket of slots under a header we cannot read, and is
+ * reported rather than discarded. */
+static enum bucket_class bucket_classify(const uint8_t *buf, uint16_t bid)
+{
+	static const uint8_t zero_magic[4];
+	const struct blob_db_bucket_hdr *bhdr =
+		(const struct blob_db_bucket_hdr *)buf;
+	enum bucket_class cls;
+
+	if (all_erased(buf, sizeof(*bhdr))) {
+		return BUCKET_UNFORMATTED;
+	}
+	if (memcmp(bhdr->magic, BUCKET_MAGIC, 4) != 0 ||
+	    bhdr->hdr_crc32 != hdr_crc32(bhdr, sizeof(*bhdr))) {
+		cls = BUCKET_CORRUPT;
+	} else if (bhdr->bucket_id != bid) {
+		cls = BUCKET_DISPLACED;
+	} else {
+		return BUCKET_OK;
+	}
+
+	if (memcmp(bhdr->magic, zero_magic, sizeof(zero_magic)) == 0 ||
+	    all_erased(buf + BLOB_DB_BUCKET_DATA_OFF, sizeof(struct slot_head))) {
+		return BUCKET_UNFORMATTED;
+	}
+	return cls;
+}
+
+/* Turn a classification into what the operations act on: formatted or not,
+ * or -EIO for a bucket whose slots are there but cannot be trusted. That
+ * bucket answers -EIO on every path and is never formatted, unless
+ * CONFIG_BLOB_DB_AUTOFORMAT_ON_CORRUPT asks for the old behaviour, where it
+ * reads as empty and the next write to it formats over it. */
+static int bucket_check(const uint8_t *buf, uint16_t bid, bool *formatted)
+{
+	const enum bucket_class cls = bucket_classify(buf, bid);
+
+	*formatted = (cls == BUCKET_OK);
+	if (cls == BUCKET_OK || cls == BUCKET_UNFORMATTED) {
+		return 0;
+	}
+	if (IS_ENABLED(CONFIG_BLOB_DB_AUTOFORMAT_ON_CORRUPT)) {
+		LOG_WRN("bucket %u header %s; treating it as unformatted per "
+			"CONFIG_BLOB_DB_AUTOFORMAT_ON_CORRUPT", bid,
+			cls == BUCKET_CORRUPT ? "corrupt" : "displaced");
+		return 0;
+	}
+	LOG_ERR("bucket %u header %s over programmed slots; refusing the "
+		"bucket (-EIO)", bid,
+		cls == BUCKET_CORRUPT ? "corrupt" : "displaced");
+	return -EIO;
+}
+
 /* Interpret a slot at buf[off] in a bucket buffer.
  * Returns true iff structurally valid AND CRC verifies — i.e., a real
  * committed slot. Returns false otherwise (end-of-log, torn write, etc.). */
@@ -959,14 +1046,13 @@ static int read_bucket_hdr(uint16_t bid, bool *valid)
 		return 0;
 	}
 
-	struct blob_db_bucket_hdr bhdr;
-	int rc = blob_db_store_read(bucket_offset(bid), &bhdr, sizeof(bhdr));
+	uint8_t __aligned(4) peek[BUCKET_PEEK_LEN];
+	int rc = blob_db_store_read(bucket_offset(bid), peek, sizeof(peek));
 
 	if (rc < 0) {
 		return rc;
 	}
-	*valid = bucket_hdr_valid((const uint8_t *)&bhdr, bid);
-	return 0;
+	return bucket_check(peek, bid, valid);
 }
 
 /* Walk bucket `bid` by slot header, recording the append cursor and the LAST
@@ -1644,8 +1730,11 @@ static int compact_bucket(uint16_t bid)
 		return rc;
 	}
 	if (!bucket_hdr_valid(g_bbuf, bid)) {
-		LOG_WRN("compact: bucket %u not formatted; nothing to do", bid);
-		return -EINVAL;
+		/* Callers compact only a bucket they found formatted, so the
+		 * header changed under them: never rebuild a bucket from slots
+		 * whose header cannot be trusted. */
+		LOG_ERR("compact: bucket %u header no longer valid", bid);
+		return -EIO;
 	}
 
 	g_bbuf_new_busy = true;
@@ -3129,10 +3218,10 @@ size_t blob_db_count(void)
 	size_t total = 0;
 
 	for (uint16_t bid = 0; bid < st.n_buckets; bid++) {
-		if (read_bucket(bid, g_bbuf) < 0) {
-			continue;
-		}
-		if (!bucket_hdr_valid(g_bbuf, bid)) {
+		bool formatted;
+
+		if (read_bucket(bid, g_bbuf) < 0 ||
+		    bucket_check(g_bbuf, bid, &formatted) < 0 || !formatted) {
 			continue;
 		}
 		(void)for_each_live_slot(g_bbuf, count_visitor, &total);
@@ -3162,12 +3251,21 @@ int blob_db_iterate(blob_db_iter_cb_t cb, void *user)
 	}
 
 	struct iterate_trampoline t = { .user_cb = cb, .user = user };
+	int unreadable = 0;
 
 	for (uint16_t bid = 0; bid < st.n_buckets; bid++) {
+		bool formatted;
+
 		if (read_bucket(bid, g_bbuf) < 0) {
 			continue;
 		}
-		if (!bucket_hdr_valid(g_bbuf, bid)) {
+		/* A bucket that cannot be trusted is not empty: visit the rest,
+		 * then say the walk was incomplete. */
+		if (bucket_check(g_bbuf, bid, &formatted) < 0) {
+			unreadable = -EIO;
+			continue;
+		}
+		if (!formatted) {
 			continue;
 		}
 
@@ -3177,7 +3275,7 @@ int blob_db_iterate(blob_db_iter_cb_t cb, void *user)
 			return rc;  /* user-requested early stop */
 		}
 	}
-	return 0;
+	return unreadable;
 }
 
 #if defined(CONFIG_BLOB_DB_INSPECT)
@@ -3635,8 +3733,8 @@ static int bind_root_empty(void)
  * the bucket is used again, so nothing behind the header can resurface. The
  * write covers at least the 4 magic bytes, rounded up to the device's
  * write-block-size; the extra bytes land inside the bucket header and
- * programming them to 0x00 is equally legal. Buckets that already look
- * unformatted are skipped, so fresh sectors cost one 4-byte read each.
+ * programming them to 0x00 is equally legal. Buckets that are erased or
+ * already zeroed are skipped, so fresh sectors cost one 4-byte read each.
  *
  * Not in place when the backend replaces atomically: there a bucket last
  * written by blob_db_store_replace() carries a checksum over its header
@@ -3665,7 +3763,13 @@ static int invalidate_buckets(int skip_bid)
 			LOG_ERR("invalidate: peek bid %u: %d", bid, rc);
 			return rc;
 		}
-		if (memcmp(peek, BUCKET_MAGIC, 4) != 0) {
+		/* Already unformatted. Any other magic is zeroed too, valid or
+		 * not: a damaged header would otherwise outlive the erase as a
+		 * bucket that answers -EIO (bucket_classify()). */
+		static const uint8_t zero_magic[4];
+
+		if (all_erased(peek, sizeof(peek)) ||
+		    memcmp(peek, zero_magic, sizeof(peek)) == 0) {
 			continue;
 		}
 		rc = blob_db_store_replace_is_atomic()
@@ -3762,16 +3866,18 @@ int blob_db_prepare(size_t n)
 		}
 
 		/* Peek only the header — no need to pull a full sector into
-		 * g_bbuf just to decide whether formatting is needed. */
-		struct blob_db_bucket_hdr peek;
-		int rc = blob_db_store_read(bucket_offset(bid),
-					 &peek, sizeof(peek));
+		 * g_bbuf just to decide whether formatting is needed. A bucket
+		 * that cannot be trusted is left as it is: preparing is an
+		 * optimisation, and formatting would discard its slots. */
+		bool formatted;
+		int rc = read_bucket_hdr(bid, &formatted);
+
+		if (rc == -EIO || (rc == 0 && formatted)) {
+			continue;
+		}
 		if (rc < 0) {
 			LOG_ERR("prepare: read bid %u: %d", bid, rc);
 			return rc;
-		}
-		if (bucket_hdr_valid((const uint8_t *)&peek, bid)) {
-			continue;
 		}
 
 		rc = format_bucket(bid);
