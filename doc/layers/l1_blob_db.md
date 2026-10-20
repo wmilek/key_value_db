@@ -60,6 +60,13 @@ rely on nothing beyond it.
 | **No reuse** | A dead id is never returned by `alloc_id` again. The next allocated id is strictly greater than every id ever seen. |
 | **Atomicity of single operations** | Each `update`/`delete` is atomic with respect to crash: either it takes effect fully or it doesn't (on next mount). Partial writes are detected and discarded — never surfaced as data. |
 | **No partial reads** | `get` either returns the complete payload that was committed at some point, or returns `-ENOENT`/`-EIO`. It never returns partial bytes from an in-flight write. |
+| **Authenticity** (protected builds) | With `CONFIG_BLOB_DB_PROTECT`, `get` never returns bytes whose tag did not verify — bytes changed on flash, moved from another id, or taken from another store — and never reports `-ENOENT` for a blob in a bucket it cannot authenticate. Both answer `-EIO`. |
+
+`-EIO` covers a flash I/O error, damage the implementation cannot recover
+from, and — in a protected build — a failed authentication or a storage
+region (a bucket) that was displaced or damaged. A client cannot and need not
+tell these apart: in every case the blob is not available, and no other
+blob's state is implied.
 
 These together make ids usable as **persistent references** — foreign keys
 for client-owned structures. What the contract means for a client — the call
@@ -115,7 +122,10 @@ Any implementation of this contract must satisfy:
   visible state flips atomically; internal residue is bounded and reclaimed
   by the implementation's own maintenance.
 - **R6 — Scale target**: 100 000 blobs in an 8 MB partition; payload size cap
-  is a Kconfig option; no structural limit other than partition size.
+  is a Kconfig option; no structural limit other than partition size. The
+  cap a geometry can sustain depends on the protection mode, which adds a tag
+  and, when encrypting, a nonce to every stored payload: on 4 KB sectors
+  2026 B unprotected, 2002 B authenticated, 1990 B encrypted (8-byte tags).
 - **R7 — Transient buffers are stack-allocated and bounded** (≤ one erase
   sector; 4 KB target on `native_sim`).
 
@@ -412,4 +422,5 @@ increasing" — ids are opaque.
 |---|---|
 | `doc/layers/l1_model_container.md` | The client contract in executable form: mutation discipline, crash tables, recovery — normative for every L1 client. |
 | `doc/layers/l1_root_registry.md` | Owner of id = 1; where clients persist their structure roots. |
+| `doc/proposals/2026-10-15-blob-db-protection.md` | Authenticated and encrypted storage (`CONFIG_BLOB_DB_PROTECT`): threat model, formats, keys, and what is out of scope. Integration hooks in `<app/lib/blob_db_security.h>`. |
 | `doc/impl/l1_bucketlog.md` | Feasibility/implementation design of the v1 allocator: on-flash format, algorithms, crash recovery mechanics, costs, open implementation items. **Non-normative** — upper layers must not depend on anything in it. |

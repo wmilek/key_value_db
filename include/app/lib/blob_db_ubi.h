@@ -25,16 +25,18 @@ extern "C" {
  * PSA key handle, and asks the application whether to trust the device at
  * every attach and every CONFIG_UBI_STATE_CHECK_INTERVAL writes. blob_db owns
  * the UBI device, so these two decisions reach the application through the
- * hooks below. Application data is not encrypted either way.
+ * hooks below. The key now comes through blob_db_ikm_key()
+ * (<app/lib/blob_db_security.h>), which also keys blob_db's own protection;
+ * application data is encrypted only with CONFIG_BLOB_DB_PROTECT_AEAD.
  */
 
 /**
- * @brief Hand blob_db the keying material UBI derives its keys from.
+ * @brief Deprecated: define blob_db_ikm_key() instead.
  *
- * Called by blob_db_mount() (and blob_db_format() on an unmountable store)
- * after psa_crypto_init(), each time the store is opened. Defined by the
- * application when CONFIG_BLOB_DB_UBI_KEY_APP is set; the build fails to link
- * otherwise.
+ * Kept for one release. With CONFIG_BLOB_DB_KEY_APP on the UBI backend,
+ * blob_db's weak blob_db_ikm_key() calls this, so an application that defines
+ * only this function still links and keeps its keys. Same contract as
+ * blob_db_ikm_key().
  *
  * The key must carry PSA_KEY_USAGE_DERIVE, permit
  * PSA_ALG_HKDF(PSA_ALG_SHA_256), be unique per device and be the same at every

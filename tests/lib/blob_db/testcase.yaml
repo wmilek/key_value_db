@@ -71,6 +71,13 @@ tests:
       # zephyr-ubi's own bookkeeping checks after every call: meant for
       # tests, and these are the scenarios that drive UBI hardest.
       - CONFIG_UBI_SELF_CHECKS=y
+      - CONFIG_BLOB_DB_KEY_APP=y
+  # An application written before the key moved to blob_db_ikm_key(): the
+  # deprecated option and hook (blob_db_ubi_ikm_key()) still build and key UBI.
+  lib.blob_db.ubi.app_key.deprecated:
+    extra_configs:
+      - CONFIG_BLOB_DB_BACKEND_UBI=y
+      - CONFIG_UBI_SELF_CHECKS=y
       - CONFIG_BLOB_DB_UBI_KEY_APP=y
   # UBI compacting through the scratch-sector protocol instead of
   # ubi_leb_change() (CONFIG_BLOB_DB_UBI_ATOMIC_REPLACE=n). Not the default,
@@ -130,3 +137,62 @@ tests:
       - CONFIG_BLOB_DB_SLOT_INDEX_ENTRIES=64
       - CONFIG_BLOB_DB_SLOT_INDEX_VERIFY=y
       - CONFIG_ASSERT=y
+  # Authenticated and encrypted storage (CONFIG_BLOB_DB_PROTECT,
+  # doc/proposals/2026-10-15-blob-db-protection.md). The whole suite runs over
+  # a protected store; the raw-partition cases of src/main.c skip (their
+  # offsets are the unprotected layout) and src/protect.c forges slots,
+  # headers and masters in the protected one instead, on flash_area.
+  lib.blob_db.protect_auth:
+    extra_configs:
+      - CONFIG_BLOB_DB_BACKEND_FLASH_AREA=y
+      - CONFIG_BLOB_DB_PROTECT_AUTH=y
+  lib.blob_db.protect_aead:
+    extra_configs:
+      - CONFIG_BLOB_DB_BACKEND_FLASH_AREA=y
+      - CONFIG_BLOB_DB_PROTECT_AEAD=y
+      # Records every nonce, to show none is used twice.
+      - CONFIG_BLOB_DB_TEST_PROTECT_HOOKS=y
+  # Also builds the shell, whose `dump` shows an encrypted slot as stored.
+  lib.blob_db.protect_aead.tag16:
+    extra_configs:
+      - CONFIG_BLOB_DB_BACKEND_FLASH_AREA=y
+      - CONFIG_BLOB_DB_PROTECT_AEAD=y
+      - CONFIG_BLOB_DB_PROTECT_TAG_16=y
+      - CONFIG_BLOB_DB_TEST_PROTECT_HOOKS=y
+      - CONFIG_SHELL=y
+      - CONFIG_BLOB_DB_SHELL=y
+  # Segment slots keep their owner in the clear (AAD) and the sweep walks
+  # them; index records are resealed by compaction like any slot.
+  lib.blob_db.protect_aead.large_payloads:
+    extra_configs:
+      - CONFIG_BLOB_DB_BACKEND_FLASH_AREA=y
+      - CONFIG_BLOB_DB_PROTECT_AEAD=y
+      - CONFIG_BLOB_DB_TEST_PROTECT_HOOKS=y
+      - CONFIG_BLOB_DB_LARGE_PAYLOADS=y
+      - CONFIG_BLOB_DB_TEST_CRASH_HOOKS=y
+  # A compacted slot reached through the index reads its nonce base from the
+  # bucket header; each answer is cross-checked against the walk.
+  lib.blob_db.protect_aead.slot_index:
+    extra_configs:
+      - CONFIG_BLOB_DB_BACKEND_FLASH_AREA=y
+      - CONFIG_BLOB_DB_PROTECT_AEAD=y
+      - CONFIG_BLOB_DB_SLOT_INDEX=y
+      - CONFIG_BLOB_DB_SLOT_INDEX_MAX_BUCKETS=2048
+      - CONFIG_BLOB_DB_SLOT_INDEX_VERIFY=y
+      - CONFIG_ASSERT=y
+  # On UBI, one application key feeds UBI and blob_db under separate labels,
+  # and compaction is an atomic replace: the nonce range it reserves is
+  # persisted by a master write of its own.
+  lib.blob_db.protect_aead.ubi:
+    extra_configs:
+      - CONFIG_BLOB_DB_BACKEND_UBI=y
+      - CONFIG_UBI_SELF_CHECKS=y
+      - CONFIG_BLOB_DB_KEY_APP=y
+      - CONFIG_BLOB_DB_PROTECT_AEAD=y
+      - CONFIG_BLOB_DB_TEST_PROTECT_HOOKS=y
+  lib.blob_db.protect_auth.ubi.scratch_compaction:
+    extra_configs:
+      - CONFIG_BLOB_DB_BACKEND_UBI=y
+      - CONFIG_UBI_SELF_CHECKS=y
+      - CONFIG_BLOB_DB_UBI_ATOMIC_REPLACE=n
+      - CONFIG_BLOB_DB_PROTECT_AUTH=y

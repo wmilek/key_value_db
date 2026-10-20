@@ -48,12 +48,59 @@
  * anything up to its own major, so enabling the feature adopts an existing
  * store rather than refusing it — and upgrades it to major 2 on the next
  * master write. */
+/* A protected build (CONFIG_BLOB_DB_PROTECT_AUTH/_AEAD) declares major 3, or
+ * 4 with segmented objects, and reads only [3, its own]: a protected build
+ * that read major 1 or 2 would accept slots nobody authenticated, which is a
+ * downgrade, and an unprotected build refuses 3 and above because it reads
+ * only up to its own major. The master's suite byte then names the mode, and
+ * a build mounts only its own. */
+#if defined(CONFIG_BLOB_DB_PROTECTED)
+#define BLOB_DB_FORMAT_MAJOR_MIN  3
+#ifdef CONFIG_BLOB_DB_LARGE_PAYLOADS
+#define BLOB_DB_FORMAT_MAJOR      4
+#else
+#define BLOB_DB_FORMAT_MAJOR      3
+#endif
+#else
+#define BLOB_DB_FORMAT_MAJOR_MIN  1
 #ifdef CONFIG_BLOB_DB_LARGE_PAYLOADS
 #define BLOB_DB_FORMAT_MAJOR      2
 #else
 #define BLOB_DB_FORMAT_MAJOR      1
 #endif
+#endif
 #define BLOB_DB_FORMAT_MINOR      0
+
+/* Protection suite, in the master's suite byte: the mode in the low nibble,
+ * the slot tag length / 4 in the high one. 0 in an unprotected store. */
+#define BLOB_DB_SUITE_AUTH_CMAC   1
+#define BLOB_DB_SUITE_AEAD_CCM    2
+#if defined(CONFIG_BLOB_DB_PROTECT_AUTH)
+#define BLOB_DB_SUITE                                                          \
+	(BLOB_DB_SUITE_AUTH_CMAC | ((CONFIG_BLOB_DB_PROTECT_TAG_LEN / 4) << 4))
+#elif defined(CONFIG_BLOB_DB_PROTECT_AEAD)
+#define BLOB_DB_SUITE                                                          \
+	(BLOB_DB_SUITE_AEAD_CCM | ((CONFIG_BLOB_DB_PROTECT_TAG_LEN / 4) << 4))
+#else
+#define BLOB_DB_SUITE             0
+#endif
+
+/* Per-slot tag and stored nonce. */
+#if defined(CONFIG_BLOB_DB_PROTECTED)
+#define BLOB_DB_TAG_LEN           CONFIG_BLOB_DB_PROTECT_TAG_LEN
+#else
+#define BLOB_DB_TAG_LEN           0
+#endif
+#if defined(CONFIG_BLOB_DB_PROTECT_AEAD)
+#define BLOB_DB_NONCE_LEN         12
+#else
+#define BLOB_DB_NONCE_LEN         0
+#endif
+
+/* Store identity, drawn at format, in every derived key (§3.1). */
+#define BLOB_DB_UUID_LEN          16
+/* Metadata MACs: full AES-CMAC. */
+#define BLOB_DB_META_MAC_LEN      16
 
 /* Largest master header any version may declare. Bounds the read buffer that
  * older software must be able to stage a foreign header in. */
@@ -81,6 +128,9 @@
  * introducing them is a MAJOR format change. */
 #define BLOB_DB_SLOT_F_INDEXED    (1u << 2)
 #define BLOB_DB_SLOT_F_SEGMENT    (1u << 3)
+/* AEAD only: the slot was resealed by compaction and stores no nonce; its
+ * nonce derives from the bucket header's cbase and the slot's offset. */
+#define BLOB_DB_SLOT_F_COMPACTED  (1u << 4)
 
 /* Every flag bit this version understands. A slot carrying a bit outside this
  * mask was written by software we do not understand, and its payload must not
@@ -92,12 +142,18 @@
  * covers the case where that discipline is broken.
  */
 #ifdef CONFIG_BLOB_DB_LARGE_PAYLOADS
-#define BLOB_DB_SLOT_F_KNOWN                                                   \
+#define BLOB_DB_SLOT_F_KNOWN_BASE                                              \
 	(BLOB_DB_SLOT_F_SEALED | BLOB_DB_SLOT_F_TOMBSTONE |                    \
 	 BLOB_DB_SLOT_F_INDEXED | BLOB_DB_SLOT_F_SEGMENT)
 #else
-#define BLOB_DB_SLOT_F_KNOWN                                                   \
+#define BLOB_DB_SLOT_F_KNOWN_BASE                                              \
 	(BLOB_DB_SLOT_F_SEALED | BLOB_DB_SLOT_F_TOMBSTONE)
+#endif
+#ifdef CONFIG_BLOB_DB_PROTECT_AEAD
+#define BLOB_DB_SLOT_F_KNOWN                                                   \
+	(BLOB_DB_SLOT_F_KNOWN_BASE | BLOB_DB_SLOT_F_COMPACTED)
+#else
+#define BLOB_DB_SLOT_F_KNOWN      BLOB_DB_SLOT_F_KNOWN_BASE
 #endif
 
 /* Frozen compatibility prefix (12 B).
@@ -140,34 +196,78 @@ struct __packed blob_db_master_hdr {
 	uint32_t generation;      /* 12..15  monotonic LE                       */
 	uint8_t  state;           /* 16      BLOB_DB_STATE_*                    */
 	uint16_t compacting_bid;  /* 17..18  meaningful only when COMPACTING    */
-	uint8_t  reserved0;       /* 19                                         */
+	uint8_t  suite;           /* 19      BLOB_DB_SUITE; 0 below major 3     */
 	uint64_t next_id_hint;    /* 20..27  leading id ceiling                 */
 	uint64_t seg_owner;       /* 28..35  segment sweep intent; 0 = none     */
-	uint8_t  reserved1[24];   /* 36..59  future MINOR revisions             */
+	uint8_t  store_uuid[BLOB_DB_UUID_LEN]; /* 36..51  major 3+; else 0      */
+	uint64_t seq_hint;        /* 52..59  leading nonce ceiling (AEAD)       */
 	uint32_t hdr_crc32;       /* 60..63  CRC32-IEEE over bytes [0, 60)      */
 };
 BUILD_ASSERT(sizeof(struct blob_db_master_hdr) == 64,
 	     "blob_db_master_hdr layout drift");
-BUILD_ASSERT(sizeof(struct blob_db_master_hdr) <= BLOB_DB_MASTER_HDR_MAX,
+
+/* Protected masters (major 3+) append a MAC and a second CRC; hdr_len 84.
+ *
+ * Check order, as everywhere: erased, then structure, then CRC, then MAC.
+ * A CRC that fails is damage; a CRC that verifies over a MAC that does not is
+ * tampering, and the tail CRC is what keeps the two apart for the MAC bytes
+ * themselves. */
+struct __packed blob_db_master_tail {
+	uint8_t  mac[BLOB_DB_META_MAC_LEN]; /* 64..79  CMAC(K_meta, [0, 64))    */
+	uint32_t tail_crc32;      /* 80..83  CRC32-IEEE over bytes [0, 80)      */
+};
+BUILD_ASSERT(sizeof(struct blob_db_master_hdr) +
+		     sizeof(struct blob_db_master_tail) <= BLOB_DB_MASTER_HDR_MAX,
 	     "master header exceeds the bound older readers can stage");
 
-/* Bucket sector header (16 B). Lives at offset 0 of every bucket sector,
- * written once after that sector is erased. */
+#if defined(CONFIG_BLOB_DB_PROTECTED)
+#define BLOB_DB_MASTER_LEN                                                     \
+	(sizeof(struct blob_db_master_hdr) + sizeof(struct blob_db_master_tail))
+#else
+#define BLOB_DB_MASTER_LEN        sizeof(struct blob_db_master_hdr)
+#endif
+
+/* Bucket sector header. Lives at offset 0 of every bucket sector, written
+ * once after that sector is erased: 16 B, or 48 B in a protected store, which
+ * adds the AEAD compaction nonce base and a MAC. */
 struct __packed blob_db_bucket_hdr {
 	uint8_t  magic[4];        /* 'B','D','B','H' */
 	uint16_t bucket_id;       /* redundant sanity check */
 	uint16_t reserved;
 	uint32_t gen;             /* incremented on each compaction of this bucket */
-	uint32_t hdr_crc32;       /* CRC32-IEEE over the preceding 12 bytes */
+#if defined(CONFIG_BLOB_DB_PROTECTED)
+	uint64_t cbase_seq;       /* 12..19  AEAD: nonce base of COMPACTED slots;
+				   *         0 = none (always 0 in AUTH)       */
+	uint32_t cbase_salt;      /* 20..23  ... and its salt                  */
+	uint32_t reserved1;       /* 24..27                                    */
+	uint8_t  mac[BLOB_DB_META_MAC_LEN]; /* 28..43  CMAC(K_meta, [0, 28))   */
+#endif
+	uint32_t hdr_crc32;       /* CRC32-IEEE over every byte before it */
 };
+#if defined(CONFIG_BLOB_DB_PROTECTED)
+BUILD_ASSERT(sizeof(struct blob_db_bucket_hdr) == 48,
+	     "blob_db_bucket_hdr layout drift");
+#else
 BUILD_ASSERT(sizeof(struct blob_db_bucket_hdr) == 16,
 	     "blob_db_bucket_hdr layout drift");
+#endif
 
 /* Entry slot header (4 B). Full slot on flash:
  *
  *     slot_hdr (4) | id (8 LE) | payload[val_len] | crc16 (2 LE)
  *
  * The CRC16 is CCITT(0xFFFF) over slot_hdr + id + payload.
+ *
+ * A protected store adds a tag after the payload and, for an appended AEAD
+ * slot, a nonce before it; the CRC still comes last, over every byte before
+ * it, tag included:
+ *
+ *     AUTH            slot_hdr | id |         payload[L] | tag[T] | crc16
+ *     AEAD appended   slot_hdr | id | nonce | P[L]       | tag[T] | crc16
+ *     AEAD compacted  slot_hdr | id |         P[L]       | tag[T] | crc16
+ *
+ * The CRC tells damage (a torn append, bit rot: fall back to the older slot)
+ * from tampering (a CRC that verifies over a tag that does not: -EIO).
  */
 struct __packed blob_db_slot_hdr {
 	uint8_t  flags;           /* BLOB_DB_SLOT_F_* bits */
@@ -177,10 +277,16 @@ struct __packed blob_db_slot_hdr {
 BUILD_ASSERT(sizeof(struct blob_db_slot_hdr) == 4,
 	     "blob_db_slot_hdr layout drift");
 
-/* Per-slot overhead (header + id + crc). */
-#define BLOB_DB_SLOT_OVERHEAD                                                  \
-	(sizeof(struct blob_db_slot_hdr) + sizeof(uint64_t) + sizeof(uint16_t))
+/* Per-slot overhead of the smallest slot (header + id + tag + crc): an
+ * unprotected or AUTH slot, or a compacted AEAD one. */
+#define BLOB_DB_SLOT_MIN_OVERHEAD                                              \
+	(sizeof(struct blob_db_slot_hdr) + sizeof(uint64_t) +                  \
+	 BLOB_DB_TAG_LEN + sizeof(uint16_t))
+/* Per-slot overhead of an appended slot, nonce included. */
+#define BLOB_DB_SLOT_OVERHEAD    (BLOB_DB_SLOT_MIN_OVERHEAD + BLOB_DB_NONCE_LEN)
+#if !defined(CONFIG_BLOB_DB_PROTECTED)
 BUILD_ASSERT(BLOB_DB_SLOT_OVERHEAD == 14, "slot overhead drift");
+#endif
 
 /* Data area within a bucket starts immediately after its header. */
 #define BLOB_DB_BUCKET_DATA_OFF   (sizeof(struct blob_db_bucket_hdr))
@@ -199,14 +305,29 @@ BUILD_ASSERT(BLOB_DB_SLOT_OVERHEAD == 14, "slot overhead drift");
  * which the UBI backend's ubi_leb_write_at() mapping relies on — the reason
  * the header is not simply written last instead.
  */
+/* A protected store's seal also names the bucket and carries a MAC over
+ * itself and the whole image, checked once per recovery and never on a read
+ * (40 B). */
 struct __packed blob_db_scratch_seal {
 	uint8_t  magic[4];        /* 'B','D','S','L'                          */
 	uint32_t image_len;       /* bytes of compacted image at offset 0      */
 	uint32_t image_crc32;     /* CRC32-IEEE over those image_len bytes     */
-	uint32_t seal_crc32;      /* CRC32-IEEE over the preceding 12 bytes    */
+#if defined(CONFIG_BLOB_DB_PROTECTED)
+	uint16_t bucket_id;       /* 12..13  the bucket the image is for       */
+	uint16_t reserved;        /* 14..15                                    */
+	uint32_t image_gen;       /* 16..19  the image's bucket header gen     */
+	uint8_t  mac[BLOB_DB_META_MAC_LEN]; /* 20..35  CMAC(K_meta,
+				   *          seal[0, 20) || image)             */
+#endif
+	uint32_t seal_crc32;      /* CRC32-IEEE over every byte before it      */
 };
+#if defined(CONFIG_BLOB_DB_PROTECTED)
+BUILD_ASSERT(sizeof(struct blob_db_scratch_seal) == 40,
+	     "blob_db_scratch_seal layout drift");
+#else
 BUILD_ASSERT(sizeof(struct blob_db_scratch_seal) == 16,
 	     "blob_db_scratch_seal layout drift");
+#endif
 
 #define BLOB_DB_SCRATCH_MAGIC     "BDSL"
 

@@ -162,20 +162,36 @@ in `tests/lib/blob_db/testcase.yaml`.
 **Authenticated metadata.** UBI seals its headers and volume table with
 AES-CMAC under keys derived (HKDF-SHA256) from a PSA key handle, so the
 backend selects `PSA_CRYPTO` (Mbed TLS, or TF-M where the build has it).
-`CONFIG_BLOB_DB_UBI_KEY` picks where the key comes from:
+The key handle is acquired by the blob_db core, not by this backend
+(`lib/blob_db/blob_db_protect.c`), once per open of the store, and handed to
+UBI at attach: the same handle keys blob_db's own protection
+(`CONFIG_BLOB_DB_PROTECT`), under separate HKDF salts and labels, so one
+provisioned key covers both layers. `CONFIG_BLOB_DB_KEY` picks where it comes
+from:
 
-- `BLOB_DB_UBI_KEY_BUILTIN` (default) — a fixed key compiled into blob_db.
+- `BLOB_DB_KEY_BUILTIN` (default) — a fixed key compiled into blob_db.
   The MAC then catches damage, not tampering: anyone can re-seal a forged
-  header. It matches what the previous, unauthenticated UBI backend offered.
-- `BLOB_DB_UBI_KEY_APP` — the application defines `blob_db_ubi_ikm_key()`
-  (`<app/lib/blob_db_ubi.h>`) and returns a per-device key it provisioned.
+  header. It matches what the previous, unauthenticated UBI backend offered,
+  and its bytes are the ones this backend imported before keying moved to
+  the core, so existing devices still attach.
+- `BLOB_DB_KEY_APP` — the application defines `blob_db_ikm_key()`
+  (`<app/lib/blob_db_security.h>`) and returns a per-device key it
+  provisioned. `BLOB_DB_UBI_KEY_APP` and `blob_db_ubi_ikm_key()` are kept,
+  deprecated, for one release: the option makes `BLOB_DB_KEY_APP` the
+  default, and a weak `blob_db_ikm_key()` calls the old hook.
+
+UBI's events (a corrupt or tampered header, corrupt data) reach the
+application through `blob_db_event()` with layer `BLOB_DB_EVENT_UBI`, beside
+blob_db's own.
 
 UBI also consults a state callback at attach and every
 `CONFIG_UBI_STATE_CHECK_INTERVAL` writes, the place for rollback detection.
 blob_db forwards it to `blob_db_ubi_state_check()`, whose weak default trusts
 every device; an application with a trusted store (PSA ITS, a monotonic
 counter) overrides it. A refusal fails the mount, or every later write, with
-`-EROFS`. Application data is neither encrypted nor authenticated either way.
+`-EROFS`. Application data is authenticated, and encrypted, only by blob_db's
+own `CONFIG_BLOB_DB_PROTECT` (`doc/proposals/2026-10-15-blob-db-protection.md`):
+UBI's MAC covers UBI's metadata, and blob_db does not rely on it.
 
 **Maintenance.** zephyr-ubi has no background thread. A write that finds no
 free block erases one itself, and `ubi_leb_erase()` hands its block straight
@@ -263,12 +279,13 @@ and is tracked as `doc/impl/l1_bucketlog.md` §13.7.
 choice BLOB_DB_BACKEND                        # in lib/blob_db/Kconfig
     BLOB_DB_BACKEND_FLASH_AREA                # raw partition
     BLOB_DB_BACKEND_UBI      (default)        # selects UBI, PSA_CRYPTO
-        choice BLOB_DB_UBI_KEY
-            BLOB_DB_UBI_KEY_BUILTIN  (default)   # fixed development key
-            BLOB_DB_UBI_KEY_APP                  # blob_db_ubi_ikm_key()
+        BLOB_DB_UBI_KEY_APP          (n)          # deprecated: BLOB_DB_KEY_APP
         BLOB_DB_UBI_RELOCATE_BUDGET  (1)          # wear-leveling moves per erase
         BLOB_DB_UBI_ATOMIC_REPLACE   (y)          # replace and compact by ubi_leb_change()
     BLOB_DB_UBI_HEAP_SIZE                     # heap for UBI, from the partition size
+choice BLOB_DB_KEY                            # UBI backend, or BLOB_DB_PROTECT
+    BLOB_DB_KEY_BUILTIN      (default)        # fixed development key
+    BLOB_DB_KEY_APP                           # blob_db_ikm_key()
 ```
 
 `BLOB_DB` selects `FLASH` and `FLASH_MAP` for either provider;

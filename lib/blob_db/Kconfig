@@ -55,33 +55,14 @@ endchoice
 
 if BLOB_DB_BACKEND_UBI
 
-choice BLOB_DB_UBI_KEY
-	prompt "Keying material for UBI's metadata MAC"
-	default BLOB_DB_UBI_KEY_BUILTIN
-	help
-	  UBI derives the keys that seal its headers and volume table from a
-	  PSA key handle. Other keying material makes the store unreadable,
-	  so whichever is chosen must stay the same for the life of the
-	  device; switching means erasing the partition.
-
-config BLOB_DB_UBI_KEY_BUILTIN
-	bool "Built-in development key (NOT secret)"
-	help
-	  Import a fixed key compiled into blob_db, the same on every device.
-	  The MAC then detects damage but not tampering — anyone can re-seal
-	  a forged header. Fine for development and for products that only
-	  wanted UBI's wear-leveling; not for a threat model with an attacker
-	  who can write the flash.
-
 config BLOB_DB_UBI_KEY_APP
-	bool "Application-provisioned key"
+	bool "Application-provisioned key (deprecated: BLOB_DB_KEY_APP)"
+	select DEPRECATED
 	help
-	  The application defines blob_db_ubi_ikm_key()
-	  (<app/lib/blob_db_ubi.h>) and returns a per-device key it
-	  provisioned into its PSA key store. The build fails to link until
-	  it does.
-
-endchoice
+	  Kept for one release so existing configurations still build: it
+	  makes BLOB_DB_KEY_APP the default. The application may keep defining
+	  blob_db_ubi_ikm_key(); new code defines blob_db_ikm_key()
+	  (<app/lib/blob_db_security.h>).
 
 config BLOB_DB_UBI_RELOCATE_BUDGET
 	int "Wear-leveling relocations per bucket erase"
@@ -126,6 +107,159 @@ config HEAP_MEM_POOL_ADD_SIZE_BLOB_DB_UBI
 
 endif # BLOB_DB_BACKEND_UBI
 
+choice BLOB_DB_PROTECT
+	prompt "Authentication and encryption of stored data"
+	default BLOB_DB_PROTECT_NONE
+	help
+	  Protect every slot -- the unit blob_db writes and verifies whole --
+	  and blob_db's own metadata (masters, bucket headers, compaction seal)
+	  with keys derived from the keying material BLOB_DB_KEY picks
+	  (doc/proposals/2026-10-15-blob-db-protection.md).
+
+	  A protected store is on-flash format major 3 (4 with
+	  BLOB_DB_LARGE_PAYLOADS) and records its mode: a build mounts only
+	  its own mode, and an unprotected build refuses a protected store,
+	  and the other way round, with -ENOTSUP. Switching means
+	  blob_db_format().
+
+	  Out of scope: an attacker who restores a bucket, or the whole
+	  store, to an older authentic image; traffic analysis of ids, sizes
+	  and timing; side channels and fault injection; availability.
+
+config BLOB_DB_PROTECT_NONE
+	bool "None (CRCs only)"
+	help
+	  Today's format, major 1 or 2, and today's code size. CRCs detect
+	  damage; anyone who can write the flash can change the data, and
+	  anyone who can read it reads it.
+
+config BLOB_DB_PROTECT_AUTH
+	bool "Authenticated (AES-CMAC per slot)"
+	select BLOB_DB_PROTECTED
+	select PSA_WANT_ALG_CMAC
+	help
+	  An AES-CMAC tag on every slot, under a key bound to this store, and
+	  on the metadata. Data stays readable on flash; every change to it,
+	  a slot moved to another id or bucket, or one taken from another
+	  store is detected: get() answers -EIO, never the altered bytes.
+	  Costs BLOB_DB_PROTECT_TAG_LEN bytes per slot and one CMAC per read
+	  and write.
+
+config BLOB_DB_PROTECT_AEAD
+	bool "Encrypted and authenticated (AES-CCM per slot)"
+	select BLOB_DB_PROTECTED
+	select PSA_WANT_ALG_CMAC
+	select PSA_WANT_ALG_CCM
+	help
+	  AES-CCM on every slot: the payload is encrypted and authenticated,
+	  and the slot header and id stay in the clear for the walk, covered
+	  by the tag. An appended slot carries its 12-byte nonce; one rewritten
+	  by compaction carries none, because its nonce derives from a base
+	  in the bucket header. Costs BLOB_DB_PROTECT_TAG_LEN + 12 bytes per
+	  appended slot, BLOB_DB_PROTECT_TAG_LEN per compacted one.
+
+endchoice
+
+config BLOB_DB_PROTECTED
+	bool
+	select PSA_CRYPTO
+	select PSA_WANT_ALG_HKDF
+	select PSA_WANT_ALG_SHA_256
+	select PSA_WANT_KEY_TYPE_AES
+	select PSA_WANT_KEY_TYPE_DERIVE
+	help
+	  BLOB_DB_PROTECT_AUTH or BLOB_DB_PROTECT_AEAD.
+
+if BLOB_DB_PROTECTED
+
+choice BLOB_DB_PROTECT_TAG
+	prompt "Tag length per slot"
+	default BLOB_DB_PROTECT_TAG_8
+	help
+	  The truncated MAC (AUTH) or CCM tag (AEAD) each slot carries. The
+	  metadata MACs are always the full 16 bytes.
+
+config BLOB_DB_PROTECT_TAG_8
+	bool "8 bytes"
+	help
+	  A forgery succeeds with probability 2^-64 per attempt, and every
+	  attempt needs a write to the flash and a read by the device.
+
+config BLOB_DB_PROTECT_TAG_16
+	bool "16 bytes (UBI's length)"
+	help
+	  The full AES block, as zephyr-ubi uses; 8 more bytes per slot.
+
+endchoice
+
+config BLOB_DB_PROTECT_TAG_LEN
+	int
+	default 16 if BLOB_DB_PROTECT_TAG_16
+	default 8
+
+config BLOB_DB_SEQ_STEP
+	int "Nonce counter values per master write"
+	depends on BLOB_DB_PROTECT_AEAD
+	default 65536
+	range 4096 1073741824
+	help
+	  An appended AEAD slot takes its nonce from a store-wide counter
+	  whose leading ceiling is kept in the master, as the id ceiling is:
+	  a new ceiling this far ahead is written before any value past the
+	  old one is used, so no value is used twice across a power cut.
+	  Compaction reserves one sector's worth of values at a time. Larger
+	  means fewer master writes and more values skipped at each mount.
+
+config BLOB_DB_TEST_PROTECT_HOOKS
+	bool "Test-only: report every AEAD nonce used"
+	depends on BLOB_DB_PROTECT_AEAD
+	help
+	  Calls blob_db_test_nonce_used() (<app/lib/blob_db_test.h>), which
+	  the test defines, with every nonce a slot is sealed under, so a
+	  test can show none is used twice. For tests only.
+
+endif # BLOB_DB_PROTECTED
+
+config BLOB_DB_KEYS
+	bool
+	default y if BLOB_DB_BACKEND_UBI || BLOB_DB_PROTECTED
+	help
+	  Keying material is needed: for UBI's metadata MAC, for blob_db's
+	  own protection, or both.
+
+choice BLOB_DB_KEY
+	prompt "Keying material"
+	depends on BLOB_DB_KEYS
+	default BLOB_DB_KEY_APP if BLOB_DB_UBI_KEY_APP
+	default BLOB_DB_KEY_BUILTIN
+	help
+	  The PSA key handle every key blob_db and UBI use is derived from,
+	  through HKDF-SHA256 with separate labels. Other keying material
+	  makes the store unreadable, so whichever is chosen must stay the
+	  same for the life of the device; switching means erasing the
+	  partition.
+
+config BLOB_DB_KEY_BUILTIN
+	bool "Built-in development key (NOT secret)"
+	help
+	  Import a fixed key compiled into blob_db, the same on every device.
+	  The MACs then detect damage but not tampering -- anyone can re-seal
+	  a forged slot or header -- and BLOB_DB_PROTECT_AEAD only
+	  obfuscates. Fine for development and for products that only
+	  wanted UBI's wear-leveling; not for a threat model with an attacker
+	  who can read or write the flash.
+
+config BLOB_DB_KEY_APP
+	bool "Application-provisioned key"
+	help
+	  The application defines blob_db_ikm_key()
+	  (<app/lib/blob_db_security.h>) and returns a per-device key it
+	  provisioned into its PSA key store. The build fails to link until
+	  it does. On the UBI backend, an application that still defines
+	  only the deprecated blob_db_ubi_ikm_key() keeps working.
+
+endchoice
+
 config BLOB_DB_UBI_HEAP_SIZE
 	int "Heap reserved for the UBI device"
 	default $(add,$(div,$(dt_nodelabel_reg_size_int,storage_partition),512),4096)
@@ -150,12 +284,17 @@ config BLOB_DB_PARTITION_LABEL
 
 config BLOB_DB_MAX_PAYLOAD_LEN
 	int "Max single-slot payload length in bytes"
+	default 1982 if BLOB_DB_LARGE_PAYLOADS && BLOB_DB_PROTECT_AEAD && BLOB_DB_PROTECT_TAG_16
+	default 1990 if BLOB_DB_LARGE_PAYLOADS && BLOB_DB_PROTECT_AEAD
+	default 1994 if BLOB_DB_LARGE_PAYLOADS && BLOB_DB_PROTECT_AUTH && BLOB_DB_PROTECT_TAG_16
+	default 2002 if BLOB_DB_LARGE_PAYLOADS && BLOB_DB_PROTECT_AUTH
 	default 2016 if BLOB_DB_LARGE_PAYLOADS
 	default 256
 	range 1 65535
 	help
 	  Maximum payload size accepted by blob_db_update. Slot size on flash
-	  is bounded by this plus a 14-byte header.
+	  is bounded by this plus a 14-byte header, plus the tag and nonce of
+	  BLOB_DB_PROTECT.
 
 	  The upper bound here is only the on-flash field width (val_len is
 	  16-bit). The binding limit is the erase-block geometry, which is a
@@ -163,7 +302,9 @@ config BLOB_DB_MAX_PAYLOAD_LEN
 	  two slots to fit before compaction can reclaim the first. Mount
 	  therefore refuses a build whose cap exceeds
 	  (sector_size - 16) / 2 - 14 — about 2026 B on 4 KB sectors and
-	  32746 B on 64 KB sectors.
+	  32746 B on 64 KB sectors. A protected store has a 48-byte bucket
+	  header and a larger slot overhead: 2002 B on 4 KB sectors with
+	  BLOB_DB_PROTECT_AUTH, 1990 B with BLOB_DB_PROTECT_AEAD (8-byte tags).
 
 config BLOB_DB_LARGE_PAYLOADS
 	bool "Objects larger than one slot (segmented)"
@@ -290,6 +431,7 @@ config BLOB_DB_SHELL
 
 config BLOB_DB_AUTOFORMAT_ON_CORRUPT
 	bool "Format when no master is usable (destroys the store)"
+	depends on BLOB_DB_PROTECT_NONE
 	help
 	  What mount does when neither master can be used and they are not
 	  both erased — bit rot, a power loss while a format wrote the first
@@ -307,6 +449,13 @@ config BLOB_DB_AUTOFORMAT_ON_CORRUPT
 	  A store written in a format this build does not understand is
 	  always refused with -ENOTSUP and never formatted, regardless of this
 	  option.
+
+	  The same choice applies to a bucket whose header cannot be read:
+	  n answers -EIO for it, y treats it as unformatted, so the next
+	  write to it erases its slots.
+
+	  Not available with BLOB_DB_PROTECT: whoever can corrupt both
+	  masters, or a header, would then have a factory reset.
 
 config BLOB_DB_SECTOR_BUF_SIZE
 	int "Max flash sector size in bytes"

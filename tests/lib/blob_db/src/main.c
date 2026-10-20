@@ -45,14 +45,21 @@
  * that does not reach past the API still runs on both backends — see the
  * lib.blob_db.ubi scenario in testcase.yaml.
  *
+ * The offsets are those of an unprotected store, so these cases skip in a
+ * protected build (CONFIG_BLOB_DB_PROTECT) too; src/protect.c injects the
+ * same faults, and forgeries, into the protected layout.
+ *
  * The guard goes at the top of each affected case, not inside the injection
  * helpers. ztest_test_skip() escapes by longjmp, which the compiler cannot see,
  * so guarding a helper leaves every local it fills looking uninitialised to
  * -Werror=uninitialized. Guarding the case works because Z_TEST_SKIP() ends in
  * a plain return.
  */
-#define SKIP_UNLESS_RAW_PARTITION() \
-	Z_TEST_SKIP_IFNDEF(CONFIG_BLOB_DB_BACKEND_FLASH_AREA)
+#define SKIP_UNLESS_RAW_PARTITION()                                            \
+	do {                                                                   \
+		Z_TEST_SKIP_IFNDEF(CONFIG_BLOB_DB_BACKEND_FLASH_AREA);         \
+		Z_TEST_SKIP_IFDEF(CONFIG_BLOB_DB_PROTECTED);                   \
+	} while (0)
 
 /* alloc + bind in one step — the contract's replacement for the old `put`. */
 static uint64_t put_blob(const void *payload, size_t len)

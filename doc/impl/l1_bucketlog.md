@@ -314,6 +314,105 @@ no room the writer simply allocates another id and lands elsewhere. A
 user-visible id cannot do this — its bucket is fixed — but segments are never
 user-visible.
 
+### 3.6 Protected store (`CONFIG_BLOB_DB_PROTECT`)
+
+Authentication (`PROTECT_AUTH`, AES-CMAC) or authenticated encryption
+(`PROTECT_AEAD`, AES-CCM) of every slot and of blob_db's own metadata. The
+design, threat model and the alternatives it rejected are in
+`doc/proposals/2026-10-15-blob-db-protection.md` (cited here as [P]); this
+section records the format as built.
+
+**Format.** Major 3, or 4 with `LARGE_PAYLOADS` (unprotected stores are 1/2).
+A protected build reads only [3, its own] — adopting an unprotected store would
+accept slots nobody authenticated — and an unprotected build reads only up to
+its own. The master's `suite` byte (byte 19, reserved before) names the mode in
+its low nibble and the tag length / 4 in its high one; a build mounts only its
+own suite, anything else is `-ENOTSUP`.
+
+```
+master (84 B)   bytes 0..63 as §3.1, with suite (19), store_uuid (36..51),
+                seq_hint (52..59; AEAD); then mac[16] = CMAC(K_meta, [0, 64))
+                and tail_crc32 over [0, 80)
+bucket (48 B)   magic, bucket_id, reserved, gen, cbase_seq (12..19),
+                cbase_salt (20..23), reserved, mac[16] = CMAC(K_meta, [0, 28)),
+                hdr_crc32 over [0, 44)
+scratch seal    magic, image_len, image_crc32, bucket_id, reserved, image_gen,
+(40 B)          mac[16] = CMAC(K_meta, seal[0, 20) || image), seal_crc32
+
+slot            AUTH            head(12) |         payload[L] | tag[T] | crc16
+                AEAD appended   head(12) | nonce | P[L]       | tag[T] | crc16
+                AEAD compacted  head(12) |         P[L]       | tag[T] | crc16
+```
+
+`DATA_OFF` is 48. T is 8 (default) or 16. The CRC16 comes last and covers every
+byte before it, tag included; a slot's size still follows from `flags` and
+`val_len` alone (the COMPACTED flag, bit 4, AEAD only, means "no stored nonce").
+AUTH tags `head || payload`; AEAD encrypts the payload with AAD = every clear
+byte before the ciphertext — the head, a stored nonce, and a SEGMENT slot's
+12-byte owner/seq prefix, which stays in the clear so the sweep finds owners
+without decrypting.
+
+**Keys** ([P] §3.1). One PSA key handle (`BLOB_DB_KEY`) feeds HKDF-SHA256 with
+salt `"blob_db/v1"` and info `label || store_uuid`: K_slot (CMAC or CCM) and
+K_meta (CMAC-128), volatile, derived at mount and destroyed at unmount. On UBI
+the same handle keys UBI under UBI's own labels. The uuid is drawn at every
+format, so a counter that starts again after a format starts under a new key.
+
+**Nonces** (AEAD). An appended slot stores `salt(4) || LE64(seq)`. `seq` is a
+store-wide counter with a leading ceiling `seq_hint` in the master, persisted
+`BLOB_DB_SEQ_STEP` ahead before any value past the old ceiling is used, exactly
+as `next_id_hint` (§13.1); mount resumes at the ceiling. `salt` is 32 random
+bits per mount, so a master rolled back to an old ceiling still gives distinct
+nonces. Compaction reserves `peb_size` consecutive values as the bucket's
+`cbase_seq` (persisting a ceiling of its own when needed, before the image is
+built) and a compacted slot at offset `off` uses `cbase_salt ||
+LE64(cbase_seq + off)`, so no compacted slot carries a nonce.
+
+**Checks.** Everywhere: erased → structure → CRC → MAC. A CRC that fails is
+damage (`BLOB_DB_EVENT_CORRUPT`); a CRC that verifies over a MAC or tag that
+does not is tampering (`BLOB_DB_EVENT_TAMPERED`). MACs are compared only by
+`psa_mac_verify*` and `psa_aead_verify`.
+
+| Object | Damaged (CRC) | Tampered (MAC/tag) |
+|---|---|---|
+| master | ignored; the other may win | ignored; the other may win. Two authentic masters with different uuids: `-EIO` |
+| bucket header | `-EIO` (§3.2) | `-EIO` (§3.2) |
+| slot | skipped: the read falls back to the newest older slot | `-EIO`, no fallback |
+| scratch seal | unsealed: the bucket is left as it is | likewise |
+
+A zeroed magic does not mean "unformatted" in a protected store (anyone can
+clear bits), so `erase_all` erases each bucket it retires. Autoformat is not
+available (`BLOB_DB_AUTOFORMAT_ON_CORRUPT` depends on `PROTECT_NONE`).
+
+**Where the header MAC is checked.** Mount no longer scans every bucket
+(§5.1), so there is no single pass to check them all in. It is checked: by the
+mount-time id scan when that runs; by every writer before it appends or
+formats (one 48-byte read and one CMAC over 28 bytes, reads of a slot index
+cursor included); by a read about to answer `-ENOENT`, so a displaced bucket
+answers `-EIO`, not "absent"; and by compaction, `count` and `iterate` on the
+resident image. A read that finds its slot does not check it: the slot's tag
+covers the id and, through the key, the store, and a forged `cbase` only makes
+a compacted slot's tag fail.
+
+**Read path.** `slot_verify()` reads `[nonce] || P || tag || crc` in one
+transaction (two before), checks the CRC, then verifies or decrypts in place
+in the staging buffer, never in the caller's. A compacted slot costs one more
+12-byte read of its bucket's `cbase`. `iterate` opens each live slot into the
+second sector buffer before calling back; `count`, `exists`, the walk and
+mount read only clear headers.
+
+**Compaction.** As §5.6, but a tombstone is dropped only if it authenticates,
+and in AEAD every kept slot is opened from the old image straight into its
+place in the new one and resealed there, COMPACTED, under the new header's
+`cbase`. A slot that does not authenticate is copied as it is, so it keeps
+reading `-EIO`: compaction never decides what tampered data means. Recovery
+copies a sealed scratch image byte for byte once its seal MAC verifies.
+
+**Costs** (estimates; [P] §4 has the table). Per slot: AUTH +T B, AEAD
+appended +T+12 B, compacted +T B. Per bucket: +32 B of header. RAM: the uuid,
+the counter, its ceiling and the salt; the keys live in PSA. The payload cap a
+geometry sustains is `(sector − 48)/2 − overhead`, checked at mount as before.
+
 ## 4. Slot semantics — latest wins
 
 A bucket is an append-only log of operations on the ids hashing to it.
@@ -386,7 +485,7 @@ bound or freshly allocated (§13.5).
 
 Walk the bucket by slot header (12 B per slot: header + id), tracking the
 latest match, apply latest-wins (§4); then read and CRC-verify just that slot's
-payload. No whole-sector read — the point of the header-driven walk is that
+payload — and, in a protected store, its tag (§3.6). No whole-sector read — the point of the header-driven walk is that
 answering one lookup costs O(slots) small reads instead of one erase-block read,
 which on 64 KB sectors is the difference between ~12 B per slot and 64 KB.
 
@@ -499,7 +598,7 @@ write master A  (gen+2, CLEAN)                    ─┘
 ```
 
 The window is bracketed by master writes; any crash inside is recovered at
-mount (§6.1).
+mount (§6.1). A protected store adds the AEAD reseal and the seal MAC (§3.6).
 
 ### 5.6a Segmented `update` / `delete`, and the sweep
 
@@ -633,6 +732,12 @@ Two atomic-commit primitives: a **single slot append** (torn → CRC fails →
 treated as end-of-log) and a **master sector write** (torn → older master
 wins). Compaction composes them.
 
+A protected store (§3.6) adds no primitive. Its crypto state is persisted
+ahead of use: a torn ceiling write leaves the older master, whose ceiling
+still covers every nonce value used; a nonce range for compaction is reserved
+under a persisted ceiling before the image is built, and the image is built
+in RAM, so a crash while resealing writes nothing.
+
 ### 6.1 Compaction crash table
 
 | Crash point | Mount sees | Recovery |
@@ -678,7 +783,14 @@ BLOB_DB                        bool, select FLASH, FLASH_MAP, CRC
 BLOB_DB_PARTITION_LABEL        string, default "storage"
 BLOB_DB_MAX_PAYLOAD_LEN        int, default 256, range 1 65535  # geometry checked at mount
 BLOB_DB_SECTOR_BUF_SIZE        int, default 4096
-BLOB_DB_AUTOFORMAT_ON_CORRUPT  bool, default n   # erase on unusable masters (§3.1)
+BLOB_DB_AUTOFORMAT_ON_CORRUPT  bool, default n   # erase on unusable masters (§3.1); not with PROTECT
+choice BLOB_DB_PROTECT                           # §3.6
+    BLOB_DB_PROTECT_NONE   (default)             # majors 1/2, CRCs only
+    BLOB_DB_PROTECT_AUTH                         # AES-CMAC per slot, major 3/4
+    BLOB_DB_PROTECT_AEAD                         # AES-CCM per slot, major 3/4
+choice BLOB_DB_PROTECT_TAG     8 (default) | 16  # bytes of tag per slot
+BLOB_DB_SEQ_STEP               int, default 65536   # AEAD nonce values per ceiling write
+choice BLOB_DB_KEY             BUILTIN (default, NOT secret) | APP   # UBI and PROTECT
 BLOB_DB_LARGE_PAYLOADS         bool, default n   # segmented objects (§3.5)
 BLOB_DB_MAX_OBJECT_LEN         int, default 131072   # validated at mount
 BLOB_DB_MAX_SEGMENTS           int, default 128      # 16 B of .bss each
