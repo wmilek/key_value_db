@@ -318,6 +318,76 @@ ZTEST(blob_db_contract, test_destroy_empty_container)
 	assert_no_leak();
 }
 
+/* --- create / destroy interrupted between root and intent ------------- */
+
+/* The intent id the list root names, read straight from the root payload. */
+static uint64_t root_intent_id(uint64_t root)
+{
+	uint8_t buf[CONFIG_BLOB_DB_MAX_PAYLOAD_LEN];
+	size_t got;
+	uint64_t id;
+
+	zassert_ok(blob_db_get(root, buf, sizeof(buf), &got));
+	memcpy(&id, buf, sizeof(id));
+	return id;
+}
+
+/* Create commits the root first, naming an intent id it has not bound yet.
+ * A crash right there must leave no residue: the next open gives the list
+ * a fresh intent blob and never binds the one the root named. */
+ZTEST(blob_db_contract, test_create_crash_before_intent)
+{
+	uint64_t root;
+
+	zassert_ok(blob_db_format());
+	zassert_ok(rootreg_init());
+	zassert_ok(rootreg_get_or_create(MC_ROOTREG_KEY, &root));
+
+	/* The state create leaves when it stops after its commit: an empty
+	 * list naming an intent id that was allocated and never bound. */
+	uint64_t unbound = blob_db_alloc_id();
+	uint8_t img[12] = { 0 };
+
+	zassert_not_equal(unbound, BLOB_DB_INVALID_ID);
+	memcpy(img, &unbound, sizeof(unbound));
+	zassert_ok(blob_db_update(root, img, sizeof(img)));
+
+	crash_and_recover();
+
+	zassert_false(blob_db_exists(unbound), "named intent id was bound");
+	zassert_not_equal(root_intent_id(root), unbound);
+	assert_no_leak();
+
+	char buf[16];
+
+	zassert_ok(mc_set("foo", "bar", 3, MC_STEP_NONE));
+	zassert_ok(get_str("foo", buf, sizeof(buf)));
+	zassert_str_equal(buf, "bar");
+	assert_no_leak();
+}
+
+/* Destroy deletes the intent before the root. A crash between the two must
+ * not leave the container unopenable: open repairs it and destroy reruns. */
+ZTEST(blob_db_contract, test_destroy_crash_before_root)
+{
+	uint64_t root;
+
+	zassert_ok(mc_set("foo", "bar", 3, MC_STEP_NONE));
+	zassert_ok(rootreg_get(MC_ROOTREG_KEY, &root));
+
+	/* Intent gone, root still bound — as when destroy stops between the
+	 * two. (Destroy would have deleted the entries too; open does not
+	 * care, and the rerun tolerates either.) */
+	zassert_ok(blob_db_delete(root_intent_id(root)));
+
+	crash_and_recover();
+
+	zassert_ok(mc_destroy());
+	zassert_ok(rootreg_unregister(MC_ROOTREG_KEY));
+	zassert_equal(blob_db_count(), 1,
+		      "want registry only, got %zu blobs", blob_db_count());
+}
+
 /* --- an unreadable key is not an absent key ---------------------------- */
 
 /* Lookups skip only a key that answers -ENOENT. Any other read error
