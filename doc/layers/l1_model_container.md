@@ -371,6 +371,9 @@ recovery decides by `del[]` alone.
 | 4 | mapping gone | staged intent | committed: deletes → `-ENOENT`; clear |
 | 5 | mapping gone | none | — |
 
+The intent is not the only way to make a delete leak-free: §9 shows a
+variant that uses the list itself as the journal.
+
 ## 9. What real containers change — and what they must not
 
 Real containers (`l2_containers.md`) optimize the model in three ways, none of
@@ -400,3 +403,22 @@ single container cannot sweep safely next to others) and costs a full scan
 whenever it runs. The intent record is the composable, normative mechanism; a
 sweep is a last resort — a maintenance tool for residue that should be
 impossible, run on purpose and never on the mount path.
+
+A delete has a cheaper alternative that needs no intent: **the list as its
+own journal**. Delete the pair *before* unlinking it — `delete(kid)`, then
+`delete(vid)`, then commit the list without the entry. The first delete is
+the linearization point: from then on the key reads as absent. A crash leaves
+an entry whose `kid` answers `-ENOENT`, and the next scan that passes it
+(every miss in a lookup does) finishes the job: delete `vid` (`-ENOENT`
+tolerated), then drop the entry in that mutation's own commit. The residue
+stays referenced from the list, so nothing leaks permanently, and ids are
+never reused, so a dangling id cannot alias another client's blob. It holds
+only if `kid` is always deleted first, only `-ENOENT` counts as deleted (any
+other read error must not trigger the heal, or a corrupt `kid` would destroy
+a valid `vid`), and the heal runs only while no intent is staged. The price:
+a dangling reference becomes a normal state instead of impossible residue
+(§7), so it no longer flags a defect, and reclamation waits until a scan next
+reaches the entry instead of happening at mount. It also covers deletes only
+— an insert's new blobs are referenced from nowhere until its commit, so they
+still need an intent to name them. The model therefore keeps the intent for
+every reference-graph mutation, to show one mechanism throughout.
