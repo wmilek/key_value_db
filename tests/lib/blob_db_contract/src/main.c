@@ -83,6 +83,7 @@ static void before(void *f)
 {
 	ARG_UNUSED(f);
 	mc_fail_after(MC_STEP_NONE, 0);
+	mc_fail_key_read(0);
 	blob_db_unmount();
 	zassert_ok(blob_db_mount());
 	fresh_container();
@@ -314,6 +315,36 @@ ZTEST(blob_db_contract, test_destroy_empty_container)
 	zassert_equal(blob_db_count(), 1);
 
 	open_container();           /* fresh container, fresh id */
+	assert_no_leak();
+}
+
+/* --- an unreadable key is not an absent key ---------------------------- */
+
+/* Lookups skip only a key that answers -ENOENT. Any other read error
+ * reaches the caller before anything is written — above all it never
+ * turns an overwrite into the insert of a second entry for the key. */
+ZTEST(blob_db_contract, test_key_read_error_propagates)
+{
+	char buf[16];
+	size_t n;
+
+	zassert_ok(mc_set("foo", "bar", 3, MC_STEP_NONE));
+
+	mc_fail_key_read(-EIO);
+	zassert_equal(mc_set("foo", "baz", 3, MC_STEP_NONE), -EIO);
+	zassert_ok(mc_entry_count(&n));
+	zassert_equal(n, 1, "an unreadable key was inserted again");
+	zassert_ok(get_str("foo", buf, sizeof(buf)));
+	zassert_str_equal(buf, "bar");
+	assert_no_leak();
+
+	mc_fail_key_read(-EIO);
+	zassert_equal(get_str("foo", buf, sizeof(buf)), -EIO);
+
+	mc_fail_key_read(-EIO);
+	zassert_equal(mc_del("foo", MC_STEP_NONE), -EIO);
+	zassert_ok(get_str("foo", buf, sizeof(buf)));
+	zassert_str_equal(buf, "bar");
 	assert_no_leak();
 }
 

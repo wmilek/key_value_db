@@ -298,7 +298,10 @@ defect, external interference), it is *impossible residue* and must not be
 carried:
 
 - lookup treats the pair as absent (`-ENOENT` from `get(kid)` ⇒ key not
-  present) — the must-tier rule that unresolvable data is not data;
+  present) — the must-tier rule that unresolvable data is not data. Only
+  `-ENOENT` counts: any other error from `get(kid)` (`-EIO`) leaves the
+  state unknown and is returned, never read as absence — a mutation that
+  took it as a miss would insert a second entry for a key that exists;
 - the next mutation of the list (or an explicit repair pass) drops the entry
   as part of its own commit.
 

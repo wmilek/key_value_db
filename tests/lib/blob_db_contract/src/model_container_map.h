@@ -57,7 +57,8 @@ enum mc_crash_point {
  * Idempotent — safe to call on every mount. */
 int mc_open(uint64_t root_id);
 
-/* Look up a key. Returns 0 and fills out/out_len on hit, -ENOENT on miss. */
+/* Look up a key. Returns 0 and fills out/out_len on hit, -ENOENT on miss,
+ * or the error of a key or value read that failed. */
 int mc_get(const char *key, void *out, size_t out_sz, size_t *out_len);
 
 /* Insert or overwrite key -> value. `crash_at` injects a stop point (§5);
@@ -78,6 +79,10 @@ int mc_del(const char *key, enum mc_crash_point crash_at);
  * `step`, as if the following blob_db call had returned it, so it takes the
  * abort path with no remount. One-shot; MC_STEP_NONE disarms. */
 void mc_fail_after(enum mc_crash_point step, int err);
+
+/* Test hook: make the next key read during a lookup return `err` instead
+ * of reading, as a flash error would. One-shot; 0 disarms. */
+void mc_fail_key_read(int err);
 
 /* Tear the container down entirely: delete every key/value blob, the intent
  * blob, and finally the list root. After this the container does not exist —
