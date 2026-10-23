@@ -50,7 +50,8 @@ enum mc_crash_point {
 #define MC_STOPPED  1
 
 /* Open the container rooted at `root_id`, creating it if the id is
- * allocated-but-unbound (the registry-§7 "creation in progress" state), and
+ * allocated-but-unbound (the registry-§7 "creation in progress" state) or
+ * bound to an empty payload (BLOB_DB_ROOT_ID on a fresh store), and
  * running intent recovery (§6) if a mutation was interrupted. The caller
  * owns the id's persistence (root registry, direct id-1 binding, ...).
  * Idempotent — safe to call on every mount. */
@@ -81,7 +82,9 @@ void mc_fail_after(enum mc_crash_point step, int err);
 /* Tear the container down entirely: delete every key/value blob, the intent
  * blob, and finally the list root. After this the container does not exist —
  * the root id is dead (never reused) and every mc_* call fails with -ENODEV
- * until a fresh mc_open(). The client completes the cleanup by dropping its
+ * until a fresh mc_open(). A root of BLOB_DB_ROOT_ID cannot be deleted, so
+ * it is reset to an empty payload instead; mc_open() on it then creates a
+ * fresh container. The client completes the cleanup by dropping its
  * record of the root id (rootreg_unregister) AFTER this returns — teardown
  * before unregistration, per l1_root_registry.md §8.
  *

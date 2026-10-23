@@ -81,6 +81,9 @@ static int list_load(struct mc_list *l)
 	if (rc < 0) {
 		return rc;
 	}
+	if (got < 12) {
+		return -EIO;
+	}
 	memset(l, 0, sizeof(*l));
 	size_t off = 0;
 
@@ -88,7 +91,7 @@ static int list_load(struct mc_list *l)
 	off += 8;
 	memcpy(&l->count, buf + off, 4);
 	off += 4;
-	if (l->count > MC_MAX_ENTRIES) {
+	if (l->count > MC_MAX_ENTRIES || got != 12 + 16 * (size_t)l->count) {
 		return -EIO;
 	}
 	for (uint32_t i = 0; i < l->count; i++) {
@@ -266,6 +269,11 @@ static int mc_create(void)
 	 * final update is the commit that makes the container exist. */
 	uint64_t intent_id = blob_db_alloc_id();
 	struct mc_intent empty = { 0 };
+
+	if (intent_id == BLOB_DB_INVALID_ID) {
+		return -EIO;
+	}
+
 	int rc = intent_store(intent_id, &empty);   /* bind intent blob */
 
 	if (rc < 0) {
@@ -281,18 +289,21 @@ static int mc_create(void)
 
 int mc_open(uint64_t root_id)
 {
-	if (root_id == 0) {
+	if (root_id == BLOB_DB_INVALID_ID) {
 		return -EINVAL;
 	}
 	mc_root = root_id;
+	mc_ready = false;
 
 	uint8_t probe[4];
 	size_t got;
 	int rc = blob_db_get(mc_root, probe, sizeof(probe), &got);
 
 	/* Allocated-but-unbound root (the client's record exists, the blob
-	 * doesn't — registry §7 "creation in progress"): finish it now. */
-	if (rc == -ENOENT) {
+	 * doesn't — registry §7 "creation in progress"): finish it now. An
+	 * empty payload means the same: BLOB_DB_ROOT_ID is never unbound, a
+	 * fresh store binds it empty, and destroy resets it to empty. */
+	if (rc == -ENOENT || (rc == 0 && got == 0)) {
 		rc = mc_create();
 		if (rc < 0) {
 			return rc;
@@ -411,10 +422,11 @@ int mc_set(const char *key, const void *val, size_t vlen,
 
 	/* step 0: allocate every id this mutation will create (RAM only). */
 	struct mc_intent in = { 0 };
-	uint64_t kid = idx < 0 ? blob_db_alloc_id() : 0;
+	uint64_t kid = idx < 0 ? blob_db_alloc_id() : BLOB_DB_INVALID_ID;
 	uint64_t vid2 = blob_db_alloc_id();
 
-	if (vid2 == 0 || (idx < 0 && kid == 0)) {
+	if (vid2 == BLOB_DB_INVALID_ID ||
+	    (idx < 0 && kid == BLOB_DB_INVALID_ID)) {
 		return -EIO;
 	}
 	if (idx < 0) {
@@ -511,13 +523,16 @@ int mc_destroy(void)
 	if (rc < 0 && rc != -ENOENT) {
 		return rc;
 	}
-	rc = blob_db_delete(mc_root);
+	/* BLOB_DB_ROOT_ID must never be deleted: reset it to the empty
+	 * payload a fresh store has, which mc_open() reads as "no container". */
+	rc = mc_root == BLOB_DB_ROOT_ID ? blob_db_update(mc_root, NULL, 0)
+					: blob_db_delete(mc_root);
 	if (rc < 0 && rc != -ENOENT) {
 		return rc;
 	}
 
 	mc_ready = false;
-	mc_root = 0;
+	mc_root = BLOB_DB_INVALID_ID;
 	return 0;
 }
 

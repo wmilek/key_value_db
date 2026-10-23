@@ -90,6 +90,15 @@ extern "C" {
 #define BLOB_DB_ROOT_ID  ((uint64_t)1)
 
 /**
+ * @brief The id that never names a blob.
+ *
+ * `blob_db_alloc_id()` returns it on failure, and no blob is ever bound to
+ * it, so callers may use it as "no id". Callers should reference this macro
+ * rather than the literal 0.
+ */
+#define BLOB_DB_INVALID_ID  ((uint64_t)0)
+
+/**
  * @brief Open the DB and recover state from flash.
  *
  * Discovers the partition geometry, validates the master sector,
@@ -147,8 +156,9 @@ int blob_db_unmount(void);
  * format time (see @ref blob_db_root). The concrete value of the first
  * user-visible allocation is not part of the contract.
  *
- * @return a fresh id (never 0 or `BLOB_DB_ROOT_ID`), or 0 if not mounted
- *         (0 is never a valid id) or the id ceiling could not be persisted.
+ * @return a fresh id (never `BLOB_DB_INVALID_ID` or `BLOB_DB_ROOT_ID`), or
+ *         `BLOB_DB_INVALID_ID` if not mounted or the id ceiling could not be
+ *         persisted.
  */
 uint64_t blob_db_alloc_id(void);
 

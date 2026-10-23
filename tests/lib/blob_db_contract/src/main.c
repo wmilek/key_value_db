@@ -317,6 +317,50 @@ ZTEST(blob_db_contract, test_destroy_empty_container)
 	assert_no_leak();
 }
 
+/* --- direct id-1 binding ------------------------------------------------ */
+
+/* A client without a registry may build the list at BLOB_DB_ROOT_ID itself.
+ * That id is never unbound — a fresh store binds it empty — so an empty
+ * payload must read as "create now", and destroy must reset it to empty
+ * instead of deleting it. */
+ZTEST(blob_db_contract, test_direct_root_binding)
+{
+	char buf[16];
+
+	zassert_ok(blob_db_format());   /* id 1 bound, empty; no registry */
+	zassert_ok(mc_open(BLOB_DB_ROOT_ID));
+	zassert_ok(mc_set("foo", "bar", 3, MC_STEP_NONE));
+
+	zassert_ok(blob_db_unmount());
+	zassert_ok(blob_db_mount());
+	zassert_ok(mc_open(BLOB_DB_ROOT_ID));
+	zassert_ok(get_str("foo", buf, sizeof(buf)));
+	zassert_str_equal(buf, "bar");
+	/* id 1 (list root) + intent + key + value */
+	zassert_equal(blob_db_count(), 4, "got %zu blobs", blob_db_count());
+
+	zassert_ok(mc_destroy());
+	zassert_true(blob_db_exists(BLOB_DB_ROOT_ID));
+	zassert_equal(blob_db_count(), 1, "got %zu blobs", blob_db_count());
+
+	zassert_ok(mc_open(BLOB_DB_ROOT_ID));   /* fresh container */
+	zassert_equal(get_str("foo", buf, sizeof(buf)), -ENOENT);
+	zassert_equal(blob_db_count(), 2, "got %zu blobs", blob_db_count());
+}
+
+/* A root whose payload is not shaped like a list is refused, and leaves
+ * the container closed. */
+ZTEST(blob_db_contract, test_malformed_root_refused)
+{
+	uint64_t id = blob_db_alloc_id();
+	char buf[16];
+
+	zassert_not_equal(id, BLOB_DB_INVALID_ID);
+	zassert_ok(blob_db_update(id, "xyz", 3));
+	zassert_equal(mc_open(id), -EIO);
+	zassert_equal(get_str("foo", buf, sizeof(buf)), -ENODEV);
+}
+
 /* --- recovery touches only the ids the intent names -------------------- */
 
 /* A second structure in the same store, registered under its own key. */
