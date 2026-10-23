@@ -51,8 +51,9 @@ enum mc_crash_point {
 
 /* Open the container rooted at `root_id`, creating it if the id is
  * allocated-but-unbound (the registry-§7 "creation in progress" state) or
- * bound to an empty payload (BLOB_DB_ROOT_ID on a fresh store), and
- * running intent recovery (§6) if a mutation was interrupted. The caller
+ * bound to an empty payload (BLOB_DB_ROOT_ID on a fresh store), running
+ * intent recovery (§6) if a mutation was interrupted, and giving the list
+ * a fresh intent blob if create or destroy stopped without one. The caller
  * owns the id's persistence (root registry, direct id-1 binding, ...).
  * Idempotent — safe to call on every mount. */
 int mc_open(uint64_t root_id);

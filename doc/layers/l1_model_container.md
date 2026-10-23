@@ -167,8 +167,12 @@ intent blob  {} or { new[], del[] }           own id: intent_id ← mutation jou
 list blob    { intent_id, [(kid1,vid1), …] }  own id: list_id   ← root now records intent_id
 ```
 
-The intent blob is created once, together with the container; its id is
-stored in the root and never changes (id stability — the journal is only ever
+The intent blob is created together with the container: create writes the
+root naming a freshly allocated `intent_id` (the commit), then binds that id
+empty. A crash between the two leaves an allocated, unbound id — no residue —
+and `open` finds the intent missing (`-ENOENT`). `open` then applies §4.3:
+point the root at a fresh id, then bind it. Apart from that repair the id
+stored in the root never changes (id stability — the journal is only ever
 `update`d). It is empty whenever no mutation is in flight.
 
 While a mutation is in flight the intent **names every id it touches**:
@@ -215,6 +219,37 @@ are opened lazily, another client can bind blobs in that gap; they lie above
 W, this list does not reference them, and rollback deleted them
 (`test_rollback_spares_other_store` reproduces it). Naming the ids removes
 both the scan and the assumption.
+
+### 4.3 A referenced id that does not resolve is replaced, never rebound
+
+`get` answers `-ENOENT` both for an id that was allocated and never bound and
+for one that was deleted; after compaction no trace tells them apart, so L1
+cannot be asked (`l1_blob_db.md` §5.3, D3). `update` is defined on the first
+and undefined on the second. Hence the rule:
+
+> **Never `update` an id that `get` cannot read.** If the content can be
+> regenerated, allocate a fresh id, commit the referrer to it, then bind it.
+> If it cannot, drop the reference (§7).
+
+- Only `-ENOENT` qualifies. Any other error is returned, or a transient read
+  failure would discard a live blob.
+- Re-point first, bind second. The other order leaves a bound blob that
+  nothing names — the leak this rule exists to avoid.
+- The old id needs no `delete`: on an id that does not resolve it answers
+  `-ENOENT` and writes nothing, and since ids are never reissued, an id that
+  nothing names is gone for good.
+- One referrer makes the re-point a single atomic write. An id named from
+  several places would need its own staged mutation.
+
+The intent blob is the model's case: its only referrer is the root, and an
+empty journal is its regenerated content, because a missing journal means no
+mutation is in flight — every mutation stages through it. Create stopping
+after its root write, and destroy stopping after deleting the intent but
+before the root, both reach `open` as a root naming an intent that does not
+resolve; the same repair serves both, and a destroy so interrupted can be run
+again. Ids a mutation allocates follow the rule too: they are bound only in
+the session that allocated them, and after a crash recovery deletes them,
+never binds them.
 
 ## 5. The extended mutation discipline
 

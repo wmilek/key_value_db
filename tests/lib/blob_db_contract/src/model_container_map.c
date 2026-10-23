@@ -261,28 +261,37 @@ static int mc_abort(struct mc_list *l, int err)
 
 /* ---- create (virgin store, basic flow §3.1 + registry §7) ------------- */
 
-static int mc_create(void)
+/* Point the list at a fresh intent id, then bind it empty — §4.3: an id
+ * that does not resolve is replaced, never rebound. The root is written
+ * first, so a crash between the two leaves an id that is allocated but
+ * unbound and named by the root — no residue; the next mc_open() finds the
+ * intent missing and comes back here. The id the root named is never bound:
+ * a missing intent may also be one destroy already deleted, and update on a
+ * deleted id is undefined. Nothing can be in flight while the intent is
+ * missing, since every mutation stages through it. */
+static int intent_rebind(struct mc_list *l)
 {
-	/* mc_root is allocated but not yet bound (the client's durable record
-	 * of it — e.g. a registry entry — is the creation intent). Allocate
-	 * and bind the intent blob, then bind the initial list image; the
-	 * final update is the commit that makes the container exist. */
 	uint64_t intent_id = blob_db_alloc_id();
-	struct mc_intent empty = { 0 };
 
 	if (intent_id == BLOB_DB_INVALID_ID) {
 		return -EIO;
 	}
+	l->intent_id = intent_id;
 
-	int rc = intent_store(intent_id, &empty);   /* bind intent blob */
+	int rc = list_store(l);
 
-	if (rc < 0) {
-		return rc;
-	}
+	return rc < 0 ? rc : intent_clear(intent_id);
+}
 
-	struct mc_list l = { .intent_id = intent_id, .count = 0 };
+static int mc_create(void)
+{
+	/* mc_root is allocated but not yet bound (the client's durable record
+	 * of it — e.g. a registry entry — is the creation intent). The list
+	 * update is the commit that makes the container exist; binding its
+	 * intent blob follows, and a crash before it is repaired on open. */
+	struct mc_list l = { 0 };
 
-	return list_store(&l);   /* COMMIT — container exists at mc_root */
+	return intent_rebind(&l);
 }
 
 /* ---- public API ------------------------------------------------------- */
@@ -324,6 +333,11 @@ int mc_open(uint64_t root_id)
 		return rc;
 	}
 	rc = mc_recover(&l, NULL);
+	if (rc == -ENOENT) {
+		/* The intent blob is missing: create, or destroy, stopped
+		 * between its root write and its intent write. */
+		rc = intent_rebind(&l);
+	}
 	if (rc < 0) {
 		return rc;
 	}
