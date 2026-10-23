@@ -1,0 +1,33 @@
+*** Booting Zephyr OS build 4a405846193f ***
+l0 perf 1.0.0 — raw flash_area timing
+l0geom part_bytes=8388608 block_bytes=65536 blocks=128 write_align=4 erased_val=0xff region_blocks=32 max_xfer=65536 program_page=256 cycles_per_s=32768 source=hardware timing=real board=nrf5340dk/nrf5340/cpuapp
+partition 8388608 B, 128 blocks of 65536 B, write align 4, erased 0xff
+working region: first 32 block(s) = 2097152 B  (THIS ERASES THEM)
+
+-- reprogram: programming over programmed cells, no erase --
+block 31, 4 B per program, 256 B pages
+l0rp test=rp_page_fresh programs=64 max_per_cell=1 ns_per_op=150680 bad_bytes=0 verdict=PASS
+  rp_page_fresh       64 programs     1 per cell       150.680 us/op  ok
+l0rp test=rp_page_re programs=448 max_per_cell=8 ns_per_op=150476 bad_bytes=0 verdict=PASS
+  rp_page_re         448 programs     8 per cell       150.476 us/op  ok
+l0rp test=rp_lane_fresh programs=64 max_per_cell=1 ns_per_op=144481 bad_bytes=0 verdict=PASS
+  rp_lane_fresh       64 programs     1 per cell       144.481 us/op  ok
+l0rp test=rp_lane_re programs=448 max_per_cell=8 ns_per_op=144277 bad_bytes=0 verdict=PASS
+  rp_lane_re         448 programs     8 per cell       144.277 us/op  ok
+l0rp test=rp_and programs=2 max_per_cell=3 ns_per_op=152587 bad_bytes=0 verdict=PASS
+  rp_and               2 programs     3 per cell       152.587 us/op  ok
+l0rp_hammer programs=1 bad_bytes=0 ns_per_op=152587
+l0rp_hammer programs=10 bad_bytes=0 ns_per_op=119018
+l0rp_hammer programs=100 bad_bytes=0 ns_per_op=115051
+l0rp_hammer programs=1000 bad_bytes=0 ns_per_op=114532
+l0rp_hammer programs=10000 bad_bytes=0 ns_per_op=114443
+l0rp_hammer programs=100000 bad_bytes=0 ns_per_op=114431
+l0rp test=rp_hammer programs=100000 max_per_cell=100000 ns_per_op=114431 bad_bytes=0 verdict=PASS
+  rp_hammer       100000 programs  100000 per cell       114.431 us/op  ok
+l0rp test=rp_block programs=0 max_per_cell=0 ns_per_op=0 bad_bytes=0 verdict=PASS
+  rp_block             0 programs     0 per cell         0.000 us/op  ok
+l0rp_end mismatches=0 verdict=PASS
+  reprogram: every re-program cleared only the bits it asked to, and nothing else moved
+l0end status=0
+
+done. Feed this capture to tools/l0_timing.py fit.

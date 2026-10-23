@@ -84,6 +84,7 @@
 
 #include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
+#include <zephyr/logging/log_ctrl.h>
 #include <zephyr/storage/flash_map.h>
 #include <zephyr/sys/printk.h>
 #include <zephyr/sys/util.h>
@@ -915,8 +916,8 @@ static int phase_read_odd(void)
  * outside the timed span.
  *
  * Sequential offsets, not one address rewritten: a NOR page program can only
- * clear bits, so rewriting the same offset would measure a different (and
- * illegal) operation. That does mean a transfer size which is not a divisor of
+ * clear bits, so rewriting the same offset would measure a different
+ * operation — re-programming, which the `reprogram` phase checks separately. That does mean a transfer size which is not a divisor of
  * the part's program page can straddle two pages, which is exactly what the
  * `write_unaligned` points below isolate.
  */
@@ -1207,6 +1208,332 @@ static int phase_write_unaligned(void)
 	return 0;
 }
 
+/* --- phase: reprogram --------------------------------------------------- */
+
+/*
+ * Programming over already-programmed cells, without an erase in between.
+ *
+ * Every other write phase in this app writes each byte exactly once per erase,
+ * because that is the operation the timing model describes. But the stack does
+ * NOT only do that: blob_db_erase_all() invalidates bucket headers by
+ * programming 0x00 over their magic, and blob_db appends many small slots into
+ * the same 256 B program page, one partial page program each. Both assume a
+ * NOR property the flash_area API does not promise and the datasheet does not
+ * quantify: that a page can take many program operations between erases, and
+ * that each one only ever clears bits — 1 -> 0 lands, 0 -> 1 is ignored, and
+ * cells the operation leaves at 1 stay at 1.
+ *
+ * This phase checks that property rather than assuming it, in one erase block
+ * at the end of the working region, against a shadow copy of what the block
+ * should hold:
+ *
+ *   rp_page   — one page, rewritten word by word in eight rounds, each round
+ *               clearing one more bit of every byte (0xff, 0xfe, 0xfc ... 0x00).
+ *               That is 8 x page/unit partial programs of one page, every word
+ *               programmed eight times, verified after every round.
+ *   rp_lane   — one page where each word clears bits in ONE byte lane only and
+ *               writes 0xff to the others: a single byte modified eight times,
+ *               and proof that programming 0xff over a byte leaves it alone.
+ *   rp_and    — data with 1s where the cell already holds 0s: the result must be
+ *               old & new, i.e. the write cannot set a bit, and the driver must
+ *               not report an error for it.
+ *   rp_hammer — one word programmed with the same mixed 0/1 pattern
+ *               CONFIG_APP_PERF_L0_REPROGRAM_REPS times, checked at every
+ *               decade, with the rest of its page left erased. That is the
+ *               program-disturb test: a 1 bit flipping in the hammered word, or
+ *               in an erased neighbour, is the failure mode of re-programming.
+ *
+ * and finally reads the whole block back: everything outside the pages above
+ * must still be erased. Timing is recorded alongside (a fresh program against
+ * re-programming the same cells) because "is a re-program cheaper" is the
+ * question a layer considering in-place flag updates will ask next.
+ *
+ * A mismatch is a finding, not an I/O error: it is reported in an `l0rp`
+ * record and summarised in `l0rp_end`, and the run carries on so the timing
+ * model is still produced. Only a failing flash_area call aborts.
+ */
+#define RP_UNIT_MAX   16
+#define RP_PAGES      4
+#define RP_PAGE_MAX   512
+
+static uint8_t __aligned(4) g_rp_shadow[RP_PAGES * RP_PAGE_MAX];
+static uint8_t __aligned(4) g_rp_rd[RP_PAGE_MAX];
+
+static struct {
+	off_t    base;      /* offset of the test block */
+	size_t   unit;      /* bytes per program operation */
+	size_t   page;      /* layout page: the program page, or 256 */
+	uint32_t mismatches;
+} rp;
+
+/* Program one unit at `off` (relative to the test block) and fold it into the
+ * shadow with NOR semantics. */
+static int rp_write(off_t off, const uint8_t *data)
+{
+	int rc = flash_area_write(g_fa, rp.base + off, data, rp.unit);
+
+	if (rc < 0) {
+		LOG_ERR("reprogram write @%ld: %d", (long)off, rc);
+		return rc;
+	}
+	for (size_t i = 0; i < rp.unit; i++) {
+		g_rp_shadow[off + i] &= data[i];
+	}
+	return 0;
+}
+
+/* Read [off, off+len) back and count bytes that differ from the shadow, or
+ * from erased if the range lies past the shadowed pages. Reports the first
+ * difference, since one is enough to say which cell moved and which way. */
+static int rp_verify(const char *test, off_t off, size_t len, uint32_t *bad)
+{
+	*bad = 0;
+	while (len) {
+		const size_t n = MIN(len, sizeof(g_rp_rd));
+		int rc = flash_area_read(g_fa, rp.base + off, g_rp_rd, n);
+
+		if (rc < 0) {
+			LOG_ERR("reprogram read @%ld: %d", (long)off, rc);
+			return rc;
+		}
+		for (size_t i = 0; i < n; i++) {
+			const size_t at = (size_t)off + i;
+			const uint8_t want = at < RP_PAGES * rp.page
+						     ? g_rp_shadow[at]
+						     : g.erased_val;
+
+			if (g_rp_rd[i] != want) {
+				if (*bad == 0) {
+					printk("l0rp_diff test=%s off=%zu want=0x%02x "
+					       "got=0x%02x\n", test, at, want,
+					       g_rp_rd[i]);
+				}
+				(*bad)++;
+			}
+		}
+		off += (off_t)n;
+		len -= n;
+	}
+	rp.mismatches += *bad;
+	return 0;
+}
+
+static void rp_report(const char *test, uint32_t programs, uint32_t max_per_cell,
+		      uint64_t ns, uint32_t bad)
+{
+	printk("l0rp test=%s programs=%u max_per_cell=%u ns_per_op=%llu "
+	       "bad_bytes=%u verdict=%s\n", test, programs, max_per_cell,
+	       (unsigned long long)(programs ? ns / programs : 0), bad,
+	       bad ? "FAIL" : "PASS");
+	printk("  %-14s %7u programs  %4u per cell  %8llu.%03llu us/op  %s\n",
+	       test, programs, max_per_cell,
+	       (unsigned long long)(programs ? ns / programs / 1000 : 0),
+	       (unsigned long long)(programs ? ns / programs % 1000 : 0),
+	       bad ? "FAIL" : "ok");
+	/* printk goes through the deferred log buffer, and these records come
+	 * in bursts between flash calls: drain it so none are dropped. Never
+	 * inside a timed span. */
+	log_flush();
+}
+
+/* Bit-by-bit rounds over a page. lane < 0 clears every byte of each unit;
+ * otherwise only byte lane (word index + lane) % unit changes and the other
+ * lanes are written as erased, so they must not move. */
+static int rp_rounds(const char *test, off_t page_off, bool one_lane)
+{
+	const size_t words = rp.page / rp.unit;
+	uint8_t __aligned(4) w[RP_UNIT_MAX];
+	uint64_t fresh_ns = 0, re_ns = 0;
+	uint32_t bad = 0, b;
+
+	for (uint32_t round = 1; round <= 8; round++) {
+		struct span s;
+		const uint8_t v = (uint8_t)(0xffu << round);
+
+		span_start(&s);
+		for (size_t k = 0; k < words; k++) {
+			memset(w, 0xff, rp.unit);
+			if (one_lane) {
+				w[k % rp.unit] = v;
+			} else {
+				memset(w, v, rp.unit);
+			}
+			int rc = rp_write(page_off + (off_t)(k * rp.unit), w);
+
+			if (rc < 0) {
+				return rc;
+			}
+		}
+		const uint64_t t = span_end(&s);
+
+		if (round == 1) {
+			fresh_ns = t;
+		} else {
+			re_ns += t;
+		}
+
+		int rc = rp_verify(test, page_off, rp.page, &b);
+
+		if (rc < 0) {
+			return rc;
+		}
+		if (b) {
+			printk("  %s round %u (value 0x%02x): %u byte(s) wrong\n",
+			       test, round, v, b);
+		}
+		bad += b;
+	}
+
+	char name[24];
+
+	snprintk(name, sizeof(name), "%s_fresh", test);
+	rp_report(name, words, 1, fresh_ns, 0);
+	snprintk(name, sizeof(name), "%s_re", test);
+	rp_report(name, (uint32_t)(7 * words), 8, re_ns, bad);
+	return 0;
+}
+
+static int phase_reprogram(void)
+{
+	const size_t pg = CONFIG_APP_PERF_L0_PROGRAM_PAGE ?
+			  CONFIG_APP_PERF_L0_PROGRAM_PAGE : 256;
+	int rc;
+
+	printk("\n-- reprogram: programming over programmed cells, no erase --\n");
+
+	rp.unit = MAX(g.align, (size_t)4);
+	rp.page = pg;
+	rp.mismatches = 0;
+	if (g.erased_val != 0xff || rp.unit > RP_UNIT_MAX ||
+	    rp.unit % g.align || pg > RP_PAGE_MAX || pg % rp.unit ||
+	    RP_PAGES * pg > g.block) {
+		printk("(reprogram phase skipped: needs erased 0xff, a unit of "
+		       "<= %u B and %u pages of <= %u B in one block)\n",
+		       RP_UNIT_MAX, RP_PAGES, RP_PAGE_MAX);
+		return 0;
+	}
+
+	rp.base = (off_t)(g.region - 1) * (off_t)g.block;
+	memset(g_rp_shadow, g.erased_val, sizeof(g_rp_shadow));
+	rc = flash_area_erase(g_fa, rp.base, g.block);
+	if (rc < 0) {
+		LOG_ERR("reprogram erase: %d", rc);
+		return rc;
+	}
+	printk("block %u, %zu B per program, %zu B pages\n",
+	       g.region - 1, rp.unit, rp.page);
+	log_flush();
+
+	/* Pages 0 and 1: eight programs of every cell, bit by bit. */
+	rc = rp_rounds("rp_page", 0, false);
+	if (rc == 0) {
+		rc = rp_rounds("rp_lane", (off_t)pg, true);
+	}
+	if (rc < 0) {
+		return rc;
+	}
+
+	/* Page 2: writes that ask for 0 -> 1. The part must ignore the 1s. */
+	{
+		static const uint8_t first[]  = { 0xa5, 0x0f, 0x00, 0x3c };
+		static const uint8_t second[] = { 0x5a, 0xf0, 0xff, 0xff };
+		uint8_t __aligned(4) w[RP_UNIT_MAX];
+		const off_t at = (off_t)(2 * pg);
+		uint32_t bad;
+		struct span s;
+
+		for (size_t i = 0; i < rp.unit; i++) {
+			w[i] = first[i % sizeof(first)];
+		}
+		rc = rp_write(at, w);
+		for (size_t i = 0; rc == 0 && i < rp.unit; i++) {
+			w[i] = second[i % sizeof(second)];
+		}
+		span_start(&s);
+		if (rc == 0) {
+			rc = rp_write(at, w);
+		}
+		const uint64_t t = span_end(&s);
+
+		/* All ones over all zeros: a no-op, and still not an error. */
+		memset(w, 0xff, rp.unit);
+		if (rc == 0) {
+			rc = rp_write(at, w);
+		}
+		if (rc == 0) {
+			rc = rp_verify("rp_and", at, rp.unit, &bad);
+		}
+		if (rc < 0) {
+			return rc;
+		}
+		rp_report("rp_and", 2, 3, t * 2, bad);
+	}
+
+	/* Page 3: one word hammered with the same mixed pattern, the rest of
+	 * its page erased. Checked at every decade so a drift is located, not
+	 * just detected. */
+	{
+		static const uint8_t pat[] = { 0x55, 0xaa, 0x0f, 0xf0 };
+		uint8_t __aligned(4) w[RP_UNIT_MAX];
+		const off_t at = (off_t)(3 * pg);
+		const uint32_t total = CONFIG_APP_PERF_L0_REPROGRAM_REPS;
+		uint32_t done = 0, next = 1, bad_all = 0;
+		uint64_t ns = 0;
+
+		for (size_t i = 0; i < rp.unit; i++) {
+			w[i] = pat[i % sizeof(pat)];
+		}
+		while (done < total) {
+			const uint32_t upto = MIN(next, total);
+			struct span s;
+			uint32_t bad;
+
+			span_start(&s);
+			for (; done < upto; done++) {
+				rc = rp_write(at, w);
+				if (rc < 0) {
+					return rc;
+				}
+			}
+			ns += span_end(&s);
+
+			/* The whole page: the hammered word, and the erased
+			 * neighbours that share its program page. */
+			rc = rp_verify("rp_hammer", at, pg, &bad);
+			if (rc < 0) {
+				return rc;
+			}
+			printk("l0rp_hammer programs=%u bad_bytes=%u "
+			       "ns_per_op=%llu\n", done, bad,
+			       (unsigned long long)(ns / done));
+			log_flush();
+			bad_all += bad;
+			next *= 10;
+		}
+		rp_report("rp_hammer", total, total, ns, bad_all);
+	}
+
+	/* Nothing outside the four pages was ever addressed. Any byte there
+	 * that is not erased was disturbed by the programs above. */
+	{
+		uint32_t bad;
+
+		rc = rp_verify("rp_block", 0, g.block, &bad);
+		if (rc < 0) {
+			return rc;
+		}
+		rp_report("rp_block", 0, 0, 0, bad);
+	}
+
+	printk("l0rp_end mismatches=%u verdict=%s\n", rp.mismatches,
+	       rp.mismatches ? "FAIL" : "PASS");
+	printk("  reprogram: %s\n", rp.mismatches
+	       ? "CELLS MOVED — re-programming without erase is NOT safe here"
+	       : "every re-program cleared only the bits it asked to, and "
+		 "nothing else moved");
+	return 0;
+}
+
 /* --- geometry ----------------------------------------------------------- */
 
 static int geometry(void)
@@ -1305,21 +1632,26 @@ int main(void)
 		return 0;
 	}
 
-	rc = phase_erase();
-	if (rc == 0) {
-		rc = phase_read();
+	if (!IS_ENABLED(CONFIG_APP_PERF_L0_REPROGRAM_ONLY)) {
+		rc = phase_erase();
+		if (rc == 0) {
+			rc = phase_read();
+		}
+		if (rc == 0) {
+			rc = phase_read_odd();
+		}
+		if (rc == 0) {
+			rc = phase_write();
+		}
+		if (rc == 0) {
+			rc = phase_write_pages();
+		}
+		if (rc == 0) {
+			rc = phase_write_unaligned();
+		}
 	}
-	if (rc == 0) {
-		rc = phase_read_odd();
-	}
-	if (rc == 0) {
-		rc = phase_write();
-	}
-	if (rc == 0) {
-		rc = phase_write_pages();
-	}
-	if (rc == 0) {
-		rc = phase_write_unaligned();
+	if (rc == 0 && IS_ENABLED(CONFIG_APP_PERF_L0_REPROGRAM)) {
+		rc = phase_reprogram();
 	}
 
 	/* Leave the region erased rather than half-programmed: whatever runs
