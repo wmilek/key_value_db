@@ -67,7 +67,12 @@ a human-readable line:
 5. `-- write: page-program staircase --` — page-aligned transfers around the
    256 B boundary; twenty seconds or so.
 6. `-- write: page-straddle penalty --` — seconds to tens of seconds.
-7. A final erase of the working region, then `l0end status=0`.
+7. `-- reprogram: programming over programmed cells, no erase --`, which takes
+   a few seconds. This is a correctness check, not a sweep. It must end with
+   `l0rp_end mismatches=0 verdict=PASS`. Any `FAIL` comes with an
+   `l0rp_diff` line naming the first byte that moved, and means
+   `blob_db_erase_all()` cannot be trusted on this part.
+8. A final erase of the working region, then `l0end status=0`.
 
 Each sweep prints a matrix: size, ops, µs/op, KiB/s, ns/B, the marginal cost
 and the pass-to-pass spread. The marginal column is the one to read — see

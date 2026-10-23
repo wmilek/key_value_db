@@ -1053,6 +1053,88 @@ erase cost does not even fit in the Kconfig range. It is useful for pacing and
 watchdog behaviour on a host build; it is not a substitute for `predict`,
 which uses the whole model.
 
+## 8. Re-programming without an erase — measured on both DKs
+
+**The question.** Can the MX25R6435F program the same cell more than once
+between erases, so that a byte can be changed several times as long as each
+change only clears bits? `blob_db` already relies on that. `blob_db_erase_all()`
+programs `0x00` over each bucket's magic, and slot appends program a page in
+many small pieces. The answer had never been measured, only assumed.
+
+**What the datasheet says.** Rev. 1.6 §10-22 (p.50), Page Program: *"for
+programming the memory to be '0'"*, and when fewer than 256 bytes are sent
+*"the data will be programmed at the request address of the page. There will be
+no effort [effect] on the other data bytes of the same page."* §15 (p.75) gives
+100 000 erase/program cycles. Nowhere does it give a partial-program (NOP)
+limit per page or a cumulative program-time limit, and nowhere does it mention
+program disturb. It also neither allows nor forbids programming bytes that
+already hold 0s. So the datasheet does not settle the question, and the
+`reprogram` phase measures it.
+
+**Setup.** Build: `-DCONFIG_APP_PERF_L0_REPROGRAM_ONLY=y
+-DCONFIG_APP_PERF_L0_REPROGRAM_REPS=100000`, Zephyr `4a405846193`. Both boards
+(J-Link 960115021 and 1050091053), block 31 of `storage_partition`, 4 B per
+program (`write_align`), 256 B pages. The board-2 capture is
+[`models/observations_nrf5340dk_reprogram.txt`](models/observations_nrf5340dk_reprogram.txt).
+
+| test | programs | programs per cell | µs/op (b1 / b2) | bad bytes (b1 / b2) |
+|---|---:|---:|---:|---:|
+| `rp_page` first round | 64 | 1 | — / 150.7 | 0 / 0 |
+| `rp_page` rounds 2–8 | 448 | 8 | 154.7 / 150.5 | 0 / 0 |
+| `rp_lane` first round | 64 | 1 | 149.7 / 144.5 | 0 / 0 |
+| `rp_lane` rounds 2–8 | 448 | 8 | 150.0 / 144.3 | 0 / 0 |
+| `rp_and` (0→1 requested) | 2 | 3 | 152.6 / 152.6 | 0 / 0 |
+| `rp_hammer` | 100 000 | 100 000 | 114.3 / 114.4 | 0 / 0 |
+| `rp_block` (rest of the 64 KB block) | — | — | — | 0 / 0 |
+
+Board 1's two `rp_page` first-round lines were dropped by the deferred log
+buffer. That round was still verified, and the run's total of
+`mismatches=0` includes it. The phase now flushes the log after each record,
+and board 2's capture is complete. In the hammer, the page read back clean at
+every check: 1, 10, 100, 1 000, 10 000 and 100 000 programs.
+
+**What it shows.**
+
+- **Re-programming works, bit by bit.** Every byte of a page went
+  `ff → fe → fc → … → 00` in eight programs, and each step read back exactly.
+  So did a single byte lane changed eight times while the other three lanes
+  were written as `0xff`. Writing `0xff` over a byte leaves it alone, which is
+  what a byte-level update needs, given that the smallest write is 4 B.
+- **0→1 is ignored silently.** `a5 0f 00 3c` followed by `5a f0 ff ff` reads
+  back `00 00 00 3c`, which is `old & new`, and the driver returns 0. Neither
+  the part nor `nrf_qspi_nor` reports a write that asked for a 1 it could not
+  give. A layer that needs to know whether a write landed as intended has to
+  read it back.
+- **No program disturb at 100 000 programs.** A word holding a mixed 0/1
+  pattern was programmed 100 000 times. Its 1 bits stayed 1, the 252 erased
+  bytes beside it in the same page stayed `0xff`, and so did the rest of the
+  block. For scale, `blob_db_erase_all()` programs each bucket header once per
+  erase cycle.
+- **A re-program costs the same as a first program.** It is about 150 µs for a
+  4 B write either way (rounds 2–8 are within 1 % of round 1). The hammer is
+  cheaper at 114 µs, apparently because a write that clears no new bits finishes
+  faster, but it costs far more than nothing. In-place flag updates are not a
+  shortcut on time, only on erases.
+
+**What it does not show.**
+
+- **Retention.** All reads came straight after programming. A cell that has
+  been over-programmed could in principle lose margin and read wrong after
+  months or at temperature. Checking that needs a bake or a re-read on a later
+  boot, which this app does not do. The capture's region is erased on exit, by
+  design.
+- **Other parts.** Parts with internal ECC (some serial NOR families, most NAND)
+  forbid re-programming, or allow it only in whole ECC units. The test is the
+  same on any board, so run it before relying on this property somewhere else.
+- **Endurance.** All of this happened within a single erase cycle. Erase wear is
+  the datasheet's 100 000 cycles and is measured nowhere in this app.
+
+**On `native_sim`** the phase also passes, but that shows nothing about any part.
+The flash simulator ANDs on a double write only when
+`CONFIG_FLASH_SIMULATOR_DOUBLE_WRITES=y` (which this app's `native_sim.conf`
+sets). Without it the simulator *rejects* a re-program with `-EIO`, so it is
+stricter than the part.
+
 ## Raw capture — `native_sim`, simulator defaults
 
 Machine-readable records only; the human tables are in §1.
