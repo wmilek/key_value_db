@@ -336,6 +336,7 @@ persondb verify [n]               check n sampled persons against the generator
 persondb mutate                   advance one revision
 persondb bench [kind] [n]         measure
 persondb show <index>             print a stored person
+persondb repair <person-id>       put one person back to what the generator says
 persondb cardof <index> [slot]    the card id for a dataset index
 persondb card <card-id>           resolve a card to its owner
 persondb check <card> <perm>      the access decision, timed
@@ -343,6 +344,13 @@ persondb grant|revoke <id> <perm>
 persondb assign <id> <card> | unassign <card>
 persondb reset                    erase and start over
 ```
+
+When `verify` fails it names each bad person and why — `missing`, or the
+fields that differ (`name`, `validity`, `perms`, `perm order`, `cards`, ...).
+`persondb repair <person-id>` puts that one person back: it recreates a
+deleted person, undoes hand edits from `persondb tui` or `grant`/`assign`, and
+re-points its cards in the credential index. It refuses to take a card someone
+else now holds, and says which card and who, so you can `unassign` it first.
 
 The shell frontend also brings in the read-only `blob_db` group
 (`CONFIG_BLOB_DB_SHELL`) to see how that data lies on flash — `blob_db stats`

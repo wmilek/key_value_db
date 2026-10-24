@@ -6,6 +6,7 @@
  */
 
 #include <errno.h>
+#include <stdio.h>
 #include <string.h>
 
 #include <zephyr/kernel.h>
@@ -204,6 +205,10 @@ int scenario_verify(struct scenario *s, uint32_t samples,
 
 		out->persons_checked++;
 		if (rc == -ENOENT) {
+			/* Named, not just counted: a person in the filled range
+			 * with no record was deleted (persondb tui) or lost, and
+			 * `repair <person-id>` needs to know which. */
+			LOG_ERR("verify: person %u missing", want.id);
 			out->missing++;
 			continue;
 		}
@@ -213,8 +218,12 @@ int scenario_verify(struct scenario *s, uint32_t samples,
 			continue;
 		}
 		if (!persondb_person_equal(&want, &got)) {
-			LOG_ERR("verify: person %u differs from the generator",
-				want.id);
+			char why[96];
+
+			scenario_diff_describe(scenario_person_diff(&want, &got),
+					       why, sizeof(why));
+			LOG_ERR("verify: person %u differs from the generator: "
+				"%s", want.id, why);
 			out->bad_records++;
 			continue;
 		}
@@ -237,6 +246,113 @@ int scenario_verify(struct scenario *s, uint32_t samples,
 
 	out->ms = scenario_since_us(t) / 1000;
 	return 0;
+}
+
+/* 0: the same list. 1: the same members in another order. 2: different
+ * members. The lists are rows of a char matrix, @p stride bytes apart. */
+static int list_cmp(const char *a, uint8_t na, const char *b, uint8_t nb,
+		    size_t stride)
+{
+	bool same_order = true;
+
+	if (na != nb) {
+		return 2;
+	}
+	for (uint8_t i = 0; i < na; i++) {
+		if (strcmp(a + i * stride, b + i * stride) != 0) {
+			same_order = false;
+			break;
+		}
+	}
+	if (same_order) {
+		return 0;
+	}
+	for (uint8_t i = 0; i < na; i++) {
+		bool found = false;
+
+		for (uint8_t j = 0; j < nb && !found; j++) {
+			found = (strcmp(a + i * stride, b + j * stride) == 0);
+		}
+		if (!found) {
+			return 2;
+		}
+	}
+	return 1;
+}
+
+uint32_t scenario_person_diff(const struct persondb_person *want,
+			      const struct persondb_person *got)
+{
+	uint32_t d = 0;
+	int c;
+
+	if (want->id != got->id) {
+		d |= SCENARIO_DIFF_ID;
+	}
+	if (strcmp(want->name, got->name) != 0) {
+		d |= SCENARIO_DIFF_NAME;
+	}
+	if (strcmp(want->dept, got->dept) != 0) {
+		d |= SCENARIO_DIFF_DEPT;
+	}
+	if (strcmp(want->title, got->title) != 0) {
+		d |= SCENARIO_DIFF_TITLE;
+	}
+	if (want->valid_from != got->valid_from ||
+	    want->valid_until != got->valid_until) {
+		d |= SCENARIO_DIFF_VALIDITY;
+	}
+	if (memcmp(want->pin_hash, got->pin_hash, sizeof(want->pin_hash)) != 0) {
+		d |= SCENARIO_DIFF_PIN;
+	}
+
+	/* Order is its own reason because the comparison is by encoded bytes:
+	 * revoking a permission and granting it back restores the set but not
+	 * the order, and verify still fails. Saying so saves the hunt. */
+	c = list_cmp(want->perm[0], want->n_perms, got->perm[0], got->n_perms,
+		     sizeof(want->perm[0]));
+	d |= (c == 2) ? SCENARIO_DIFF_PERMS : (c == 1) ? SCENARIO_DIFF_PERM_ORDER : 0;
+	c = list_cmp(want->card[0], want->n_cards, got->card[0], got->n_cards,
+		     sizeof(want->card[0]));
+	d |= (c == 2) ? SCENARIO_DIFF_CARDS : (c == 1) ? SCENARIO_DIFF_CARD_ORDER : 0;
+
+	if (d == 0 && !persondb_person_equal(want, got)) {
+		d = SCENARIO_DIFF_OTHER;
+	}
+	return d;
+}
+
+static const char *const diff_names[] = {
+	"missing", "unreadable", "id", "name", "dept", "title", "validity",
+	"pin", "perms", "perm order", "cards", "card order", "card index",
+	"other",
+};
+BUILD_ASSERT(1u << (ARRAY_SIZE(diff_names) - 1) == SCENARIO_DIFF_OTHER,
+	     "one name per enum scenario_diff bit");
+
+void scenario_diff_describe(uint32_t diff, char *buf, size_t sz)
+{
+	size_t len = 0;
+
+	if (sz == 0) {
+		return;
+	}
+	buf[0] = '\0';
+	if (diff == 0) {
+		snprintf(buf, sz, "none");
+		return;
+	}
+	for (size_t i = 0; i < ARRAY_SIZE(diff_names) && len < sz; i++) {
+		if (diff & (1u << i)) {
+			int n = snprintf(buf + len, sz - len, "%s%s",
+					 len ? ", " : "", diff_names[i]);
+
+			if (n < 0) {
+				break;
+			}
+			len += (size_t)n;
+		}
+	}
 }
 
 /* -- mutation ----------------------------------------------------------- */
@@ -549,6 +665,79 @@ int scenario_person_show(struct scenario *s, uint32_t index,
 		return -EINVAL;
 	}
 	return persondb_person_get(s->db, dataset_id_of(index), out);
+}
+
+int scenario_repair(struct scenario *s, uint32_t person_id,
+		    struct scenario_repair_report *out)
+{
+	struct persondb_person want, got;
+	/* An id below the base wraps to a huge index, so one test covers both
+	 * ends — and ids above the dataset, which `persondb tui` hands out. */
+	uint32_t index = dataset_index_of(person_id);
+	uint32_t populated, rev;
+	int rc;
+
+	memset(out, 0, sizeof(*out));
+	out->id = person_id;
+	if (index >= s->n_persons) {
+		return -EINVAL;
+	}
+	persondb_progress_get(s->db, &populated, &rev);
+	if (index >= populated) {
+		return -ERANGE;
+	}
+
+	dataset_person(index, rev, s->n_persons, &want);
+
+	rc = persondb_person_get(s->db, want.id, &got);
+	if (rc == -ENOENT) {
+		out->diff = SCENARIO_DIFF_MISSING;
+	} else if (rc == -EILSEQ) {
+		/* persondb_person_put() reads the old record to drop the index
+		 * entries of cards it no longer lists, and refuses when it
+		 * cannot. Overwriting blind could leave one of those entries
+		 * granting on behalf of a record that does not list it. */
+		out->diff = SCENARIO_DIFF_UNREADABLE;
+		return rc;
+	} else if (rc != 0) {
+		return rc;
+	} else {
+		out->diff = scenario_person_diff(&want, &got);
+	}
+
+	/* Every generated card must be free or already this person's. The
+	 * check also catches the state verify skips once a record is bad: a
+	 * matching record whose cards do not resolve back to it. */
+	for (uint8_t c = 0; c < want.n_cards; c++) {
+		uint32_t owner;
+
+		rc = persondb_card_owner(s->db, want.card[c], &owner);
+		if (rc == -ENOENT) {
+			/* Said already, for a deleted person: delete drops
+			 * every card along with the record. */
+			if (!(out->diff & SCENARIO_DIFF_MISSING)) {
+				out->diff |= SCENARIO_DIFF_CARD_INDEX;
+			}
+			continue;
+		}
+		if (rc != 0) {
+			return rc;
+		}
+		if (owner != want.id) {
+			snprintf(out->held_card, sizeof(out->held_card), "%s",
+				 want.card[c]);
+			out->held_by = owner;
+			out->diff |= SCENARIO_DIFF_CARD_INDEX;
+			return -EEXIST;
+		}
+	}
+
+	if (out->diff == 0) {
+		return 0;
+	}
+	rc = persondb_person_put(s->db, &want);
+	out->written = (rc == 0);
+	return rc;
 }
 
 uint32_t scenario_index_of(uint32_t person_id)
