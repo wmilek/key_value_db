@@ -226,6 +226,19 @@ int scenario_card_of(struct scenario *s, uint32_t index, uint8_t slot,
  */
 uint32_t scenario_index_of(uint32_t person_id);
 
+/** The person id of dataset index @p index — the forward direction. */
+uint32_t scenario_id_of(uint32_t index);
+
+/**
+ * @brief The permission vocabulary the population is drawn from.
+ *
+ * For a frontend offering permissions to choose from. The strings are static
+ * and live for the life of the image.
+ *
+ * @return the name of entry @p i, or NULL past the end
+ */
+const char *scenario_permission_name(uint8_t i);
+
 #ifdef __cplusplus
 }
 #endif

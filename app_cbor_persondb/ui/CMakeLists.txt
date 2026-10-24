@@ -3,3 +3,8 @@
 target_sources(app PRIVATE main.c)
 target_sources_ifdef(CONFIG_APP_CBOR_PERSONDB_FRONTEND_BENCH app PRIVATE ui_bench.c)
 target_sources_ifdef(CONFIG_APP_CBOR_PERSONDB_FRONTEND_SHELL app PRIVATE ui_shell.c)
+target_sources_ifdef(CONFIG_APP_CBOR_PERSONDB_TUI app PRIVATE
+  term.c
+  tui_widgets.c
+  ui_tui.c
+)

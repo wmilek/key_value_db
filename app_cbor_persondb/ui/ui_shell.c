@@ -21,6 +21,9 @@
 #include <zephyr/shell/shell.h>
 
 #include "scenario.h"
+#if defined(CONFIG_APP_CBOR_PERSONDB_TUI)
+#include "ui_tui.h"
+#endif
 
 static struct scenario g_s;
 static bool g_open;
@@ -323,6 +326,22 @@ static int cmd_revoke(const struct shell *sh, size_t argc, char **argv)
 	return rc;
 }
 
+#if defined(CONFIG_APP_CBOR_PERSONDB_TUI)
+static int cmd_tui(const struct shell *sh, size_t argc, char **argv)
+{
+	int rc = need_open(sh);
+
+	ARG_UNUSED(argc);
+	ARG_UNUSED(argv);
+	if (rc) {
+		return rc;
+	}
+	/* Returns once the screen is drawn; the TUI then runs from the
+	 * shell's bypass callback until 'q' hands the terminal back. */
+	return ui_tui_enter(sh, &g_s);
+}
+#endif
+
 static int cmd_assign(const struct shell *sh, size_t argc, char **argv)
 {
 	int rc = need_open(sh);
@@ -387,6 +406,8 @@ SHELL_STATIC_SUBCMD_SET_CREATE(
 	SHELL_CMD_ARG(assign, NULL, "assign <person-id> <card-id>", cmd_assign, 3, 0),
 	SHELL_CMD_ARG(unassign, NULL, "unassign <card-id>", cmd_unassign, 2, 0),
 	SHELL_CMD_ARG(reset, NULL, "Erase the store and start over", cmd_reset, 1, 0),
+	SHELL_COND_CMD_ARG(CONFIG_APP_CBOR_PERSONDB_TUI, tui, NULL,
+			   "Full-screen browser: persons, grant/revoke", cmd_tui, 1, 0),
 	SHELL_SUBCMD_SET_END);
 
 SHELL_CMD_REGISTER(persondb, &persondb_cmds, "CBOR person/credential database", NULL);
