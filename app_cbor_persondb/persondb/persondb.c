@@ -439,11 +439,13 @@ int persondb_open(struct persondb **out, uint32_t n_persons)
 		if (rc == 0 && db->sb.n_people_maps != N_PEOPLE_MAPS) {
 			/* The shard count is baked into where every key lives,
 			 * so a build that disagrees cannot read the store.
-			 * kvhash cannot rehash (K3) and cannot be iterated
-			 * (K6), so there is no migration path — say so plainly
+			 * kvhash cannot rehash (K3). Migrating would mean
+			 * walking every old map with map_ops.next (K6, closed)
+			 * and rewriting each person under the new layout, which
+			 * this app does not implement — so say so plainly
 			 * rather than returning wrong answers. */
 			LOG_ERR("store has %u people maps, this build has %u — "
-				"reformat required (FINDINGS.md K3/K6)",
+				"reformat required (FINDINGS.md K3)",
 				db->sb.n_people_maps, N_PEOPLE_MAPS);
 			rc = -ENOTSUP;
 		}
