@@ -637,9 +637,10 @@ instances** — the domain has two collections, so the store has two containers:
 ```
 rootreg[ ROOTREG_KEY('PADB', 0) ] ──► superblock blob   (CBOR, app-owned)
                                         1 version
-                                        2 root_id         people map
-                                        3 root_id         credential index
-                                        4 n_persons, populated, rev
+                                        2 table directory (§12.3)
+                                            1 → root_id   people map
+                                            2 → root_id   credential index
+                                        3 n_persons  4 populated  5 rev
                                             │
         kvhash_map_ops on each root ────────┘
 ```
@@ -829,11 +830,12 @@ person maps, the payload, and the stack.
 array of people-map roots and its count, set to 1, so stores written before the
 change stayed readable. That left a sharding knob nothing should turn — and one
 that overran the sixteen-slot array if set past 16 — plus a hash computed on
-every lookup only to be reduced modulo 1. Superblock **version 2** stores a
-single `people_root`; the knob, the hash and the map-count check are gone. A
-version-1 store is refused at open with `-ENOTSUP`, not misread: kvhash cannot
-be iterated (K6), so there is nothing to migrate, and `persondb reset` (or
-`CONFIG_APP_CBOR_PERSONDB_FRESH_START`) starts over.
+every lookup only to be reduced modulo 1. Superblock **version 2** replaces the
+array with the table directory of §12.3; the knob, the hash and the map-count
+check are gone. A version 1 store of one people map is upgraded at open by
+rewriting the superblock alone — the maps are the same maps, so no record
+moves. One of several maps is refused (`-ENOTSUP`): folding shards into one
+map would mean re-inserting every record.
 
 It is finding **V4** from the other side too: the shard fan-out that made
 `kvdb` stop paying for itself is gone, so V4 no longer describes this
@@ -846,6 +848,52 @@ with `blob_db_get(sb_id) == -ENOENT`, allocates two ids, calls
 atomic write that publishes the structure. A crash before it leaves the maps
 unreferenced, and `blob_db` has no reachability GC: finding **B8**, the same
 window `kvdb` itself has (`kvdb.c:118`).
+
+### 12.3 The table directory — what a build does with a table it does not know
+
+The superblock lists the maps as a directory, `table_id → { root, class,
+schema }`, so that a later build can add a table without making the store
+unopenable by this one — and so that rolling firmware back stays possible.
+
+The obvious rule, "a table you do not know can be removed", is right for some
+tables and destroys data for others, and an older build cannot tell which from
+an id it has never seen. So the build that creates a table records the answer
+next to it, in a field every build reads:
+
+| class | A build that does not know the table… | For |
+|---|---|---|
+| **required** (0) | refuses to open the store (`-ENOTSUP`) | authoritative data an older build would get *wrong* without it — e.g. permissions moved out of the person record |
+| **preserve** (1) | keeps it, and keeps its entry on every superblock rewrite | data no older build's write can make inconsistent — an audit log, a configuration table |
+| **derived** (2) | destroys it and drops its entry at open, before its first write | indexes and caches over other tables |
+
+A class value newer than the build is treated as required: refusing is the only
+answer that cannot lose or corrupt anything.
+
+**Derived tables are dropped, not ignored**, because ignoring one is wrong. An
+older build that writes people does not maintain a newer build's index over
+them; rolled forward again, the newer build would trust an index that is
+missing every change made in between. Dropping it hands the newer build an
+absent table, which it knows how to rebuild — from the tables it is derived
+from, walked with `map_ops.next`.
+
+**Refusing is decided before anything is written.** Every entry is classified
+first; only then are derived tables destroyed. A store this build refuses is
+left byte-identical, so the newer build that wrote it still finds it intact.
+
+**Dropping survives a power cut.** `map_ops.destroy` runs before the directory
+is rewritten. Unlinking first would leak the table's blobs for good if power
+failed in between (B8); destroying first leaves at worst an entry naming a
+destroyed map, which the next open destroys again — `-ENOENT`, taken as done.
+
+**This build's own tables** must carry the record format it reads (`schema`);
+another is refused rather than misread. Both are **required**: either one
+missing would let an access decision be made on half the data.
+
+**What is not here yet.** No table is derived today, so nothing rebuilds one:
+that code belongs to the build that introduces the first derived table. What
+ships now is the half that has to exist *before* that build does — the older
+build's side — and `tests/app_cbor_persondb` exercises it by planting the
+tables a newer build would leave.
 
 ## 13. Acceptance criteria
 

@@ -358,7 +358,7 @@ static int cmd_unassign(const struct shell *sh, size_t argc, char **argv)
 }
 
 /* The one command that does not need an open store: it is how a store this
- * build cannot open — another superblock version — gets replaced. */
+ * build cannot open — one a newer build wrote — gets replaced. */
 static int cmd_reset(const struct shell *sh, size_t argc, char **argv)
 {
 	int rc;
@@ -398,8 +398,8 @@ int ui_main(void)
 	if (rc != 0) {
 		printk("persondb: open failed: %d\n", rc);
 		if (rc == -ENOTSUP) {
-			printk("If the log above names another superblock "
-			       "version, `persondb reset` erases the store and "
+			printk("The log above says what this build cannot "
+			       "read. `persondb reset` erases the store and "
 			       "starts over.\n");
 		}
 		return rc;

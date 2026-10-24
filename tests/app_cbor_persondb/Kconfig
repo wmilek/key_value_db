@@ -1,0 +1,13 @@
+# Copyright (c) 2026
+# SPDX-License-Identifier: Apache-2.0
+
+mainmenu "app_cbor_persondb ztest"
+
+# persondb.c logs under the application's module name.
+module = APP_CBOR_PERSONDB
+module-str = APP_CBOR_PERSONDB
+source "subsys/logging/Kconfig.template.log_config"
+
+menu "Zephyr"
+source "Kconfig.zephyr"
+endmenu

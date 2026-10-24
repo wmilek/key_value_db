@@ -41,13 +41,58 @@ extern "C" {
 /** A credential index entry is just the owner's id. */
 #define CRED_CBOR_MAX 16
 
-/** The application superblock: version, map roots, dataset geometry. */
+/** The application superblock: version, table directory, dataset geometry.
+ *  A full directory encodes to at most 251 B. */
 #define SUPERBLOCK_CBOR_MAX 256
 
-/* Bump on any change to the superblock's encoding. 2 replaced the array of
- * people-map roots (sixteen shards until DESIGN.md §12.2, then one) with a
- * single root. */
+/* Bump on any change to the superblock's own encoding — not when a table is
+ * added, which is what the table directory is for (DESIGN.md §12.3).
+ *
+ *   1  an array of people-map roots plus a credential root: the sixteen
+ *      shards of DESIGN.md §12.2, then one. Read, and rewritten as 2.
+ *   2  the table directory.
+ */
 #define SUPERBLOCK_VERSION 2
+
+/** Directory capacity. A store with more tables is refused, not truncated. */
+#define SB_TABLES_MAX 8
+
+/* Table ids. Assigned once, never reused: a build that meets an id it does
+ * not know acts on that table's class, so an id that changed meaning would
+ * have an old build apply one table's rule to another's data. */
+#define SB_TABLE_PEOPLE 1
+#define SB_TABLE_CRED   2
+
+/* The record formats this codec reads, per table. A table whose schema is
+ * not the one listed here is refused rather than misread. */
+#define SB_SCHEMA_PEOPLE 1
+#define SB_SCHEMA_CRED   1
+
+/**
+ * What a build that does not know a table must do with it. Recorded by the
+ * build that creates the table, because only that build knows the answer.
+ */
+enum sb_table_class {
+	/** Refuse to open the store. Authoritative data an older build would
+	 *  get wrong without it. Also how any class value newer than this
+	 *  build is treated. */
+	SB_CLASS_REQUIRED = 0,
+	/** Keep it, and keep its entry on every superblock rewrite. Data no
+	 *  write by an older build can make inconsistent. */
+	SB_CLASS_PRESERVE = 1,
+	/** Destroy it and drop its entry at open, before the first write.
+	 *  Derived from other tables, which an older build would update
+	 *  without updating it; the build that knows it rebuilds it. */
+	SB_CLASS_DERIVED = 2,
+};
+
+/** One directory entry. */
+struct sb_table {
+	uint32_t id;
+	uint64_t root;
+	uint32_t cls;      /* enum sb_table_class, or a newer build's value */
+	uint32_t schema;
+};
 
 /**
  * @brief Encode @p p into @p buf.
@@ -81,26 +126,40 @@ int cred_cbor_decode(const uint8_t *buf, size_t len, uint32_t *person_id);
 
 /** The superblock's decoded form. */
 struct superblock {
-	uint32_t version;
-	uint64_t people_root;
-	uint64_t cred_root;
+	uint32_t version;              /* as read from flash */
+	uint8_t  n_tables;
+	struct sb_table table[SB_TABLES_MAX];   /* ascending id */
 	uint32_t n_persons;
 	uint32_t populated;
 	uint32_t rev;
 };
 
+/**
+ * @brief Encode @p sb as SUPERBLOCK_VERSION, whatever sb->version says.
+ *
+ * @retval -EINVAL  table ids not strictly ascending, or too many tables
+ * @retval -ENOMEM  buf too small
+ */
 int superblock_cbor_encode(const struct superblock *sb, uint8_t *buf,
 			   size_t buf_sz, size_t *out_len);
 
 /**
- * @brief Decode a superblock.
+ * @brief Decode a superblock of any version this build reads.
  *
- * The version is read first and checked before anything else, because a
- * different version means a different layout: decoding on would report a
- * well-formed store of another format as corrupt.
+ * The version is read first, because a different version means a different
+ * layout: decoding on would report a well-formed store of another format as
+ * corrupt. A version 1 superblock comes back as its directory — people and
+ * credentials, both required — with out->version still 1, so the caller can
+ * tell it needs rewriting.
+ *
+ * The directory is decoded whole, unknown tables included; deciding what to
+ * do with them is the caller's business, because only the caller knows which
+ * tables it has.
  *
  * @retval 0        decoded
- * @retval -ENOTSUP written as another SUPERBLOCK_VERSION; out->version holds it
+ * @retval -ENOTSUP a version this build does not read (out->version holds it),
+ *                  more than SB_TABLES_MAX tables, or a version 1 store of
+ *                  more than one people map
  * @retval -EILSEQ  not a well-formed superblock
  */
 int superblock_cbor_decode(const uint8_t *buf, size_t len,
