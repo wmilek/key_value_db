@@ -593,6 +593,9 @@ poking a live store on the DK:
 | `assign`/`unassign` | `persondb_card_*` |
 | `tui` | full-screen browser, below |
 
+While the store is still opening at boot, every command is refused, `reset`
+included; once the open has finished, `reset` works even if it failed.
+
 Being able to `fill 500`, pull the power, reboot and `stat` is the most direct
 demonstration of F8 and F5 that this app can offer — and it is only possible
 because §9 exists.

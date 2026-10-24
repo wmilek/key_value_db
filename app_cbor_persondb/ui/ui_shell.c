@@ -19,18 +19,30 @@
 
 #include <zephyr/kernel.h>
 #include <zephyr/shell/shell.h>
+#include <zephyr/sys/atomic.h>
 
 #include "scenario.h"
 #if defined(CONFIG_APP_CBOR_PERSONDB_TUI)
 #include "ui_tui.h"
 #endif
 
+/* Where the store is. ui_main() leaves OPENING once, on the main thread, after
+ * scenario_open() returns; from then on only `reset`, on the shell thread,
+ * changes it. Atomic because the shell thread reads it from the start: the
+ * shell accepts commands before the open, which can be slow on a first boot,
+ * has finished. */
+enum store_state {
+	STORE_OPENING,
+	STORE_OPEN,
+	STORE_FAILED,
+};
+
 static struct scenario g_s;
-static bool g_open;
+static atomic_t g_state = ATOMIC_INIT(STORE_OPENING);
 
 static int need_open(const struct shell *sh)
 {
-	if (!g_open) {
+	if (atomic_get(&g_state) != STORE_OPEN) {
 		shell_error(sh, "store not open");
 		return -ENODEV;
 	}
@@ -395,15 +407,22 @@ static int cmd_unassign(const struct shell *sh, size_t argc, char **argv)
 }
 
 /* The one command that does not need an open store: it is how a store this
- * build cannot open — one a newer build wrote — gets replaced. */
+ * build cannot open — one a newer build wrote — gets replaced. It still waits
+ * for the open to finish, failed or not: until then scenario_open() is inside
+ * persondb on the main thread, and erasing under it would make two callers
+ * where persondb allows one (persondb.h). */
 static int cmd_reset(const struct shell *sh, size_t argc, char **argv)
 {
 	int rc;
 
 	ARG_UNUSED(argc);
 	ARG_UNUSED(argv);
+	if (atomic_get(&g_state) == STORE_OPENING) {
+		shell_error(sh, "store is still opening");
+		return -EBUSY;
+	}
 	rc = scenario_erase(&g_s);
-	g_open = (rc == 0);
+	atomic_set(&g_state, rc == 0 ? STORE_OPEN : STORE_FAILED);
 	shell_print(sh, "reset: %d", rc);
 	return rc;
 }
@@ -441,13 +460,16 @@ int ui_main(void)
 			       "read. `persondb reset` erases the store and "
 			       "starts over.\n");
 		}
+		atomic_set(&g_state, STORE_FAILED);
 		return rc;
 	}
-	g_open = true;
 
 	struct persondb_stat st;
 
+	/* Before OPEN is published: once it is, persondb belongs to the shell
+	 * thread, and this would be a second caller. */
 	persondb_stat(g_s.db, &st);
+	atomic_set(&g_state, STORE_OPEN);
 	printk("\npersondb shell ready — %u/%u persons at rev %u.\n",
 	       st.populated, st.n_persons, st.rev);
 	printk("Try: persondb stat | persondb fill 500 | persondb verify\n\n");
