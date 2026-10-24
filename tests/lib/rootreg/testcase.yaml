@@ -3,3 +3,8 @@ common:
   platform_allow: native_sim
 tests:
   lib.rootreg: {}
+  # The same suite over an encrypted and authenticated store
+  # (CONFIG_BLOB_DB_PROTECT_AEAD): the layers above see no difference.
+  lib.rootreg.protect_aead:
+    extra_configs:
+      - CONFIG_BLOB_DB_PROTECT_AEAD=y

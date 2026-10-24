@@ -4,3 +4,11 @@ common:
   platform_allow: native_sim
 tests:
   lib.blob_db_contract: {}
+  # The same suite over an encrypted and authenticated store
+  # (CONFIG_BLOB_DB_PROTECT_AEAD): the layers above see no difference.
+  lib.blob_db_contract.protect_aead:
+    extra_configs:
+      - CONFIG_BLOB_DB_PROTECT_AEAD=y
+  lib.blob_db_contract.protect_auth:
+    extra_configs:
+      - CONFIG_BLOB_DB_PROTECT_AUTH=y

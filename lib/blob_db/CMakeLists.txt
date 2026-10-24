@@ -3,6 +3,8 @@
 
 zephyr_library_named(blob_db)
 zephyr_library_sources(blob_db.c)
+# Keying material for UBI and for CONFIG_BLOB_DB_PROTECT.
+zephyr_library_sources_ifdef(CONFIG_BLOB_DB_KEYS               blob_db_protect.c)
 zephyr_library_sources_ifdef(CONFIG_BLOB_DB_SLOT_INDEX          blob_db_slot_index.c)
 zephyr_library_sources_ifdef(CONFIG_BLOB_DB_BACKEND_FLASH_AREA blob_db_store_flash.c)
 zephyr_library_sources_ifdef(CONFIG_BLOB_DB_BACKEND_UBI        blob_db_store_ubi.c)

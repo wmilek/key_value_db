@@ -198,8 +198,9 @@ Two things to know before switching a real device:
   assuming 4 KB blocks. A board with larger blocks may lower it.
 - UBI authenticates its metadata with a key from PSA Crypto. The default is a
   fixed development key that detects damage but not tampering; a product
-  provisions its own (`CONFIG_BLOB_DB_UBI_KEY_APP`, see
-  [`blob_db_ubi.h`](include/app/lib/blob_db_ubi.h)).
+  provisions its own (`CONFIG_BLOB_DB_KEY_APP`, see
+  [`blob_db_security.h`](include/app/lib/blob_db_security.h)). UBI does not
+  protect the data itself; `CONFIG_BLOB_DB_PROTECT_*` does, on either backend.
 - A UBI build refuses a partition holding anything but a UBI device it can
   read — a `flash_area` store, or one written by the UBI release used before
   zephyr-ubi v0.1.0 — with `-ENOTSUP`, and leaves it untouched;
@@ -300,13 +301,16 @@ unrepresentable.
 | Ids and blobs only, no containers | `CONFIG_BLOB_DB=y` | blob_db |
 | Raw partition instead of UBI | `+ CONFIG_BLOB_DB_BACKEND_FLASH_AREA=y` | drops the UBI volume backend |
 | Objects larger than one flash sector | `+ CONFIG_BLOB_DB_LARGE_PAYLOADS=y` | + segmented objects and partial access |
+| Data authenticated on flash | `+ CONFIG_BLOB_DB_PROTECT_AUTH=y` | + AES-CMAC per slot and on metadata, via PSA Crypto |
+| Data encrypted and authenticated on flash | `+ CONFIG_BLOB_DB_PROTECT_AEAD=y` | + AES-CCM per slot, AES-CMAC on metadata, via PSA Crypto |
 
 Frequently adjusted options (see the module `Kconfig` files for the rest):
 
 | Option | Meaning |
 |---|---|
 | `CONFIG_BLOB_DB_PARTITION_LABEL` | fixed-partition label to store blobs in (default `storage`) |
-| `CONFIG_BLOB_DB_UBI_KEY_APP` | UBI's metadata key comes from the application, not the built-in development key (UBI backend) |
+| `CONFIG_BLOB_DB_KEY_APP` | the key UBI's metadata MAC and `CONFIG_BLOB_DB_PROTECT_*` derive from comes from the application (`blob_db_ikm_key()`), not the built-in development key, which is not secret |
+| `CONFIG_BLOB_DB_PROTECT_TAG_16` | 16-byte slot tags instead of 8 (protected stores) |
 | `CONFIG_BLOB_DB_UBI_HEAP_SIZE` | heap reserved for UBI's bookkeeping; defaults from the partition size (UBI backend) |
 | `CONFIG_BLOB_DB_AUTOFORMAT_ON_CORRUPT` | when no master is usable and the partition is not blank, erase it and start empty instead of returning `-EIO` (default `n`; destroys every blob) |
 | `CONFIG_BLOB_DB_MAX_PAYLOAD_LEN` | largest blob payload; also caps the kvhash bucket directory |

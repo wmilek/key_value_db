@@ -27,6 +27,27 @@
 /* native_sim overlay geometry: 8 MB of 4 KB sectors. */
 #define TEST_SECTOR_SZ  4096
 
+/* The slot stream as this build writes it, for the helpers that walk raw
+ * flash: a protected store (CONFIG_BLOB_DB_PROTECT) has a 48 B bucket header,
+ * a tag on every slot and, on an appended AEAD slot (not COMPACTED, 0x10), a
+ * 12 B nonce. */
+#if defined(CONFIG_BLOB_DB_PROTECTED)
+#define TEST_DATA_OFF   48
+#define TEST_TAG_LEN    CONFIG_BLOB_DB_PROTECT_TAG_LEN
+#else
+#define TEST_DATA_OFF   16
+#define TEST_TAG_LEN    0
+#endif
+#define TEST_SLOT_MIN   (14 + TEST_TAG_LEN)
+
+static inline size_t test_slot_bytes(uint8_t flags, uint16_t val_len)
+{
+	const size_t nonce = (IS_ENABLED(CONFIG_BLOB_DB_PROTECT_AEAD) &&
+			      !(flags & 0x10)) ? 12 : 0;
+
+	return TEST_SLOT_MIN + nonce + val_len;
+}
+
 /*
  * Several cases here inject faults by writing or erasing the storage partition
  * directly, at offsets derived from blob_db's own on-flash layout — a torn
@@ -45,14 +66,21 @@
  * that does not reach past the API still runs on both backends — see the
  * lib.blob_db.ubi scenario in testcase.yaml.
  *
+ * The offsets are those of an unprotected store, so these cases skip in a
+ * protected build (CONFIG_BLOB_DB_PROTECT) too; src/protect.c injects the
+ * same faults, and forgeries, into the protected layout.
+ *
  * The guard goes at the top of each affected case, not inside the injection
  * helpers. ztest_test_skip() escapes by longjmp, which the compiler cannot see,
  * so guarding a helper leaves every local it fills looking uninitialised to
  * -Werror=uninitialized. Guarding the case works because Z_TEST_SKIP() ends in
  * a plain return.
  */
-#define SKIP_UNLESS_RAW_PARTITION() \
-	Z_TEST_SKIP_IFNDEF(CONFIG_BLOB_DB_BACKEND_FLASH_AREA)
+#define SKIP_UNLESS_RAW_PARTITION()                                            \
+	do {                                                                   \
+		Z_TEST_SKIP_IFNDEF(CONFIG_BLOB_DB_BACKEND_FLASH_AREA);         \
+		Z_TEST_SKIP_IFDEF(CONFIG_BLOB_DB_PROTECTED);                   \
+	} while (0)
 
 /* alloc + bind in one step — the contract's replacement for the old `put`. */
 static uint64_t put_blob(const void *payload, size_t len)
@@ -349,6 +377,174 @@ ZTEST(blob_db, test_corrupt_slot_does_not_hide_later_slots)
 		   "a later slot in the same bucket must remain reachable");
 	zassert_equal(got, 6);
 	zassert_mem_equal(buf, "SECOND", 6);
+}
+
+/* --- bucket headers that cannot be trusted (proposal phase 0) -----------
+ *
+ * A bucket header that fails its CRC, or names another bucket, sits over slots
+ * that may be data. It used to read as "unformatted": the bucket's blobs
+ * answered -ENOENT and the next write to it formatted over them. Now the
+ * bucket answers -EIO and keeps its slots, unless
+ * CONFIG_BLOB_DB_AUTOFORMAT_ON_CORRUPT asks for the old behaviour.
+ */
+
+static off_t bucket_raw_off(uint64_t id)
+{
+	return (off_t)(3 + (id % 2045)) * TEST_SECTOR_SZ;
+}
+
+/* Clear a bit of the bucket header's CRC, as bit rot would. */
+static void rot_bucket_hdr(uint64_t id)
+{
+	const struct flash_area *fa;
+	const off_t crc_off = bucket_raw_off(id) + 12;
+	uint8_t crc[4];
+
+	zassert_ok(flash_area_open(BLOB_DB_TEST_PARTITION_ID, &fa));
+	zassert_ok(flash_area_read(fa, crc_off, crc, sizeof(crc)));
+	for (size_t i = 0; i < sizeof(crc); i++) {
+		if (crc[i] != 0) {
+			crc[i] &= (uint8_t)(crc[i] - 1);   /* NOR goes 1->0 */
+			break;
+		}
+	}
+	zassert_ok(flash_area_write(fa, crc_off, crc, sizeof(crc)));
+	flash_area_close(fa);
+}
+
+static bool first_slot_programmed(uint64_t id)
+{
+	const struct flash_area *fa;
+	uint8_t head[12];
+
+	zassert_ok(flash_area_open(BLOB_DB_TEST_PARTITION_ID, &fa));
+	zassert_ok(flash_area_read(fa, bucket_raw_off(id) + 16, head,
+				   sizeof(head)));
+	flash_area_close(fa);
+	for (size_t i = 0; i < sizeof(head); i++) {
+		if (head[i] != 0xff) {
+			return true;
+		}
+	}
+	return false;
+}
+
+static int iter_count_cb(uint64_t id, const void *p, size_t len, void *user)
+{
+	ARG_UNUSED(id);
+	ARG_UNUSED(p);
+	ARG_UNUSED(len);
+	(*(int *)user)++;
+	return 0;
+}
+
+ZTEST(blob_db, test_damaged_bucket_header_is_not_unformatted)
+{
+	SKIP_UNLESS_RAW_PARTITION();
+
+	uint64_t a = put_blob("AAA", 3);
+	uint64_t b = put_blob("BBB", 3);
+
+	zassert_ok(blob_db_unmount());
+	rot_bucket_hdr(a);
+	zassert_ok(blob_db_mount(), "one bad bucket must not stop a mount");
+
+	uint8_t buf[16];
+	size_t got;
+	int visited = 0;
+
+	zassert_ok(blob_db_get(b, buf, sizeof(buf), &got),
+		   "another bucket must be unaffected");
+
+#if defined(CONFIG_BLOB_DB_AUTOFORMAT_ON_CORRUPT)
+	/* The opt-in keeps the old behaviour: absent, and formatted over. */
+	zassert_equal(blob_db_get(a, buf, sizeof(buf), &got), -ENOENT);
+	zassert_ok(blob_db_update(a, "NEW", 3));
+	zassert_ok(blob_db_get(a, buf, sizeof(buf), &got));
+	zassert_mem_equal(buf, "NEW", 3);
+	zassert_ok(blob_db_iterate(iter_count_cb, &visited));
+	zassert_equal(visited, 3, "root, a and b");
+#else
+	zassert_equal(blob_db_get(a, buf, sizeof(buf), &got), -EIO,
+		      "a bucket behind a bad header is not empty");
+	zassert_equal(blob_db_size(a, &got), -EIO);
+	zassert_false(blob_db_exists(a));
+	zassert_equal(blob_db_update(a, "NEW", 3), -EIO,
+		      "a write must not format over the bucket");
+	zassert_equal(blob_db_delete(a), -EIO);
+	zassert_equal(blob_db_count(), 2, "root and b are what can be read");
+	zassert_equal(blob_db_iterate(iter_count_cb, &visited), -EIO,
+		      "iterate must say it could not read everything");
+	zassert_equal(visited, 2, "iterate still visits every readable blob");
+	zassert_ok(blob_db_unmount());
+	zassert_true(first_slot_programmed(a),
+		     "the bucket's slots must still be on flash");
+	zassert_ok(blob_db_mount());
+	zassert_equal(blob_db_get(a, buf, sizeof(buf), &got), -EIO,
+		      "and still refused after a remount");
+#endif
+}
+
+/* A whole bucket sector copied over another: a valid header naming the wrong
+ * bucket. */
+ZTEST(blob_db, test_displaced_bucket_is_not_unformatted)
+{
+	SKIP_UNLESS_RAW_PARTITION();
+	Z_TEST_SKIP_IFDEF(CONFIG_BLOB_DB_AUTOFORMAT_ON_CORRUPT);
+
+	uint64_t a = put_blob("AAA", 3);
+	uint64_t c = put_blob("CCC", 3);
+	static uint8_t sector[TEST_SECTOR_SZ];
+	const struct flash_area *fa;
+
+	zassert_ok(blob_db_unmount());
+	zassert_ok(flash_area_open(BLOB_DB_TEST_PARTITION_ID, &fa));
+	zassert_ok(flash_area_read(fa, bucket_raw_off(a), sector,
+				   sizeof(sector)));
+	zassert_ok(flash_area_erase(fa, bucket_raw_off(c), sizeof(sector)));
+	zassert_ok(flash_area_write(fa, bucket_raw_off(c), sector,
+				    sizeof(sector)));
+	flash_area_close(fa);
+	zassert_ok(blob_db_mount());
+
+	uint8_t buf[16];
+	size_t got;
+
+	zassert_ok(blob_db_get(a, buf, sizeof(buf), &got));
+	zassert_equal(blob_db_get(c, buf, sizeof(buf), &got), -EIO);
+	zassert_equal(blob_db_update(c, "NEW", 3), -EIO);
+	zassert_ok(blob_db_unmount());
+	zassert_true(first_slot_programmed(c), "nothing may be erased");
+	zassert_ok(blob_db_mount());
+}
+
+/* A format cut inside its header write leaves a partial header over an
+ * erased sector. Nothing can be lost there, so it is unformatted, and the
+ * next write formats it as before. */
+ZTEST(blob_db, test_torn_bucket_format_reads_as_unformatted)
+{
+	SKIP_UNLESS_RAW_PARTITION();
+
+	uint64_t a = blob_db_alloc_id();
+	const struct flash_area *fa;
+	const uint8_t partial[4] = { 'B', 'D', 0x00, 0x00 };
+
+	zassert_not_equal(a, 0);
+	zassert_ok(blob_db_unmount());
+	zassert_ok(flash_area_open(BLOB_DB_TEST_PARTITION_ID, &fa));
+	zassert_ok(flash_area_erase(fa, bucket_raw_off(a), TEST_SECTOR_SZ));
+	zassert_ok(flash_area_write(fa, bucket_raw_off(a), partial,
+				    sizeof(partial)));
+	flash_area_close(fa);
+	zassert_ok(blob_db_mount());
+
+	uint8_t buf[16];
+	size_t got;
+
+	zassert_equal(blob_db_get(a, buf, sizeof(buf), &got), -ENOENT);
+	zassert_ok(blob_db_update(a, "NEW", 3), "the torn bucket is reformatted");
+	zassert_ok(blob_db_get(a, buf, sizeof(buf), &got));
+	zassert_mem_equal(buf, "NEW", 3);
 }
 
 /* 11. Hitting bucket-full triggers per-bucket compaction; the latest
@@ -1615,7 +1811,7 @@ static void count_segment_slots(int *out_live, int *out_tombs)
 			continue;
 		}
 
-		off_t cursor = 16;
+		off_t cursor = TEST_DATA_OFF;
 
 		for (;;) {
 			struct __packed {
@@ -1625,7 +1821,7 @@ static void count_segment_slots(int *out_live, int *out_tombs)
 				uint64_t id;
 			} head;
 
-			if (cursor + 14 > TEST_SECTOR_SZ) {
+			if (cursor + TEST_SLOT_MIN > TEST_SECTOR_SZ) {
 				break;
 			}
 			zassert_ok(flash_area_read(fa, base + cursor, &head,
@@ -1635,7 +1831,7 @@ static void count_segment_slots(int *out_live, int *out_tombs)
 				break;
 			}
 
-			size_t ssz = 14 + head.val_len;
+			size_t ssz = test_slot_bytes(head.flags, head.val_len);
 
 			ssz = (ssz + align - 1) & ~(align - 1);
 			if (cursor + (off_t)ssz > TEST_SECTOR_SZ) {
@@ -2532,12 +2728,12 @@ static off_t bucket_write_cursor(uint16_t bid)
 
 	const size_t align = flash_area_align(fa);
 	const off_t base = (off_t)(3 + bid) * TEST_SECTOR_SZ;
-	off_t cursor = 16;
+	off_t cursor = TEST_DATA_OFF;
 
 	for (;;) {
 		struct test_slot_head head;
 
-		if (cursor + 14 > TEST_SECTOR_SZ) {
+		if (cursor + TEST_SLOT_MIN > TEST_SECTOR_SZ) {
 			break;
 		}
 		zassert_ok(flash_area_read(fa, base + cursor, &head,
@@ -2547,7 +2743,7 @@ static off_t bucket_write_cursor(uint16_t bid)
 			break;
 		}
 
-		size_t ssz = 14 + head.val_len;
+		size_t ssz = test_slot_bytes(head.flags, head.val_len);
 
 		ssz = (ssz + align - 1) & ~(align - 1);
 		if (cursor + (off_t)ssz > TEST_SECTOR_SZ) {
@@ -2602,12 +2798,12 @@ static uint64_t first_segment_id(void)
 			continue;
 		}
 
-		off_t cursor = 16;
+		off_t cursor = TEST_DATA_OFF;
 
 		for (;;) {
 			struct test_slot_head head;
 
-			if (cursor + 14 > TEST_SECTOR_SZ) {
+			if (cursor + TEST_SLOT_MIN > TEST_SECTOR_SZ) {
 				break;
 			}
 			zassert_ok(flash_area_read(fa, base + cursor, &head,
@@ -2623,7 +2819,7 @@ static uint64_t first_segment_id(void)
 				break;
 			}
 
-			size_t ssz = 14 + head.val_len;
+			size_t ssz = test_slot_bytes(head.flags, head.val_len);
 
 			ssz = (ssz + align - 1) & ~(align - 1);
 			if (cursor + (off_t)ssz > TEST_SECTOR_SZ) {

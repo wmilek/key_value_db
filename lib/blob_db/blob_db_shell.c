@@ -98,6 +98,14 @@ static int cmd_info(const struct shell *sh, size_t argc, char **argv)
 							    : "flash_area");
 	shell_print(sh, "format        : %u.%u", in.format_major,
 		    in.format_minor);
+	if (in.suite == 0) {
+		shell_print(sh, "protection    : none (CRCs only)");
+	} else {
+		shell_print(sh, "protection    : %s, %u B tags",
+			    (in.suite & 0x0f) == 1 ? "AES-CMAC (authenticated)"
+						   : "AES-CCM (encrypted)",
+			    (in.suite >> 4) * 4);
+	}
 	shell_print(sh, "partition     : %zu B", in.partition_size);
 	shell_print(sh, "sector        : %zu B x %u (2 master, 1 scratch, "
 		    "%u buckets)", in.sector_size, in.n_sectors, in.n_buckets);
@@ -469,6 +477,79 @@ static int cmd_id(const struct shell *sh, size_t argc, char **argv)
 
 /* blob_db dump <id> [len] ------------------------------------------------- */
 
+#if defined(CONFIG_BLOB_DB_PROTECT_AEAD)
+/* An encrypted store dumps the id's newest slot as it is on flash -- head,
+ * nonce, ciphertext, tag -- and never decrypts: a diagnostic shell is not a
+ * way around the encryption. */
+struct dump_find {
+	uint64_t id;
+	uint32_t off, size;
+	bool found;
+};
+
+static int dump_find_cb(const struct blob_db_inspect_slot *s, void *user)
+{
+	struct dump_find *f = user;
+
+	if (s->id == f->id) {
+		f->off = s->offset;
+		f->size = s->size;
+		f->found = true;
+	}
+	return 0;
+}
+
+static int cmd_dump(const struct shell *sh, size_t argc, char **argv)
+{
+	struct blob_db_inspect_info in;
+	struct blob_db_inspect_bucket bs;
+	struct dump_find f = { 0 };
+	uint64_t max = DUMP_DEFAULT;
+
+	if (parse_u64(sh, argv[1], &f.id) < 0) {
+		return -EINVAL;
+	}
+	if (argc > 2 && parse_u64(sh, argv[2], &max) < 0) {
+		return -EINVAL;
+	}
+	if (need_info(sh, &in) < 0) {
+		return -ENODEV;
+	}
+
+	const uint16_t bid = (uint16_t)(f.id % in.n_buckets);
+	int rc = blob_db_inspect_bucket_get(bid, &bs, dump_find_cb, &f);
+
+	if (rc < 0) {
+		shell_error(sh, "bucket %u: %d", bid, rc);
+		return rc;
+	}
+	if (!f.found) {
+		shell_error(sh, "id %llu: no slot", (unsigned long long)f.id);
+		return -ENOENT;
+	}
+	shell_print(sh, "id %llu: newest slot, %u B at bucket %u + %u, as "
+		    "stored (encrypted)", (unsigned long long)f.id, f.size, bid,
+		    f.off);
+
+	const size_t want = MIN((size_t)max, (size_t)f.size);
+	uint8_t buf[DUMP_CHUNK];
+
+	for (size_t off = 0; off < want; off += sizeof(buf)) {
+		const size_t n = MIN(sizeof(buf), want - off);
+
+		rc = blob_db_inspect_raw_read(bid, f.off + off, buf, n);
+		if (rc < 0) {
+			shell_error(sh, "read at %zu: %d", off, rc);
+			return rc;
+		}
+		for (size_t i = 0; i < n; i += 16) {
+			shell_hexdump_line(sh, off + i, buf + i,
+					   MIN((size_t)16, n - i));
+		}
+	}
+	return 0;
+}
+#else
 static int cmd_dump(const struct shell *sh, size_t argc, char **argv)
 {
 	uint64_t id, max = DUMP_DEFAULT;
@@ -514,6 +595,7 @@ static int cmd_dump(const struct shell *sh, size_t argc, char **argv)
 	}
 	return 0;
 }
+#endif /* CONFIG_BLOB_DB_PROTECT_AEAD */
 
 #if defined(CONFIG_BLOB_DB_IOSTATS)
 /* blob_db iostats [reset] ------------------------------------------------- */
@@ -568,7 +650,8 @@ SHELL_STATIC_SUBCMD_SET_CREATE(sub_blob_db,
 		"usage: id <id>",
 		cmd_id, 2, 0),
 	SHELL_CMD_ARG(dump, NULL,
-		"Hex dump of a blob's payload\n"
+		"Hex dump of a blob's payload (in an encrypted store, of its\n"
+		"newest slot as stored)\n"
 		"usage: dump <id> [max_bytes]  (default 256)",
 		cmd_dump, 2, 1),
 #if defined(CONFIG_BLOB_DB_IOSTATS)

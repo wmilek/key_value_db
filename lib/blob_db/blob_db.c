@@ -16,13 +16,16 @@
 
 #include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
+#include <zephyr/sys/byteorder.h>
 #include <zephyr/sys/crc.h>
 
 #include <app/lib/blob_db.h>
 #include <app/lib/blob_db_iostats.h>
+#include <app/lib/blob_db_security.h>
 #include <app/lib/blob_db_test.h>
 
 #include "blob_db_internal.h"
+#include "blob_db_protect.h"
 #include "blob_db_slot_index.h"
 #include "blob_db_store.h"
 
@@ -41,6 +44,7 @@ static int bind_root_empty(void);
 static int invalidate_buckets(int skip_bid);
 static int format_whole_store(void);
 static bool bucket_hdr_valid(const uint8_t *buf, uint16_t bid);
+static int bucket_hdr_authentic(const uint8_t *buf, uint16_t bid);
 
 /* The on-flash prefix of a slot: header then id, contiguous. These 12 bytes
  * are enough to size a slot and know whose it is, which is what lets the walk
@@ -50,6 +54,43 @@ struct __packed slot_head {
 	uint64_t id;
 };
 BUILD_ASSERT(sizeof(struct slot_head) == 12, "slot_head layout drift");
+
+/* Slot layout -------------------------------------------------------------
+ *
+ *     slot_head (12) | [nonce] | payload[val_len] | [tag] | crc16 | pad
+ *
+ * The nonce is stored only by an appended AEAD slot, the tag only in a
+ * protected store; both are zero-length otherwise, so an unprotected slot is
+ * byte for byte what it always was. The size comes from flags and val_len
+ * alone, so the walk still strides without reading a payload. */
+
+static inline size_t slot_nonce_len(uint8_t flags)
+{
+	return (flags & BLOB_DB_SLOT_F_COMPACTED) ? 0 : BLOB_DB_NONCE_LEN;
+}
+
+/* Bytes before the CRC, which covers all of them. */
+static inline size_t slot_crc_off(uint8_t flags, uint16_t val_len)
+{
+	return sizeof(struct slot_head) + slot_nonce_len(flags) + val_len +
+	       BLOB_DB_TAG_LEN;
+}
+
+/* AEAD: the leading bytes of the payload kept in the clear and authenticated
+ * as associated data: a segment's owner and sequence, so the mount-time sweep
+ * finds owners without decrypting. */
+static inline size_t slot_clear_len(uint8_t flags, uint16_t val_len)
+{
+#if defined(CONFIG_BLOB_DB_LARGE_PAYLOADS)
+	if ((flags & BLOB_DB_SLOT_F_SEGMENT) &&
+	    val_len >= sizeof(struct blob_db_seg_hdr)) {
+		return sizeof(struct blob_db_seg_hdr);
+	}
+#endif
+	ARG_UNUSED(flags);
+	ARG_UNUSED(val_len);
+	return 0;
+}
 
 /* Result of one streaming pass over a bucket. */
 struct bucket_scan {
@@ -63,7 +104,7 @@ struct bucket_scan {
 					 * slot sits at write_cursor          */
 };
 
-static int read_bucket_hdr(uint16_t bid, bool *valid);
+static int read_bucket_hdr(uint16_t bid, bool mac, bool *valid);
 static int scan_bucket_for(uint16_t bid, uint64_t target_id, off_t limit,
 			   struct bucket_scan *out);
 static int slot_verify(uint16_t bid, const struct bucket_scan *sc, void *dst);
@@ -120,11 +161,58 @@ static struct {
 	uint64_t  next_id_hint;    /* durable leading ceiling (see internal.h) */
 	uint64_t  seg_owner;       /* segmented write in flight; 0 = none */
 	bool      wedged;          /* a torn compaction makes further writes unsafe */
+#if defined(CONFIG_BLOB_DB_PROTECTED)
+	uint8_t   store_uuid[BLOB_DB_UUID_LEN]; /* drawn at format; in every key */
+#endif
+#if defined(CONFIG_BLOB_DB_PROTECT_AEAD)
+	uint64_t  seq;             /* RAM: next nonce counter value */
+	uint64_t  seq_hint;        /* durable leading ceiling on seq */
+	uint32_t  salt;            /* random per mount: nonce prefix */
+#endif
 } st;
+
+/* Damage and tampering, for the application (<app/lib/blob_db_security.h>).
+ * blob_db has acted on what it found by the time this runs. */
+__weak void blob_db_event(enum blob_db_event_kind kind,
+			  enum blob_db_event_layer layer, uint32_t where)
+{
+	static const char *const kinds[] = { "corrupt", "tampered" };
+	static const char *const layers[] = { "ubi", "master", "bucket", "slot" };
+
+	LOG_WRN("event: %s %s 0x%08x", layers[layer], kinds[kind], where);
+}
+
+/* Close the store and drop the keys opened with it. */
+static void store_close(void)
+{
+	blob_db_store_close();
+#if defined(CONFIG_BLOB_DB_KEYS)
+	blob_db_keys_close();
+#endif
+}
 
 static inline off_t peb_offset(uint16_t peb)
 {
 	return (off_t)peb * (off_t)st.peb_size;
+}
+
+/* On-flash size of a slot with these flags and payload length. Rounded up to
+ * the backing device's write-block-size so writes always land on aligned
+ * boundaries. Any padding bytes read back as the erased value (0xff) and
+ * don't affect the CRC (which sits at slot_crc_off(), before the padding is
+ * added — see append_slot / slot_view_at). */
+static inline size_t slot_size_of(uint8_t flags, uint16_t val_len)
+{
+	const size_t base = slot_crc_off(flags, val_len) + sizeof(uint16_t);
+	const size_t a = st.write_align ? st.write_align : 1;
+
+	return (base + a - 1) & ~(a - 1);
+}
+
+/* Size of a slot this build appends. */
+static inline size_t slot_size_for(uint16_t val_len)
+{
+	return slot_size_of(0, val_len);
 }
 
 /* CRC32-IEEE over the leading (sizeof - 4) bytes of a header struct;
@@ -195,11 +283,66 @@ enum master_class {
 	MASTER_CORRUPT,  /* written, but unparseable — treat as absent */
 	MASTER_FOREIGN,  /* parses, and says it is a format we do not know */
 	MASTER_OK,
+	MASTER_TAMPERED, /* CRCs verify, MAC does not — treat as absent */
 };
 
 static const char *const master_class_str[] = {
-	"erased", "corrupt", "foreign", "ok"
+	"erased", "corrupt", "foreign", "ok", "tampered"
 };
+
+#if defined(CONFIG_BLOB_DB_PROTECTED)
+/* The MAC over a master body, under K_meta of the uuid it names. */
+static int master_mac(const uint8_t *buf, uint8_t *mac)
+{
+	const struct blob_db_iov iov = { buf, sizeof(struct blob_db_master_hdr) };
+
+	return blob_db_meta_mac(&iov, 1, mac);
+}
+
+/* Check the tail and the MAC of a master whose prefix and body verified,
+ * setting *@p cls. K_meta depends on the uuid inside the master, so derive for
+ * that uuid: a forged uuid only yields a key under which nothing verifies.
+ * Returns a negative errno only when the crypto backend fails, which says
+ * nothing about the sector. */
+static int master_authenticate(uint8_t slot, const uint8_t *buf,
+			       enum master_class *cls)
+{
+	const struct blob_db_master_hdr *m = (const void *)buf;
+	const struct blob_db_master_tail *t =
+		(const void *)(buf + sizeof(struct blob_db_master_hdr));
+	const size_t tail_span = BLOB_DB_MASTER_LEN - sizeof(uint32_t);
+
+	if (t->tail_crc32 != crc32_ieee(buf, tail_span)) {
+		LOG_WRN("master %u: tail CRC mismatch — treating as corrupt",
+			slot);
+		blob_db_event(BLOB_DB_EVENT_CORRUPT, BLOB_DB_EVENT_MASTER, slot);
+		*cls = MASTER_CORRUPT;
+		return 0;
+	}
+
+	int rc = blob_db_keys_derive(m->store_uuid);
+
+	if (rc == 0) {
+		const struct blob_db_iov iov = {
+			buf, sizeof(struct blob_db_master_hdr)
+		};
+
+		rc = blob_db_meta_verify(&iov, 1, t->mac);
+	}
+	if (rc == -EBADMSG) {
+		LOG_ERR("master %u: MAC does not verify — ignoring it", slot);
+		blob_db_event(BLOB_DB_EVENT_TAMPERED, BLOB_DB_EVENT_MASTER, slot);
+		*cls = MASTER_TAMPERED;
+		return 0;
+	}
+	if (rc < 0) {
+		LOG_ERR("master %u: cannot authenticate (%d)", slot, rc);
+		return rc;
+	}
+	*cls = MASTER_OK;
+	return 0;
+}
+#endif
 
 static int read_master(uint8_t slot, struct blob_db_master_hdr *out,
 		       enum master_class *cls)
@@ -235,6 +378,7 @@ static int read_master(uint8_t slot, struct blob_db_master_hdr *out,
 
 	if (c->prefix_crc16 != prefix_crc(buf)) {
 		LOG_WRN("master %u: prefix CRC bad — treating as corrupt", slot);
+		blob_db_event(BLOB_DB_EVENT_CORRUPT, BLOB_DB_EVENT_MASTER, slot);
 		return 0;   /* MASTER_CORRUPT */
 	}
 
@@ -255,10 +399,19 @@ static int read_master(uint8_t slot, struct blob_db_master_hdr *out,
 		*cls = MASTER_FOREIGN;
 		return 0;
 	}
-	if (c->hdr_len < sizeof(struct blob_db_master_hdr) ||
+	/* Not below either, in a protected build: a store nobody authenticated
+	 * would be adopted with slots that carry no tag (a downgrade). */
+	if (c->format_major < BLOB_DB_FORMAT_MAJOR_MIN) {
+		LOG_ERR("master %u: format major %u is an unprotected store; "
+			"this build reads %u..%u", slot, c->format_major,
+			BLOB_DB_FORMAT_MAJOR_MIN, BLOB_DB_FORMAT_MAJOR);
+		*cls = MASTER_FOREIGN;
+		return 0;
+	}
+	if (c->hdr_len < BLOB_DB_MASTER_LEN ||
 	    c->hdr_len > BLOB_DB_MASTER_HDR_MAX) {
 		LOG_ERR("master %u: hdr_len %u outside [%zu, %u]", slot,
-			c->hdr_len, sizeof(struct blob_db_master_hdr),
+			c->hdr_len, (size_t)BLOB_DB_MASTER_LEN,
 			BLOB_DB_MASTER_HDR_MAX);
 		*cls = MASTER_FOREIGN;
 		return 0;
@@ -278,8 +431,27 @@ static int read_master(uint8_t slot, struct blob_db_master_hdr *out,
 	if (((const struct blob_db_master_hdr *)buf)->hdr_crc32 != want) {
 		LOG_WRN("master %u: body CRC mismatch — treating as corrupt",
 			slot);
+		blob_db_event(BLOB_DB_EVENT_CORRUPT, BLOB_DB_EVENT_MASTER, slot);
 		return 0;   /* MASTER_CORRUPT */
 	}
+
+#if defined(CONFIG_BLOB_DB_PROTECTED)
+	/* The mode is part of the format: AUTH and AEAD slots are not each
+	 * other's, and a tag length decides where every slot ends. */
+	if (((const struct blob_db_master_hdr *)buf)->suite != BLOB_DB_SUITE) {
+		LOG_ERR("master %u: protection suite 0x%02x, this build is "
+			"0x%02x", slot,
+			((const struct blob_db_master_hdr *)buf)->suite,
+			BLOB_DB_SUITE);
+		*cls = MASTER_FOREIGN;
+		return 0;
+	}
+	rc = master_authenticate(slot, buf, cls);
+	if (rc < 0 || *cls != MASTER_OK) {
+		*cls = rc < 0 ? MASTER_CORRUPT : *cls;
+		return rc;
+	}
+#endif
 
 	memcpy(out, buf, sizeof(*out));
 	*cls = MASTER_OK;
@@ -304,19 +476,38 @@ static int write_master(uint8_t slot, uint32_t gen, uint8_t state,
 	memcpy(hdr->compat.magic, MASTER_MAGIC, 4);
 	hdr->compat.format_major = BLOB_DB_FORMAT_MAJOR;
 	hdr->compat.format_minor = BLOB_DB_FORMAT_MINOR;
-	hdr->compat.hdr_len      = sizeof(*hdr);
+	hdr->compat.hdr_len      = BLOB_DB_MASTER_LEN;
 	hdr->compat.reserved     = 0;
 	hdr->compat.prefix_crc16 = prefix_crc(hdr);
 
 	hdr->generation     = gen;
 	hdr->state          = state;
 	hdr->compacting_bid = compacting_bid;
+	hdr->suite          = BLOB_DB_SUITE;
 	hdr->next_id_hint   = next_id_hint;
 	hdr->seg_owner      = seg_owner;
+#if defined(CONFIG_BLOB_DB_PROTECTED)
+	memcpy(hdr->store_uuid, st.store_uuid, sizeof(hdr->store_uuid));
+#endif
+#if defined(CONFIG_BLOB_DB_PROTECT_AEAD)
+	/* The ceiling, never the counter: see seq_reserve(). */
+	hdr->seq_hint       = st.seq_hint;
+#endif
 	hdr->hdr_crc32      = hdr_crc32(hdr, sizeof(*hdr));
 
+#if defined(CONFIG_BLOB_DB_PROTECTED)
+	struct blob_db_master_tail *tail =
+		(struct blob_db_master_tail *)(buf + sizeof(*hdr));
+
+	rc = master_mac(buf, tail->mac);
+	if (rc < 0) {
+		return rc;
+	}
+	tail->tail_crc32 = crc32_ieee(buf, BLOB_DB_MASTER_LEN - sizeof(uint32_t));
+#endif
+
 	const size_t a = st.write_align ? st.write_align : 1;
-	const size_t len = ROUND_UP(sizeof(*hdr), a);
+	const size_t len = ROUND_UP(BLOB_DB_MASTER_LEN, a);
 
 	if (len > sizeof(buf)) {
 		LOG_ERR("write_align %zu too large to stage a master", a);
@@ -356,6 +547,73 @@ static int persist_next_id_hint(uint64_t new_hint)
 	return 0;
 }
 
+#if defined(CONFIG_BLOB_DB_PROTECT_AEAD)
+/* Take @p n consecutive nonce counter values, persisting a new leading
+ * ceiling first when they would reach the durable one.
+ *
+ * seq_hint follows next_id_hint's rules (§13.1): mount resumes at the
+ * ceiling, a ceiling BLOB_DB_SEQ_STEP ahead is on flash before any value past
+ * the old one is used, and every master write carries the ceiling, never the
+ * counter. So no value is used twice across a power cut. If an attacker rolls
+ * the master back, the device resumes at an old ceiling; the per-mount salt in
+ * front of the counter still keeps the nonces apart, barring a 2^-32 match. */
+static int seq_reserve(uint64_t n, uint64_t *base)
+{
+	if (st.seq + n > st.seq_hint) {
+		const uint64_t prev = st.seq_hint;
+		const uint8_t inactive = !st.active_master;
+
+		st.seq_hint = st.seq + n + CONFIG_BLOB_DB_SEQ_STEP;
+
+		int rc = write_master(inactive, st.master_gen + 1,
+				      BLOB_DB_STATE_CLEAN, 0, st.next_id_hint);
+
+		if (rc < 0) {
+			LOG_ERR("persist seq_hint=%llu failed: %d",
+				(unsigned long long)st.seq_hint, rc);
+			st.seq_hint = prev;
+			return rc;
+		}
+		st.active_master = inactive;
+		st.master_gen++;
+	}
+	*base = st.seq;
+	st.seq += n;
+	return 0;
+}
+
+/* salt (4) || counter (8, LE). */
+static void nonce_make(uint8_t *nonce, uint32_t salt, uint64_t seq)
+{
+	sys_put_le32(salt, nonce);
+	sys_put_le64(seq, nonce + sizeof(uint32_t));
+}
+#endif
+
+/* Start a new store incarnation: a fresh uuid, so fresh keys, and with them a
+ * nonce counter that may start again. Every format path calls this before its
+ * first master write. */
+static int store_new_identity(void)
+{
+#if defined(CONFIG_BLOB_DB_PROTECTED)
+	int rc = blob_db_random(st.store_uuid, sizeof(st.store_uuid));
+
+	if (rc == 0) {
+		rc = blob_db_keys_derive(st.store_uuid);
+	}
+	if (rc < 0) {
+		return rc;
+	}
+#endif
+#if defined(CONFIG_BLOB_DB_PROTECT_AEAD)
+	/* 0 is no value: a bucket header's cbase_seq of 0 means "none". The
+	 * first master carries a ceiling ahead of the first value. */
+	st.seq = 1;
+	st.seq_hint = 1 + CONFIG_BLOB_DB_SEQ_STEP;
+#endif
+	return 0;
+}
+
 /* Bucket scan ----------------------------------------------------------- */
 
 static int scan_bucket(uint16_t bid, uint64_t *max_id_inout)
@@ -368,21 +626,25 @@ static int scan_bucket(uint16_t bid, uint64_t *max_id_inout)
 		return rc;
 	}
 
-	if (memcmp(bhdr.magic, BUCKET_MAGIC, 4) != 0) {
-		return 0; /* unformatted — no entries */
-	}
-	if (bhdr.hdr_crc32 != hdr_crc32(&bhdr, sizeof(bhdr))) {
-		LOG_WRN("bucket %u header CRC bad; ignoring", bid);
+	/* Unformatted, or a header that cannot be trusted: no ids to count.
+	 * The latter is never formatted over (bucket_check()), so its ids
+	 * cannot meet the counter again either. A protected store checks the
+	 * MAC here, in the scan it already makes: a bucket that fails stays
+	 * out of the slot index and answers -EIO when it is used. */
+	if (!bucket_hdr_valid((const uint8_t *)&bhdr, bid)) {
 		return 0;
 	}
-	if (bhdr.bucket_id != bid) {
-		LOG_WRN("bucket %u header claims bid %u; ignoring", bid, bhdr.bucket_id);
+	rc = bucket_hdr_authentic((const uint8_t *)&bhdr, bid);
+	if (rc == -EBADMSG) {
+		blob_db_event(BLOB_DB_EVENT_TAMPERED, BLOB_DB_EVENT_BUCKET, bid);
 		return 0;
+	}
+	if (rc < 0) {
+		return rc;
 	}
 
 	off_t cursor = BLOB_DB_BUCKET_DATA_OFF;
-	const size_t min_slot = sizeof(struct blob_db_slot_hdr) +
-				 sizeof(uint64_t) + sizeof(uint16_t);
+	const size_t min_slot = BLOB_DB_SLOT_MIN_OVERHEAD;
 
 	blob_db_sidx_begin(bid, (uint32_t)cursor);
 
@@ -412,10 +674,7 @@ static int scan_bucket(uint16_t bid, uint64_t *max_id_inout)
 		if (shdr.flags & ~(uint8_t)BLOB_DB_SLOT_F_KNOWN) {
 			blob_db_sidx_forget(bid);
 		}
-		const size_t base_sz = sizeof(shdr) + sizeof(uint64_t) +
-				       shdr.val_len + sizeof(uint16_t);
-		const size_t a = st.write_align ? st.write_align : 1;
-		const size_t slot_sz = (base_sz + a - 1) & ~(a - 1);
+		const size_t slot_sz = slot_size_of(shdr.flags, shdr.val_len);
 		if (cursor + slot_sz > st.peb_size) {
 			break;
 		}
@@ -459,6 +718,10 @@ static int format_masters_fresh(void)
 	if (rc < 0) {
 		return rc;
 	}
+	rc = store_new_identity();
+	if (rc < 0) {
+		return rc;
+	}
 
 	/* Root id (=1) is consumed at format time (see @blob_db_root in
 	 * blob_db.h), so the leading ceiling starts at 2. */
@@ -490,12 +753,33 @@ static int format_masters_fresh(void)
 static int store_open_and_validate(bool discard)
 {
 	struct blob_db_store_geom geom;
-	int rc = blob_db_store_open(&geom, discard);
+	int rc;
 
+#if defined(CONFIG_BLOB_DB_KEYS)
+	/* Keying material first: the UBI backend hands the same key to UBI
+	 * at attach. */
+	rc = blob_db_keys_open();
 	if (rc < 0) {
-		LOG_ERR("store open: %d", rc);
 		return rc;
 	}
+#endif
+	rc = blob_db_store_open(&geom, discard);
+	if (rc < 0) {
+		LOG_ERR("store open: %d", rc);
+#if defined(CONFIG_BLOB_DB_KEYS)
+		blob_db_keys_close();
+#endif
+		return rc;
+	}
+
+#if defined(CONFIG_BLOB_DB_PROTECT_AEAD)
+	/* Fresh at every open: if the master is rolled back and the counter
+	 * resumes at an old ceiling, the salt still keeps the nonces apart. */
+	rc = blob_db_random(&st.salt, sizeof(st.salt));
+	if (rc < 0) {
+		goto err_close;
+	}
+#endif
 
 	st.peb_size = geom.peb_size;
 	st.write_align = geom.write_align ? geom.write_align : 1;
@@ -553,7 +837,7 @@ static int store_open_and_validate(bool discard)
 	return 0;
 
 err_close:
-	blob_db_store_close();
+	store_close();
 	return rc;
 }
 
@@ -663,6 +947,38 @@ int blob_db_mount(void)
 		}
 		const struct blob_db_master_hdr *m = pick_a ? &m_a : &m_b;
 
+#if defined(CONFIG_BLOB_DB_PROTECTED)
+		/* Every master a store writes carries the uuid it was
+		 * formatted with, and a format erases the other master. Two
+		 * authentic masters of different stores means one was put
+		 * there: which one is the store cannot be told, so neither is
+		 * trusted. */
+		if (ca == MASTER_OK && cb == MASTER_OK &&
+		    memcmp(m_a.store_uuid, m_b.store_uuid,
+			   sizeof(m_a.store_uuid)) != 0) {
+			LOG_ERR("masters name different stores; refusing");
+			blob_db_event(BLOB_DB_EVENT_TAMPERED,
+				      BLOB_DB_EVENT_MASTER, pick_a ? 1 : 0);
+			rc = -EIO;
+			goto err_close;
+		}
+		memcpy(st.store_uuid, m->store_uuid, sizeof(st.store_uuid));
+		rc = blob_db_keys_derive(st.store_uuid);
+		if (rc < 0) {
+			goto err_close;
+		}
+#endif
+#if defined(CONFIG_BLOB_DB_PROTECT_AEAD)
+		/* Resume at the ceiling: nothing at or above it was used. */
+		st.seq_hint = m->seq_hint;
+		st.seq = m->seq_hint;
+		if (st.seq == 0) {
+			LOG_ERR("master carries no nonce ceiling");
+			rc = -EIO;
+			goto err_close;
+		}
+#endif
+
 		st.active_master = pick_a ? BLOB_DB_MASTER_A_SECTOR
 					  : BLOB_DB_MASTER_B_SECTOR;
 		st.master_gen = m->generation;
@@ -716,22 +1032,29 @@ int blob_db_mount(void)
 		const uint16_t root_bid =
 			(uint16_t)(BLOB_DB_ROOT_ID % st.n_buckets);
 		bool formatted = false;
-
-		rc = read_bucket_hdr(root_bid, &formatted);
-		if (rc < 0) {
-			goto err_close;
-		}
 		bool root_live = false;
 
-		if (formatted) {
+		rc = read_bucket_hdr(root_bid, true, &formatted);
+		if (rc == 0 && formatted) {
 			struct bucket_scan sc;
 
 			rc = find_live_slot(root_bid, BLOB_DB_ROOT_ID, &sc,
 					    g_bbuf);
-			if (rc < 0 && rc != -ENOENT) {
-				goto err_close;
-			}
 			root_live = (rc == 0);
+			if (rc == -ENOENT) {
+				rc = 0;
+			}
+		}
+		if (rc == -EIO) {
+			/* A root we cannot read is not a root we may rebind:
+			 * that formats its bucket over whatever is in it. Mount,
+			 * and let the root answer -EIO like the rest of that
+			 * bucket. */
+			LOG_ERR("root bucket %u unreadable; root left as it is",
+				root_bid);
+			root_live = true;
+		} else if (rc < 0) {
+			goto err_close;
 		}
 		if (!root_live) {
 			LOG_WRN("root not bound; binding empty root");
@@ -777,7 +1100,7 @@ int blob_db_mount(void)
 
 err_close:
 	blob_db_sidx_disable();
-	blob_db_store_close();
+	store_close();
 	return rc;
 }
 
@@ -786,7 +1109,7 @@ int blob_db_unmount(void)
 	if (!st.mounted) {
 		return 0;
 	}
-	blob_db_store_close();
+	store_close();
 	st.mounted = false;
 	IDX_INVALIDATE();
 	blob_db_sidx_disable();
@@ -796,19 +1119,6 @@ int blob_db_unmount(void)
 
 /* Stage 4 — put / get / update / delete / exists ------------------------ */
 
-static inline size_t slot_size_for(uint16_t val_len)
-{
-	/* Round the on-flash slot size up to the backing device's
-	 * write-block-size so writes always land on aligned boundaries. Any
-	 * padding bytes read back as the erased value (0xff) and don't
-	 * affect the CRC (which is stored at slot_size_for()-2, before the
-	 * padding is added — see append_slot / slot_view_at). */
-	const size_t base = BLOB_DB_SLOT_OVERHEAD + val_len;
-	const size_t a = st.write_align ? st.write_align : 1;
-
-	return (base + a - 1) & ~(a - 1);
-}
-
 static inline off_t bucket_offset(uint16_t bid)
 {
 	return peb_offset(BLOB_DB_FIRST_BUCKET + bid);
@@ -817,19 +1127,6 @@ static inline off_t bucket_offset(uint16_t bid)
 static inline uint16_t id_to_bucket(uint64_t id)
 {
 	return (uint16_t)(id % st.n_buckets);
-}
-
-/* CRC16-CCITT(0xFFFF) over slot_hdr + id + payload. */
-static uint16_t slot_crc16(const struct blob_db_slot_hdr *hdr, uint64_t id,
-			    const void *payload, uint16_t val_len)
-{
-	uint16_t c = crc16_ccitt(0xffff, (const uint8_t *)hdr, sizeof(*hdr));
-
-	c = crc16_ccitt(c, (const uint8_t *)&id, sizeof(id));
-	if (val_len > 0) {
-		c = crc16_ccitt(c, (const uint8_t *)payload, val_len);
-	}
-	return c;
 }
 
 static bool bucket_hdr_valid(const uint8_t *buf, uint16_t bid)
@@ -849,6 +1146,153 @@ static bool bucket_hdr_valid(const uint8_t *buf, uint16_t bid)
 	return true;
 }
 
+/* The MAC over a bucket header: CMAC(K_meta, [0, 28)). */
+#if defined(CONFIG_BLOB_DB_PROTECTED)
+static const struct blob_db_iov *bucket_hdr_iov(const uint8_t *buf,
+						struct blob_db_iov *iov)
+{
+	iov->p = buf;
+	iov->n = offsetof(struct blob_db_bucket_hdr, mac);
+	return iov;
+}
+#endif
+
+/* Whether a header that bucket_hdr_valid() accepted was written by this
+ * store: 0, -EBADMSG, or -EIO from the crypto backend. A header copied from
+ * another bucket names the wrong bucket; one copied from another store, or
+ * forged, fails here. Nothing to check unprotected. The caller raises the
+ * event. */
+static int bucket_hdr_authentic(const uint8_t *buf, uint16_t bid)
+{
+#if defined(CONFIG_BLOB_DB_PROTECTED)
+	const struct blob_db_bucket_hdr *bhdr =
+		(const struct blob_db_bucket_hdr *)buf;
+	struct blob_db_iov iov;
+	const int rc = blob_db_meta_verify(bucket_hdr_iov(buf, &iov), 1,
+					   bhdr->mac);
+
+	if (rc == -EBADMSG) {
+		LOG_ERR("bucket %u: header MAC does not verify", bid);
+	}
+	return rc;
+#else
+	ARG_UNUSED(buf);
+	ARG_UNUSED(bid);
+	return 0;
+#endif
+}
+
+static bool all_erased(const uint8_t *p, size_t n)
+{
+	for (size_t i = 0; i < n; i++) {
+		if (p[i] != 0xff) {
+			return false;
+		}
+	}
+	return true;
+}
+
+/* How a bucket sector presents itself. Only UNFORMATTED may be formatted. */
+enum bucket_class {
+	BUCKET_UNFORMATTED, /* nothing a format could destroy                */
+	BUCKET_OK,          /* a header for this bucket that verifies         */
+	BUCKET_CORRUPT,     /* a header that fails its CRC, over slots        */
+	BUCKET_DISPLACED,   /* a header for another bucket or store, or one
+			     * whose MAC fails, over slots                    */
+	BUCKET_CRYPTO_ERR,  /* the MAC could not be computed                  */
+};
+
+/* What the slot stream needs to judge a header: the header, and the head of
+ * the first slot behind it. */
+#define BUCKET_PEEK_LEN  (BLOB_DB_BUCKET_DATA_OFF + sizeof(struct slot_head))
+
+/* Classify the BUCKET_PEEK_LEN bytes at the start of bucket @p bid.
+ *
+ * A header that cannot be trusted used to mean "unformatted", so one bit flip
+ * in it hid the bucket's blobs as absent and the next write to the bucket
+ * formatted over them. It no longer does: a bucket is unformatted only when
+ * nothing a format would erase is in it --
+ *  - its header is erased (never written, or erased by format);
+ *  - its magic is zeroed: invalidate_buckets() retired it on purpose;
+ *  - or the first slot behind a bad header is erased, which is what a format
+ *    torn inside its header write leaves: the sector was erased just before.
+ * Anything else is a bucket of slots under a header we cannot read, and is
+ * reported rather than discarded.
+ *
+ * A protected store checks the header's MAC when @p mac is set; a valid CRC
+ * over a MAC that fails is tampering, classed with a displaced header. It
+ * does not honour a zeroed magic: anyone can clear bits, so its erase_all
+ * erases buckets instead (invalidate_buckets()). */
+static enum bucket_class bucket_classify(const uint8_t *buf, uint16_t bid,
+					 bool mac)
+{
+	static const uint8_t zero_magic[4];
+	const struct blob_db_bucket_hdr *bhdr =
+		(const struct blob_db_bucket_hdr *)buf;
+	enum bucket_class cls;
+
+	if (all_erased(buf, sizeof(*bhdr))) {
+		return BUCKET_UNFORMATTED;
+	}
+	if (memcmp(bhdr->magic, BUCKET_MAGIC, 4) != 0 ||
+	    bhdr->hdr_crc32 != hdr_crc32(bhdr, sizeof(*bhdr))) {
+		cls = BUCKET_CORRUPT;
+	} else if (bhdr->bucket_id != bid) {
+		cls = BUCKET_DISPLACED;
+	} else if (!mac) {
+		return BUCKET_OK;
+	} else {
+		const int rc = bucket_hdr_authentic(buf, bid);
+
+		if (rc == 0) {
+			return BUCKET_OK;
+		}
+		if (rc != -EBADMSG) {
+			return BUCKET_CRYPTO_ERR;
+		}
+		cls = BUCKET_DISPLACED;
+	}
+
+	if ((!IS_ENABLED(CONFIG_BLOB_DB_PROTECTED) &&
+	     memcmp(bhdr->magic, zero_magic, sizeof(zero_magic)) == 0) ||
+	    all_erased(buf + BLOB_DB_BUCKET_DATA_OFF, sizeof(struct slot_head))) {
+		return BUCKET_UNFORMATTED;
+	}
+	return cls;
+}
+
+/* Turn a classification into what the operations act on: formatted or not,
+ * or -EIO for a bucket whose slots are there but cannot be trusted. That
+ * bucket answers -EIO on every path and is never formatted, unless
+ * CONFIG_BLOB_DB_AUTOFORMAT_ON_CORRUPT asks for the old behaviour, where it
+ * reads as empty and the next write to it formats over it. */
+static int bucket_check(const uint8_t *buf, uint16_t bid, bool mac,
+			bool *formatted)
+{
+	const enum bucket_class cls = bucket_classify(buf, bid, mac);
+
+	*formatted = (cls == BUCKET_OK);
+	if (cls == BUCKET_OK || cls == BUCKET_UNFORMATTED) {
+		return 0;
+	}
+	if (cls == BUCKET_CRYPTO_ERR) {
+		return -EIO;
+	}
+	blob_db_event(cls == BUCKET_CORRUPT ? BLOB_DB_EVENT_CORRUPT
+					    : BLOB_DB_EVENT_TAMPERED,
+		      BLOB_DB_EVENT_BUCKET, bid);
+	if (IS_ENABLED(CONFIG_BLOB_DB_AUTOFORMAT_ON_CORRUPT)) {
+		LOG_WRN("bucket %u header %s; treating it as unformatted per "
+			"CONFIG_BLOB_DB_AUTOFORMAT_ON_CORRUPT", bid,
+			cls == BUCKET_CORRUPT ? "corrupt" : "displaced");
+		return 0;
+	}
+	LOG_ERR("bucket %u header %s over programmed slots; refusing the "
+		"bucket (-EIO)", bid,
+		cls == BUCKET_CORRUPT ? "corrupt" : "displaced");
+	return -EIO;
+}
+
 /* Interpret a slot at buf[off] in a bucket buffer.
  * Returns true iff structurally valid AND CRC verifies — i.e., a real
  * committed slot. Returns false otherwise (end-of-log, torn write, etc.). */
@@ -861,7 +1305,7 @@ struct slot_view {
 
 static bool slot_view_at(const uint8_t *buf, off_t off, struct slot_view *out)
 {
-	if (off + BLOB_DB_SLOT_OVERHEAD > (off_t)st.peb_size) {
+	if (off + BLOB_DB_SLOT_MIN_OVERHEAD > (off_t)st.peb_size) {
 		return false;
 	}
 	const struct blob_db_slot_hdr *shdr =
@@ -883,7 +1327,7 @@ static bool slot_view_at(const uint8_t *buf, off_t off, struct slot_view *out)
 	if (shdr->val_len > CONFIG_BLOB_DB_MAX_PAYLOAD_LEN) {
 		return false;
 	}
-	const size_t ssz = slot_size_for(shdr->val_len);
+	const size_t ssz = slot_size_of(shdr->flags, shdr->val_len);
 
 	if (off + ssz > (off_t)st.peb_size) {
 		return false;
@@ -891,12 +1335,11 @@ static bool slot_view_at(const uint8_t *buf, off_t off, struct slot_view *out)
 
 	uint64_t id;
 	memcpy(&id, buf + off + sizeof(*shdr), sizeof(id));
-	const uint8_t *payload = buf + off + sizeof(*shdr) + sizeof(id);
 	uint16_t stored;
-	const size_t crc_off = sizeof(*shdr) + sizeof(id) + shdr->val_len;
+	const size_t crc_off = slot_crc_off(shdr->flags, shdr->val_len);
 
 	memcpy(&stored, buf + off + crc_off, sizeof(stored));
-	if (slot_crc16(shdr, id, payload, shdr->val_len) != stored) {
+	if (crc16_ccitt(0xffff, buf + off, crc_off) != stored) {
 		return false;
 	}
 
@@ -912,6 +1355,134 @@ static int read_bucket(uint16_t bid, uint8_t *buf)
 	return blob_db_store_read(bucket_offset(bid), buf, st.peb_size);
 }
 
+/* Slot protection ---------------------------------------------------------
+ *
+ *   AUTH  tag = CMAC_T(K_slot, slot_head || payload)
+ *   AEAD  CCM_T(K_slot, nonce, AAD = every clear byte before the ciphertext
+ *         -- slot_head, a stored nonce, a segment's clear prefix -- payload)
+ *
+ * The CRC is computed after the tag, over everything before it. -EACCES from
+ * these means "does not authenticate"; the caller reports tampering.
+ */
+
+#if defined(CONFIG_BLOB_DB_PROTECT_AEAD)
+/* The nonce of a COMPACTED slot at @p off, from its bucket header's base. */
+static void compacted_nonce(const struct blob_db_bucket_hdr *bhdr, off_t off,
+			    uint8_t *nonce)
+{
+	nonce_make(nonce, bhdr->cbase_salt, bhdr->cbase_seq + (uint64_t)off);
+}
+#endif
+
+#if defined(CONFIG_BLOB_DB_PROTECTED)
+/* Verify, and in AEAD decrypt, the slot whose head is @p head and whose
+ * remaining bytes -- [nonce] || payload || tag -- are at @p body.
+ *
+ * @p cnonce is a COMPACTED slot's derived nonce. The payload, in the clear,
+ * goes to @p out, which may be @p body itself or lie before it, or NULL to
+ * verify only. Returns 0, -EACCES, or -EIO. */
+static int slot_open(const struct slot_head *head, const uint8_t *body,
+		     const uint8_t *cnonce, uint8_t *out)
+{
+	const uint16_t len = head->hdr.val_len;
+	int rc;
+
+#if defined(CONFIG_BLOB_DB_PROTECT_AUTH)
+	ARG_UNUSED(cnonce);
+
+	const struct blob_db_iov iov[] = {
+		{ head, sizeof(*head) }, { body, len },
+	};
+
+	rc = blob_db_slot_mac_verify(iov, ARRAY_SIZE(iov), body + len);
+	if (rc == 0 && out != NULL && out != body && len > 0) {
+		memmove(out, body, len);
+	}
+#else
+	const uint8_t flags = head->hdr.flags;
+	const size_t nlen = slot_nonce_len(flags);
+	const size_t clear = slot_clear_len(flags, len);
+	const uint8_t *nonce = nlen ? body : cnonce;
+	uint8_t clear_copy[16];
+
+	BUILD_ASSERT(sizeof(clear_copy) >= sizeof(struct blob_db_seg_hdr),
+		     "clear prefix staging too small");
+
+	if (nonce == NULL) {
+		return -EACCES;
+	}
+	memcpy(clear_copy, body + nlen, clear);
+
+	const struct blob_db_iov aad[] = {
+		{ head, sizeof(*head) }, { body, nlen + clear },
+	};
+
+	rc = blob_db_slot_open(nonce, aad, ARRAY_SIZE(aad), body + nlen + clear,
+			       out != NULL ? out + clear : NULL, len - clear,
+			       body + nlen + len);
+	if (rc == 0 && out != NULL) {
+		memcpy(out, clear_copy, clear);
+	}
+#endif
+	return rc == -EBADMSG ? -EACCES : rc;
+}
+#endif /* CONFIG_BLOB_DB_PROTECTED */
+
+/* Finish the slot assembled at @p s -- head, any stored nonce, and the
+ * payload in the clear at its place -- by sealing it in place and writing its
+ * tag and CRC. @p cnonce is a COMPACTED slot's derived nonce. */
+static int slot_seal(uint8_t *s, const uint8_t *cnonce)
+{
+	const struct slot_head *head = (const struct slot_head *)s;
+	const uint8_t flags = head->hdr.flags;
+	const uint16_t len = head->hdr.val_len;
+	const size_t crc_off = slot_crc_off(flags, len);
+
+#if defined(CONFIG_BLOB_DB_PROTECT_AUTH)
+	ARG_UNUSED(cnonce);
+
+	const struct blob_db_iov iov = { s, sizeof(*head) + len };
+	int rc = blob_db_slot_mac(&iov, 1, s + sizeof(*head) + len);
+
+	if (rc < 0) {
+		return rc;
+	}
+#elif defined(CONFIG_BLOB_DB_PROTECT_AEAD)
+	const size_t nlen = slot_nonce_len(flags);
+	const size_t clear = slot_clear_len(flags, len);
+	const size_t po = sizeof(*head) + nlen;
+	const struct blob_db_iov aad = { s, po + clear };
+	int rc = blob_db_slot_seal(nlen ? s + sizeof(*head) : cnonce, &aad, 1,
+				   s + po + clear, len - clear, s + po + len);
+
+	if (rc < 0) {
+		return rc;
+	}
+#else
+	ARG_UNUSED(cnonce);
+#endif
+	const uint16_t crc = crc16_ccitt(0xffff, s, crc_off);
+
+	memcpy(s + crc_off, &crc, sizeof(crc));
+	return 0;
+}
+
+/* A slot whose CRC verifies and whose tag does not was written by someone
+ * else: report it. Unlike a CRC failure it gets no fallback to an older slot,
+ * which would let whoever wrote it choose which version the reader gets. */
+static void slot_tampered(uint16_t bid, off_t off)
+{
+	LOG_ERR("bucket %u: slot at %ld does not authenticate", bid, (long)off);
+	blob_db_event(BLOB_DB_EVENT_TAMPERED, BLOB_DB_EVENT_SLOT,
+		      ((uint32_t)bid << 16) | ((uint32_t)off & 0xffff));
+}
+
+static void slot_corrupt(uint16_t bid, off_t off)
+{
+	blob_db_event(BLOB_DB_EVENT_CORRUPT, BLOB_DB_EVENT_SLOT,
+		      ((uint32_t)bid << 16) | ((uint32_t)off & 0xffff));
+}
+
 static int format_bucket(uint16_t bid)
 {
 	struct blob_db_bucket_hdr bhdr = {
@@ -919,12 +1490,24 @@ static int format_bucket(uint16_t bid)
 		.reserved  = 0,
 		.gen       = 1,
 	};
+	int rc;
+
 	memcpy(bhdr.magic, BUCKET_MAGIC, 4);
+#if defined(CONFIG_BLOB_DB_PROTECTED)
+	/* No compacted slots yet: cbase_seq 0. */
+	struct blob_db_iov iov;
+
+	rc = blob_db_meta_mac(bucket_hdr_iov((const uint8_t *)&bhdr, &iov), 1,
+			      bhdr.mac);
+	if (rc < 0) {
+		blob_db_sidx_forget(bid);
+		return rc;
+	}
+#endif
 	bhdr.hdr_crc32 = hdr_crc32(&bhdr, sizeof(bhdr));
 
 	IO_CAUSE(bucket_formats);
-	const int rc = blob_db_store_replace(bucket_offset(bid), &bhdr,
-					     sizeof(bhdr));
+	rc = blob_db_store_replace(bucket_offset(bid), &bhdr, sizeof(bhdr));
 	if (rc < 0) {
 		LOG_ERR("bucket %u format: %d", bid, rc);
 		blob_db_sidx_forget(bid);
@@ -948,25 +1531,51 @@ static int format_bucket(uint16_t bid)
  * diagnostics and maintenance, not the hot path (contract D5).
  */
 
-static int read_bucket_hdr(uint16_t bid, bool *valid)
+/* Whether bucket @p bid is formatted, or -EIO when its header cannot be
+ * trusted (bucket_check()).
+ *
+ * @p mac asks a protected store to check the header's MAC as well. Writers
+ * and the mount ask, before they append or format. A read that finds its slot
+ * does not need it: the slot's own tag covers its id and store, and a forged
+ * cbase only makes a compacted slot's tag fail. A read about to answer
+ * -ENOENT does need it, and asks through absent_or_eio(). */
+static int read_bucket_hdr(uint16_t bid, bool mac, bool *valid)
 {
 	uint32_t known;
 
 	/* The index holds a cursor only for a bucket whose header it has seen
-	 * valid, and forgets it whenever the bucket is rewritten. */
-	if (blob_db_sidx_cursor(bid, &known)) {
+	 * valid, and forgets it whenever the bucket is rewritten. It does not
+	 * remember having checked a MAC. */
+	if ((!mac || !IS_ENABLED(CONFIG_BLOB_DB_PROTECTED)) &&
+	    blob_db_sidx_cursor(bid, &known)) {
 		*valid = true;
 		return 0;
 	}
 
-	struct blob_db_bucket_hdr bhdr;
-	int rc = blob_db_store_read(bucket_offset(bid), &bhdr, sizeof(bhdr));
+	uint8_t __aligned(4) peek[BUCKET_PEEK_LEN];
+	int rc = blob_db_store_read(bucket_offset(bid), peek, sizeof(peek));
 
 	if (rc < 0) {
 		return rc;
 	}
-	*valid = bucket_hdr_valid((const uint8_t *)&bhdr, bid);
-	return 0;
+	return bucket_check(peek, bid, mac, valid);
+}
+
+/* The -ENOENT a read is about to return, once the bucket has shown it is
+ * this store's: a displaced or forged bucket answers -EIO, never "absent". */
+static int absent_or_eio(uint16_t bid)
+{
+#if defined(CONFIG_BLOB_DB_PROTECTED)
+	bool formatted;
+	const int rc = read_bucket_hdr(bid, true, &formatted);
+
+	if (rc < 0) {
+		return rc;
+	}
+#else
+	ARG_UNUSED(bid);
+#endif
+	return -ENOENT;
 }
 
 /* Walk bucket `bid` by slot header, recording the append cursor and the LAST
@@ -994,7 +1603,8 @@ static int scan_bucket_for(uint16_t bid, uint64_t target_id, off_t limit,
 	out->tail_torn = false;
 
 	for (;;) {
-		if (cursor + (off_t)BLOB_DB_SLOT_OVERHEAD > (off_t)st.peb_size) {
+		if (cursor + (off_t)BLOB_DB_SLOT_MIN_OVERHEAD >
+		    (off_t)st.peb_size) {
 			break;
 		}
 
@@ -1014,7 +1624,7 @@ static int scan_bucket_for(uint16_t bid, uint64_t target_id, off_t limit,
 			break;
 		}
 
-		const size_t ssz = slot_size_for(sh.hdr.val_len);
+		const size_t ssz = slot_size_of(sh.hdr.flags, sh.hdr.val_len);
 
 		if (cursor + (off_t)ssz > (off_t)st.peb_size) {
 			out->tail_torn = true;
@@ -1031,36 +1641,73 @@ static int scan_bucket_for(uint16_t bid, uint64_t target_id, off_t limit,
 	return 0;
 }
 
-/* Read the target slot's payload into `dst` and check its CRC.
+/* Read the target slot's payload into `dst` and check its CRC, then, in a
+ * protected store, its tag.
  *
- * The CRC is computed over the header and id bytes exactly as they were read
- * from flash — not over a reconstruction — so a slot written by a version that
- * used a currently-reserved field still verifies against its own bytes.
+ * Everything after the 12-byte head -- [nonce] || payload || [tag] || crc --
+ * is read in one transaction. The CRC is computed over the header and id
+ * bytes exactly as they were read from flash — not over a reconstruction — so
+ * a slot written by a version that used a currently-reserved field still
+ * verifies against its own bytes. A payload that is decrypted is decrypted
+ * into `dst`, never into the caller's buffer, so a slot that fails leaves
+ * nothing behind that a caller could take for data. `dst` is a sector buffer.
  *
- * -EBADMSG means the slot is torn or rotten; every other negative value is an
- * I/O error.
+ * -EBADMSG means the slot is torn or rotten; -EACCES that its CRC verifies
+ * and its tag does not; every other negative value is an I/O error.
  */
 static int slot_verify(uint16_t bid, const struct bucket_scan *sc, void *dst)
 {
 	const off_t poff = bucket_offset(bid) + sc->target_off +
 			   (off_t)sizeof(struct slot_head);
+	const uint8_t flags = sc->target.hdr.flags;
 	const uint16_t val_len = sc->target.hdr.val_len;
+	const size_t body = slot_crc_off(flags, val_len) -
+			    sizeof(struct slot_head);
+	uint8_t *const d = dst;
 	uint16_t stored;
 	int rc;
 
-	if (val_len > 0) {
-		rc = blob_db_store_read(poff, dst, val_len);
-		if (rc < 0) {
-			return rc;
-		}
-	}
-	rc = blob_db_store_read(poff + val_len, &stored, sizeof(stored));
+	rc = blob_db_store_read(poff, d, body + sizeof(stored));
 	if (rc < 0) {
 		return rc;
 	}
-	if (slot_crc16(&sc->target.hdr, sc->target.id, dst, val_len) != stored) {
+	memcpy(&stored, d + body, sizeof(stored));
+
+	uint16_t crc = crc16_ccitt(0xffff, (const uint8_t *)&sc->target,
+				   sizeof(sc->target));
+
+	if (crc16_ccitt(crc, d, body) != stored) {
 		return -EBADMSG;
 	}
+
+#if defined(CONFIG_BLOB_DB_PROTECTED)
+	const uint8_t *cnonce = NULL;
+#if defined(CONFIG_BLOB_DB_PROTECT_AEAD)
+	uint8_t nonce[BLOB_DB_NONCE_LEN];
+
+	/* The index caches nothing per bucket, so a compacted slot costs one
+	 * small read of its header's nonce base. A forged base only makes the
+	 * tag fail. */
+	if (flags & BLOB_DB_SLOT_F_COMPACTED) {
+		struct blob_db_bucket_hdr bhdr;
+
+		rc = blob_db_store_read(bucket_offset(bid), &bhdr,
+					offsetof(struct blob_db_bucket_hdr,
+						 reserved1));
+		if (rc < 0) {
+			return rc;
+		}
+		if (bhdr.cbase_seq != 0) {
+			compacted_nonce(&bhdr, sc->target_off, nonce);
+			cnonce = nonce;
+		}
+	}
+#endif
+	rc = slot_open(&sc->target, d, cnonce, d);
+	if (rc < 0) {
+		return rc;
+	}
+#endif
 	return 0;
 }
 
@@ -1088,8 +1735,13 @@ static int walk_live_slot(uint16_t bid, uint64_t id, struct bucket_scan *sc,
 
 		rc = slot_verify(bid, sc, dst);
 		if (rc == -EBADMSG) {
+			slot_corrupt(bid, sc->target_off);
 			limit = sc->target_off;
 			continue;
+		}
+		if (rc == -EACCES) {
+			slot_tampered(bid, sc->target_off);
+			return -EIO;
 		}
 		if (rc < 0) {
 			return rc;
@@ -1234,7 +1886,7 @@ static int find_indexed_slot(uint16_t bid, uint64_t id,
 	struct slot_head sh;
 	int rc;
 
-	if (off + BLOB_DB_SLOT_OVERHEAD > cursor) {
+	if (off + BLOB_DB_SLOT_MIN_OVERHEAD > cursor) {
 		goto stale;
 	}
 	rc = blob_db_store_read(bucket_offset(bid) + off, &sh, sizeof(sh));
@@ -1245,7 +1897,7 @@ static int find_indexed_slot(uint16_t bid, uint64_t id,
 	    !(sh.hdr.flags & BLOB_DB_SLOT_F_SEALED) ||
 	    (sh.hdr.flags & ~(uint8_t)BLOB_DB_SLOT_F_KNOWN) ||
 	    sh.hdr.val_len > CONFIG_BLOB_DB_MAX_PAYLOAD_LEN ||
-	    off + slot_size_for(sh.hdr.val_len) > cursor) {
+	    off + slot_size_of(sh.hdr.flags, sh.hdr.val_len) > cursor) {
 		goto stale;
 	}
 
@@ -1258,6 +1910,10 @@ static int find_indexed_slot(uint16_t bid, uint64_t id,
 	rc = slot_verify(bid, sc, dst);
 	if (rc == -EBADMSG) {
 		return -EAGAIN;   /* rotten: the walk falls back past it */
+	}
+	if (rc == -EACCES) {
+		slot_tampered(bid, off);
+		return -EIO;      /* the walk would find the same slot */
 	}
 	if (rc < 0) {
 		return rc;
@@ -1356,6 +2012,13 @@ static int append_slot2(uint16_t bid, off_t write_cursor, uint64_t id,
 	IDX_INVALIDATE();
 
 	uint8_t *buf = g_bbuf_new;
+	int rc;
+
+	if (st.write_align > BLOB_DB_MAX_WRITE_ALIGN) {
+		LOG_ERR("write_align %zu exceeds BLOB_DB_MAX_WRITE_ALIGN=%u",
+			st.write_align, BLOB_DB_MAX_WRITE_ALIGN);
+		return -ENOTSUP;
+	}
 
 	struct blob_db_slot_hdr *shdr = (struct blob_db_slot_hdr *)buf;
 
@@ -1365,7 +2028,19 @@ static int append_slot2(uint16_t bid, off_t write_cursor, uint64_t id,
 
 	memcpy(buf + sizeof(*shdr), &id, sizeof(id));
 
-	uint8_t *pl = buf + sizeof(*shdr) + sizeof(id);
+	uint8_t *pl = buf + sizeof(struct slot_head) + slot_nonce_len(shdr->flags);
+
+#if defined(CONFIG_BLOB_DB_PROTECT_AEAD)
+	/* The nonce is taken -- and its ceiling persisted if need be -- before
+	 * the slot can reach flash. */
+	uint64_t seq;
+
+	rc = seq_reserve(1, &seq);
+	if (rc < 0) {
+		return rc;
+	}
+	nonce_make(buf + sizeof(struct slot_head), st.salt, seq);
+#endif
 
 	if (hdr_len > 0) {
 		memcpy(pl, hdr, hdr_len);
@@ -1374,27 +2049,21 @@ static int append_slot2(uint16_t bid, off_t write_cursor, uint64_t id,
 		memcpy(pl + hdr_len, payload, (size_t)val_len - hdr_len);
 	}
 
-	/* CRC over the assembled bytes, so the scatter and contiguous forms
-	 * produce identical slots. */
-	uint16_t crc = slot_crc16(shdr, id, pl, val_len);
-	const size_t crc_off = sizeof(*shdr) + sizeof(id) + val_len;
-
-	memcpy(buf + crc_off, &crc, sizeof(crc));
+	/* Tag and CRC over the assembled bytes, so the scatter and contiguous
+	 * forms produce identical slots. */
+	rc = slot_seal(buf, NULL);
+	if (rc < 0) {
+		return rc;
+	}
 
 	const size_t total = slot_size_for(val_len);
-	const size_t base = BLOB_DB_SLOT_OVERHEAD + val_len;
+	const size_t base = slot_crc_off(shdr->flags, val_len) + sizeof(uint16_t);
 
 	if (total > base) {
 		memset(buf + base, 0xff, total - base);
 	}
-	if (st.write_align > BLOB_DB_MAX_WRITE_ALIGN) {
-		LOG_ERR("write_align %zu exceeds BLOB_DB_MAX_WRITE_ALIGN=%u",
-			st.write_align, BLOB_DB_MAX_WRITE_ALIGN);
-		return -ENOTSUP;
-	}
 
-	int rc = blob_db_store_write(bucket_offset(bid) + write_cursor,
-				     buf, total);
+	rc = blob_db_store_write(bucket_offset(bid) + write_cursor, buf, total);
 
 	/* The one place a slot is added, so the one place the slot index has
 	 * to follow. A failed write may have left a torn slot the walk will
@@ -1412,12 +2081,42 @@ static int append_slot2(uint16_t bid, off_t write_cursor, uint64_t id,
 
 /* Per-bucket compaction & crash recovery (stage 5) ---------------------- */
 
+#if defined(CONFIG_BLOB_DB_PROTECTED)
+/* Open the slot at @p off of the resident bucket image @p buf, into @p out
+ * (another buffer) or nowhere. 0, -EACCES or -EIO. */
+static int resident_open(const uint8_t *buf, off_t off, uint8_t *out)
+{
+	const struct slot_head *head = (const struct slot_head *)(buf + off);
+	const uint8_t *cnonce = NULL;
+
+#if defined(CONFIG_BLOB_DB_PROTECT_AEAD)
+	const struct blob_db_bucket_hdr *bhdr =
+		(const struct blob_db_bucket_hdr *)buf;
+	uint8_t nonce[BLOB_DB_NONCE_LEN];
+
+	if ((head->hdr.flags & BLOB_DB_SLOT_F_COMPACTED) &&
+	    bhdr->cbase_seq != 0) {
+		compacted_nonce(bhdr, off, nonce);
+		cnonce = nonce;
+	}
+#endif
+	return slot_open(head, buf + off + sizeof(*head), cnonce, out);
+}
+#endif
+
 /* Build a compacted image of bucket `bid` in new_buf using old_buf as the
- * source. Returns the number of bytes written into new_buf (≥ 16 for the
- * bucket header). Skipped entries: tombstones, and any slot whose id has
- * a later occurrence in the same bucket. */
-static size_t build_compacted_image(const uint8_t *old_buf, uint8_t *new_buf,
-				    uint16_t bid)
+ * source. Returns the number of bytes written into new_buf (at least the
+ * bucket header), or a negative errno. Skipped entries: tombstones, and any
+ * slot whose id has a later occurrence in the same bucket.
+ *
+ * In a protected store a tombstone is dropped only if it authenticates, and
+ * in AEAD every slot kept is opened and resealed at its new offset, COMPACTED,
+ * under the nonce base (@p cbase_seq, @p cbase_salt) the new header carries.
+ * A slot that does not open is copied as it is, so reads of it keep answering
+ * -EIO: compaction never decides what tampered data means. */
+static int build_compacted_image(const uint8_t *old_buf, uint8_t *new_buf,
+				 uint16_t bid, uint64_t cbase_seq,
+				 uint32_t cbase_salt)
 {
 	const struct blob_db_bucket_hdr *old_bhdr =
 		(const struct blob_db_bucket_hdr *)old_buf;
@@ -1425,10 +2124,27 @@ static size_t build_compacted_image(const uint8_t *old_buf, uint8_t *new_buf,
 	struct blob_db_bucket_hdr *new_bhdr =
 		(struct blob_db_bucket_hdr *)new_buf;
 
+	memset(new_bhdr, 0, sizeof(*new_bhdr));
 	memcpy(new_bhdr->magic, BUCKET_MAGIC, 4);
 	new_bhdr->bucket_id = bid;
 	new_bhdr->reserved  = 0;
 	new_bhdr->gen       = old_bhdr->gen + 1;
+#if defined(CONFIG_BLOB_DB_PROTECTED)
+	new_bhdr->cbase_seq  = cbase_seq;
+	new_bhdr->cbase_salt = cbase_salt;
+	{
+		struct blob_db_iov iov;
+		int rc = blob_db_meta_mac(bucket_hdr_iov(new_buf, &iov), 1,
+					  new_bhdr->mac);
+
+		if (rc < 0) {
+			return rc;
+		}
+	}
+#else
+	ARG_UNUSED(cbase_seq);
+	ARG_UNUSED(cbase_salt);
+#endif
 	new_bhdr->hdr_crc32 = hdr_crc32(new_bhdr, sizeof(*new_bhdr));
 
 	off_t new_cursor = BLOB_DB_BUCKET_DATA_OFF;
@@ -1458,7 +2174,59 @@ static size_t build_compacted_image(const uint8_t *old_buf, uint8_t *new_buf,
 			scan += future.total_size;
 		}
 
-		if (!superseded && !(sv.flags & BLOB_DB_SLOT_F_TOMBSTONE)) {
+		bool keep = !superseded;
+
+#if defined(CONFIG_BLOB_DB_PROTECTED)
+		if (keep && (sv.flags & BLOB_DB_SLOT_F_TOMBSTONE)) {
+			const int rc = resident_open(old_buf, cursor, NULL);
+
+			if (rc == 0) {
+				keep = false;
+			} else if (rc != -EACCES) {
+				return rc;
+			}
+		}
+#if defined(CONFIG_BLOB_DB_PROTECT_AEAD)
+		else if (keep) {
+			/* Open straight into the new slot's payload position,
+			 * then seal it there under its new nonce. */
+			uint8_t *d = new_buf + new_cursor;
+			const uint8_t flags = sv.flags | BLOB_DB_SLOT_F_COMPACTED;
+			int rc;
+
+			memcpy(d, old_buf + cursor, sizeof(struct slot_head));
+			d[0] = flags;
+			rc = resident_open(old_buf, cursor,
+					   d + sizeof(struct slot_head));
+			if (rc == 0) {
+				uint8_t nonce[BLOB_DB_NONCE_LEN];
+				const size_t size = slot_size_of(flags,
+								 sv.val_len);
+				const size_t base =
+					slot_crc_off(flags, sv.val_len) +
+					sizeof(uint16_t);
+
+				compacted_nonce(new_bhdr, new_cursor, nonce);
+				rc = slot_seal(d, nonce);
+				if (rc < 0) {
+					return rc;
+				}
+				memset(d + base, 0xff, size - base);
+				new_cursor += size;
+				cursor += sv.total_size;
+				continue;
+			}
+			if (rc != -EACCES) {
+				return rc;
+			}
+		}
+#endif
+#else
+		if (sv.flags & BLOB_DB_SLOT_F_TOMBSTONE) {
+			keep = false;
+		}
+#endif
+		if (keep) {
 			memcpy(new_buf + new_cursor,
 			       old_buf + cursor, sv.total_size);
 			new_cursor += sv.total_size;
@@ -1467,7 +2235,7 @@ static size_t build_compacted_image(const uint8_t *old_buf, uint8_t *new_buf,
 		cursor += sv.total_size;
 	}
 
-	return (size_t)new_cursor;
+	return (int)new_cursor;
 }
 
 /* Byte offset of the scratch seal: the tail of the scratch sector, rounded
@@ -1495,15 +2263,40 @@ static int scratch_seal_write(off_t scratch_off, const uint8_t *image,
 	memcpy(seal->magic, SCRATCH_MAGIC, 4);
 	seal->image_len   = (uint32_t)image_len;
 	seal->image_crc32 = crc32_ieee(image, image_len);
+#if defined(CONFIG_BLOB_DB_PROTECTED)
+	const struct blob_db_bucket_hdr *bhdr =
+		(const struct blob_db_bucket_hdr *)image;
+
+	seal->bucket_id = bhdr->bucket_id;
+	seal->reserved  = 0;
+	seal->image_gen = bhdr->gen;
+
+	const struct blob_db_iov iov[] = {
+		{ seal, offsetof(struct blob_db_scratch_seal, mac) },
+		{ image, image_len },
+	};
+	int rc = blob_db_meta_mac(iov, ARRAY_SIZE(iov), seal->mac);
+
+	if (rc < 0) {
+		return rc;
+	}
+#endif
 	seal->seal_crc32  = hdr_crc32(seal, sizeof(*seal));
 
 	return blob_db_store_write(scratch_off + scratch_seal_off(), buf,
 				   scratch_seal_len());
 }
 
-/* Is the scratch sector a complete, self-consistent compacted image?
- * `image` must already hold the sector's first peb_size bytes. */
-static bool scratch_seal_valid(const uint8_t *image, size_t *image_len)
+/* Is the scratch sector a complete, self-consistent compacted image of
+ * bucket `bid`? `image` must already hold the sector's first peb_size bytes.
+ *
+ * In a protected store the seal's MAC covers the seal and the whole image:
+ * the one place a MAC spans a bucket, checked once per recovery and never on
+ * a read. A seal whose CRC fails is unsealed, as ever; one whose CRC verifies
+ * over a MAC that does not was not written by this store, and the bucket is
+ * left alone. */
+static bool scratch_seal_valid(const uint8_t *image, uint16_t bid,
+			       size_t *image_len)
 {
 	struct blob_db_scratch_seal seal;
 
@@ -1522,6 +2315,22 @@ static bool scratch_seal_valid(const uint8_t *image, size_t *image_len)
 	if (seal.image_crc32 != crc32_ieee(image, seal.image_len)) {
 		return false;
 	}
+#if defined(CONFIG_BLOB_DB_PROTECTED)
+	const struct blob_db_iov iov[] = {
+		{ &seal, offsetof(struct blob_db_scratch_seal, mac) },
+		{ image, seal.image_len },
+	};
+
+	if (seal.bucket_id != bid ||
+	    blob_db_meta_verify(iov, ARRAY_SIZE(iov), seal.mac) != 0) {
+		LOG_ERR("recover: scratch seal for bucket %u does not "
+			"authenticate", bid);
+		blob_db_event(BLOB_DB_EVENT_TAMPERED, BLOB_DB_EVENT_BUCKET, bid);
+		return false;
+	}
+#else
+	ARG_UNUSED(bid);
+#endif
 	*image_len = seal.image_len;
 	return true;
 }
@@ -1644,13 +2453,47 @@ static int compact_bucket(uint16_t bid)
 		return rc;
 	}
 	if (!bucket_hdr_valid(g_bbuf, bid)) {
-		LOG_WRN("compact: bucket %u not formatted; nothing to do", bid);
-		return -EINVAL;
+		/* Callers compact only a bucket they found formatted, so the
+		 * header changed under them: never rebuild a bucket from slots
+		 * whose header cannot be trusted. */
+		LOG_ERR("compact: bucket %u header no longer valid", bid);
+		return -EIO;
 	}
+	rc = bucket_hdr_authentic(g_bbuf, bid);
+	if (rc == -EBADMSG) {
+		blob_db_event(BLOB_DB_EVENT_TAMPERED, BLOB_DB_EVENT_BUCKET, bid);
+		return -EIO;
+	}
+	if (rc < 0) {
+		return rc;
+	}
+
+	uint64_t cbase_seq = 0;
+	uint32_t cbase_salt = 0;
+
+#if defined(CONFIG_BLOB_DB_PROTECT_AEAD)
+	/* One counter value per byte of the sector, so every offset a slot can
+	 * start at has a nonce of its own, and no appended slot ever draws one
+	 * of them. Reserved -- and its ceiling persisted -- before the image
+	 * that uses it is built, let alone written. */
+	rc = seq_reserve(st.peb_size, &cbase_seq);
+	if (rc < 0) {
+		return rc;
+	}
+	cbase_salt = st.salt;
+#endif
 
 	g_bbuf_new_busy = true;
 
-	const size_t new_len = build_compacted_image(g_bbuf, g_bbuf_new, bid);
+	const int built = build_compacted_image(g_bbuf, g_bbuf_new, bid,
+						cbase_seq, cbase_salt);
+
+	if (built < 0) {
+		g_bbuf_new_busy = false;
+		return built;
+	}
+
+	const size_t new_len = (size_t)built;
 
 	LOG_INF("compact bid=%u: new bucket has %zu B (was up to %zu B)",
 		bid, new_len, st.peb_size);
@@ -1715,7 +2558,7 @@ static int recover_compaction(uint16_t bid)
 	 * therefore overwrote intact buckets with truncated images. */
 	size_t image_len = 0;
 
-	if (scratch_seal_valid(g_bbuf, &image_len) &&
+	if (scratch_seal_valid(g_bbuf, bid, &image_len) &&
 	    bucket_hdr_valid(g_bbuf, bid)) {
 		LOG_WRN("recover: scratch sealed for bid %u (%zu B); "
 			"restoring bucket", bid, image_len);
@@ -1957,7 +2800,7 @@ static int index_load(uint64_t id, uint8_t *ids, struct blob_db_index_hdr *h)
 	const uint16_t bid = id_to_bucket(id);
 	bool formatted;
 
-	int rc = read_bucket_hdr(bid, &formatted);
+	int rc = read_bucket_hdr(bid, false, &formatted);
 
 	if (rc < 0) {
 		return rc;
@@ -2060,7 +2903,7 @@ static int seg_chunk_read(uint64_t owner, uint64_t seg_id, uint16_t seq,
 	const uint16_t bid = id_to_bucket(seg_id);
 	bool formatted;
 
-	int rc = read_bucket_hdr(bid, &formatted);
+	int rc = read_bucket_hdr(bid, false, &formatted);
 
 	if (rc < 0) {
 		return rc;
@@ -2129,7 +2972,7 @@ static int seg_write_chunk(uint64_t owner, uint16_t seq, const void *chunk,
 
 		const uint16_t bid = id_to_bucket(sid);
 		bool formatted;
-		int rc = read_bucket_hdr(bid, &formatted);
+		int rc = read_bucket_hdr(bid, true, &formatted);
 
 		if (rc < 0) {
 			return rc;
@@ -2195,7 +3038,7 @@ static void seg_release(const uint8_t *ids, uint16_t k)
 		const uint16_t bid = id_to_bucket(sid);
 		bool formatted;
 
-		if (read_bucket_hdr(bid, &formatted) < 0 || !formatted) {
+		if (read_bucket_hdr(bid, true, &formatted) < 0 || !formatted) {
 			continue;
 		}
 
@@ -2236,7 +3079,7 @@ static int seg_sweep(uint64_t owner)
 	for (uint16_t bid = 0; bid < st.n_buckets; bid++) {
 		bool formatted;
 
-		if (read_bucket_hdr(bid, &formatted) < 0 || !formatted) {
+		if (read_bucket_hdr(bid, false, &formatted) < 0 || !formatted) {
 			continue;
 		}
 
@@ -2250,7 +3093,7 @@ static int seg_sweep(uint64_t owner)
 			 * ourselves via a scan limited to what we have seen. */
 			struct slot_head sh;
 
-			if (cursor + (off_t)BLOB_DB_SLOT_OVERHEAD >
+			if (cursor + (off_t)BLOB_DB_SLOT_MIN_OVERHEAD >
 			    (off_t)st.peb_size) {
 				break;
 			}
@@ -2265,7 +3108,8 @@ static int seg_sweep(uint64_t owner)
 				break;
 			}
 
-			const size_t ssz = slot_size_for(sh.hdr.val_len);
+			const size_t ssz = slot_size_of(sh.hdr.flags,
+							sh.hdr.val_len);
 
 			if (cursor + (off_t)ssz > (off_t)st.peb_size) {
 				break;
@@ -2341,7 +3185,7 @@ static int index_commit(uint64_t id, const struct blob_db_index_hdr *h,
 	const uint16_t bid = id_to_bucket(id);
 	bool formatted;
 
-	int rc = read_bucket_hdr(bid, &formatted);
+	int rc = read_bucket_hdr(bid, true, &formatted);
 
 	if (rc < 0) {
 		return rc;
@@ -2663,7 +3507,7 @@ int blob_db_get(uint64_t id, void *out, size_t out_sz, size_t *out_len)
 	const uint16_t bid = id_to_bucket(id);
 	bool formatted;
 
-	int rc = read_bucket_hdr(bid, &formatted);
+	int rc = read_bucket_hdr(bid, false, &formatted);
 	if (rc < 0) {
 		return rc;
 	}
@@ -2676,6 +3520,9 @@ int blob_db_get(uint64_t id, void *out, size_t out_sz, size_t *out_len)
 	struct bucket_scan sc;
 
 	rc = find_live_slot(bid, id, &sc, g_bbuf);
+	if (rc == -ENOENT) {
+		return absent_or_eio(bid);
+	}
 	if (rc < 0) {
 		return rc;
 	}
@@ -2758,7 +3605,7 @@ int blob_db_update(uint64_t id, const void *payload, size_t len)
 	const uint16_t bid = id_to_bucket(id);
 	bool formatted;
 
-	int rc = read_bucket_hdr(bid, &formatted);
+	int rc = read_bucket_hdr(bid, true, &formatted);
 	if (rc < 0) {
 		return rc;
 	}
@@ -2925,7 +3772,7 @@ int blob_db_delete(uint64_t id)
 	const uint16_t bid = id_to_bucket(id);
 	bool formatted;
 
-	int rc = read_bucket_hdr(bid, &formatted);
+	int rc = read_bucket_hdr(bid, true, &formatted);
 	if (rc < 0) {
 		return rc;
 	}
@@ -3033,7 +3880,7 @@ bool blob_db_exists(uint64_t id)
 	const uint16_t bid = id_to_bucket(id);
 	bool formatted;
 
-	if (read_bucket_hdr(bid, &formatted) < 0 || !formatted) {
+	if (read_bucket_hdr(bid, false, &formatted) < 0 || !formatted) {
 		return false;
 	}
 
@@ -3055,14 +3902,24 @@ bool blob_db_exists(uint64_t id)
 /* Walk a bucket buffer, invoking `cb` for each *live* slot — the latest
  * non-tombstoned slot for its id within this bucket. O(n²) over slots in
  * the bucket; the per-bucket count is small in normal use. Returns 0 if
- * walk completed, or the non-zero value the callback returned to abort. */
+ * walk completed, or the non-zero value the callback returned to abort.
+ *
+ * With @p open, a protected store hands the callback the payload opened into
+ * g_bbuf_new, and a slot that does not authenticate -- a forged tombstone
+ * included -- is not visited but sets *@p unreadable to -EIO. Without it
+ * (count), only the clear headers are read. */
 typedef int (*live_slot_visit_t)(uint64_t id, const uint8_t *payload,
 				  uint16_t val_len, void *user);
 
-static int for_each_live_slot(const uint8_t *buf,
-			      live_slot_visit_t cb, void *user)
+static int for_each_live_slot(const uint8_t *buf, uint16_t bid, bool open,
+			      live_slot_visit_t cb, void *user,
+			      int *unreadable)
 {
 	off_t cursor = BLOB_DB_BUCKET_DATA_OFF;
+
+	ARG_UNUSED(bid);
+	ARG_UNUSED(open);
+	ARG_UNUSED(unreadable);
 
 	for (;;) {
 		struct slot_view sv;
@@ -3094,11 +3951,32 @@ static int for_each_live_slot(const uint8_t *buf,
 			IS_ENABLED(CONFIG_BLOB_DB_LARGE_PAYLOADS) &&
 			(sv.flags & BLOB_DB_SLOT_F_SEGMENT);
 
-		if (!superseded && !internal &&
-		    !(sv.flags & BLOB_DB_SLOT_F_TOMBSTONE)) {
-			const uint8_t *payload = buf + cursor +
-						 sizeof(struct blob_db_slot_hdr) +
-						 sizeof(uint64_t);
+		if (superseded || internal) {
+			cursor += sv.total_size;
+			continue;
+		}
+
+		const uint8_t *payload = buf + cursor +
+					 sizeof(struct slot_head) +
+					 slot_nonce_len(sv.flags);
+
+#if defined(CONFIG_BLOB_DB_PROTECTED)
+		if (open) {
+			const int orc = resident_open(buf, cursor, g_bbuf_new);
+
+			if (orc == -EACCES) {
+				slot_tampered(bid, cursor);
+				*unreadable = -EIO;
+				cursor += sv.total_size;
+				continue;
+			}
+			if (orc < 0) {
+				return orc;
+			}
+			payload = g_bbuf_new;
+		}
+#endif
+		if (!(sv.flags & BLOB_DB_SLOT_F_TOMBSTONE)) {
 			int r = cb(sv.id, payload, sv.val_len, user);
 
 			if (r) {
@@ -3129,13 +4007,14 @@ size_t blob_db_count(void)
 	size_t total = 0;
 
 	for (uint16_t bid = 0; bid < st.n_buckets; bid++) {
-		if (read_bucket(bid, g_bbuf) < 0) {
+		bool formatted;
+
+		if (read_bucket(bid, g_bbuf) < 0 ||
+		    bucket_check(g_bbuf, bid, true, &formatted) < 0 || !formatted) {
 			continue;
 		}
-		if (!bucket_hdr_valid(g_bbuf, bid)) {
-			continue;
-		}
-		(void)for_each_live_slot(g_bbuf, count_visitor, &total);
+		(void)for_each_live_slot(g_bbuf, bid, false, count_visitor,
+					 &total, NULL);
 	}
 	return total;
 }
@@ -3162,22 +4041,32 @@ int blob_db_iterate(blob_db_iter_cb_t cb, void *user)
 	}
 
 	struct iterate_trampoline t = { .user_cb = cb, .user = user };
+	int unreadable = 0;
 
 	for (uint16_t bid = 0; bid < st.n_buckets; bid++) {
+		bool formatted;
+
 		if (read_bucket(bid, g_bbuf) < 0) {
 			continue;
 		}
-		if (!bucket_hdr_valid(g_bbuf, bid)) {
+		/* A bucket that cannot be trusted is not empty: visit the rest,
+		 * then say the walk was incomplete. */
+		if (bucket_check(g_bbuf, bid, true, &formatted) < 0) {
+			unreadable = -EIO;
+			continue;
+		}
+		if (!formatted) {
 			continue;
 		}
 
-		int rc = for_each_live_slot(g_bbuf, iterate_visitor, &t);
+		int rc = for_each_live_slot(g_bbuf, bid, true, iterate_visitor,
+					    &t, &unreadable);
 
 		if (rc) {
 			return rc;  /* user-requested early stop */
 		}
 	}
-	return 0;
+	return unreadable;
 }
 
 #if defined(CONFIG_BLOB_DB_INSPECT)
@@ -3243,7 +4132,7 @@ int blob_db_size(uint64_t id, size_t *out_size)
 
 	const uint16_t bid = id_to_bucket(id);
 	bool formatted;
-	int rc = read_bucket_hdr(bid, &formatted);
+	int rc = read_bucket_hdr(bid, false, &formatted);
 
 	if (rc < 0) {
 		return rc;
@@ -3255,6 +4144,9 @@ int blob_db_size(uint64_t id, size_t *out_size)
 	struct bucket_scan sc;
 
 	rc = find_live_slot(bid, id, &sc, g_bbuf);
+	if (rc == -ENOENT) {
+		return absent_or_eio(bid);
+	}
 	if (rc < 0) {
 		return rc;
 	}
@@ -3356,7 +4248,7 @@ int blob_db_read(uint64_t id, size_t offset, void *out, size_t len,
 
 	const uint16_t bid = id_to_bucket(id);
 	bool formatted;
-	int rc = read_bucket_hdr(bid, &formatted);
+	int rc = read_bucket_hdr(bid, false, &formatted);
 
 	if (rc < 0) {
 		return rc;
@@ -3368,6 +4260,9 @@ int blob_db_read(uint64_t id, size_t offset, void *out, size_t len,
 	struct bucket_scan sc;
 
 	rc = find_live_slot(bid, id, &sc, g_bbuf);
+	if (rc == -ENOENT) {
+		return absent_or_eio(bid);
+	}
 	if (rc < 0) {
 		return rc;
 	}
@@ -3440,7 +4335,7 @@ int blob_db_write(uint64_t id, size_t offset, const void *buf, size_t len)
 
 	const uint16_t bid = id_to_bucket(id);
 	bool formatted;
-	int rc = read_bucket_hdr(bid, &formatted);
+	int rc = read_bucket_hdr(bid, true, &formatted);
 
 	if (rc < 0) {
 		return rc;
@@ -3539,6 +4434,10 @@ static int format_whole_store(void)
 		LOG_ERR("format: erase: %d", rc);
 		return rc;
 	}
+	rc = store_new_identity();
+	if (rc < 0) {
+		return rc;
+	}
 
 	/* Root id (=1) is consumed at format time — see bind_root_empty(). */
 	rc = write_master(BLOB_DB_MASTER_A_SECTOR, 1, BLOB_DB_STATE_CLEAN, 0, 2);
@@ -3601,7 +4500,7 @@ err:
 	/* Only unwind what this call set up: a format that fails on an already
 	 * mounted store leaves it mounted, as it always has. */
 	if (opened_here) {
-		blob_db_store_close();
+		store_close();
 	}
 	return rc;
 }
@@ -3635,8 +4534,12 @@ static int bind_root_empty(void)
  * the bucket is used again, so nothing behind the header can resurface. The
  * write covers at least the 4 magic bytes, rounded up to the device's
  * write-block-size; the extra bytes land inside the bucket header and
- * programming them to 0x00 is equally legal. Buckets that already look
- * unformatted are skipped, so fresh sectors cost one 4-byte read each.
+ * programming them to 0x00 is equally legal. Buckets that are already
+ * unformatted are skipped, so fresh sectors cost one header read each.
+ *
+ * A protected store erases each bucket instead: an attacker can zero a magic
+ * as easily as this can, so there a zeroed magic does not mean unformatted.
+ * erase_all is rare; it costs one erase per bucket in use.
  *
  * Not in place when the backend replaces atomically: there a bucket last
  * written by blob_db_store_replace() carries a checksum over its header
@@ -3658,17 +4561,25 @@ static int invalidate_buckets(int skip_bid)
 			continue;
 		}
 		const off_t off = peb_offset(BLOB_DB_FIRST_BUCKET + bid);
-		uint8_t peek[4];
+		uint8_t __aligned(4) peek[BUCKET_PEEK_LEN];
 		int rc = blob_db_store_read(off, peek, sizeof(peek));
 
 		if (rc < 0) {
 			LOG_ERR("invalidate: peek bid %u: %d", bid, rc);
 			return rc;
 		}
-		if (memcmp(peek, BUCKET_MAGIC, 4) != 0) {
+		/* Already unformatted. Any other header is retired too, valid
+		 * or not: a damaged one would otherwise outlive the erase as a
+		 * bucket that answers -EIO (bucket_classify()). */
+		if (bucket_classify(peek, bid, false) == BUCKET_UNFORMATTED) {
 			continue;
 		}
-		rc = blob_db_store_replace_is_atomic()
+		/* A protected store does not take a zeroed magic for
+		 * "unformatted" (anyone can clear bits), so it erases. On UBI
+		 * that erases every copy awaiting reclaim too. */
+		rc = IS_ENABLED(CONFIG_BLOB_DB_PROTECTED)
+			     ? blob_db_store_erase(off, st.peb_size)
+			: blob_db_store_replace_is_atomic()
 			     ? blob_db_store_replace(off, zeros, zlen)
 			     : blob_db_store_write(off, zeros, zlen);
 		if (rc < 0) {
@@ -3762,16 +4673,18 @@ int blob_db_prepare(size_t n)
 		}
 
 		/* Peek only the header — no need to pull a full sector into
-		 * g_bbuf just to decide whether formatting is needed. */
-		struct blob_db_bucket_hdr peek;
-		int rc = blob_db_store_read(bucket_offset(bid),
-					 &peek, sizeof(peek));
+		 * g_bbuf just to decide whether formatting is needed. A bucket
+		 * that cannot be trusted is left as it is: preparing is an
+		 * optimisation, and formatting would discard its slots. */
+		bool formatted;
+		int rc = read_bucket_hdr(bid, true, &formatted);
+
+		if (rc == -EIO || (rc == 0 && formatted)) {
+			continue;
+		}
 		if (rc < 0) {
 			LOG_ERR("prepare: read bid %u: %d", bid, rc);
 			return rc;
-		}
-		if (bucket_hdr_valid((const uint8_t *)&peek, bid)) {
-			continue;
 		}
 
 		rc = format_bucket(bid);
