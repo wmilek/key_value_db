@@ -744,6 +744,92 @@ int persondb_person_delete(struct persondb *db, uint32_t id)
 	return map_del(db, db->people_root, key);
 }
 
+int persondb_person_add(struct persondb *db, const struct persondb_person *p)
+{
+	struct persondb_person existing;
+	uint32_t owner;
+	int rc;
+
+	if (p->name[0] == '\0' || p->valid_until <= p->valid_from) {
+		return -EINVAL;
+	}
+
+	rc = persondb_person_get(db, p->id, &existing);
+	if (rc == 0) {
+		return -EEXIST;
+	}
+	if (rc != -ENOENT) {
+		return rc;
+	}
+
+	for (uint8_t i = 0; i < p->n_cards && i < PERSONDB_CARDS_MAX; i++) {
+		/* Listed twice in the record itself: stored, it would keep one
+		 * listing after the card's index entry is revoked. */
+		for (uint8_t j = 0; j < i; j++) {
+			if (strcmp(p->card[i], p->card[j]) == 0) {
+				return -EINVAL;
+			}
+		}
+		rc = persondb_card_owner(db, p->card[i], &owner);
+		if (rc == 0) {
+			return -EEXIST;
+		}
+		if (rc != -ENOENT) {
+			return rc;
+		}
+	}
+
+	/* Checked, then written: the caller serializes every call (see the
+	 * header), so nothing can take the id or a card in between. */
+	return persondb_person_put(db, p);
+}
+
+/* -- enumeration -------------------------------------------------------- */
+
+int persondb_person_next(struct persondb *db, const uint32_t *after,
+			 struct persondb_person *out)
+{
+	char cursor[PERSON_KEY_SZ];
+	char key[PERSON_KEY_SZ + 1];    /* one spare: detects a longer key */
+	uint8_t buf[PERSON_CBOR_MAX];
+	size_t klen = 0, vlen = 0;
+
+	if (after != NULL) {
+		person_key(cursor, *after);
+	}
+
+	/* Counted as a get: it is one lookup of the cursor plus a forward
+	 * search, which is what the stat block's map traffic means. */
+	db->st.map_gets++;
+
+	int rc = db->ops->next(db->people_root, after ? cursor : NULL,
+			       after ? strlen(cursor) : 0, key, sizeof(key),
+			       &klen, buf, sizeof(buf), &vlen);
+
+	if (rc == -ENODATA) {
+		return rc;
+	}
+	if (rc == -ENOMEM || (rc == 0 && klen != PERSON_KEY_SZ - 1)) {
+		/* The people map holds person keys and nothing else. */
+		return -EIO;
+	}
+	if (rc != 0) {
+		return rc;
+	}
+	return person_cbor_decode(buf, vlen, out) == 0 ? 0 : -EIO;
+}
+
+int persondb_person_count(struct persondb *db, uint32_t *n)
+{
+	size_t count = 0;
+	int rc = db->ops->count(db->people_root, &count);
+
+	if (rc == 0) {
+		*n = (uint32_t)count;
+	}
+	return rc;
+}
+
 /* -- credentials -------------------------------------------------------- */
 
 int persondb_card_assign(struct persondb *db, uint32_t person_id,
@@ -955,6 +1041,52 @@ int persondb_permission_revoke(struct persondb *db, uint32_t person_id,
 		return -ENOENT;
 	}
 	p.n_perms = n;
+	return person_store(db, &p);
+}
+
+/* -- person details ----------------------------------------------------- */
+
+int persondb_person_rename(struct persondb *db, uint32_t person_id,
+			   const char *name)
+{
+	struct persondb_person p;
+	size_t n = name ? strlen(name) : 0;
+
+	if (n == 0 || n > PERSONDB_NAME_MAX) {
+		return -EINVAL;
+	}
+
+	int rc = persondb_person_get(db, person_id, &p);
+
+	if (rc != 0) {
+		return rc;
+	}
+	if (strcmp(p.name, name) == 0) {
+		return 0;
+	}
+	memcpy(p.name, name, n + 1);
+	return person_store(db, &p);
+}
+
+int persondb_person_set_validity(struct persondb *db, uint32_t person_id,
+				 uint32_t valid_from, uint32_t valid_until)
+{
+	struct persondb_person p;
+
+	if (valid_until <= valid_from) {
+		return -EINVAL;
+	}
+
+	int rc = persondb_person_get(db, person_id, &p);
+
+	if (rc != 0) {
+		return rc;
+	}
+	if (p.valid_from == valid_from && p.valid_until == valid_until) {
+		return 0;
+	}
+	p.valid_from = valid_from;
+	p.valid_until = valid_until;
 	return person_store(db, &p);
 }
 

@@ -228,6 +228,9 @@ int scenario_card_of(struct scenario *s, uint32_t index, uint8_t slot,
  */
 uint32_t scenario_index_of(uint32_t person_id);
 
+/** The person id of dataset index @p index — the forward direction. */
+uint32_t scenario_id_of(uint32_t index);
+
 #ifdef __cplusplus
 }
 #endif

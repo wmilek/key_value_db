@@ -591,10 +591,81 @@ poking a live store on the DK:
 | `card <card>` | `persondb_card_owner` |
 | `grant`/`revoke <id> <perm>` | `persondb_permission_*` |
 | `assign`/`unassign` | `persondb_card_*` |
+| `tui` | full-screen browser, below |
 
 Being able to `fill 500`, pull the power, reboot and `stat` is the most direct
 demonstration of F8 and F5 that this app can offer — and it is only possible
 because §9 exists.
+
+**`persondb tui` — full-screen, inside the shell frontend.** A page of stored
+persons on the left, the selected one's permissions and cards on the right.
+Tab cycles the three panes, and `a` / `d` add and remove in the one in focus:
+persons, permissions (pick a `tui-…` one or type any name), cards. `n`
+renames, `v` sets the days a person's cards are valid, `g` opens a person by
+id and `c` by card. Every removal asks y/N first.
+
+The validity dialogs ask for the first and the last valid day, pre-filled with
+the stored ones; the last day is stored as the following midnight, because the
+record's window is half-open. A date left as it was keeps the stored instant
+exactly, even when that instant is mid-day.
+
+It takes over the shell's own terminal through the shell's bypass mode and
+gives it back on `q`, Ctrl-C or Ctrl-D, so it needs no second UART, and it
+runs on the shell thread like every other command, so persondb still has one
+caller.
+
+It is stricter about layers than the other two frontends: it calls
+`persondb.h` — this application's L3, the access interface built on the L2
+Map — and nothing else. It does not include `scenario.h` or `dataset.h`, and
+`ui_tui.c` refuses to compile if either is pulled in. The few things it needs
+that are not about stored persons arrive in `struct ui_tui_config`, filled by
+the shell frontend, which already owns the scenario: the persondb handle, the
+first id for persons added by hand (above the dataset's range, so `fill`
+cannot overwrite them), "today" (`SCENARIO_BENCH_NOW`; the board has no
+clock), and a clock that advances on `native_sim`. The grant dialog offers the
+TUI's own permissions, all named `tui-…` so a grant made here is recognisable
+as one, plus any name typed in; the generator's vocabulary is the dataset's
+business, not the TUI's. Plain VT100 and DEC line drawing at 80x24 (`ui/term.c`); the dialogs
+are in `ui/tui_widgets.c`, the screens in `ui/ui_tui.c`. It is
+`CONFIG_APP_CBOR_PERSONDB_TUI`, on by default with the shell frontend.
+
+The storage shapes it as much as the other frontends:
+
+- The list is a walk of the people map (`persondb_person_next()`, on
+  `map_ops.next` — FINDINGS.md K6), so it shows every stored person, dataset
+  or added by hand, in the container's order: stable, not sorted. A page is
+  "the 17 persons after this id". The walk cannot seek, so the start of each
+  page visited is remembered (128 of them, 512 B) and PgUp is free; End walks
+  the whole store with progress on the status line (~49 s on the DK at 8 000)
+  and any key stops it. There is no search by name, which would be that same
+  walk; `g` and `c` go straight to one person instead.
+- An insert can shift page boundaries, so after an add or a delete the
+  remembered starts are dropped; the page on screen keeps its own and its
+  position numbers show `~` until the next walk from the start.
+- The total is `persondb_person_count()` once, at entry (~2 s on the DK), and
+  kept up to date from there.
+- Each row costs about one `persondb_person_get` (~6 ms on the DK), so a page
+  is drawn row by row as the walk returns them. Only a summary per row is
+  cached; the full record is kept for the selected person alone.
+- After every write it reads the person back from the store, and the status
+  line shows the return code and the time the write took. It never patches the
+  screen from RAM.
+- A person is added with `persondb_person_add()`, which refuses a taken id and
+  a card someone already holds — `persondb_person_put()` would overwrite or
+  steal — and only at or above `ui_tui_config.new_id_min`. Their cards are
+  added afterwards in the cards pane.
+- Cards are removed with `persondb_card_revoke_from()`, never the card-only
+  revoke: the screen knows the person, so a removal cut short by a power loss
+  is finished by repeating it.
+- A dataset person edited here no longer matches the generator, so `verify`
+  reports it as a bad record (or, deleted, as missing) if it samples that
+  index. That is `verify` working as intended. Persons added by hand are
+  outside the dataset, so `verify` and `stat`'s content figure do not see them.
+- `mutate` skips, with a warning, a dataset person whose generated state a
+  hand edit made unreachable: deleted, brought to five cards so the temporary
+  card has no slot, or holding nothing while the temporary card's id was
+  given to someone else. The dataset produces none of these, and stopping
+  would fail every later round at the same person.
 
 **`sample.yaml`.**
 

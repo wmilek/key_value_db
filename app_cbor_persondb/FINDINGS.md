@@ -696,10 +696,32 @@ find out what it stored.
   and `shape_map.h` says so.
 - **Hash order, not sorted.** Ordered scans still wait for `kvtree`.
 - **Not wired above L2.** `kvdb_foreach` is still deferred
-  (`doc/layers/l3_interfaces.md` §3). This app binds `map_ops` directly, so it
-  has `next`; it does not use it yet. Verification, `scenario_report_get()` and
+  (`doc/layers/l3_interfaces.md` §3). This app binds `map_ops` directly, and
+  now uses `next` and `count` through `persondb_person_next()` and
+  `persondb_person_count()`: `persondb tui` lists every stored person with
+  them (DESIGN.md §10). Verification, `scenario_report_get()` and
   `tools/sizing.py` still re-derive content from the dataset (F6, README
   practice 7).
+
+**Validated against this app's store**, on `native_sim` at the full 8 000
+persons, with a throwaway probe over `persondb`'s two maps:
+
+| Check | Result |
+|---|---|
+| Walk the people map | 8 000 entries, `count()` 8 000; every key well-formed, every record decodes to its own id, no duplicate, none missing |
+| Walk the credential map | 19 905 entries = the cards the persons list; every entry resolves to a person who lists that card |
+| Put an id outside the dataset (900001), walk | 8 001, and it is found |
+| Delete it and a dataset person, walk | 7 999, exactly that person missing |
+
+**What a walk costs on the DK**, measured with the I/O counters and priced
+with `app_perf_l0`'s model (`l0_timing.py`, flash time only):
+
+| Operation | Flash reads | Predicted on the DK |
+|---|---|---|
+| One `next()` call | 67 reads, 5.8 KB | ~6.1 ms — about one `person_get` (5.8 ms) |
+| A page of 17 | 1 150 reads, 88 KB | 102 ms |
+| Walk all 8 000 persons | 533 008 reads, 46.5 MB | **48.7 s** |
+| `count()` of the people map | 17 693 reads, 3.2 MB | 2.0 s |
 
 ### K7 — Scratch buffers are file-scope and shared across all maps (moderate, `read`)
 

@@ -183,6 +183,58 @@ int persondb_person_get(struct persondb *db, uint32_t id,
 /** Remove a person and every credential pointing at it. */
 int persondb_person_delete(struct persondb *db, uint32_t id);
 
+/**
+ * @brief Enroll a new person — insert only, never replace.
+ *
+ * persondb_person_put() replaces whatever is stored under the id and indexes
+ * every card it lists, whoever holds it now. That is right for a caller
+ * rewriting a record it owns and wrong for one creating a person: it would
+ * overwrite a stranger, or take a card from its current holder while their
+ * record still lists it. This refuses both before the first write.
+ *
+ * @retval 0       stored
+ * @retval -EEXIST the id is taken, or one of @p p's cards is held
+ * @retval -EINVAL empty name, a validity window no instant falls in, a card
+ *                 listed twice, or what persondb_person_put() rejects
+ */
+int persondb_person_add(struct persondb *db, const struct persondb_person *p);
+
+/* -- enumeration -------------------------------------------------------- */
+
+/*
+ * Every stored person, without knowing their ids in advance. Built on the Map
+ * shape's stateless enumeration (map_ops.next): the cursor is the id of the
+ * last person returned, so a walk holds no state, survives a reboot, and may
+ * be resumed from any id — including one deleted since.
+ *
+ * Order is the container's, stable but not sorted: not by id, not by
+ * insertion. Each call costs about one person_get on the DK (~6 ms of flash
+ * reads), so a walk of the full 8 000 is ~49 s — this is for listing a page
+ * at a time, not for searching (measured in FINDINGS.md K6).
+ */
+
+/**
+ * @brief The person after @p after in enumeration order.
+ *
+ * @param after id of the last person returned, or NULL to start the walk.
+ *              Need not exist: a deleted id still has a successor.
+ *
+ * @retval 0        *out holds the next person
+ * @retval -ENODATA the walk is over (an empty store answers this at once)
+ * @retval -EIO     flash error, or an entry that is not a person record
+ */
+int persondb_person_next(struct persondb *db, const uint32_t *after,
+			 struct persondb_person *out);
+
+/**
+ * @brief How many persons are stored — every one, not just the dataset.
+ *
+ * Exact at any time, power cuts included, because it is counted from flash
+ * rather than kept. That is also its cost: every bucket of the people map is
+ * read (~2 s on the DK at 8 000 persons). Call it once and keep the figure.
+ */
+int persondb_person_count(struct persondb *db, uint32_t *n);
+
 /* -- credentials -------------------------------------------------------- */
 
 /**
@@ -258,6 +310,36 @@ int persondb_permission_grant(struct persondb *db, uint32_t person_id,
 /** Remove @p perm from a person. @retval -ENOENT not held. */
 int persondb_permission_revoke(struct persondb *db, uint32_t person_id,
 			       const char *perm);
+
+/* -- person details ----------------------------------------------------- */
+
+/*
+ * Each of these rewrites the one person record and nothing else: the fields
+ * they touch live only in that record, so — as with permissions — there is no
+ * second structure to keep in step. A call that would store what is already
+ * stored writes nothing and returns 0.
+ */
+
+/**
+ * @brief Change a person's name.
+ *
+ * @retval -EINVAL empty, or longer than PERSONDB_NAME_MAX. Refused rather than
+ *                 truncated, so what is stored is what was asked for.
+ * @retval -ENOENT no such person
+ */
+int persondb_person_rename(struct persondb *db, uint32_t person_id,
+			   const char *name);
+
+/**
+ * @brief Set the window a person's cards are valid in: [@p valid_from,
+ *        @p valid_until), epoch seconds, as persondb_check() reads it.
+ *
+ * @retval -EINVAL @p valid_until is not after @p valid_from — a window no
+ *                 instant falls in would expire every card silently
+ * @retval -ENOENT no such person
+ */
+int persondb_person_set_validity(struct persondb *db, uint32_t person_id,
+				 uint32_t valid_from, uint32_t valid_until);
 
 /* -- the decision (R-D) ------------------------------------------------- */
 
