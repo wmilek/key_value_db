@@ -1,0 +1,24 @@
+/*
+ * Model the DK's storage exactly: 8 MiB of partition in 64 KB sectors.
+ *
+ * The erase-block-size override is load-bearing, not cosmetic. blob_db can
+ * only rebind a payload that fits *twice* between the bucket header and the
+ * sector end, so on native_sim's default 4 KB sectors the sustainable payload
+ * is 2026 B — below the 4096 this app configures, which would leave a full
+ * kvhash bucket writable once and never updatable (FINDINGS.md B10).
+ * blob_db_mount() checks the same inequality against the real geometry
+ * (FINDINGS.md B9/B10 — findings this app raised).
+ */
+
+&flashcontroller0 {
+	reg = <0x00000000 DT_SIZE_M(16)>;
+};
+
+&flash0 {
+	reg = <0x00000000 DT_SIZE_M(16)>;
+	erase-block-size = <65536>;
+};
+
+&storage_partition {
+	reg = <0x00800000 DT_SIZE_M(8)>;
+};

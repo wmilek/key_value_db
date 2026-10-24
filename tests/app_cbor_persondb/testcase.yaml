@@ -1,0 +1,5 @@
+common:
+  tags: [storage, cbor, app_cbor_persondb]
+  platform_allow: native_sim
+tests:
+  app.cbor_persondb.superblock: {}
