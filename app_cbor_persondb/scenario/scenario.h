@@ -55,6 +55,10 @@ int scenario_close(struct scenario *s);
 /** Destroy this store and build an empty one (`persondb reset`). */
 int scenario_reset(struct scenario *s);
 
+/** Destroy this store and leave none (`persondb destroy`); s->db is NULL
+ *  afterwards, success or not. */
+int scenario_destroy(struct scenario *s);
+
 /* -- population --------------------------------------------------------- */
 
 struct scenario_fill_report {

@@ -342,6 +342,7 @@ persondb check <card> <perm>      the access decision, timed
 persondb grant|revoke <id> <perm>
 persondb assign <id> <card> | unassign <card>
 persondb reset                    destroy this store and start over
+persondb destroy                  destroy this store; none until reset or reboot
 ```
 
 The shell frontend also brings in the read-only `blob_db` group

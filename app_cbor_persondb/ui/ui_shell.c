@@ -31,7 +31,7 @@ static bool g_open;
 static int need_open(const struct shell *sh)
 {
 	if (!g_open) {
-		shell_error(sh, "store not open");
+		shell_error(sh, "store not open; `persondb reset` builds one");
 		return -ENODEV;
 	}
 	return 0;
@@ -409,6 +409,22 @@ static int cmd_reset(const struct shell *sh, size_t argc, char **argv)
 	return rc;
 }
 
+/* reset without the rebuild: persondb leaves nothing on the partition until
+ * a reset, or the next boot, builds a store again. The handle is gone either
+ * way — a failed destroy may have released part of the store — so every
+ * other command refuses from here. */
+static int cmd_destroy(const struct shell *sh, size_t argc, char **argv)
+{
+	int rc;
+
+	ARG_UNUSED(argc);
+	ARG_UNUSED(argv);
+	rc = scenario_destroy(&g_s);
+	g_open = false;
+	shell_print(sh, "destroy: %d", rc);
+	return rc;
+}
+
 SHELL_STATIC_SUBCMD_SET_CREATE(
 	persondb_cmds,
 	SHELL_CMD_ARG(stat, NULL, "Store geometry, fill and counters", cmd_stat, 1, 0),
@@ -425,6 +441,7 @@ SHELL_STATIC_SUBCMD_SET_CREATE(
 	SHELL_CMD_ARG(assign, NULL, "assign <person-id> <card-id>", cmd_assign, 3, 0),
 	SHELL_CMD_ARG(unassign, NULL, "unassign <card-id>", cmd_unassign, 2, 0),
 	SHELL_CMD_ARG(reset, NULL, "Destroy this store and start over", cmd_reset, 1, 0),
+	SHELL_CMD_ARG(destroy, NULL, "Destroy this store, build none", cmd_destroy, 1, 0),
 	SHELL_COND_CMD_ARG(CONFIG_APP_CBOR_PERSONDB_TUI, tui, NULL,
 			   "Full-screen browser: persons, grant/revoke", cmd_tui, 1, 0),
 	SHELL_SUBCMD_SET_END);

@@ -102,6 +102,11 @@ int scenario_reset(struct scenario *s)
 	return scenario_open(s);
 }
 
+int scenario_destroy(struct scenario *s)
+{
+	return persondb_destroy(&s->db);
+}
+
 int scenario_prepare(struct scenario *s, int *buckets_formatted, int64_t *ms)
 {
 	int64_t t = scenario_now_us();
