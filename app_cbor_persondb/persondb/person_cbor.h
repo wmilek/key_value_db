@@ -44,6 +44,11 @@ extern "C" {
 /** The application superblock: version, map roots, dataset geometry. */
 #define SUPERBLOCK_CBOR_MAX 256
 
+/* Bump on any change to the superblock's encoding. 2 replaced the array of
+ * people-map roots (sixteen shards until DESIGN.md §12.2, then one) with a
+ * single root. */
+#define SUPERBLOCK_VERSION 2
+
 /**
  * @brief Encode @p p into @p buf.
  *
@@ -77,8 +82,7 @@ int cred_cbor_decode(const uint8_t *buf, size_t len, uint32_t *person_id);
 /** The superblock's decoded form. */
 struct superblock {
 	uint32_t version;
-	uint8_t  n_people_maps;
-	uint64_t people_root[16];
+	uint64_t people_root;
 	uint64_t cred_root;
 	uint32_t n_persons;
 	uint32_t populated;
@@ -87,6 +91,18 @@ struct superblock {
 
 int superblock_cbor_encode(const struct superblock *sb, uint8_t *buf,
 			   size_t buf_sz, size_t *out_len);
+
+/**
+ * @brief Decode a superblock.
+ *
+ * The version is read first and checked before anything else, because a
+ * different version means a different layout: decoding on would report a
+ * well-formed store of another format as corrupt.
+ *
+ * @retval 0        decoded
+ * @retval -ENOTSUP written as another SUPERBLOCK_VERSION; out->version holds it
+ * @retval -EILSEQ  not a well-formed superblock
+ */
 int superblock_cbor_decode(const uint8_t *buf, size_t len,
 			   struct superblock *out);
 

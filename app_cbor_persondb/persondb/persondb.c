@@ -7,18 +7,17 @@
  * Layout (DESIGN.md §12). One registry key, one app-owned superblock, two
  * kvhash instances; everything is reachable from the integer 1 (P5):
  *
- *   rootreg[ ROOTREG_KEY('PADB', 0) ] -> superblock -> people_root[0]
+ *   rootreg[ ROOTREG_KEY('PADB', 0) ] -> superblock -> people_root
  *                                                   -> cred_root
  *
  * Two containers, because the domain has two collections. The people map was
  * sixteen shards until DESIGN.md §12.2, to keep any one bucket under a 4 KB
  * payload cap that has since been lifted; that was a workaround for K2, and
  * workarounds hide the limitations this application exists to find (DESIGN.md
- * §1). The loop below still runs over n_people_maps because the superblock
- * format carries the count -- it is 1.
+ * §1). Superblock version 2 dropped the array of roots the shards left behind.
  *
- * This is the only file in the application that mentions a key, a shard, a
- * blob id or a map operation.
+ * This is the only file in the application that mentions a key, a blob id or
+ * a map operation.
  */
 
 #include <errno.h>
@@ -47,9 +46,6 @@ LOG_MODULE_REGISTER(persondb, CONFIG_APP_CBOR_PERSONDB_LOG_LEVEL);
  * numbering the only one 1 would imply a ('PADB', 0) that does not exist.
  */
 #define PADB_ROOTREG_KEY  ROOTREG_KEY(PADB_MAGIC, 0)
-#define SUPERBLOCK_VERSION 1
-
-#define N_PEOPLE_MAPS CONFIG_APP_CBOR_PERSONDB_PEOPLE_MAPS
 
 /* Person keys are "pXXXXXXXX": fixed width, so every key is 9 bytes and the
  * entry-size arithmetic in DESIGN.md §6 has no variance from key length. */
@@ -87,27 +83,6 @@ struct persondb {
 static struct persondb g_db;
 
 /* -- plumbing ----------------------------------------------------------- */
-
-static uint32_t fnv1a32(const void *data, size_t len)
-{
-	const uint8_t *p = data;
-	uint32_t h = 0x811c9dc5u;
-
-	for (size_t i = 0; i < len; i++) {
-		h ^= p[i];
-		h *= 0x01000193u;
-	}
-	return h;
-}
-
-/* Shard on a hash of the id rather than the id itself, so persondb stays
- * independent of how the caller numbers people — a caller allocating ids
- * sequentially and one allocating them sparsely get the same distribution,
- * which is what DESIGN.md §6.1's sizing assumes. */
-static uint64_t people_root(struct persondb *db, uint32_t id)
-{
-	return db->sb.people_root[fnv1a32(&id, sizeof(id)) % db->sb.n_people_maps];
-}
 
 static void person_key(char *buf, uint32_t id)
 {
@@ -174,8 +149,8 @@ static int cred_put(struct persondb *db, const char *card, uint32_t person_id)
 	return map_set(db, db->sb.cred_root, card, buf, len);
 }
 
-/* Encode a person and write it to its shard. One map set, so one atomic write:
- * a crash either leaves the previous record or this one, never a blend. */
+/* Encode a person and write it to the people map. One map set, so one atomic
+ * write: a crash either leaves the previous record or this one, never a blend. */
 static int person_store(struct persondb *db, const struct persondb_person *p)
 {
 	uint8_t buf[PERSON_CBOR_MAX];
@@ -187,7 +162,7 @@ static int person_store(struct persondb *db, const struct persondb_person *p)
 		return rc;
 	}
 	person_key(key, p->id);
-	return map_set(db, people_root(db, p->id), key, buf, len);
+	return map_set(db, db->sb.people_root, key, buf, len);
 }
 
 static bool person_lists_card(const struct persondb_person *p, const char *card)
@@ -297,7 +272,6 @@ static int create_store(struct persondb *db, uint32_t n_persons)
 
 	memset(sb, 0, sizeof(*sb));
 	sb->version = SUPERBLOCK_VERSION;
-	sb->n_people_maps = N_PEOPLE_MAPS;
 	sb->n_persons = n_persons;
 
 	/*
@@ -335,16 +309,15 @@ static int create_store(struct persondb *db, uint32_t n_persons)
 		.max_entry_bytes = 23,
 	};
 
-	for (uint8_t i = 0; i < sb->n_people_maps; i++) {
-		sb->people_root[i] = blob_db_alloc_id();
-		if (sb->people_root[i] == 0) {
-			return -EIO;
-		}
-		int rc = db->ops->create(sb->people_root[i], &people_cfg);
+	sb->people_root = blob_db_alloc_id();
+	if (sb->people_root == 0) {
+		return -EIO;
+	}
 
-		if (rc != 0) {
-			return rc;
-		}
+	int rc = db->ops->create(sb->people_root, &people_cfg);
+
+	if (rc != 0) {
+		return rc;
 	}
 
 	sb->cred_root = blob_db_alloc_id();
@@ -352,15 +325,14 @@ static int create_store(struct persondb *db, uint32_t n_persons)
 		return -EIO;
 	}
 
-	int rc = db->ops->create(sb->cred_root, &cred_cfg);
-
+	rc = db->ops->create(sb->cred_root, &cred_cfg);
 	if (rc != 0) {
 		return rc;
 	}
 
 	struct map_info people_info, cred_info;
 
-	if (db->ops->stat && db->ops->stat(sb->people_root[0], &people_info) == 0 &&
+	if (db->ops->stat && db->ops->stat(sb->people_root, &people_info) == 0 &&
 	    db->ops->stat(sb->cred_root, &cred_info) == 0) {
 		LOG_INF("created store for %u persons: people map depth %u, "
 			"%u buckets; credential map depth %u, %u buckets",
@@ -431,21 +403,16 @@ int persondb_open(struct persondb **out, uint32_t n_persons)
 		rc = create_store(db, n_persons);
 	} else if (rc == 0) {
 		rc = superblock_cbor_decode(buf, got, &db->sb);
-		if (rc == 0 && db->sb.version != SUPERBLOCK_VERSION) {
-			LOG_ERR("superblock version %u, expected %u",
-				db->sb.version, SUPERBLOCK_VERSION);
-			rc = -EIO;
-		}
-		if (rc == 0 && db->sb.n_people_maps != N_PEOPLE_MAPS) {
-			/* The shard count is baked into where every key lives,
-			 * so a build that disagrees cannot read the store.
-			 * kvhash cannot rehash (K3) and cannot be iterated
+		if (rc == -ENOTSUP) {
+			/* A store in another format. kvhash cannot be iterated
 			 * (K6), so there is no migration path — say so plainly
 			 * rather than returning wrong answers. */
-			LOG_ERR("store has %u people maps, this build has %u — "
-				"reformat required (FINDINGS.md K3/K6)",
-				db->sb.n_people_maps, N_PEOPLE_MAPS);
-			rc = -ENOTSUP;
+			LOG_ERR("superblock version %u, this build reads %u — "
+				"reformat required (FINDINGS.md K6)",
+				db->sb.version, SUPERBLOCK_VERSION);
+		} else if (rc != 0) {
+			LOG_ERR("superblock unreadable: %d", rc);
+			rc = -EIO;
 		}
 	}
 	if (rc != 0) {
@@ -578,7 +545,7 @@ int persondb_person_get(struct persondb *db, uint32_t id,
 
 	person_key(key, id);
 
-	int rc = map_get(db, people_root(db, id), key, buf, sizeof(buf), &len);
+	int rc = map_get(db, db->sb.people_root, key, buf, sizeof(buf), &len);
 
 	if (rc != 0) {
 		return rc;
@@ -607,7 +574,7 @@ int persondb_person_delete(struct persondb *db, uint32_t id)
 	char key[PERSON_KEY_SZ];
 
 	person_key(key, id);
-	return map_del(db, people_root(db, id), key);
+	return map_del(db, db->sb.people_root, key);
 }
 
 /* -- credentials -------------------------------------------------------- */
@@ -1000,14 +967,13 @@ int persondb_stat(struct persondb *db, struct persondb_stat *out)
 	out->n_persons = db->sb.n_persons;
 	out->populated = db->sb.populated;
 	out->rev = db->sb.rev;
-	out->n_people_maps = db->sb.n_people_maps;
 
 	/* Read the geometry back rather than modelling it. Costs one or two
 	 * blob reads and no writes — the container reports only what it
 	 * already had to persist in order to work. */
 	struct map_info info;
 
-	if (db->ops->stat && db->ops->stat(db->sb.people_root[0], &info) == 0) {
+	if (db->ops->stat && db->ops->stat(db->sb.people_root, &info) == 0) {
 		out->people_depth = info.depth;
 		out->people_buckets = info.buckets;
 	}

@@ -8,8 +8,6 @@
 #include <errno.h>
 #include <string.h>
 
-#include <zephyr/sys/util.h>
-
 #include <zcbor_common.h>
 #include <zcbor_decode.h>
 #include <zcbor_encode.h>
@@ -29,7 +27,7 @@ enum {
 #define PERSON_PAIRS 9
 
 enum {
-	SB_VERSION = 1, SB_PEOPLE_ROOTS, SB_CRED_ROOT,
+	SB_VERSION = 1, SB_PEOPLE_ROOT, SB_CRED_ROOT,
 	SB_N_PERSONS, SB_POPULATED, SB_REV,
 };
 #define SB_PAIRS 6
@@ -196,31 +194,21 @@ int cred_cbor_decode(const uint8_t *buf, size_t len, uint32_t *person_id)
 int superblock_cbor_encode(const struct superblock *sb, uint8_t *buf,
 			   size_t buf_sz, size_t *out_len)
 {
-	if (sb->n_people_maps > ARRAY_SIZE(sb->people_root)) {
-		return -EINVAL;
-	}
-
 	ZCBOR_STATE_E(zs, NBACKUPS, buf, buf_sz, 1);
 
 	bool ok = zcbor_map_start_encode(zs, SB_PAIRS) &&
 		  zcbor_uint32_put(zs, SB_VERSION) &&
 		  zcbor_uint32_put(zs, sb->version) &&
-		  zcbor_uint32_put(zs, SB_PEOPLE_ROOTS) &&
-		  zcbor_list_start_encode(zs, ARRAY_SIZE(sb->people_root));
-
-	for (uint8_t i = 0; ok && i < sb->n_people_maps; i++) {
-		ok = zcbor_uint64_put(zs, sb->people_root[i]);
-	}
-
-	ok = ok && zcbor_list_end_encode(zs, ARRAY_SIZE(sb->people_root)) &&
-	     zcbor_uint32_put(zs, SB_CRED_ROOT) &&
-	     zcbor_uint64_put(zs, sb->cred_root) &&
-	     zcbor_uint32_put(zs, SB_N_PERSONS) &&
-	     zcbor_uint32_put(zs, sb->n_persons) &&
-	     zcbor_uint32_put(zs, SB_POPULATED) &&
-	     zcbor_uint32_put(zs, sb->populated) &&
-	     zcbor_uint32_put(zs, SB_REV) && zcbor_uint32_put(zs, sb->rev) &&
-	     zcbor_map_end_encode(zs, SB_PAIRS);
+		  zcbor_uint32_put(zs, SB_PEOPLE_ROOT) &&
+		  zcbor_uint64_put(zs, sb->people_root) &&
+		  zcbor_uint32_put(zs, SB_CRED_ROOT) &&
+		  zcbor_uint64_put(zs, sb->cred_root) &&
+		  zcbor_uint32_put(zs, SB_N_PERSONS) &&
+		  zcbor_uint32_put(zs, sb->n_persons) &&
+		  zcbor_uint32_put(zs, SB_POPULATED) &&
+		  zcbor_uint32_put(zs, sb->populated) &&
+		  zcbor_uint32_put(zs, SB_REV) && zcbor_uint32_put(zs, sb->rev) &&
+		  zcbor_map_end_encode(zs, SB_PAIRS);
 
 	if (!ok) {
 		return -ENOMEM;
@@ -240,20 +228,17 @@ int superblock_cbor_decode(const uint8_t *buf, size_t len,
 
 	bool ok = zcbor_map_start_decode(zs) &&
 		  zcbor_uint32_expect(zs, SB_VERSION) &&
-		  zcbor_uint32_decode(zs, &out->version) &&
-		  zcbor_uint32_expect(zs, SB_PEOPLE_ROOTS) &&
-		  zcbor_list_start_decode(zs);
+		  zcbor_uint32_decode(zs, &out->version);
 
-	while (ok && !zcbor_array_at_end(zs)) {
-		if (out->n_people_maps >= ARRAY_SIZE(out->people_root) ||
-		    !zcbor_uint64_decode(zs,
-					 &out->people_root[out->n_people_maps])) {
-			return -EILSEQ;
-		}
-		out->n_people_maps++;
+	if (!ok) {
+		return -EILSEQ;
+	}
+	if (out->version != SUPERBLOCK_VERSION) {
+		return -ENOTSUP;
 	}
 
-	ok = ok && zcbor_list_end_decode(zs) &&
+	ok = zcbor_uint32_expect(zs, SB_PEOPLE_ROOT) &&
+	     zcbor_uint64_decode(zs, &out->people_root) &&
 	     zcbor_uint32_expect(zs, SB_CRED_ROOT) &&
 	     zcbor_uint64_decode(zs, &out->cred_root) &&
 	     zcbor_uint32_expect(zs, SB_N_PERSONS) &&

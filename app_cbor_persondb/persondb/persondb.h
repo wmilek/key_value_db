@@ -72,7 +72,6 @@ struct persondb_stat {
 	uint32_t n_persons;          /* dataset size recorded at create time */
 	uint32_t populated;          /* persons written so far */
 	uint32_t rev;                /* mutation revision */
-	uint8_t  n_people_maps;
 
 	/* The geometry the container chose, read back through map_ops.stat().
 	 * This used to be absent with an apology: the app asked for the largest
@@ -131,7 +130,9 @@ struct persondb;
  *                    attaching to a store that already exists
  *
  * @retval 0        ready
- * @retval -ENOTSUP the configured payload does not fit this geometry
+ * @retval -ENOTSUP the configured payload does not fit this geometry, or the
+ *                  store was written in another superblock format — erase it
+ *                  (persondb_erase) to start over in this one
  * @retval -EIO     flash error or a corrupt superblock
  */
 int persondb_open(struct persondb **db, uint32_t n_persons);

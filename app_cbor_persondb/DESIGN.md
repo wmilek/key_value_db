@@ -637,7 +637,7 @@ instances** — the domain has two collections, so the store has two containers:
 ```
 rootreg[ ROOTREG_KEY('PADB', 0) ] ──► superblock blob   (CBOR, app-owned)
                                         1 version
-                                        2 [ root_id ]×1   people map
+                                        2 root_id         people map
                                         3 root_id         credential index
                                         4 n_persons, populated, rev
                                             │
@@ -824,6 +824,16 @@ through is not probing.
 **What did not change.** The registry key, the superblock, the commit
 discipline, the API, the CBOR encoding, the verification. Only the number of
 person maps, the payload, and the stack.
+
+**The superblock followed, one version later.** §12.2 kept the superblock's
+array of people-map roots and its count, set to 1, so stores written before the
+change stayed readable. That left a sharding knob nothing should turn — and one
+that overran the sixteen-slot array if set past 16 — plus a hash computed on
+every lookup only to be reduced modulo 1. Superblock **version 2** stores a
+single `people_root`; the knob, the hash and the map-count check are gone. A
+version-1 store is refused at open with `-ENOTSUP`, not misread: kvhash cannot
+be iterated (K6), so there is nothing to migrate, and `persondb reset` (or
+`CONFIG_APP_CBOR_PERSONDB_FRESH_START`) starts over.
 
 It is finding **V4** from the other side too: the shard fan-out that made
 `kvdb` stop paying for itself is gone, so V4 no longer describes this
