@@ -229,44 +229,6 @@ uint32_t scenario_index_of(uint32_t person_id);
 /** The person id of dataset index @p index — the forward direction. */
 uint32_t scenario_id_of(uint32_t index);
 
-/**
- * @brief The permission vocabulary the population is drawn from.
- *
- * For a frontend offering permissions to choose from. The strings are static
- * and live for the life of the image.
- *
- * @return the name of entry @p i, or NULL past the end
- */
-const char *scenario_permission_name(uint8_t i);
-
-/* -- hand-added persons -------------------------------------------------- */
-
-/*
- * The dataset owns the ids id_of(0) .. id_of(n_persons-1): `fill` writes them,
- * `verify` checks them against the generator. A person added by hand must live
- * outside that range, or a later fill would silently overwrite them with
- * generated content.
- */
-
-/** True if @p id belongs to the dataset, populated yet or not. */
-bool scenario_id_reserved(struct scenario *s, uint32_t id);
-
-/**
- * @brief Suggest an id for a new person: the first free one above the
- *        dataset range.
- *
- * @retval -ENOSPC the first 256 ids above the range are all taken
- */
-int scenario_free_id(struct scenario *s, uint32_t *id);
-
-/**
- * @brief Enroll a person by hand (persondb_person_add), outside the dataset.
- *
- * @retval -ERANGE @p p->id is in the dataset's range
- * @retval other   as persondb_person_add()
- */
-int scenario_person_add(struct scenario *s, const struct persondb_person *p);
-
 #ifdef __cplusplus
 }
 #endif

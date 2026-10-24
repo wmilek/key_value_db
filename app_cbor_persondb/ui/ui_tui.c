@@ -2,11 +2,11 @@
  * Copyright (c) 2026
  * SPDX-License-Identifier: Apache-2.0
  *
- * ui_tui — a full-screen person browser with permission dialogs.
+ * ui_tui — a full-screen person manager.
  *
  * A frontend, so the same rule as the other two applies: parsing and drawing
- * only, and every action is one call into scenario.h or persondb.h
- * (DESIGN.md F15). What it adds is a way to see a person and change what they
+ * only (DESIGN.md F15). Stricter than the other two, it calls persondb.h —
+ * the application's L3 — and nothing else; see struct ui_tui_config. What it adds is a way to see a person and change what they
  * may open, which cards they carry, who they are and for how long, without
  * typing ids into a command line.
  *
@@ -58,10 +58,17 @@
 #include <zephyr/shell/shell_log_backend.h>
 #include <zephyr/sys/util.h>
 
-#include "scenario.h"
+#include "persondb.h"
 #include "term.h"
 #include "tui_widgets.h"
 #include "ui_tui.h"
+
+/* The TUI is a client of persondb (L3) and of nothing below or beside it.
+ * Anything it needs to know about the dataset or the benchmark arrives in
+ * struct ui_tui_config, filled by the shell frontend. */
+#if defined(APP_CBOR_PERSONDB_SCENARIO_H_) || defined(APP_CBOR_PERSONDB_DATASET_H_)
+#error "ui_tui.c calls persondb.h only; pass what it needs in ui_tui_config"
+#endif
 
 /* -- layout (80x24) ------------------------------------------------------ */
 
@@ -146,10 +153,34 @@ enum purpose {
 
 static const char OTHER[] = "<other...>";
 
+/*
+ * What the grant dialog offers, besides typing a name (<other...>). The TUI's
+ * own set, prefixed so a grant made here is recognisable as one: the
+ * generated population draws from a different vocabulary, which belongs to
+ * the dataset and is none of the TUI's business. Each fits
+ * PERSONDB_PERM_MAX.
+ */
+static const char *const tui_perms[] = {
+	"tui-door-main",
+	"tui-door-lab",
+	"tui-door-server-room",
+	"tui-door-storage",
+	"tui-parking",
+	"tui-lift",
+	"tui-after-hours",
+	"tui-weekend",
+	"tui-visitor-escort",
+	"tui-admin",
+};
+
+BUILD_ASSERT(ARRAY_SIZE(tui_perms) < TUI_PICK_MAX,
+	     "the pick list needs one slot for <other...>");
+
 static struct {
 	bool                 active;
 	const struct shell  *sh;
-	struct scenario     *s;
+	struct ui_tui_config cfg;
+	struct persondb     *db;        /* cfg.db, for brevity */
 	bool                 logs_muted;
 
 	uint32_t             n;          /* persons stored (count at entry,
@@ -263,7 +294,7 @@ static void set_status(bool err, const char *fmt, ...)
 static const char *dur_since(int64_t t0_us)
 {
 	static char buf[24];
-	int64_t us = scenario_since_us(t0_us);
+	int64_t us = g.cfg.now_us() - t0_us;
 
 	if (us < 10000) {
 		snprintf(buf, sizeof(buf), "%lld us", (long long)us);
@@ -670,7 +701,7 @@ static void load_sel(void)
 		cursor_clamp();
 		return;
 	}
-	g.sel_rc = persondb_person_get(g.s->db, id, &g.sel);
+	g.sel_rc = persondb_person_get(g.db, id, &g.sel);
 	if (!g.detached && g.sel_rc == 0) {
 		summarize(&g.rows[g.cur - g.top], &g.sel);
 	}
@@ -703,7 +734,7 @@ static bool key_waiting(void)
 static uint32_t seek_page(uint32_t want, bool *has_after, uint32_t *after)
 {
 	uint32_t shown = g.shown_page;
-	int64_t t0 = scenario_now_us();
+	int64_t t0 = g.cfg.now_us();
 	uint32_t walked = 0;
 
 	/* The page on screen and the one after it are known without a cache:
@@ -739,7 +770,7 @@ static uint32_t seek_page(uint32_t want, bool *has_after, uint32_t *after)
 		int rc = 0;
 
 		for (int i = 0; i < LIST_ROWS && rc == 0; i++) {
-			rc = persondb_person_next(g.s->db, has ? &id : NULL,
+			rc = persondb_person_next(g.db, has ? &id : NULL,
 						  &g_scratch);
 			if (rc == 0) {
 				id = g_scratch.id;
@@ -781,7 +812,7 @@ static void load_page(void)
 	bool has;
 	uint32_t after;
 	uint32_t page = seek_page(g.top / LIST_ROWS, &has, &after);
-	int64_t t0 = scenario_now_us();
+	int64_t t0 = g.cfg.now_us();
 	int rows = 0;
 	int rc = 0;
 
@@ -798,7 +829,7 @@ static void load_page(void)
 	term_flush();
 
 	for (; rows < LIST_ROWS; rows++) {
-		rc = persondb_person_next(g.s->db, has ? &after : NULL,
+		rc = persondb_person_next(g.db, has ? &after : NULL,
 					  &g_scratch);
 		if (rc != 0) {
 			break;
@@ -877,7 +908,7 @@ static void select_pos(uint32_t pos)
 		g.top = top;
 		load_page();
 	} else if (pos != old || was_detached) {
-		int64_t t0 = scenario_now_us();
+		int64_t t0 = g.cfg.now_us();
 
 		draw_row((int)(old - g.top));
 		load_sel();
@@ -906,7 +937,7 @@ static void show_person(uint32_t id)
 		}
 	}
 
-	int rc = persondb_person_get(g.s->db, id, &g_scratch);
+	int rc = persondb_person_get(g.db, id, &g_scratch);
 
 	if (rc != 0) {
 		set_status(true, rc == -ENOENT ? "no person %u is stored"
@@ -944,8 +975,8 @@ static void do_grant(const char *perm)
 	draw_status();
 	term_flush();
 
-	int64_t t0 = scenario_now_us();
-	int rc = persondb_permission_grant(g.s->db, id, perm);
+	int64_t t0 = g.cfg.now_us();
+	int rc = persondb_permission_grant(g.db, id, perm);
 	char took[24];
 
 	snprintf(took, sizeof(took), "%s", dur_since(t0));
@@ -991,8 +1022,8 @@ static void do_revoke(const char *perm)
 	draw_status();
 	term_flush();
 
-	int64_t t0 = scenario_now_us();
-	int rc = persondb_permission_revoke(g.s->db, id, perm);
+	int64_t t0 = g.cfg.now_us();
+	int rc = persondb_permission_revoke(g.db, id, perm);
 	char took[24];
 
 	snprintf(took, sizeof(took), "%s", dur_since(t0));
@@ -1021,8 +1052,8 @@ static void do_rename(const char *name)
 	draw_status();
 	term_flush();
 
-	int64_t t0 = scenario_now_us();
-	int rc = persondb_person_rename(g.s->db, id, name);
+	int64_t t0 = g.cfg.now_us();
+	int rc = persondb_person_rename(g.db, id, name);
 	char took[24];
 
 	snprintf(took, sizeof(took), "%s", dur_since(t0));
@@ -1050,8 +1081,8 @@ static void do_set_validity(uint32_t from, uint32_t until)
 	draw_status();
 	term_flush();
 
-	int64_t t0 = scenario_now_us();
-	int rc = persondb_person_set_validity(g.s->db, id, from, until);
+	int64_t t0 = g.cfg.now_us();
+	int rc = persondb_person_set_validity(g.db, id, from, until);
 	char took[24];
 
 	snprintf(took, sizeof(took), "%s", dur_since(t0));
@@ -1093,8 +1124,8 @@ static void do_card_add(const char *card)
 	/* Called even when the record already lists the card: assignment is
 	 * the repair for a crash between its two writes, and completes a
 	 * missing index entry rather than reporting the card as present. */
-	int64_t t0 = scenario_now_us();
-	int rc = persondb_card_assign(g.s->db, id, card);
+	int64_t t0 = g.cfg.now_us();
+	int rc = persondb_card_assign(g.db, id, card);
 	char took[24];
 
 	snprintf(took, sizeof(took), "%s", dur_since(t0));
@@ -1119,7 +1150,7 @@ static void do_card_add(const char *card)
 		uint32_t owner;
 
 		/* Say who: the operator has to go there to revoke it. */
-		if (persondb_card_owner(g.s->db, card, &owner) == 0) {
+		if (persondb_card_owner(g.db, card, &owner) == 0) {
 			set_status(true, "card %s is held by %u; remove it there"
 				   " first | rc %d", card, owner, rc);
 		} else {
@@ -1154,8 +1185,8 @@ static void do_card_remove(const char *card)
 	/* The owner-qualified revoke, because the person is known: a removal
 	 * interrupted between its two writes is finished by doing it again.
 	 * The card-only form loses the person after its first write. */
-	int64_t t0 = scenario_now_us();
-	int rc = persondb_card_revoke_from(g.s->db, id, card);
+	int64_t t0 = g.cfg.now_us();
+	int rc = persondb_card_revoke_from(g.db, id, card);
 	char took[24];
 
 	snprintf(took, sizeof(took), "%s", dur_since(t0));
@@ -1183,8 +1214,9 @@ static void do_person_add(uint32_t until)
 	draw_status();
 	term_flush();
 
-	int64_t t0 = scenario_now_us();
-	int rc = scenario_person_add(g.s, p);
+	int64_t t0 = g.cfg.now_us();
+	int rc = (p->id < g.cfg.new_id_min) ? -ERANGE
+					     : persondb_person_add(g.db, p);
 	char took[24];
 
 	snprintf(took, sizeof(took), "%s", dur_since(t0));
@@ -1202,8 +1234,7 @@ static void do_person_add(uint32_t until)
 			   took);
 		break;
 	case -ERANGE:
-		set_status(true, "ids %u..%u belong to the dataset | rc %d",
-			   scenario_id_of(0), scenario_id_of(g.n_persons) - 1, rc);
+		set_status(true, "new ids start at %u", g.cfg.new_id_min);
 		break;
 	case -EEXIST:
 		set_status(true, "id %u is taken | rc %d", g.new_id, rc);
@@ -1226,8 +1257,8 @@ static void do_person_delete(void)
 	draw_status();
 	term_flush();
 
-	int64_t t0 = scenario_now_us();
-	int rc = persondb_person_delete(g.s->db, id);
+	int64_t t0 = g.cfg.now_us();
+	int rc = persondb_person_delete(g.db, id);
 	char took[24];
 
 	snprintf(took, sizeof(took), "%s", dur_since(t0));
@@ -1279,14 +1310,11 @@ static void open_grant(void)
 	snprintf(title, sizeof(title), "Grant to %u", g.sel.id);
 	g.pick.title = title;
 
-	/* The vocabulary, less what is already held: offering a permission
+	/* The TUI's set, less what is already held: offering a permission
 	 * the person has would make Enter a no-op that looks like a success. */
-	for (uint8_t i = 0; g.pick.n < TUI_PICK_MAX - 1; i++) {
-		const char *name = scenario_permission_name(i);
+	for (uint8_t i = 0; i < ARRAY_SIZE(tui_perms); i++) {
+		const char *name = tui_perms[i];
 
-		if (name == NULL) {
-			break;
-		}
 		if (!sel_holds(name)) {
 			g.pick.item[g.pick.n++] = name;
 		}
@@ -1393,6 +1421,26 @@ static void open_validity(void)
 		   10, from);
 }
 
+/* The first id at or above cfg.new_id_min that holds nobody. Bounded: a
+ * store with this many hand-added persons in a row is not what a suggestion
+ * is for, and each probe is a flash read. */
+static int free_id(uint32_t *id)
+{
+	for (uint32_t i = 0; i < 256; i++) {
+		uint32_t candidate = g.cfg.new_id_min + i;
+		int rc = persondb_person_get(g.db, candidate, &g_scratch);
+
+		if (rc == -ENOENT) {
+			*id = candidate;
+			return 0;
+		}
+		if (rc != 0) {
+			return rc;
+		}
+	}
+	return -ENOSPC;
+}
+
 static void open_person_add(void)
 {
 	char suggest[16] = "";
@@ -1400,11 +1448,10 @@ static void open_person_add(void)
 
 	/* A suggestion, not a reservation: the id is checked again when the
 	 * person is written. */
-	if (scenario_free_id(g.s, &id) == 0) {
+	if (free_id(&id) == 0) {
 		snprintf(suggest, sizeof(suggest), "%u", id);
 	}
-	open_input(FOR_NEW_ID, "Add person", "Id (outside the dataset range):",
-		   10, suggest);
+	open_input(FOR_NEW_ID, "Add person", "Id:", 10, suggest);
 }
 
 static void open_person_delete(void)
@@ -1439,14 +1486,13 @@ static bool new_id_done(const char *text)
 		set_status(true, "'%s' is not an id", text);
 		return false;
 	}
-	if (scenario_id_reserved(g.s, (uint32_t)v)) {
-		set_status(true, "ids %u..%u belong to the dataset",
-			   scenario_id_of(0), scenario_id_of(g.n_persons) - 1);
+	if (v < g.cfg.new_id_min) {
+		set_status(true, "new ids start at %u", g.cfg.new_id_min);
 		return false;
 	}
 	/* Asked now, so a taken id fails before the name is typed; the write
 	 * asks again. */
-	if (persondb_person_get(g.s->db, (uint32_t)v, p) == 0) {
+	if (persondb_person_get(g.db, (uint32_t)v, p) == 0) {
 		set_status(true, "id %lu is taken by '%s'", v, p->name);
 		return false;
 	}
@@ -1465,9 +1511,8 @@ static bool new_name_done(const char *text)
 		return false;
 	}
 	snprintf(g.new_name, sizeof(g.new_name), "%s", text);
-	/* The board has no clock. SCENARIO_BENCH_NOW is the instant `check`
-	 * decides at, so it is this application's "today". */
-	fmt_date(from, sizeof(from), SCENARIO_BENCH_NOW);
+	/* The board has no clock; "today" is whatever the starter says. */
+	fmt_date(from, sizeof(from), g.cfg.today);
 	close_dialog();
 	open_input(FOR_NEW_FROM, "Add person",
 		   "First valid day (YYYY-MM-DD, UTC):", 10, from);
@@ -1574,8 +1619,8 @@ static void goto_person(const char *text)
 static void goto_card(const char *card)
 {
 	uint32_t owner;
-	int64_t t0 = scenario_now_us();
-	int rc = persondb_card_owner(g.s->db, card, &owner);
+	int64_t t0 = g.cfg.now_us();
+	int rc = persondb_card_owner(g.db, card, &owner);
 	char took[24];
 
 	snprintf(took, sizeof(took), "%s", dur_since(t0));
@@ -1956,10 +2001,10 @@ static void leave(void)
 	shell_print(g.sh, "left persondb tui; `persondb tui` opens it again");
 }
 
-int ui_tui_enter(const struct shell *sh, struct scenario *s)
+int ui_tui_enter(const struct shell *sh, const struct ui_tui_config *cfg)
 {
 	struct persondb_stat st;
-	int rc = persondb_stat(s->db, &st);
+	int rc = persondb_stat(cfg->db, &st);
 
 	if (rc != 0) {
 		return rc;
@@ -1968,7 +2013,8 @@ int ui_tui_enter(const struct shell *sh, struct scenario *s)
 	memset(&g, 0, sizeof(g));
 	memset(g_page_known, 0, sizeof(g_page_known));
 	g.sh = sh;
-	g.s = s;
+	g.cfg = *cfg;
+	g.db = cfg->db;
 	g.populated = st.populated;
 	g.n_persons = st.n_persons;
 	g.rev = st.rev;
@@ -1984,7 +2030,7 @@ int ui_tui_enter(const struct shell *sh, struct scenario *s)
 	 * kept up to date from here: the container keeps no counter. */
 	set_status(false, "counting persons ...");
 	draw_all();
-	rc = persondb_person_count(s->db, &g.n);
+	rc = persondb_person_count(g.db, &g.n);
 	if (rc != 0) {
 		g.n = 0;
 	}

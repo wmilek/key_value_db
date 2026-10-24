@@ -600,7 +600,7 @@ because §9 exists.
 **`persondb tui` — full-screen, inside the shell frontend.** A page of stored
 persons on the left, the selected one's permissions and cards on the right.
 Tab cycles the three panes, and `a` / `d` add and remove in the one in focus:
-persons, permissions (pick from the vocabulary or type a name), cards. `n`
+persons, permissions (pick a `tui-…` one or type any name), cards. `n`
 renames, `v` sets the days a person's cards are valid, `g` opens a person by
 id and `c` by card. Every removal asks y/N first.
 
@@ -612,7 +612,20 @@ exactly, even when that instant is mid-day.
 It takes over the shell's own terminal through the shell's bypass mode and
 gives it back on `q`, Ctrl-C or Ctrl-D, so it needs no second UART, and it
 runs on the shell thread like every other command, so persondb still has one
-caller. Plain VT100 and DEC line drawing at 80x24 (`ui/term.c`); the dialogs
+caller.
+
+It is stricter about layers than the other two frontends: it calls
+`persondb.h` — this application's L3, the access interface built on the L2
+Map — and nothing else. It does not include `scenario.h` or `dataset.h`, and
+`ui_tui.c` refuses to compile if either is pulled in. The few things it needs
+that are not about stored persons arrive in `struct ui_tui_config`, filled by
+the shell frontend, which already owns the scenario: the persondb handle, the
+first id for persons added by hand (above the dataset's range, so `fill`
+cannot overwrite them), "today" (`SCENARIO_BENCH_NOW`; the board has no
+clock), and a clock that advances on `native_sim`. The grant dialog offers the
+TUI's own permissions, all named `tui-…` so a grant made here is recognisable
+as one, plus any name typed in; the generator's vocabulary is the dataset's
+business, not the TUI's. Plain VT100 and DEC line drawing at 80x24 (`ui/term.c`); the dialogs
 are in `ui/tui_widgets.c`, the screens in `ui/ui_tui.c`. It is
 `CONFIG_APP_CBOR_PERSONDB_TUI`, on by default with the shell frontend.
 
@@ -639,9 +652,8 @@ The storage shapes it as much as the other frontends:
   screen from RAM.
 - A person is added with `persondb_person_add()`, which refuses a taken id and
   a card someone already holds — `persondb_person_put()` would overwrite or
-  steal — and outside the dataset's id range (`scenario_person_add()`), so a
-  later `fill` cannot overwrite them. Their cards are added afterwards in the
-  cards pane.
+  steal — and only at or above `ui_tui_config.new_id_min`. Their cards are
+  added afterwards in the cards pane.
 - Cards are removed with `persondb_card_revoke_from()`, never the card-only
   revoke: the screen knows the person, so a removal cut short by a power loss
   is finished by repeating it.

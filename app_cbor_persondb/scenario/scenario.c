@@ -555,46 +555,6 @@ uint32_t scenario_id_of(uint32_t index)
 	return dataset_id_of(index);
 }
 
-const char *scenario_permission_name(uint8_t i)
-{
-	return (i < DATASET_PERM_VOCAB) ? dataset_permission(i) : NULL;
-}
-
-bool scenario_id_reserved(struct scenario *s, uint32_t id)
-{
-	return id >= dataset_id_of(0) && id < dataset_id_of(s->n_persons);
-}
-
-int scenario_free_id(struct scenario *s, uint32_t *id)
-{
-	struct persondb_person p;
-
-	/* Hand-added persons live above the dataset range, so the search
-	 * starts there. Bounded: a store with this many hand-added persons
-	 * in a row is not what this suggestion is for. */
-	for (uint32_t i = 0; i < 256; i++) {
-		uint32_t candidate = dataset_id_of(s->n_persons) + i;
-		int rc = persondb_person_get(s->db, candidate, &p);
-
-		if (rc == -ENOENT) {
-			*id = candidate;
-			return 0;
-		}
-		if (rc != 0) {
-			return rc;
-		}
-	}
-	return -ENOSPC;
-}
-
-int scenario_person_add(struct scenario *s, const struct persondb_person *p)
-{
-	if (scenario_id_reserved(s, p->id)) {
-		return -ERANGE;
-	}
-	return persondb_person_add(s->db, p);
-}
-
 int scenario_card_of(struct scenario *s, uint32_t index, uint8_t slot,
 		     char *out, size_t sz)
 {

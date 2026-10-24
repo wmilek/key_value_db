@@ -330,6 +330,7 @@ static int cmd_revoke(const struct shell *sh, size_t argc, char **argv)
 #if defined(CONFIG_APP_CBOR_PERSONDB_TUI)
 static int cmd_tui(const struct shell *sh, size_t argc, char **argv)
 {
+	struct ui_tui_config cfg;
 	int rc = need_open(sh);
 
 	ARG_UNUSED(argc);
@@ -337,9 +338,26 @@ static int cmd_tui(const struct shell *sh, size_t argc, char **argv)
 	if (rc) {
 		return rc;
 	}
+
+	/*
+	 * The TUI calls persondb and nothing else. What it needs to know about
+	 * this application's dataset and benchmark is decided here, where the
+	 * scenario already lives:
+	 *
+	 *  - hand-added persons start above the dataset's ids, so `fill` —
+	 *    which rewrites every id in that range — cannot overwrite them;
+	 *  - "today" is SCENARIO_BENCH_NOW, the instant `check` decides at,
+	 *    because the board has no clock;
+	 *  - the clock is the scenario's, the one that advances on native_sim.
+	 */
+	cfg.db = g_s.db;
+	cfg.new_id_min = scenario_id_of(g_s.n_persons);
+	cfg.today = SCENARIO_BENCH_NOW;
+	cfg.now_us = scenario_now_us;
+
 	/* Returns once the screen is drawn; the TUI then runs from the
 	 * shell's bypass callback until 'q' hands the terminal back. */
-	return ui_tui_enter(sh, &g_s);
+	return ui_tui_enter(sh, &cfg);
 }
 #endif
 
