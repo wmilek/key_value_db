@@ -600,8 +600,9 @@ because §9 exists.
 **`persondb tui` — full-screen, inside the shell frontend.** A page of persons
 on the left, the selected one's permissions and cards on the right, and dialogs
 to grant (pick from the vocabulary, or type a name) and revoke (with a y/N
-confirmation) permissions, rename the person (`n`), and set the days their
-cards are valid (`v`). The validity dialogs ask for the first and the last
+confirmation) permissions, add and remove cards, rename the person (`n`), and
+set the days their cards are valid (`v`). Tab cycles the list, the permissions
+and the cards; `a` and `d` act on the pane in focus. The validity dialogs ask for the first and the last
 valid day, pre-filled with the stored ones; the last day is stored as the
 following midnight, because the record's window is half-open. A date left as
 it was keeps the stored instant exactly, even when that instant is mid-day. It takes over the shell's own terminal through the shell's
@@ -623,9 +624,16 @@ The storage shapes it as much as the other frontends:
 - After a grant or revoke it reads the person back from the store, and the
   status line shows the return code and the time the write took. It never
   patches the screen from RAM.
+- Cards are removed with `persondb_card_revoke_from()`, never the card-only
+  revoke: the screen knows the person, so a removal cut short by a power loss
+  is finished by repeating it.
 - A person edited by hand no longer matches the generator, so `verify`
   reports it as a bad record if it samples that index. That is `verify`
   working as intended.
+- `mutate` gives each person in its batch a generated temporary card. A
+  person brought to five cards by hand has no room for it, so if they fall in
+  the next batch the round stops on `-ENOSPC` without committing. That is the
+  five-card cap, not a fault in either.
 
 **`sample.yaml`.**
 

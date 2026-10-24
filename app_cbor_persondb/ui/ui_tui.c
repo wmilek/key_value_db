@@ -7,15 +7,16 @@
  * A frontend, so the same rule as the other two applies: parsing and drawing
  * only, and every action is one call into scenario.h or persondb.h
  * (DESIGN.md F15). What it adds is a way to see a person and change what they
- * may open — and who they are, and for how long — without typing ids into
- * a command line.
+ * may open, which cards they carry, who they are and for how long, without
+ * typing ids into a command line.
  *
  *  ┌ Persons ──────────────────────────┐┌ 100042 ───────────────────────┐
  *  │     id  name           dept   P C ││ Anna Kowalska                  │
  *  │ 100042  Anna Kowalska  R&D   18 3 ││ Permissions (18)               │
  *  └───────────────────────────────────┘└────────────────────────────────┘
  *   status: what the last operation did, its return code, its time
- *   keys: a grant, d revoke, n name, v valid from/to, g goto, c card
+ *   keys: Tab cycles list / permissions / cards; a adds and d removes in
+ *   the focused pane; n name, v valid from/to, g goto, c find a card
  *
  * Three things below are shaped by the store rather than by taste:
  *
@@ -106,7 +107,9 @@ struct row {
 	char     dept[10];
 };
 
-enum focus { FOCUS_LIST, FOCUS_PERMS };
+/* The three panes Tab cycles through; a and d act on the focused one, and
+ * on permissions from the list. */
+enum focus { FOCUS_LIST, FOCUS_PERMS, FOCUS_CARDS };
 
 enum mode {
 	MODE_MAIN,
@@ -126,6 +129,8 @@ enum purpose {
 	FOR_RENAME,         /* input: the person's new name */
 	FOR_VALID_FROM,     /* input: first valid day, then ... */
 	FOR_VALID_UNTIL,    /* input: ... last valid day */
+	FOR_CARD_ADD,       /* input: a card id to assign */
+	FOR_CARD_REMOVE,    /* confirm: remove g.card */
 };
 
 static const char OTHER[] = "<other...>";
@@ -145,6 +150,7 @@ static struct {
 	enum focus           focus;
 	uint8_t              perm_cur;
 	uint8_t              perm_top;
+	uint8_t              card_cur;
 
 	struct row           rows[LIST_ROWS];
 	struct persondb_person sel;      /* the selected person, as stored */
@@ -156,6 +162,7 @@ static struct {
 	struct tui_input     input;
 	struct tui_confirm   confirm;
 	char                 perm[PERSONDB_PERM_MAX + 1];
+	char                 card[PERSONDB_CARD_LEN + 1];
 	uint32_t             new_from;   /* carried from one validity dialog
 					  * to the next */
 
@@ -316,8 +323,12 @@ static void summarize(struct row *r, const struct persondb_person *p, int rc)
 static void draw_title(void)
 {
 	char left[TERM_COLS];
-	const char *right = (g.focus == FOCUS_LIST) ? "[list] "
-						    : "[permissions] ";
+	static const char *const pane[] = {
+		[FOCUS_LIST]  = "[list] ",
+		[FOCUS_PERMS] = "[permissions] ",
+		[FOCUS_CARDS] = "[cards] ",
+	};
+	const char *right = pane[g.focus];
 
 	snprintf(left, sizeof(left), " persondb | %u of %u persons | rev %u",
 		 g.n, g.n_persons, g.rev);
@@ -378,6 +389,23 @@ static void border_mark(int row, bool more, char mark)
 	} else {
 		term_puts("\x1b(0x\x1b(B");
 	}
+}
+
+static void draw_card_row(int i)
+{
+	int row = DET_CTOP + i;
+
+	if (g.sel_rc != 0 || i >= g.sel.n_cards) {
+		term_field(row, DET_COL + 1, DET_IN, "");
+		return;
+	}
+	if (i == g.card_cur && g.focus == FOCUS_CARDS) {
+		term_attr(TERM_REVERSE);
+	}
+	term_fieldf(row, DET_COL + 1, DET_IN, " %c %s",
+		    (i == g.card_cur && g.focus == FOCUS_CARDS) ? '>' : ' ',
+		    g.sel.card[i]);
+	term_attr(TERM_NORMAL);
 }
 
 static void draw_perm_row(int i)
@@ -452,8 +480,7 @@ static void draw_detail(void)
 	term_fieldf(DET_CHDR, DET_COL + 1, DET_IN, " Cards (%u)", g.sel.n_cards);
 	term_attr(TERM_NORMAL);
 	for (int i = 0; i < PERSONDB_CARDS_MAX; i++) {
-		term_fieldf(DET_CTOP + i, DET_COL + 1, DET_IN, "   %s",
-			    i < g.sel.n_cards ? g.sel.card[i] : "");
+		draw_card_row(i);
 	}
 }
 
@@ -466,17 +493,25 @@ static void draw_status(void)
 
 static void draw_help(void)
 {
+	static const char *const move[] = {
+		[FOCUS_LIST]  = " arrows/PgUp/PgDn/Home/End move  Tab next pane"
+				"  r reload",
+		[FOCUS_PERMS] = " arrows/PgUp/PgDn move  Tab next pane  d/Del"
+				" revokes the selected permission",
+		[FOCUS_CARDS] = " Up/Dn move  Tab next pane  d/Del removes the"
+				" selected card",
+	};
+
 	term_attr(TERM_REVERSE);
 	term_field(HELP_ROW, 1, TERM_COLS,
-		   " a grant  d revoke  n name  v valid from/to  g goto  c card"
-		   "  r reload  q quit");
+		   g.focus == FOCUS_CARDS ?
+		   " a add card  d remove card  n name  v valid from/to  g goto"
+		   "  c find  q quit" :
+		   " a grant  d revoke  n name  v valid from/to  g goto"
+		   "  c find card  q quit");
 	/* 79 columns, not 80: writing the bottom-right cell makes some
 	 * terminals scroll the whole screen up a line. */
-	term_field(HELP_ROW + 1, 1, TERM_COLS - 1,
-		   g.focus == FOCUS_LIST ?
-		   " arrows/PgUp/PgDn/Home/End move  Tab to permissions" :
-		   " arrows/PgUp/PgDn move  Tab to list  d/Del revokes the"
-		   " selected permission");
+	term_field(HELP_ROW + 1, 1, TERM_COLS - 1, move[g.focus]);
 	term_attr(TERM_NORMAL);
 }
 
@@ -511,9 +546,13 @@ static void draw_all(void)
 
 /* -- reading the store --------------------------------------------------- */
 
-/** Keep the permission cursor on a held permission and in view. */
-static void perm_clamp(void)
+/** Keep the permission and card cursors on held items, and in view. */
+static void cursor_clamp(void)
 {
+	if (g.sel_rc != 0 || g.card_cur >= g.sel.n_cards) {
+		g.card_cur = (g.sel_rc == 0 && g.sel.n_cards) ?
+			     g.sel.n_cards - 1 : 0;
+	}
 	if (g.sel_rc != 0 || g.sel.n_perms == 0) {
 		g.perm_cur = 0;
 		g.perm_top = 0;
@@ -544,7 +583,7 @@ static void load_sel(void)
 	}
 	g.sel_rc = scenario_person_show(g.s, g.cur, &g.sel);
 	summarize(&g.rows[g.cur - g.top], &g.sel, g.sel_rc);
-	perm_clamp();
+	cursor_clamp();
 }
 
 /**
@@ -583,7 +622,7 @@ static void load_page(void)
 		draw_row(i);
 		term_flush();
 	}
-	perm_clamp();   /* a reload may find fewer permissions than before */
+	cursor_clamp();   /* a reload may find fewer permissions than before */
 	if (g.n == 0) {
 		g.sel_rc = -ENOENT;
 		set_status(false, "the store holds no persons yet");
@@ -607,6 +646,7 @@ static void select_index(uint32_t index)
 	g.cur = index;
 	g.perm_cur = 0;
 	g.perm_top = 0;
+	g.card_cur = 0;
 
 	if (top != g.top) {
 		g.top = top;
@@ -662,7 +702,7 @@ static void do_grant(const char *perm)
 				g.perm_cur = i;
 			}
 		}
-		perm_clamp();
+		cursor_clamp();
 		set_status(false, "granted '%s' to %u | %s", perm, id, took);
 		break;
 	case -EINVAL:
@@ -777,6 +817,98 @@ static void do_set_validity(uint32_t from, uint32_t until)
 	}
 }
 
+static void do_card_add(const char *card)
+{
+	uint32_t id = g.sel.id;
+	bool listed = false;
+
+	for (uint8_t i = 0; i < g.sel.n_cards; i++) {
+		listed |= (strcmp(g.sel.card[i], card) == 0);
+	}
+
+	set_status(false, "assigning card %s to %u ...", card, id);
+	draw_status();
+	term_flush();
+
+	/* Called even when the record already lists the card: assignment is
+	 * the repair for a crash between its two writes, and completes a
+	 * missing index entry rather than reporting the card as present. */
+	int64_t t0 = scenario_now_us();
+	int rc = persondb_card_assign(g.s->db, id, card);
+	char took[24];
+
+	snprintf(took, sizeof(took), "%s", dur_since(t0));
+	load_sel();
+
+	switch (rc) {
+	case 0:
+		for (uint8_t i = 0; g.sel_rc == 0 && i < g.sel.n_cards; i++) {
+			if (strcmp(g.sel.card[i], card) == 0) {
+				g.card_cur = i;
+			}
+		}
+		if (listed) {
+			set_status(false, "%u already holds card %s | %s", id,
+				   card, took);
+		} else {
+			set_status(false, "card %s assigned to %u | %s", card,
+				   id, took);
+		}
+		break;
+	case -EEXIST: {
+		uint32_t owner;
+
+		/* Say who: the operator has to go there to revoke it. */
+		if (persondb_card_owner(g.s->db, card, &owner) == 0) {
+			set_status(true, "card %s is held by %u; remove it there"
+				   " first | rc %d", card, owner, rc);
+		} else {
+			set_status(true, "card %s is held by someone else | rc %d",
+				   card, rc);
+		}
+		break;
+	}
+	case -ENOSPC:
+		set_status(true, "%u already holds %d cards, the maximum | rc %d",
+			   id, PERSONDB_CARDS_MAX, rc);
+		break;
+	case -EINVAL:
+		set_status(true, "a card id is 1..%d characters | rc %d",
+			   PERSONDB_CARD_LEN, rc);
+		break;
+	default:
+		set_status(true, "assign card %s to %u failed | rc %d | %s",
+			   card, id, rc, took);
+		break;
+	}
+}
+
+static void do_card_remove(const char *card)
+{
+	uint32_t id = g.sel.id;
+
+	set_status(false, "removing card %s from %u ...", card, id);
+	draw_status();
+	term_flush();
+
+	/* The owner-qualified revoke, because the person is known: a removal
+	 * interrupted between its two writes is finished by doing it again.
+	 * The card-only form loses the person after its first write. */
+	int64_t t0 = scenario_now_us();
+	int rc = persondb_card_revoke_from(g.s->db, id, card);
+	char took[24];
+
+	snprintf(took, sizeof(took), "%s", dur_since(t0));
+	load_sel();
+
+	if (rc == 0) {
+		set_status(false, "card %s removed from %u | %s", card, id, took);
+	} else {
+		set_status(true, "remove card %s from %u failed | rc %d | %s",
+			   card, id, rc, took);
+	}
+}
+
 /* -- dialogs ------------------------------------------------------------- */
 
 static void open_input(enum purpose why, const char *title, const char *prompt,
@@ -881,6 +1013,37 @@ static bool need_sel(void)
 		return false;
 	}
 	return true;
+}
+
+static void open_card_add(void)
+{
+	static char title[32];
+
+	if (!need_sel()) {
+		return;
+	}
+	snprintf(title, sizeof(title), "Add card to %u", g.sel.id);
+	open_input(FOR_CARD_ADD, title, "Card id (up to 14 characters):",
+		   PERSONDB_CARD_LEN, NULL);
+}
+
+static void open_card_remove(void)
+{
+	if (!need_sel()) {
+		return;
+	}
+	if (g.sel.n_cards == 0) {
+		set_status(false, "%u holds no cards", g.sel.id);
+		draw_status();
+		return;
+	}
+	snprintf(g.card, sizeof(g.card), "%s", g.sel.card[g.card_cur]);
+	g.confirm.title = "Remove card";
+	snprintf(g.confirm.msg, sizeof(g.confirm.msg),
+		 "Remove card %s from %u?", g.card, g.sel.id);
+	g.purpose = FOR_CARD_REMOVE;
+	g.mode = MODE_CONFIRM;
+	tui_confirm_draw(&g.confirm);
 }
 
 static void open_rename(void)
@@ -1087,6 +1250,12 @@ static void dialog_key(int key)
 	case FOR_VALID_UNTIL:
 		validity_until_done(g.input.buf);
 		break;
+	case FOR_CARD_ADD:
+		do_card_add(g.input.buf);
+		break;
+	case FOR_CARD_REMOVE:
+		do_card_remove(g.card);
+		break;
 	}
 	close_dialog();
 }
@@ -1118,9 +1287,23 @@ static void move_perm(int delta)
 	}
 }
 
+static void move_card(int delta)
+{
+	if (g.sel_rc != 0 || g.sel.n_cards == 0) {
+		return;
+	}
+	g.card_cur = (uint8_t)CLAMP((int)g.card_cur + delta, 0,
+				    (int)g.sel.n_cards - 1);
+	for (int i = 0; i < PERSONDB_CARDS_MAX; i++) {
+		draw_card_row(i);
+	}
+}
+
 static void set_focus(enum focus f)
 {
-	if (f == FOCUS_PERMS && (g.sel_rc != 0 || g.sel.n_perms == 0)) {
+	/* The detail panes stay focusable when empty — adding the first card
+	 * or permission starts there — but not when there is no person. */
+	if (f != FOCUS_LIST && g.sel_rc != 0) {
 		return;
 	}
 	g.focus = f;
@@ -1150,22 +1333,31 @@ static void main_key(int key)
 		draw_status();
 		return;
 	case TERM_KEY_TAB:
-		set_focus(list ? FOCUS_PERMS : FOCUS_LIST);
+		set_focus(g.focus == FOCUS_LIST  ? FOCUS_PERMS :
+			  g.focus == FOCUS_PERMS ? FOCUS_CARDS : FOCUS_LIST);
 		return;
 	case TERM_KEY_LEFT:
 		set_focus(FOCUS_LIST);
 		return;
 	case TERM_KEY_RIGHT:
-		set_focus(FOCUS_PERMS);
+		set_focus(g.focus == FOCUS_LIST ? FOCUS_PERMS : FOCUS_CARDS);
 		return;
 	case 'a':
 	case '+':
-		open_grant();
+		if (g.focus == FOCUS_CARDS) {
+			open_card_add();
+		} else {
+			open_grant();
+		}
 		return;
 	case 'd':
 	case '-':
 	case TERM_KEY_DEL:
-		open_revoke();
+		if (g.focus == FOCUS_CARDS) {
+			open_card_remove();
+		} else {
+			open_revoke();
+		}
 		return;
 	case 'n':
 		open_rename();
@@ -1200,6 +1392,14 @@ static void main_key(int key)
 		default:            return;
 		}
 		select_index(cur);
+	} else if (g.focus == FOCUS_CARDS) {
+		switch (key) {
+		case TERM_KEY_UP:   move_card(-1); break;
+		case TERM_KEY_DOWN: move_card(1); break;
+		case TERM_KEY_HOME: move_card(-PERSONDB_CARDS_MAX); break;
+		case TERM_KEY_END:  move_card(PERSONDB_CARDS_MAX); break;
+		default:            return;
+		}
 	} else {
 		switch (key) {
 		case TERM_KEY_UP:   move_perm(-1); break;

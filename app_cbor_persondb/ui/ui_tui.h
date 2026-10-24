@@ -6,8 +6,8 @@
  *
  * `persondb tui` takes over the shell's terminal: a page of persons on the
  * left, the selected one's permissions and cards on the right, and dialogs to
- * grant and revoke permissions, rename a person and set the days their cards
- * are valid. `q` gives the terminal back to the shell.
+ * grant and revoke permissions, add and remove cards, rename a person and set
+ * the days their cards are valid. `q` gives the terminal back to the shell.
  */
 
 #ifndef APP_CBOR_PERSONDB_UI_TUI_H_

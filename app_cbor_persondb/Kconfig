@@ -38,10 +38,10 @@ config APP_CBOR_PERSONDB_TUI
 	depends on APP_CBOR_PERSONDB_FRONTEND_SHELL
 	help
 	  Adds "persondb tui": a VT100 full-screen view of the stored persons
-	  with dialogs to grant and revoke permissions, rename a person and
-	  set the days their cards are valid. It draws over the shell's own
-	  terminal and hands it back on 'q'. Plain VT100 and DEC line
-	  drawing, 80x24, so any serial terminal will do. Costs ~2.9 KB of
+	  with dialogs to grant and revoke permissions, add and remove cards,
+	  rename a person and set the days their cards are valid. It draws
+	  over the shell's own terminal and hands it back on 'q'. Plain
+	  VT100 and DEC line drawing, 80x24, so any serial terminal will do. Costs ~2.9 KB of
 	  .bss (measured with nm): the page cache, the selected person and a
 	  read buffer. Nothing on the shell thread's stack beyond what the
 	  shell commands already use.
