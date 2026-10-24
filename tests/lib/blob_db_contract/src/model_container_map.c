@@ -53,6 +53,10 @@ static bool mc_ready;
 static enum mc_crash_point mc_fail_step;
 static int mc_fail_rc;
 
+/* Test hook (mc_fail_key_read): the next key read in list_find() returns
+ * this error instead of reading. */
+static int mc_key_read_rc;
+
 /* ---- (de)serialization ------------------------------------------------ */
 
 static size_t list_serialize(const struct mc_list *l, uint8_t *buf)
@@ -179,21 +183,33 @@ static bool list_refs_any(const struct mc_list *l, const uint64_t *ids, size_t n
 	return false;
 }
 
-/* Find the entry index for `key`, or -1. */
+/* Find the entry index for `key`. Returns -ENOENT on a miss, or the error
+ * of a key read that failed: an unreadable key is not an absent one, and a
+ * mutation that took it as a miss would insert a duplicate. */
 static int list_find(const struct mc_list *l, const char *key, size_t klen)
 {
 	for (uint32_t i = 0; i < l->count; i++) {
 		uint8_t kb[MC_MAX_KEY];
 		size_t got;
+		int rc;
 
-		if (blob_db_get(l->e[i].kid, kb, sizeof(kb), &got) < 0) {
+		if (mc_key_read_rc != 0) {
+			rc = mc_key_read_rc;
+			mc_key_read_rc = 0;
+		} else {
+			rc = blob_db_get(l->e[i].kid, kb, sizeof(kb), &got);
+		}
+		if (rc == -ENOENT) {
 			continue;   /* dangling ref — treated as absent (§7) */
+		}
+		if (rc < 0) {
+			return rc;
 		}
 		if (got == klen && memcmp(kb, key, klen) == 0) {
 			return (int)i;
 		}
 	}
-	return -1;
+	return -ENOENT;
 }
 
 /* ---- recovery (l1_model_container.md §6) ------------------------------ */
@@ -361,7 +377,7 @@ int mc_get(const char *key, void *out, size_t out_sz, size_t *out_len)
 	int idx = list_find(&l, key, strlen(key));
 
 	if (idx < 0) {
-		return -ENOENT;
+		return idx;
 	}
 	return blob_db_get(l.e[idx].vid, out, out_sz, out_len);
 }
@@ -398,6 +414,11 @@ void mc_fail_after(enum mc_crash_point step, int err)
 	mc_fail_rc = err;
 }
 
+void mc_fail_key_read(int err)
+{
+	mc_key_read_rc = err;
+}
+
 /* Every mutation starts here: finish whatever an earlier failed abort left
  * staged, before this mutation's STAGE overwrites the intent. One read when
  * nothing is in flight. */
@@ -429,7 +450,12 @@ int mc_set(const char *key, const void *val, size_t vlen,
 
 	int idx = list_find(&l, key, klen);
 
-	/* Refuse before anything is written, so a full list costs nothing. */
+	/* Refuse before anything is written: an unreadable key (the state is
+	 * unknown — insert or overwrite?) and a full list cost nothing. Past
+	 * this point idx < 0 means the key is absent. */
+	if (idx < 0 && idx != -ENOENT) {
+		return idx;
+	}
 	if (idx < 0 && l.count >= MC_MAX_ENTRIES) {
 		return -ENOSPC;
 	}
@@ -566,7 +592,7 @@ int mc_del(const char *key, enum mc_crash_point crash_at)
 	int idx = list_find(&l, key, strlen(key));
 
 	if (idx < 0) {
-		return -ENOENT;
+		return idx;
 	}
 
 	/* step 0: a delete creates nothing — no ids to allocate. */
