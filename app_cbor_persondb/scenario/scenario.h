@@ -52,8 +52,8 @@ int64_t scenario_since_us(int64_t since_us);
 int scenario_open(struct scenario *s);
 int scenario_close(struct scenario *s);
 
-/** Drop everything and start over (CONFIG_..._FRESH_START, or `reset`). */
-int scenario_erase(struct scenario *s);
+/** Destroy this store and build an empty one (`persondb reset`). */
+int scenario_reset(struct scenario *s);
 
 /* -- population --------------------------------------------------------- */
 

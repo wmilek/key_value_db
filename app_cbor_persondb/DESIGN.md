@@ -966,6 +966,44 @@ ships now is the half that has to exist *before* that build does — the older
 build's side — and `tests/app_cbor_persondb` exercises it by planting the
 tables a newer build would leave.
 
+### 12.4 Destroying a store — this store, not the partition
+
+`blob_db` is shared: `rootreg` exists so that several structures can each own
+a key and a root. `persondb reset` used to call `blob_db_erase_all()`, which
+removed every one of them and reset the id counter — a wipe of the device
+issued by one of its tenants. `persondb_destroy()` removes what the store
+owns and nothing else: every table its directory lists, the superblock, then
+its registry entry. A whole-partition wipe stays available where it belongs —
+`--flash_erase`, the test fixture, and `CONFIG_APP_CBOR_PERSONDB_FRESH_START`
+for a benchmark's clean start.
+
+**A newer build's tables go too**, whatever their class: class says what an
+older build may do while *keeping* the store, and a destroy keeps nothing.
+
+**Everything is checked before anything is released.** The superblock does
+not say what kind of container a table is, and every one this build knows is
+a kvhash map; a table that is not one — a newer build's other container — is
+refused with the store untouched, rather than destroyed half-way.
+
+**It survives a power cut.** The order is §12.3's, extended: the tables while
+the superblock still names them, then the superblock, then the registry entry
+(rootreg's teardown-before-unregister). Each step is repeatable, and two
+in-between states need the open path's help:
+
+- *Tables part-released.* This build's own two tables are released first and
+  `persondb_open()` stats both, so a crash anywhere in the release opens as
+  `-EINPROGRESS` rather than as a store that answers every lookup "not found".
+- *Superblock deleted, entry still registered.* This looks exactly like a
+  create that crashed before its commit, but `blob_db_update()` on a deleted
+  id is undefined (D3). So `persondb_open()` no longer binds a missing
+  superblock at the registered id: it drops the entry and builds at a fresh
+  one. An id that was never bound holds nothing, so this leaks nothing.
+
+**What it cannot do.** It must read the superblock to know what it owns, so a
+store whose superblock is a newer format than this build reads is refused
+(`-ENOTSUP`). Fixing that means freezing the part of the superblock that lists
+the roots, so every later build keeps it readable — deliberately not done yet.
+
 ## 13. Acceptance criteria
 
 - **A1** Builds for `native_sim` and `nrf5340dk/nrf5340/cpuapp`; all three

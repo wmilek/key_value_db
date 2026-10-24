@@ -395,14 +395,15 @@ static int cmd_unassign(const struct shell *sh, size_t argc, char **argv)
 }
 
 /* The one command that does not need an open store: it is how a store this
- * build cannot open — one a newer build wrote — gets replaced. */
+ * build refuses — a newer build's, or one a reset lost power in — gets
+ * replaced. Only this store goes; the rest of the partition is untouched. */
 static int cmd_reset(const struct shell *sh, size_t argc, char **argv)
 {
 	int rc;
 
 	ARG_UNUSED(argc);
 	ARG_UNUSED(argv);
-	rc = scenario_erase(&g_s);
+	rc = scenario_reset(&g_s);
 	g_open = (rc == 0);
 	shell_print(sh, "reset: %d", rc);
 	return rc;
@@ -423,7 +424,7 @@ SHELL_STATIC_SUBCMD_SET_CREATE(
 	SHELL_CMD_ARG(revoke, NULL, "revoke <person-id> <perm>", cmd_revoke, 3, 0),
 	SHELL_CMD_ARG(assign, NULL, "assign <person-id> <card-id>", cmd_assign, 3, 0),
 	SHELL_CMD_ARG(unassign, NULL, "unassign <card-id>", cmd_unassign, 2, 0),
-	SHELL_CMD_ARG(reset, NULL, "Erase the store and start over", cmd_reset, 1, 0),
+	SHELL_CMD_ARG(reset, NULL, "Destroy this store and start over", cmd_reset, 1, 0),
 	SHELL_COND_CMD_ARG(CONFIG_APP_CBOR_PERSONDB_TUI, tui, NULL,
 			   "Full-screen browser: persons, grant/revoke", cmd_tui, 1, 0),
 	SHELL_SUBCMD_SET_END);
@@ -436,10 +437,9 @@ int ui_main(void)
 
 	if (rc != 0) {
 		printk("persondb: open failed: %d\n", rc);
-		if (rc == -ENOTSUP) {
-			printk("The log above says what this build cannot "
-			       "read. `persondb reset` erases the store and "
-			       "starts over.\n");
+		if (rc == -ENOTSUP || rc == -EINPROGRESS) {
+			printk("The log above says why. `persondb reset` "
+			       "destroys the store and starts over.\n");
 		}
 		return rc;
 	}

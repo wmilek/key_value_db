@@ -341,7 +341,7 @@ persondb card <card-id>           resolve a card to its owner
 persondb check <card> <perm>      the access decision, timed
 persondb grant|revoke <id> <perm>
 persondb assign <id> <card> | unassign <card>
-persondb reset                    erase and start over
+persondb reset                    destroy this store and start over
 ```
 
 The shell frontend also brings in the read-only `blob_db` group
@@ -361,9 +361,11 @@ Worth stating, because a practices guide is read as a checklist:
 - **Recovery from a corrupt store.** A bad superblock or an unreadable registry
   entry surfaces as `-EIO` or `-ENOTSUP` from `persondb_open()`, and both
   frontends print the errno and stop. That is honest but not a recovery story:
-  the only repair on offer is `persondb reset` (or `--flash_erase`), which
-  discards everything. What a product should do instead — a second superblock,
-  a rebuild from a durable source — is out of scope here.
+  the only repair on offer is `persondb reset`, which discards the whole store
+  (and cannot remove one whose superblock it cannot read — `DESIGN.md` §12.4),
+  or `--flash_erase`, which discards the whole partition. What a product
+  should do instead — a second superblock, a rebuild from a durable source —
+  is out of scope here.
 - **Corrupt *records*, on the other hand, are handled**: a record that fails to
   decode returns `-EILSEQ` and is counted as a bad record by `verify` rather
   than crashing the run.

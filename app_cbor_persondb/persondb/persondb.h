@@ -137,7 +137,10 @@ struct persondb;
  * @retval -ENOTSUP the configured payload does not fit this geometry, or the
  *                  store needs something this build lacks: a newer superblock
  *                  format, a table a newer build marked required, a record
- *                  format it cannot read. persondb_erase() starts over.
+ *                  format it cannot read. persondb_destroy() removes it,
+ *                  except a newer superblock format (see there).
+ * @retval -EINPROGRESS a persondb_destroy() lost power part-way; repeating
+ *                  it finishes the job
  * @retval -EIO     flash error or a corrupt superblock
  */
 int persondb_open(struct persondb **db, uint32_t n_persons);
@@ -145,8 +148,33 @@ int persondb_open(struct persondb **db, uint32_t n_persons);
 /** Detach and unmount. The store's contents are untouched. */
 int persondb_close(struct persondb *db);
 
-/** Drop every record and rebuild an empty store. Reattaches @p db. */
-int persondb_erase(struct persondb **db, uint32_t n_persons);
+/**
+ * @brief Remove this store from flash: every table its superblock lists, the
+ *        superblock, and its registry entry — and nothing else.
+ *
+ * The partition is shared. Other registry entries, their blobs and the id
+ * counter are left as they were; a whole-partition wipe is not this module's
+ * to make (DESIGN.md §12.4). A newer build's tables are this store's too and
+ * go with it, whatever their class.
+ *
+ * Works on a store persondb_open() refuses, as long as its superblock can be
+ * read: that is what tells it which blobs are its own. It does not need an
+ * open handle; @p db, if open, is closed first and set to NULL. blob_db is
+ * left mounted, so persondb_open() can build a fresh store straight after.
+ *
+ * Resumable: on any error the store is untouched or part-way destroyed, and
+ * repeating the call carries on. persondb_open() refuses a part-way destroyed
+ * store with -EINPROGRESS rather than open one that has lost a map.
+ *
+ * @retval 0        removed, or there was no store
+ * @retval -ENOTSUP the superblock is a format this build cannot read, so it
+ *                  cannot tell which blobs belong to the store; nothing is
+ *                  touched
+ * @retval -EIO     a listed table is not a map this build can walk, a corrupt
+ *                  superblock, or a flash error. Refused before anything is
+ *                  released except when a flash error interrupts the release.
+ */
+int persondb_destroy(struct persondb **db);
 
 /**
  * @brief Pre-format flash erase blocks so first-touch erases leave the hot
