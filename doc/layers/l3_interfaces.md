@@ -67,8 +67,10 @@ enum kvdb_backend { KVDB_BACKEND_DEFAULT, KVDB_BACKEND_HASH,
                     KVDB_BACKEND_TREE, KVDB_BACKEND_LIST };
 
 struct kvdb_config {
-        enum kvdb_backend backend;          /* preferred impl — create-time only */
-        size_t            initial_capacity; /* hint (hash: bucket count) */
+        enum kvdb_backend backend;             /* preferred impl — create-time only */
+        size_t            expected_entries;    /* how many entries (0 = unknown) */
+        size_t            typical_entry_bytes; /* mean key+value bytes (0 = unknown) */
+        size_t            max_entry_bytes;     /* largest key+value bytes (0 = unknown) */
 };
 
 int  kvdb_open  (kvdb_t *db, const char *name, const struct kvdb_config *cfg);
@@ -82,9 +84,14 @@ bool kvdb_has   (kvdb_t *db, const char *key);
 name always attaches to the same store. Names are 1..`KVDB_NAME_MAX` bytes.
 
 **Creation config.** `cfg` is a *preference*, consumed **only when the named
-instance does not yet exist**. It names the backend to build and a capacity
-hint for it. On every subsequent open the persisted structure governs and `cfg`
-is ignored (a conflicting `cfg` is not an error — the stored store wins). Pass
+instance does not yet exist**. It names the backend to build and declares the
+population it will hold — the three size fields pass through unchanged to the
+backend's `map_config`, which derives its own geometry from them
+(`doc/layers/l2_containers.md` §4.3). They describe the data, not the
+container: 0 means "unknown" and lets the backend choose, while a field that
+is set is honoured or the create fails with the backend's `-EINVAL`. On every
+subsequent open the persisted structure governs and `cfg` is ignored (a
+conflicting `cfg` is not an error — the stored store wins). Pass
 `NULL`, or `KVDB_BACKEND_DEFAULT`, to accept the Kconfig-selected default. A
 backend requested (or previously stored) but not compiled into the build fails
 cleanly with `-ENOTSUP`.
