@@ -483,10 +483,11 @@ int scenario_report_get(struct scenario *s, struct scenario_report *out)
 	persondb_stat(s->db, &out->st);
 	persondb_progress_get(s->db, &populated, &rev);
 
-	/* Re-derive the content and add it up. There is no iteration (K6) and
-	 * no occupancy query (B3), so this is the only route — and it works
-	 * only because the dataset is a pure function of its index. A real
-	 * deployment, whose data comes from outside, could not do this at all. */
+	/* Re-derive the content and add it up. This predates map_ops.next
+	 * (K6, since closed) and there is still no occupancy query (B3); it
+	 * works only because the dataset is a pure function of its index. A
+	 * real deployment, whose data comes from outside, would instead walk
+	 * its maps with map_ops.next. */
 	for (uint32_t i = 0; i < populated; i++) {
 		dataset_person(i, rev, s->n_persons, &p);
 		person_bytes += persondb_person_record_bytes(&p) +
