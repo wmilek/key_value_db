@@ -496,12 +496,12 @@ int scenario_report_get(struct scenario *s, struct scenario_report *out)
 	persondb_stat(s->db, &out->st);
 	persondb_progress_get(s->db, &populated, &rev);
 
-	/* Re-derive the content and add it up: CPU only, where walking the
-	 * store (K6, now possible) would be ~49 s of flash reads on the DK,
-	 * and there is no occupancy query (B3). It works only because the
-	 * dataset is a pure function of its index; a real deployment, whose
-	 * data comes from outside, would have to walk. Persons added by hand
-	 * (persondb tui) are not in this figure. */
+	/* Re-derive the content and add it up. This predates map_ops.next
+	 * (K6, since closed) and there is still no occupancy query (B3); it
+	 * works only because the dataset is a pure function of its index. A
+	 * real deployment, whose data comes from outside, would instead walk
+	 * its maps with map_ops.next. Persons added by hand (persondb tui)
+	 * are not in this figure. */
 	for (uint32_t i = 0; i < populated; i++) {
 		dataset_person(i, rev, s->n_persons, &p);
 		person_bytes += persondb_person_record_bytes(&p) +

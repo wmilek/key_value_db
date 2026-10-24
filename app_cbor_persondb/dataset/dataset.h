@@ -7,13 +7,14 @@
  * Every field of person i is derived from i alone. Nothing here reads or
  * writes storage, and nothing is remembered between calls.
  *
- * That is not a shortcut, it is how this application verifies itself. When
- * this was written the Map shape had no iteration (FINDINGS.md K6), so a run
- * had no way to discover what a previous run wrote. It now has one, but a walk
- * says what is stored, not what should be, and costs ~49 s on the DK.
- * Making the expected content computable from an index means verification
- * needs no shadow state, no journal, and no RAM proportional to the dataset
- * (P3) — a rerun re-derives what boot N-1 should have stored and checks it.
+ * That is not a shortcut, it is how this application verifies itself. It
+ * began as the only way: the Map shape had no iteration (FINDINGS.md K6), so a
+ * store could not be enumerated. K6 is now closed — map_ops.next walks a map —
+ * but a walk only reports what a store holds, not what it should hold, so a
+ * check still needs an independent source of the expected content. Making
+ * that content computable from an index means verification needs no shadow
+ * state, no journal, and no RAM proportional to the dataset (P3) — a rerun
+ * re-derives what boot N-1 should have stored and checks it.
  *
  * The one time-varying input is `rev`, the mutation revision, which decides
  * only whether a person currently holds its temporary card.

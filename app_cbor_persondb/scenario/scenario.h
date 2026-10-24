@@ -201,11 +201,13 @@ struct scenario_report {
 /**
  * @brief Account for what the store holds.
  *
- * Computed from the generator, not from the store. The store can now be
- * walked (FINDINGS.md K6), but a walk of 8 000 persons is ~49 s of flash
- * reads on the DK, and there is still no occupancy query (B3) — re-deriving
- * the content and adding it up costs CPU only. Physical occupancy — live bytes plus uncompacted garbage —
- * stays unobservable.
+ * Computed from the generator, not from the store. This was written when
+ * there was no iteration (FINDINGS.md K6) and no occupancy query (B3), so
+ * re-deriving its own content and adding it up was the only way an
+ * application could say how full its flash is. K6 has since closed —
+ * map_ops.next could walk the maps and add up what is actually stored — but
+ * this function has not been changed to do so. Physical occupancy — live
+ * bytes plus uncompacted garbage — stays unobservable either way (B3).
  */
 int scenario_report_get(struct scenario *s, struct scenario_report *out);
 
