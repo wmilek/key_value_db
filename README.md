@@ -354,6 +354,7 @@ contracts and must never be depended on from above.
 | [`doc/impl/l1_bucketlog.md`](doc/impl/l1_bucketlog.md) | implementation design of the v1 bucket-log allocator |
 | [`doc/impl/l0_backends.md`](doc/impl/l0_backends.md) | implementation design of the two L0 providers (`flash_area`, UBI) |
 | [`doc/proposals/`](doc/proposals) | change proposals: analysis + design for a change spanning a contract and its implementation |
+| [`doc/comparisons/2026-10-11-littlefs-vs-blobfs.md`](doc/comparisons/2026-10-11-littlefs-vs-blobfs.md) | littlefs vs blobfs: footprint, predicted flash time on the DK, semantics — with the harness that measured them |
 | [`doc/reviews/`](doc/reviews) | dated design-document reviews and their findings |
 
 API reference lives in the public headers under
