@@ -22,10 +22,15 @@ them: the register is the record of what an application hit, and a fixed
 finding with its before/after numbers is more use than a silent gap. The
 remaining open ones are listed in the summary below.
 
+**A sixth closed later, at L2: K6.** The Map shape gained a stateless
+enumeration op, `map_ops.next`, together with `count` and `destroy` (all
+implemented by `kvhash`), so "no iteration" no longer holds. The entry is kept
+with what closed it and what it still costs; see K6.
+
 | | |
 |---|---|
-| **Closed by `main`** | B1, B5 (partly), B9, B10, B3 (partly) |
-| **Still open** | B2, B4, B6, B7, B8, B11, B12, K1–K11, **K12**, **K13**, V1–V4, X1 |
+| **Closed by `main`** | B1, B5 (partly), B9, B10, B3 (partly), **K6** (`map_ops.next`; a walk costs reads per entry, and it is unsorted) |
+| **Still open** | B2, B4, B6, B7, B8, B11, B12, K1–K5, K7–K11, **K12**, **K13**, V1–V4, X1 |
 | **Withdrawn** | R1 — `ROOTREG_MAX_ROOTS`'s default was never the problem; the layout that wanted seventeen entries was (`DESIGN.md` §12.1) |
 | **Newly observed** | N1 — transaction count rose sharply as byte count fell (closed on hardware: ~65 µs per transaction) · B12 — compaction lowers the durable id ceiling ([issue #14](https://github.com/wmilek/key_value_db/issues/14)) |
 | **Found by removing a workaround** | **K12** — the largest map the geometry allows cannot be written to · **K13** — the directory blob caps the store at 9 670 persons, half the partition. Both were invisible while the app sharded its person records over sixteen maps; both appeared in the first hour after it stopped (`DESIGN.md` §12.2). |
@@ -82,7 +87,7 @@ The B1 prediction was right, and larger than claimed: 19× fewer bytes, not
 | **K5** directory rewrite | **Partly**, same sketch — and only when the directory is large enough to segment. |
 | **K7** shared scratch buffers | **Halved** — `dir_buf` disappears under the pread directory. |
 | **K11** directory read per op | **Not fixed; arguably worsened.** See below. |
-| **B2** five erases per compaction, **B3** no introspection, **B4** O(n²) walks, **B7** `prepare()` sizing, **K2** bucket overflow, **K3** fixed bucket count, **K4** bucket rewrite amplification, **K6** no iteration, **K9** silent clamp, **K10** no `stat`, **V1**–**V4** | **Untouched.** Out of scope, and the companion note is explicit that `kvhash` needs no change. |
+| **B2** five erases per compaction, **B3** no introspection, **B4** O(n²) walks, **B7** `prepare()` sizing, **K2** bucket overflow, **K3** fixed bucket count, **K4** bucket rewrite amplification, **K6** no iteration (since closed separately, by `map_ops.next`), **K9** silent clamp, **K10** no `stat`, **V1**–**V4** | **Untouched.** Out of scope, and the companion note is explicit that `kvhash` needs no change. |
 
 **Where I disagree — the pread directory and K11.** The companion note's
 follow-up replaces `dir_bucket(idx)` with
@@ -451,6 +456,13 @@ or a durable creation-intent list that a later mount can roll back —
 `BLOB_CONTAINERS_INTENT` is scaffolded for something like this but not
 implemented.
 
+*Update:* K6 is now closed, and it does not close this. `map_ops.next` walks
+the *entries* of a map whose root you hold; it does not report the blob ids
+that map reaches, so it cannot supply the "mark" half. `map_ops.destroy`
+releases every blob of a map — but only one whose root the caller still knows,
+and an orphan is by definition a root nobody recorded. The "sweep" half still
+needs an L1 walk of every live id, which is B4's O(n²).
+
 ---
 
 ## L2 — `kvhash` and the Map shape
@@ -590,6 +602,15 @@ needs iteration, which does not exist (K6). Capacity must be planned exactly,
 before the first insert, at a layer with no visibility into how much flash
 exists (B3).
 
+*Update:* the rebuild now has its parts (K6, closed): walk the old map with
+`map_ops.next`, `set` every entry into a map created at a fresh id with a
+larger declaration, publish the new root, then `map_ops.destroy` the old one.
+The finding stands all the same. The bucket count itself is still fixed; the
+rebuild is a full copy, paying K4's bucket rewrites on every entry; it needs
+room for both maps at once, which is least available exactly when a map has
+outgrown its geometry (K13); and publishing the new root crash-safely is the
+application's job.
+
 ### K4 — Every `set` rewrites the whole bucket blob (major, `read`)
 
 Insert, update and delete read the bucket, edit it in RAM, and
@@ -614,7 +635,9 @@ application has to trade them off with no visibility into either.
 Direction: the directory is a dense array of ids; a bucket's id could be derived
 rather than stored, or the directory chunked so a publish rewrites 64 B.
 
-### K6 — No iteration (major, `read`)
+### K6 — No iteration — **CLOSED by `main`** (was major)
+
+*As first recorded:*
 
 `map_ops` has no `iterate`. An application cannot enumerate, back up, migrate,
 fsck or garbage-collect its own data. Every key must be regenerable from outside
@@ -622,6 +645,52 @@ the store — which this app arranges (F6) by making the dataset a pure function
 of an index, but a deployment with externally-sourced keys cannot.
 
 `doc/layers/l3_interfaces.md` §3 records this as deferred until `kvtree`.
+
+**Closed** without waiting for `kvtree`, by `e895dc3 Add stateless map_ops.next
+enumeration, implemented by kvhash`, alongside `8450778 Add map_ops.count` and
+the earlier `f959f1e containers: test the Map shape directly, and give it a
+destroy`. `kvhash_map_ops` implements all three, with no on-flash format change.
+
+> `include/app/lib/containers/shape_map.h` `map_ops.next`, `.count`,
+> `.destroy`; `lib/containers/kvhash/kvhash.c` `kvhash_next`, `kvhash_count`,
+> `kvhash_destroy`
+
+Against the list above:
+
+- **Enumerate, back up.** `next(root, key, …)` returns the entry after `key`.
+  The key is the cursor, so there is no iterator to open, close or invalidate;
+  a walk starts from an empty key, resumes from a saved key after a reboot,
+  tolerates `set`/`del` between calls, and returns every key present for the
+  whole walk exactly once.
+- **Migrate.** Walk with `next`, `set` into a map at a fresh id, `destroy` the
+  old one. This is the rebuild K3 said was impossible; K3 records what it
+  still costs.
+- **fsck.** `count` gives the exact key count from what is on flash, correct
+  after a power cut at any point, with no counter kept on the write path.
+- **Garbage-collect.** `destroy` releases every blob a map root reaches, and
+  resumes if interrupted. It needs the root, though — see B8's update for why
+  that does not reach orphans.
+
+A deployment with externally-sourced keys no longer has to regenerate them to
+find out what it stored.
+
+**What still holds:**
+
+- **A walk is paid per entry, in reads.** `next` is stateless, so every call
+  locates its cursor from scratch: it re-reads the directory (at depth 2, the
+  top directory and then the sub-map's) and the cursor's bucket, then searches
+  forward past empty buckets to the next entry. A full walk of *n* entries is
+  therefore at least 2*n* blob reads at depth 1 and 3*n* at depth 2 — every
+  bucket re-read once for each entry it holds — plus a read for each spilled
+  key or value copied out. `count` is the cheap one: it reads each record once,
+  so its cost is per record, not per entry. Both are mount and recovery tools,
+  and `shape_map.h` says so.
+- **Hash order, not sorted.** Ordered scans still wait for `kvtree`.
+- **Not wired above L2.** `kvdb_foreach` is still deferred
+  (`doc/layers/l3_interfaces.md` §3). This app binds `map_ops` directly, so it
+  has `next`; it does not use it yet. Verification, `scenario_report_get()` and
+  `tools/sizing.py` still re-derive content from the dataset (F6, README
+  practice 7).
 
 ### K7 — Scratch buffers are file-scope and shared across all maps (moderate, `read`)
 
@@ -743,7 +812,8 @@ create time and persisted (K3), so a wrong value is baked into the store
 forever; the store gives no occupancy signal (K10); and the failure surfaces as
 a `-ENOSPC` from one bucket while the medium is nearly empty (K2), potentially
 hours into a fill, with no repair path short of a rebuild that needs iteration
-(K6) that does not exist.
+(K6) that does not exist. *(Since closed: `map_ops.next` makes that rebuild
+possible, at the cost of a full copy — see K3.)*
 
 **The sharpest edge is cross-Kconfig coupling.**
 `CONFIG_BLOB_DB_MAX_PAYLOAD_LEN` is a single global symbol, and `MAX_BUCKETS`
@@ -793,6 +863,9 @@ and the only one that lets `tools/sizing.py` be deleted.
 `map_ops` has `create`/`get`/`set`/`del` and nothing else. An application cannot
 ask how many entries a map holds or how close a bucket is to K2's cliff, so it
 cannot decide when to add a map. With K6 it cannot even count them by walking.
+*(Since K6 closed, it can: `map_ops.count` returns the exact key count by
+walking every record, and `map_ops.stat` reports the delivered geometry.
+Per-bucket occupancy, the half that would show K2's cliff, is still absent.)*
 
 This is the finding that makes K2 expensive rather than merely present: a
 `map_ops.stat(root)` returning entry count and peak bucket occupancy would let
@@ -907,7 +980,9 @@ reports `-ENOSPC` with no warning first. A near-full bucket signal was
 prototyped and removed (proposal D3d); it would not have helped here in any
 case, having stayed silent through every run above — correctly, because it was
 a *bucket* signal and this is a medium wall. An application still cannot see
-this coming (B3, V3) and still cannot recover from it (K3, K6).
+this coming (B3, V3) and still cannot recover from it (K3). K6's closure does
+not change that here: `map_ops.next` allows a rebuild, but a rebuild needs room
+for a second copy, which is the one thing a full medium lacks.
 
 **Below is the finding as first measured, on the one-level container.**
 
