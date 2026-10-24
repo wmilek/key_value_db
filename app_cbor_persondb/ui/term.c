@@ -309,6 +309,7 @@ int term_key_feed(uint8_t c)
 		return TERM_KEY_BACKSPACE;
 	case TERM_KEY_TAB:
 	case TERM_KEY_CTRL_C:
+	case TERM_KEY_CTRL_D:
 	case TERM_KEY_CTRL_L:
 		return c;
 	default:

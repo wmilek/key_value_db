@@ -16,30 +16,34 @@
  *  └───────────────────────────────────┘└────────────────────────────────┘
  *   status: what the last operation did, its return code, its time
  *   keys: Tab cycles list / permissions / cards; a adds and d removes in
- *   the focused pane; n name, v valid from/to, g goto, c find a card
+ *   the focused pane (persons, permissions, cards); n name, v valid from/to,
+ *   g open by id, c open by card, q / Ctrl-C / Ctrl-D back to the shell
  *
  * Three things below are shaped by the store rather than by taste:
  *
- *  - The list is dataset indices 0..populated-1. A kvhash map cannot be
- *    iterated (FINDINGS.md K6), so the only persons this screen can list are
- *    the ones whose ids the generator can name. A person put by id from
- *    outside the dataset exists and can be reached by card, but not listed.
- *    There is no search by name for the same reason: it would read all 8 000
- *    records, 1-2 minutes on the DK.
+ *  - The list is a walk of the people map (persondb_person_next), so it shows
+ *    every stored person — dataset or added by hand — in the container's
+ *    order: stable, but not sorted. The walk is stateless and forward-only,
+ *    keyed by the last id read, so a page is "the 17 persons after this id".
+ *    The start of each page visited is remembered (PAGE_CURSORS of them), so
+ *    PgUp is free; End and far jumps walk, with progress, and any key stops
+ *    them. There is no search by name: it would read every record, ~49 s on
+ *    the DK at 8 000 persons. `g` (id) and `c` (card) go straight to one
+ *    person instead.
  *
- *  - Every row is one persondb_person_get — 7.8 ms on the DK at the measured
- *    fill, more on a fuller store (RESULTS.md). A page is therefore read one
- *    row at a time and each row is drawn as it arrives, and only a ~44-byte
- *    summary per row is kept: the full record (~720 B) is held for the
- *    selected person alone.
+ *  - Every row costs about one persondb_person_get (~6 ms of flash reads on
+ *    the DK), so a page is drawn row by row as the walk returns them, and only
+ *    a ~44-byte summary per row is kept: the full record (~720 B) is held for
+ *    the selected person alone. The total comes from persondb_person_count()
+ *    once, at entry (~2 s on the DK), and is kept up to date from there.
  *
  *  - After any write the person is read back from the store, never
  *    patched in RAM. What the screen shows is what was stored — and the
  *    status line reports the return code and the time the write took.
  *
- * A person changed here no longer matches the generator, so `persondb
- * verify` will count it as a bad record if it samples that index. That is
- * verify doing its job, not a fault in either.
+ * A dataset person changed here no longer matches the generator, so `persondb
+ * verify` will count it as a bad record (or, deleted, as missing) if it
+ * samples that index. That is verify doing its job, not a fault in either.
  */
 
 #include <errno.h>
@@ -96,10 +100,13 @@ BUILD_ASSERT(DET_CTOP + PERSONDB_CARDS_MAX <= BOX_ROW + BOX_H - 1,
 
 /* -- state --------------------------------------------------------------- */
 
+/* Page starts remembered for PgUp: 128 pages is 2 176 persons back, 512 B.
+ * Further back costs a walk from the nearest one remembered. */
+#define PAGE_CURSORS 128
+
 /** One list row: what the list shows, without the ~720 B record. */
 struct row {
-	bool     used;          /* a person index, not blank space past the end */
-	int      rc;            /* the read's result; non-zero shows as an error */
+	bool     used;          /* a person, not blank space past the end */
 	uint32_t id;
 	uint8_t  n_perms;
 	uint8_t  n_cards;
@@ -107,8 +114,8 @@ struct row {
 	char     dept[10];
 };
 
-/* The three panes Tab cycles through; a and d act on the focused one, and
- * on permissions from the list. */
+/* The three panes Tab cycles through; a and d act on the focused one: persons
+ * in the list, permissions, cards. */
 enum focus { FOCUS_LIST, FOCUS_PERMS, FOCUS_CARDS };
 
 enum mode {
@@ -122,15 +129,19 @@ enum mode {
 enum purpose {
 	FOR_GRANT,          /* pick: a permission to grant */
 	FOR_GRANT_OTHER,    /* input: a permission name not in the vocabulary */
-	FOR_REVOKE,         /* pick: a held permission to revoke */
 	FOR_REVOKE_CONFIRM, /* confirm: revoke g.perm */
-	FOR_GOTO,           /* input: a person id or dataset index */
+	FOR_GOTO,           /* input: a person id */
 	FOR_CARD,           /* input: a card id, to jump to its holder */
 	FOR_RENAME,         /* input: the person's new name */
 	FOR_VALID_FROM,     /* input: first valid day, then ... */
 	FOR_VALID_UNTIL,    /* input: ... last valid day */
 	FOR_CARD_ADD,       /* input: a card id to assign */
 	FOR_CARD_REMOVE,    /* confirm: remove g.card */
+	FOR_NEW_ID,         /* input: a new person's id, then ... */
+	FOR_NEW_NAME,       /* ... name, then ... */
+	FOR_NEW_FROM,       /* ... first valid day, then ... */
+	FOR_NEW_UNTIL,      /* ... last valid day; written only after this one */
+	FOR_DELETE,         /* confirm: delete the selected person */
 };
 
 static const char OTHER[] = "<other...>";
@@ -141,12 +152,27 @@ static struct {
 	struct scenario     *s;
 	bool                 logs_muted;
 
-	uint32_t             n;          /* persons listable: populated count */
+	uint32_t             n;          /* persons stored (count at entry,
+					  * kept up to date since) */
+	uint32_t             populated;  /* dataset fill, for the title */
 	uint32_t             n_persons;
 	uint32_t             rev;
 
-	uint32_t             top;        /* index of the first row on the page */
-	uint32_t             cur;        /* selected index */
+	uint32_t             top;        /* walk position of the page's first row */
+	uint32_t             cur;        /* walk position of the selected row */
+	bool                 detached;   /* g.sel was opened by id or card and
+					  * is not (known to be) on this page */
+
+	/* The page on screen: the cursor it was read after, and the one the
+	 * next page is read after (its last row), when it was full. */
+	bool                 shown_valid;
+	uint32_t             shown_page;
+	bool                 shown_has_after;
+	uint32_t             shown_after;
+	bool                 next_valid;
+	uint32_t             next_after;
+	bool                 approx;     /* positions may be off since an edit;
+					  * see pages_forget() */
 	enum focus           focus;
 	uint8_t              perm_cur;
 	uint8_t              perm_top;
@@ -165,6 +191,8 @@ static struct {
 	char                 card[PERSONDB_CARD_LEN + 1];
 	uint32_t             new_from;   /* carried from one validity dialog
 					  * to the next */
+	uint32_t             new_id;     /* a person being added, staged */
+	char                 new_name[PERSONDB_NAME_MAX + 1];
 
 	char                 status[TERM_COLS];
 	bool                 status_err;
@@ -174,6 +202,46 @@ static struct {
  * kept off the shell thread's stack, which blob_db's write path already
  * claims most of (Kconfig, SHELL_STACK_SIZE). */
 static struct persondb_person g_scratch;
+
+/* g_page_after[k]: the id of the last person on page k-1, i.e. the cursor
+ * that page k is read after. Page 0 is read from the start and needs none. */
+static uint32_t g_page_after[PAGE_CURSORS];
+static uint8_t  g_page_known[PAGE_CURSORS / 8];
+
+static bool page_known(uint32_t k)
+{
+	return k == 0 ||
+	       (k < PAGE_CURSORS && (g_page_known[k / 8] & BIT(k % 8)));
+}
+
+static void page_remember(uint32_t k, uint32_t after)
+{
+	if (k > 0 && k < PAGE_CURSORS && !g.approx) {
+		g_page_after[k] = after;
+		g_page_known[k / 8] |= BIT(k % 8);
+	}
+}
+
+/*
+ * After an insert or a delete, forget the remembered page starts.
+ *
+ * The starts are ids, and an id stays a valid cursor whatever happens to it.
+ * What goes stale is the page *boundaries*: insert a person into page j and
+ * page j's 17 rows now end one person early, while page j+1 still starts
+ * after the old last one — who is then on neither page. So the cache is
+ * dropped, and the next jump walks from page 0 and rebuilds it.
+ *
+ * The page on screen keeps its own start (g.shown_after), so the screen does
+ * not jump, and PgDn from it still works; but its position numbers may now be
+ * off, so they are shown as approximate until that walk from page 0.
+ */
+static void pages_forget(void)
+{
+	memset(g_page_known, 0, sizeof(g_page_known));
+	if (g.shown_valid && g.shown_page > 0) {
+		g.approx = true;
+	}
+}
 
 /* -- small helpers ------------------------------------------------------- */
 
@@ -301,13 +369,9 @@ static bool sel_holds(const char *perm)
 	return false;
 }
 
-static void summarize(struct row *r, const struct persondb_person *p, int rc)
+static void summarize(struct row *r, const struct persondb_person *p)
 {
 	r->used = true;
-	r->rc = rc;
-	if (rc != 0) {
-		return;
-	}
 	r->id = p->id;
 	r->n_perms = p->n_perms;
 	r->n_cards = p->n_cards;
@@ -330,8 +394,9 @@ static void draw_title(void)
 	};
 	const char *right = pane[g.focus];
 
-	snprintf(left, sizeof(left), " persondb | %u of %u persons | rev %u",
-		 g.n, g.n_persons, g.rev);
+	snprintf(left, sizeof(left),
+		 " persondb | %u stored | dataset %u/%u | rev %u", g.n,
+		 g.populated, g.n_persons, g.rev);
 	term_attr(TERM_BOLD_REVERSE);
 	term_field(TITLE_ROW, 1, TERM_COLS - (int)strlen(right), left);
 	term_puts(right);
@@ -341,9 +406,9 @@ static void draw_title(void)
 static void draw_row(int i)
 {
 	const struct row *r = &g.rows[i];
-	uint32_t index = g.top + (uint32_t)i;
+	uint32_t pos = g.top + (uint32_t)i;
 	int row = LIST_TOP + i;
-	bool sel = r->used && index == g.cur;
+	bool sel = r->used && !g.detached && pos == g.cur;
 
 	if (sel) {
 		term_attr(g.focus == FOCUS_LIST ? TERM_REVERSE : TERM_BOLD);
@@ -353,9 +418,6 @@ static void draw_row(int i)
 
 	if (!r->used) {
 		term_field(row, LIST_COL + 1, LIST_W - 2, "");
-	} else if (r->rc != 0) {
-		term_fieldf(row, LIST_COL + 1, LIST_W - 2, " %6u  <read failed: %d>",
-			    scenario_id_of(index), r->rc);
 	} else {
 		term_fieldf(row, LIST_COL + 1, LIST_W - 2,
 			    " %6u  %-20.20s %-9.9s %2u %u", r->id, r->name,
@@ -369,8 +431,16 @@ static void draw_list_frame(void)
 	char title[32] = "Persons";
 
 	if (g.n > 0) {
-		snprintf(title, sizeof(title), "Persons %u-%u of %u", g.top,
-			 MIN(g.top + LIST_ROWS, g.n) - 1, g.n);
+		uint32_t used = 0;
+
+		while (used < LIST_ROWS && g.rows[used].used) {
+			used++;
+		}
+		/* Positions in walk order, from 1; "~" while an edit may have
+		 * shifted them (pages_forget). */
+		snprintf(title, sizeof(title), "Persons %s%u-%u of %u",
+			 g.approx ? "~" : "", g.top + 1,
+			 g.top + MAX(used, 1u), g.n);
 	}
 	term_box(BOX_ROW, LIST_COL, BOX_H, LIST_W, title, NULL, false);
 	term_attr(TERM_DIM);
@@ -427,11 +497,13 @@ static void draw_perm_row(int i)
 
 static void draw_detail(void)
 {
-	char title[16];
+	char title[24];
 	char from[24], until[24];
 
 	if (g.sel_rc == 0) {
-		snprintf(title, sizeof(title), "%u", g.sel.id);
+		/* "by id": opened with g or c, not picked from this page. */
+		snprintf(title, sizeof(title), g.detached ? "%u, by id" : "%u",
+			 g.sel.id);
 	} else {
 		snprintf(title, sizeof(title), "-");
 	}
@@ -448,6 +520,8 @@ static void draw_detail(void)
 			term_field(DET_NAME, DET_COL + 1, DET_IN,
 				   " store is empty");
 			term_field(DET_DEPT, DET_COL + 1, DET_IN,
+				   " a: add a person, or");
+			term_field(DET_VALID, DET_COL + 1, DET_IN,
 				   " q, then: persondb fill 200");
 		}
 		return;
@@ -459,8 +533,12 @@ static void draw_detail(void)
 	term_attr(TERM_BOLD);
 	term_fieldf(DET_NAME, DET_COL + 1, DET_IN, " %s", g.sel.name);
 	term_attr(TERM_NORMAL);
-	term_fieldf(DET_DEPT, DET_COL + 1, DET_IN, " %s / %s", g.sel.dept,
-		    g.sel.title);
+	if (g.sel.dept[0] != '\0' || g.sel.title[0] != '\0') {
+		term_fieldf(DET_DEPT, DET_COL + 1, DET_IN, " %s / %s",
+			    g.sel.dept, g.sel.title);
+	} else {
+		term_field(DET_DEPT, DET_COL + 1, DET_IN, " (no department)");
+	}
 	term_fieldf(DET_VALID, DET_COL + 1, DET_IN, " valid %s .. %s", from,
 		    until);
 
@@ -493,9 +571,17 @@ static void draw_status(void)
 
 static void draw_help(void)
 {
+	static const char *const act[] = {
+		[FOCUS_LIST]  = " a add person  d delete  n name  v valid"
+				" from/to  g goto id  c card  q shell",
+		[FOCUS_PERMS] = " a grant  d revoke  n name  v valid from/to"
+				"  g goto id  c find card  q shell",
+		[FOCUS_CARDS] = " a add card  d remove card  n name"
+				"  v valid from/to  g goto id  c find  q shell",
+	};
 	static const char *const move[] = {
-		[FOCUS_LIST]  = " arrows/PgUp/PgDn/Home/End move  Tab next pane"
-				"  r reload",
+		[FOCUS_LIST]  = " arrows/PgUp/PgDn/Home move  End walks to the"
+				" last  Tab next pane  r reload",
 		[FOCUS_PERMS] = " arrows/PgUp/PgDn move  Tab next pane  d/Del"
 				" revokes the selected permission",
 		[FOCUS_CARDS] = " Up/Dn move  Tab next pane  d/Del removes the"
@@ -503,12 +589,7 @@ static void draw_help(void)
 	};
 
 	term_attr(TERM_REVERSE);
-	term_field(HELP_ROW, 1, TERM_COLS,
-		   g.focus == FOCUS_CARDS ?
-		   " a add card  d remove card  n name  v valid from/to  g goto"
-		   "  c find  q quit" :
-		   " a grant  d revoke  n name  v valid from/to  g goto"
-		   "  c find card  q quit");
+	term_field(HELP_ROW, 1, TERM_COLS, act[g.focus]);
 	/* 79 columns, not 80: writing the bottom-right cell makes some
 	 * terminals scroll the whole screen up a line. */
 	term_field(HELP_ROW + 1, 1, TERM_COLS - 1, move[g.focus]);
@@ -574,29 +655,141 @@ static void cursor_clamp(void)
 	}
 }
 
-/** Read the selected person into g.sel, and refresh its list row. */
+/** Re-read the selected person into g.sel, and refresh its list row. */
 static void load_sel(void)
 {
-	if (g.n == 0) {
+	uint32_t id;
+
+	if (g.detached) {
+		id = g.sel.id;
+	} else if (g.n > 0 && g.cur >= g.top && g.cur < g.top + LIST_ROWS &&
+		   g.rows[g.cur - g.top].used) {
+		id = g.rows[g.cur - g.top].id;
+	} else {
 		g.sel_rc = -ENOENT;
+		cursor_clamp();
 		return;
 	}
-	g.sel_rc = scenario_person_show(g.s, g.cur, &g.sel);
-	summarize(&g.rows[g.cur - g.top], &g.sel, g.sel_rc);
+	g.sel_rc = persondb_person_get(g.s->db, id, &g.sel);
+	if (!g.detached && g.sel_rc == 0) {
+		summarize(&g.rows[g.cur - g.top], &g.sel);
+	}
 	cursor_clamp();
 }
 
+/* Any byte from the terminal: the operator wants a long walk to stop. Read
+ * straight from the transport, as bypass_cb does for Esc; the byte itself is
+ * dropped — it was a request to stop, not a command. */
+static bool key_waiting(void)
+{
+	uint8_t b[8];
+	size_t got = 0;
+
+	return g.sh->iface->api->read(g.sh->iface, b, sizeof(b), &got) == 0 &&
+	       got > 0;
+}
+
 /**
- * @brief Read and draw the page starting at g.top, one row at a time.
+ * @brief Walk to the start of page @p want.
+ *
+ * Starts from the nearest page start remembered at or before it, reads and
+ * discards whole pages up to it, and remembers each start passed. Stops early
+ * at the end of the store, or when a key is pressed.
+ *
+ * @param[out] has_after false: the page is read from the start of the walk
+ * @param[out] after     otherwise, the id it is read after
+ * @return the page reached, @p want or earlier
+ */
+static uint32_t seek_page(uint32_t want, bool *has_after, uint32_t *after)
+{
+	uint32_t shown = g.shown_page;
+	int64_t t0 = scenario_now_us();
+	uint32_t walked = 0;
+
+	/* The page on screen and the one after it are known without a cache:
+	 * reload, and PgDn, cost no walk — even while positions are approx. */
+	if (g.shown_valid && want == shown) {
+		*has_after = g.shown_has_after;
+		*after = g.shown_after;
+		return want;
+	}
+	if (g.shown_valid && want == shown + 1 && g.next_valid) {
+		*has_after = true;
+		*after = g.next_after;
+		return want;
+	}
+	if (g.approx) {
+		/* Anywhere else: walk from page 0, which makes the positions
+		 * exact again and rebuilds the cache as it goes. */
+		g.approx = false;
+		memset(g_page_known, 0, sizeof(g_page_known));
+	}
+
+	uint32_t k = MIN(want, (uint32_t)PAGE_CURSORS - 1);
+
+	while (!page_known(k)) {
+		k--;
+	}
+	*has_after = (k > 0);
+	*after = (k > 0) ? g_page_after[k] : 0;
+
+	while (k < want) {
+		bool has = *has_after;
+		uint32_t id = *after;
+		int rc = 0;
+
+		for (int i = 0; i < LIST_ROWS && rc == 0; i++) {
+			rc = persondb_person_next(g.s->db, has ? &id : NULL,
+						  &g_scratch);
+			if (rc == 0) {
+				id = g_scratch.id;
+				has = true;
+				walked++;
+			}
+		}
+		if (rc != 0) {
+			break;          /* page k is the last one */
+		}
+		k++;
+		*has_after = true;
+		*after = id;
+		page_remember(k, id);
+
+		if (want - k > 1) {
+			set_status(false, "walking: %u persons read in %s ..."
+				   " any key stops", walked, dur_since(t0));
+			draw_status();
+			term_flush();
+			if (key_waiting()) {
+				set_status(false, "stopped after %u persons",
+					   walked);
+				break;
+			}
+		}
+	}
+	return k;
+}
+
+/**
+ * @brief Read and draw the page that g.top falls on, one row at a time.
  *
  * Each row is flushed to the terminal as soon as it is read, so a slow page
  * fills in visibly instead of freezing the screen for the whole of it.
  */
 static void load_page(void)
 {
+	bool has;
+	uint32_t after;
+	uint32_t page = seek_page(g.top / LIST_ROWS, &has, &after);
 	int64_t t0 = scenario_now_us();
-	uint32_t reads = 0;
+	int rows = 0;
+	int rc = 0;
 
+	g.top = page * LIST_ROWS;
+	g.shown_valid = true;
+	g.shown_page = page;
+	g.shown_has_after = has;
+	g.shown_after = after;
 	memset(g.rows, 0, sizeof(g.rows));
 	draw_list_frame();
 	for (int i = 0; i < LIST_ROWS; i++) {
@@ -604,46 +797,78 @@ static void load_page(void)
 	}
 	term_flush();
 
-	for (int i = 0; i < LIST_ROWS; i++) {
-		uint32_t index = g.top + (uint32_t)i;
-
-		if (index >= g.n) {
+	for (; rows < LIST_ROWS; rows++) {
+		rc = persondb_person_next(g.s->db, has ? &after : NULL,
+					  &g_scratch);
+		if (rc != 0) {
 			break;
 		}
-
-		int rc = scenario_person_show(g.s, index, &g_scratch);
-
-		reads++;
-		summarize(&g.rows[i], &g_scratch, rc);
-		if (index == g.cur) {
+		after = g_scratch.id;
+		has = true;
+		summarize(&g.rows[rows], &g_scratch);
+		if (!g.detached && g.top + rows == g.cur) {
 			g.sel = g_scratch;
-			g.sel_rc = rc;
+			g.sel_rc = 0;
 		}
-		draw_row(i);
+		draw_row(rows);
 		term_flush();
+	}
+	g.next_valid = (rows == LIST_ROWS);
+	g.next_after = after;
+	draw_list_frame();      /* the title counts the rows just read */
+	if (rows == LIST_ROWS) {
+		page_remember(page + 1, after);
+	}
+
+	if (rc != 0 && rc != -ENODATA) {
+		set_status(true, "reading the store failed | rc %d", rc);
+		return;
+	}
+	if (rows == 0 && page > 0) {
+		/* The walk ended exactly at a page boundary — the last page was
+		 * full, or a delete just emptied this one. Show the one before. */
+		g.top -= LIST_ROWS;
+		load_page();
+		return;
+	}
+	if (rows < LIST_ROWS && !g.approx) {
+		/* The walk ended on this page, so the true total is known here
+		 * whatever the count said — when the page's position is. */
+		g.n = g.top + (uint32_t)rows;
+		draw_title();
+		draw_list_frame();
+	}
+	if (!g.detached) {
+		if (g.n == 0) {
+			g.sel_rc = -ENOENT;
+		} else if (g.cur < g.top || g.cur >= g.top + (uint32_t)rows) {
+			g.cur = MIN(MAX(g.cur, g.top), g.top + rows - 1);
+			load_sel();
+			draw_row((int)(g.cur - g.top));
+		}
 	}
 	cursor_clamp();   /* a reload may find fewer permissions than before */
 	if (g.n == 0) {
-		g.sel_rc = -ENOENT;
 		set_status(false, "the store holds no persons yet");
 	} else {
-		set_status(false, "read %u persons in %s", reads,
-			   dur_since(t0));
+		set_status(false, "read %d persons in %s", rows, dur_since(t0));
 	}
 }
 
-/** Select @p index, paging if it is off the current page. */
-static void select_index(uint32_t index)
+/** Select walk position @p pos, paging if it is off the current page. */
+static void select_pos(uint32_t pos)
 {
 	if (g.n == 0) {
 		return;
 	}
-	index = MIN(index, g.n - 1);
+	pos = MIN(pos, g.n - 1);
 
 	uint32_t old = g.cur;
-	uint32_t top = index - index % LIST_ROWS;
+	bool was_detached = g.detached;
+	uint32_t top = pos - pos % LIST_ROWS;
 
-	g.cur = index;
+	g.cur = pos;
+	g.detached = false;
 	g.perm_cur = 0;
 	g.perm_top = 0;
 	g.card_cur = 0;
@@ -651,22 +876,57 @@ static void select_index(uint32_t index)
 	if (top != g.top) {
 		g.top = top;
 		load_page();
-	} else if (index != old) {
+	} else if (pos != old || was_detached) {
 		int64_t t0 = scenario_now_us();
 
 		draw_row((int)(old - g.top));
 		load_sel();
-		draw_row((int)(index - g.top));
+		draw_row((int)(pos - g.top));
 		if (g.sel_rc == 0) {
-			set_status(false, "read %u in %s",
-				   scenario_id_of(index), dur_since(t0));
+			set_status(false, "read %u in %s", g.sel.id,
+				   dur_since(t0));
 		} else {
-			set_status(true, "person %u: read failed: %d",
-				   scenario_id_of(index), g.sel_rc);
+			set_status(true, "read failed: %d", g.sel_rc);
 		}
 	}
 	draw_detail();
 	draw_status();
+}
+
+/**
+ * @brief Show person @p id: on its row if it is on this page, otherwise in
+ *        the detail pane alone ("by id") — finding its row would mean walking.
+ */
+static void show_person(uint32_t id)
+{
+	for (int i = 0; i < LIST_ROWS; i++) {
+		if (g.rows[i].used && g.rows[i].id == id) {
+			select_pos(g.top + (uint32_t)i);
+			return;
+		}
+	}
+
+	int rc = persondb_person_get(g.s->db, id, &g_scratch);
+
+	if (rc != 0) {
+		set_status(true, rc == -ENOENT ? "no person %u is stored"
+				 : "person %u: read failed", id);
+		return;
+	}
+	if (g.n > 0 && !g.detached) {
+		uint32_t old = g.cur;
+
+		g.detached = true;
+		draw_row((int)(old - g.top));
+	}
+	g.detached = true;
+	g.sel = g_scratch;
+	g.sel_rc = 0;
+	g.perm_cur = 0;
+	g.perm_top = 0;
+	g.card_cur = 0;
+	cursor_clamp();
+	draw_detail();
 }
 
 /* -- the two writes ------------------------------------------------------ */
@@ -909,6 +1169,81 @@ static void do_card_remove(const char *card)
 	}
 }
 
+static void do_person_add(uint32_t until)
+{
+	struct persondb_person *p = &g_scratch;
+
+	memset(p, 0, sizeof(*p));
+	p->id = g.new_id;
+	memcpy(p->name, g.new_name, sizeof(p->name));
+	p->valid_from = g.new_from;
+	p->valid_until = until;
+
+	set_status(false, "adding %u ...", p->id);
+	draw_status();
+	term_flush();
+
+	int64_t t0 = scenario_now_us();
+	int rc = scenario_person_add(g.s, p);
+	char took[24];
+
+	snprintf(took, sizeof(took), "%s", dur_since(t0));
+
+	switch (rc) {
+	case 0:
+		g.n++;
+		pages_forget();
+		/* Re-read the page on screen, so the start of the next one is
+		 * taken from what it now holds. Where the walk puts the new
+		 * person is unknown without walking, so open them by id. */
+		load_page();
+		show_person(g.new_id);
+		set_status(false, "added %u '%s' | %s", g.new_id, g.new_name,
+			   took);
+		break;
+	case -ERANGE:
+		set_status(true, "ids %u..%u belong to the dataset | rc %d",
+			   scenario_id_of(0), scenario_id_of(g.n_persons) - 1, rc);
+		break;
+	case -EEXIST:
+		set_status(true, "id %u is taken | rc %d", g.new_id, rc);
+		break;
+	case -EINVAL:
+		set_status(true, "the last day cannot be before the first | rc %d",
+			   rc);
+		break;
+	default:
+		set_status(true, "add %u failed | rc %d | %s", g.new_id, rc, took);
+		break;
+	}
+}
+
+static void do_person_delete(void)
+{
+	uint32_t id = g.sel.id;
+
+	set_status(false, "deleting %u ...", id);
+	draw_status();
+	term_flush();
+
+	int64_t t0 = scenario_now_us();
+	int rc = persondb_person_delete(g.s->db, id);
+	char took[24];
+
+	snprintf(took, sizeof(took), "%s", dur_since(t0));
+
+	if (rc != 0) {
+		load_sel();
+		set_status(true, "delete %u failed | rc %d | %s", id, rc, took);
+		return;
+	}
+	g.n = g.n ? g.n - 1 : 0;
+	g.detached = false;
+	pages_forget();
+	load_page();    /* re-reads the page from its start; draws as it goes */
+	set_status(false, "deleted %u and their cards | %s", id, took);
+}
+
 /* -- dialogs ------------------------------------------------------------- */
 
 static void open_input(enum purpose why, const char *title, const char *prompt,
@@ -967,6 +1302,7 @@ static void open_revoke_confirm(const char *perm)
 {
 	snprintf(g.perm, sizeof(g.perm), "%s", perm);
 	g.confirm.title = "Revoke permission";
+	g.confirm.detail[0] = '\0';
 	snprintf(g.confirm.msg, sizeof(g.confirm.msg), "Revoke '%s' from %u?",
 		 g.perm, g.sel.id);
 	g.purpose = FOR_REVOKE_CONFIRM;
@@ -976,8 +1312,6 @@ static void open_revoke_confirm(const char *perm)
 
 static void open_revoke(void)
 {
-	static char title[32];
-
 	if (g.sel_rc != 0) {
 		set_status(true, "no person selected");
 		draw_status();
@@ -988,21 +1322,8 @@ static void open_revoke(void)
 		draw_status();
 		return;
 	}
-	if (g.focus == FOCUS_PERMS) {
-		/* The cursor already says which one. */
-		open_revoke_confirm(g.sel.perm[g.perm_cur]);
-		return;
-	}
-
-	memset(&g.pick, 0, sizeof(g.pick));
-	snprintf(title, sizeof(title), "Revoke from %u", g.sel.id);
-	g.pick.title = title;
-	for (uint8_t i = 0; i < g.sel.n_perms && i < TUI_PICK_MAX; i++) {
-		g.pick.item[g.pick.n++] = g.sel.perm[i];
-	}
-	g.purpose = FOR_REVOKE;
-	g.mode = MODE_PICK;
-	tui_pick_draw(&g.pick);
+	/* The cursor already says which one. */
+	open_revoke_confirm(g.sel.perm[g.perm_cur]);
 }
 
 static bool need_sel(void)
@@ -1039,6 +1360,7 @@ static void open_card_remove(void)
 	}
 	snprintf(g.card, sizeof(g.card), "%s", g.sel.card[g.card_cur]);
 	g.confirm.title = "Remove card";
+	g.confirm.detail[0] = '\0';
 	snprintf(g.confirm.msg, sizeof(g.confirm.msg),
 		 "Remove card %s from %u?", g.card, g.sel.id);
 	g.purpose = FOR_CARD_REMOVE;
@@ -1071,7 +1393,116 @@ static void open_validity(void)
 		   10, from);
 }
 
+static void open_person_add(void)
+{
+	char suggest[16] = "";
+	uint32_t id;
+
+	/* A suggestion, not a reservation: the id is checked again when the
+	 * person is written. */
+	if (scenario_free_id(g.s, &id) == 0) {
+		snprintf(suggest, sizeof(suggest), "%u", id);
+	}
+	open_input(FOR_NEW_ID, "Add person", "Id (outside the dataset range):",
+		   10, suggest);
+}
+
+static void open_person_delete(void)
+{
+	if (!need_sel()) {
+		return;
+	}
+	g.confirm.title = "Delete person";
+	snprintf(g.confirm.msg, sizeof(g.confirm.msg), "Delete person %u?",
+		 g.sel.id);
+	snprintf(g.confirm.detail, sizeof(g.confirm.detail),
+		 "%.24s, %u card%s", g.sel.name, g.sel.n_cards,
+		 g.sel.n_cards == 1 ? "" : "s");
+	g.purpose = FOR_DELETE;
+	g.mode = MODE_CONFIRM;
+	tui_confirm_draw(&g.confirm);
+}
+
 static void close_dialog(void);
+
+/* The add dialogs, one step each. Nothing is written until the last one: Esc
+ * at any step leaves the store as it was. Each returns true when it opened
+ * the next dialog. */
+
+static bool new_id_done(const char *text)
+{
+	char *end;
+	unsigned long v = strtoul(text, &end, 10);
+	struct persondb_person *p = &g_scratch;
+
+	if (text[0] == '\0' || *end != '\0' || v > UINT32_MAX) {
+		set_status(true, "'%s' is not an id", text);
+		return false;
+	}
+	if (scenario_id_reserved(g.s, (uint32_t)v)) {
+		set_status(true, "ids %u..%u belong to the dataset",
+			   scenario_id_of(0), scenario_id_of(g.n_persons) - 1);
+		return false;
+	}
+	/* Asked now, so a taken id fails before the name is typed; the write
+	 * asks again. */
+	if (persondb_person_get(g.s->db, (uint32_t)v, p) == 0) {
+		set_status(true, "id %lu is taken by '%s'", v, p->name);
+		return false;
+	}
+	g.new_id = (uint32_t)v;
+	close_dialog();
+	open_input(FOR_NEW_NAME, "Add person", "Name:", PERSONDB_NAME_MAX, NULL);
+	return true;
+}
+
+static bool new_name_done(const char *text)
+{
+	char from[24];
+
+	if (text[0] == '\0') {
+		set_status(true, "a name is 1..%d characters", PERSONDB_NAME_MAX);
+		return false;
+	}
+	snprintf(g.new_name, sizeof(g.new_name), "%s", text);
+	/* The board has no clock. SCENARIO_BENCH_NOW is the instant `check`
+	 * decides at, so it is this application's "today". */
+	fmt_date(from, sizeof(from), SCENARIO_BENCH_NOW);
+	close_dialog();
+	open_input(FOR_NEW_FROM, "Add person",
+		   "First valid day (YYYY-MM-DD, UTC):", 10, from);
+	return true;
+}
+
+static bool new_from_done(const char *text)
+{
+	int64_t t;
+	char until[24];
+
+	if (parse_date(text, &t) != 0) {
+		set_status(true, "'%s' is not a date: YYYY-MM-DD", text);
+		return false;
+	}
+	g.new_from = (uint32_t)t;
+	/* A year, as a default to edit: last day = first day + 364. */
+	fmt_date(until, sizeof(until),
+		 (uint32_t)MIN((int64_t)t + 364 * 86400, (int64_t)UINT32_MAX));
+	close_dialog();
+	open_input(FOR_NEW_UNTIL, "Add person",
+		   "Last valid day (YYYY-MM-DD, UTC):", 10, until);
+	return true;
+}
+
+static void new_until_done(const char *text)
+{
+	int64_t t;
+
+	if (parse_date(text, &t) != 0 || t + 86400 > UINT32_MAX) {
+		set_status(true, "'%s' is not a date: YYYY-MM-DD", text);
+		return;
+	}
+	do_person_add((uint32_t)(t + 86400));
+}
 
 /* A field left as it was pre-filled keeps the stored instant exactly. The
  * stored window may start or end mid-day (the generated population does),
@@ -1132,25 +1563,12 @@ static void goto_person(const char *text)
 {
 	char *end;
 	unsigned long v = strtoul(text, &end, 10);
-	uint32_t base = scenario_id_of(0);
-	uint32_t index;
 
-	if (text[0] == '\0' || *end != '\0') {
-		set_status(true, "'%s' is not a number", text);
+	if (text[0] == '\0' || *end != '\0' || v > UINT32_MAX) {
+		set_status(true, "'%s' is not an id", text);
 		return;
 	}
-	/* Ids and indices do not overlap (DATASET_ID_BASE), so one field
-	 * takes either. */
-	if (v >= base && scenario_index_of((uint32_t)v) < g.n) {
-		index = scenario_index_of((uint32_t)v);
-	} else if (v < g.n) {
-		index = (uint32_t)v;
-	} else {
-		set_status(true, "no person %lu among the %u in the store", v,
-			   g.n);
-		return;
-	}
-	select_index(index);
+	show_person((uint32_t)v);
 }
 
 static void goto_card(const char *card)
@@ -1169,17 +1587,10 @@ static void goto_card(const char *card)
 		set_status(true, "card %s: rc %d", card, rc);
 		return;
 	}
-
-	uint32_t index = scenario_index_of(owner);
-
-	if (owner < scenario_id_of(0) || index >= g.n) {
-		/* Resolves, but to a person outside the listable range (K6). */
-		set_status(false, "card %s -> person %u, not in this list",
-			   card, owner);
-		return;
+	show_person(owner);
+	if (g.sel_rc == 0 && g.sel.id == owner) {
+		set_status(false, "card %s -> person %u | %s", card, owner, took);
 	}
-	select_index(index);
-	set_status(false, "card %s -> person %u | %s", card, owner, took);
 }
 
 static void dialog_key(int key)
@@ -1220,16 +1631,10 @@ static void dialog_key(int key)
 	case FOR_GRANT_OTHER:
 		do_grant(g.input.buf);
 		break;
-	case FOR_REVOKE:
-		close_dialog();
-		open_revoke_confirm(g.pick.item[g.pick.cur]);
-		return;
 	case FOR_REVOKE_CONFIRM:
 		do_revoke(g.perm);
 		break;
 	case FOR_GOTO:
-		/* Uncover the list first: a jump may read a whole page, and
-		 * its rows are drawn as they arrive. */
 		close_dialog();
 		goto_person(g.input.buf);
 		draw_status();
@@ -1256,6 +1661,36 @@ static void dialog_key(int key)
 	case FOR_CARD_REMOVE:
 		do_card_remove(g.card);
 		break;
+	case FOR_NEW_ID:
+		if (new_id_done(g.input.buf)) {
+			return;
+		}
+		break;
+	case FOR_NEW_NAME:
+		if (new_name_done(g.input.buf)) {
+			return;
+		}
+		break;
+	case FOR_NEW_FROM:
+		if (new_from_done(g.input.buf)) {
+			return;
+		}
+		break;
+	case FOR_NEW_UNTIL:
+		/* Uncover the screen first: the new person is shown by id. */
+		close_dialog();
+		new_until_done(g.input.buf);
+		draw_title();
+		draw_list_frame();
+		draw_status();
+		return;
+	case FOR_DELETE:
+		close_dialog();
+		do_person_delete();
+		draw_title();
+		draw_detail();
+		draw_status();
+		return;
 	}
 	close_dialog();
 }
@@ -1308,7 +1743,7 @@ static void set_focus(enum focus f)
 	}
 	g.focus = f;
 	draw_title();
-	if (g.n > 0) {
+	if (g.n > 0 && g.cur >= g.top && g.cur < g.top + LIST_ROWS) {
 		draw_row((int)(g.cur - g.top));
 	}
 	draw_detail();
@@ -1322,6 +1757,7 @@ static void main_key(int key)
 	switch (key) {
 	case 'q':
 	case TERM_KEY_CTRL_C:
+	case TERM_KEY_CTRL_D:
 		leave();
 		return;
 	case TERM_KEY_CTRL_L:
@@ -1346,8 +1782,10 @@ static void main_key(int key)
 	case '+':
 		if (g.focus == FOCUS_CARDS) {
 			open_card_add();
-		} else {
+		} else if (g.focus == FOCUS_PERMS) {
 			open_grant();
+		} else {
+			open_person_add();
 		}
 		return;
 	case 'd':
@@ -1355,8 +1793,10 @@ static void main_key(int key)
 	case TERM_KEY_DEL:
 		if (g.focus == FOCUS_CARDS) {
 			open_card_remove();
-		} else {
+		} else if (g.focus == FOCUS_PERMS) {
 			open_revoke();
+		} else {
+			open_person_delete();
 		}
 		return;
 	case 'n':
@@ -1366,8 +1806,7 @@ static void main_key(int key)
 		open_validity();
 		return;
 	case 'g':
-		open_input(FOR_GOTO, "Go to person", "Person id or dataset index:",
-			   10, NULL);
+		open_input(FOR_GOTO, "Go to person", "Person id:", 10, NULL);
 		return;
 	case 'c':
 		open_input(FOR_CARD, "Find card holder", "Card id:",
@@ -1381,6 +1820,11 @@ static void main_key(int key)
 		uint32_t cur = g.cur;
 		uint32_t last = g.n ? g.n - 1 : 0;
 
+		if (g.detached && (key == TERM_KEY_UP || key == TERM_KEY_DOWN)) {
+			/* Back from a person opened by id to the list row. */
+			select_pos(g.cur);
+			return;
+		}
 		switch (key) {
 		case TERM_KEY_UP:   cur = cur ? cur - 1 : 0; break;
 		case TERM_KEY_DOWN: cur = MIN(cur + 1, last); break;
@@ -1391,7 +1835,7 @@ static void main_key(int key)
 		case TERM_KEY_END:  cur = last; break;
 		default:            return;
 		}
-		select_index(cur);
+		select_pos(cur);
 	} else if (g.focus == FOCUS_CARDS) {
 		switch (key) {
 		case TERM_KEY_UP:   move_card(-1); break;
@@ -1502,12 +1946,14 @@ static void logs_mute(bool mute)
 #endif
 }
 
+/* Back to the shell, exactly as it was: primary screen, cursor, logging. */
 static void leave(void)
 {
 	term_leave();
 	g.active = false;
 	shell_set_bypass(g.sh, NULL, NULL);
 	logs_mute(false);
+	shell_print(g.sh, "left persondb tui; `persondb tui` opens it again");
 }
 
 int ui_tui_enter(const struct shell *sh, struct scenario *s)
@@ -1520,9 +1966,10 @@ int ui_tui_enter(const struct shell *sh, struct scenario *s)
 	}
 
 	memset(&g, 0, sizeof(g));
+	memset(g_page_known, 0, sizeof(g_page_known));
 	g.sh = sh;
 	g.s = s;
-	g.n = st.populated;
+	g.populated = st.populated;
 	g.n_persons = st.n_persons;
 	g.rev = st.rev;
 	g.active = true;
@@ -1533,9 +1980,20 @@ int ui_tui_enter(const struct shell *sh, struct scenario *s)
 	term_enter();
 	shell_set_bypass(sh, bypass_cb, NULL);
 
+	/* The total, counted from flash once (~2 s on the DK at 8 000) and
+	 * kept up to date from here: the container keeps no counter. */
+	set_status(false, "counting persons ...");
 	draw_all();
+	rc = persondb_person_count(s->db, &g.n);
+	if (rc != 0) {
+		g.n = 0;
+	}
+	draw_title();
 	load_page();
 	draw_detail();
+	if (rc != 0) {
+		set_status(true, "counting persons failed | rc %d", rc);
+	}
 	draw_status();
 	term_flush();
 	return 0;

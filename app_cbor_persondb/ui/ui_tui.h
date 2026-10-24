@@ -4,10 +4,11 @@
  *
  * ui_tui — a full-screen person browser inside the shell frontend.
  *
- * `persondb tui` takes over the shell's terminal: a page of persons on the
- * left, the selected one's permissions and cards on the right, and dialogs to
- * grant and revoke permissions, add and remove cards, rename a person and set
- * the days their cards are valid. `q` gives the terminal back to the shell.
+ * `persondb tui` takes over the shell's terminal: a page of stored persons on
+ * the left, the selected one's permissions and cards on the right, and dialogs
+ * to add and delete persons, grant and revoke permissions, add and remove
+ * cards, rename a person and set the days their cards are valid. `q`, Ctrl-C
+ * or Ctrl-D gives the terminal back to the shell.
  */
 
 #ifndef APP_CBOR_PERSONDB_UI_TUI_H_

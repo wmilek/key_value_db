@@ -139,8 +139,12 @@ void tui_confirm_draw(const struct tui_confirm *w)
 	term_box(CONFIRM_ROW, DLG_COL, 5, DLG_W, w->title, "y yes  n/Esc no",
 		 true);
 	term_attr(TERM_BOLD);
-	term_field(CONFIRM_ROW + 2, DLG_COL + 2, DLG_IN, w->msg);
+	term_field(CONFIRM_ROW + (w->detail[0] ? 1 : 2), DLG_COL + 2, DLG_IN,
+		   w->msg);
 	term_attr(TERM_NORMAL);
+	if (w->detail[0]) {
+		term_field(CONFIRM_ROW + 2, DLG_COL + 2, DLG_IN, w->detail);
+	}
 }
 
 enum tui_outcome tui_confirm_key(struct tui_confirm *w, int key)

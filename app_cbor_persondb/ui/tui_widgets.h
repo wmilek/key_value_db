@@ -63,6 +63,7 @@ enum tui_outcome tui_input_key(struct tui_input *w, int key);
 struct tui_confirm {
 	const char *title;
 	char        msg[56];
+	char        detail[56];     /* optional second line; "" for none */
 };
 
 void tui_confirm_draw(const struct tui_confirm *w);

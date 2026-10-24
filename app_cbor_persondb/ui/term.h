@@ -98,6 +98,7 @@ void term_box(int row, int col, int height, int width, const char *title,
 enum term_key {
 	TERM_KEY_NONE = 0,
 	TERM_KEY_CTRL_C = 0x03,
+	TERM_KEY_CTRL_D = 0x04,
 	TERM_KEY_BACKSPACE = 0x08,
 	TERM_KEY_TAB = 0x09,
 	TERM_KEY_CTRL_L = 0x0c,
