@@ -52,7 +52,7 @@ int64_t scenario_since_us(int64_t since_us);
 int scenario_open(struct scenario *s);
 int scenario_close(struct scenario *s);
 
-/** Destroy this store and build an empty one (`persondb reset`). */
+/** Destroy this store and build an empty one (`scenario reset`). */
 int scenario_reset(struct scenario *s);
 
 /** Destroy this store and leave none (`persondb destroy`); s->db is NULL

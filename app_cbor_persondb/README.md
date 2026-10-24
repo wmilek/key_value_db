@@ -278,7 +278,7 @@ prints. Both frontends are argument parsing and formatting over the same calls.
 
 *What it prevents:* a benchmark and an interactive tool that drift into
 measuring different things. It is also what makes the shell able to demonstrate
-crash safety at all: `persondb fill 500`, pull the power, reboot,
+crash safety at all: `scenario fill 500`, pull the power, reboot,
 `persondb stat`.
 
 ### 14. Ship a configuration small enough to run in CI
@@ -329,20 +329,46 @@ pass by deleting those sentences, and the app would be worse for it.
 
 ## Shell
 
+Two groups, one per layer. `persondb` is the L3 API in `persondb/persondb.h`,
+one command per call and named after it — `persondb card assign` is
+`persondb_card_assign()`:
+
 ```
-persondb stat                     geometry, fill, counters
-persondb fill [n]                 populate n more persons (resumable)
-persondb verify [n]               check n sampled persons against the generator
-persondb mutate                   advance one revision
-persondb bench [kind] [n]         measure
-persondb show <index>             print a stored person
-persondb cardof <index> [slot]    the card id for a dataset index
-persondb card <card-id>           resolve a card to its owner
-persondb check <card> <perm>      the access decision, timed
-persondb grant|revoke <id> <perm>
-persondb assign <id> <card> | unassign <card>
-persondb reset                    destroy this store and start over
-persondb destroy                  destroy this store; none until reset or reboot
+persondb open | close             open (building a store if there is none), detach
+persondb destroy                  remove this store, and only it
+persondb prepare                  pre-format erase blocks
+persondb stat [reset]             geometry and counters; reset zeroes the counters
+persondb person get <id>
+persondb person add <id> <name> [dept] [title]   no cards or perms, valid forever
+persondb person delete <id>
+persondb person list [after-id] [n]              a page in enumeration order
+persondb person count
+persondb person rename <id> <name>
+persondb person validity <id> <from> <until>     epoch seconds, [from, until)
+persondb card owner <card>
+persondb card assign <id> <card>
+persondb card revoke <card>       holder found through the index
+persondb card revoke-from <id> <card>            the repairable form
+persondb perm grant|revoke <id> <perm>
+persondb check <card> <perm> [now]               the access decision, timed
+persondb tui                      full-screen browser
+```
+
+`persondb_person_put()` has no command: it replaces a whole record, and `person
+add` followed by `card assign`, `perm grant` and `person validity` covers it.
+
+`scenario` is the dataset generator and the benchmark, which persondb knows
+nothing about:
+
+```
+scenario report                   what the dataset put in the store
+scenario fill [n]                 populate n more persons (resumable)
+scenario verify [n]               check n sampled persons against the generator
+scenario mutate                   advance one revision
+scenario bench [kind] [n]         measure
+scenario show <index>             the person at a dataset index
+scenario cardof <index> [slot]    the card id for a dataset index
+scenario reset                    persondb destroy + open: start over
 ```
 
 The shell frontend also brings in the read-only `blob_db` group
@@ -362,7 +388,7 @@ Worth stating, because a practices guide is read as a checklist:
 - **Recovery from a corrupt store.** A bad superblock or an unreadable registry
   entry surfaces as `-EIO` or `-ENOTSUP` from `persondb_open()`, and both
   frontends print the errno and stop. That is honest but not a recovery story:
-  the only repair on offer is `persondb reset`, which discards the whole store
+  the only repair on offer is `scenario reset`, which discards the whole store
   (and cannot remove one whose superblock it cannot read — `DESIGN.md` §12.4),
   or `--flash_erase`, which discards the whole partition. What a product
   should do instead — a second superblock, a rebuild from a durable source —

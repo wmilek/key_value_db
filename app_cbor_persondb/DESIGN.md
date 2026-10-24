@@ -975,7 +975,8 @@ issued by one of its tenants. `persondb_destroy()` removes what the store
 owns and nothing else: every table its directory lists, the superblock, then
 its registry entry. A whole-partition wipe stays available where it belongs —
 `--flash_erase`, the test fixture, and `CONFIG_APP_CBOR_PERSONDB_FRESH_START`
-for a benchmark's clean start.
+for a benchmark's clean start. In the shell, `persondb destroy` is this call
+and `scenario reset` is it followed by `persondb open`.
 
 **A newer build's tables go too**, whatever their class: class says what an
 older build may do while *keeping* the store, and a destroy keeps nothing.
