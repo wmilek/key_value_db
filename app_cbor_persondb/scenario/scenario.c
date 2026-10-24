@@ -541,6 +541,16 @@ uint32_t scenario_index_of(uint32_t person_id)
 	return dataset_index_of(person_id);
 }
 
+uint32_t scenario_id_of(uint32_t index)
+{
+	return dataset_id_of(index);
+}
+
+const char *scenario_permission_name(uint8_t i)
+{
+	return (i < DATASET_PERM_VOCAB) ? dataset_permission(i) : NULL;
+}
+
 int scenario_card_of(struct scenario *s, uint32_t index, uint8_t slot,
 		     char *out, size_t sz)
 {

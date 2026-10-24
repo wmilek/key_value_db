@@ -259,6 +259,36 @@ int persondb_permission_grant(struct persondb *db, uint32_t person_id,
 int persondb_permission_revoke(struct persondb *db, uint32_t person_id,
 			       const char *perm);
 
+/* -- person details ----------------------------------------------------- */
+
+/*
+ * Each of these rewrites the one person record and nothing else: the fields
+ * they touch live only in that record, so — as with permissions — there is no
+ * second structure to keep in step. A call that would store what is already
+ * stored writes nothing and returns 0.
+ */
+
+/**
+ * @brief Change a person's name.
+ *
+ * @retval -EINVAL empty, or longer than PERSONDB_NAME_MAX. Refused rather than
+ *                 truncated, so what is stored is what was asked for.
+ * @retval -ENOENT no such person
+ */
+int persondb_person_rename(struct persondb *db, uint32_t person_id,
+			   const char *name);
+
+/**
+ * @brief Set the window a person's cards are valid in: [@p valid_from,
+ *        @p valid_until), epoch seconds, as persondb_check() reads it.
+ *
+ * @retval -EINVAL @p valid_until is not after @p valid_from — a window no
+ *                 instant falls in would expire every card silently
+ * @retval -ENOENT no such person
+ */
+int persondb_person_set_validity(struct persondb *db, uint32_t person_id,
+				 uint32_t valid_from, uint32_t valid_until);
+
 /* -- the decision (R-D) ------------------------------------------------- */
 
 /**
