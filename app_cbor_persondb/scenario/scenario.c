@@ -303,6 +303,13 @@ int scenario_mutate(struct scenario *s, struct scenario_mutate_report *out)
 		}
 		dataset_card(idx, DATASET_TEMP_CARD_SLOT, card);
 		rc = persondb_card_assign(s->db, dataset_id_of(idx), card);
+		if (rc == -ENOENT) {
+			/* Deleted by hand (persondb tui): nobody to give it to.
+			 * Skipped rather than fatal, or every round whose subset
+			 * includes this person would fail forever. */
+			out->skipped++;
+			continue;
+		}
 		if (rc != 0) {
 			LOG_ERR("assign %s: %d", card, rc);
 			goto done;
@@ -483,10 +490,12 @@ int scenario_report_get(struct scenario *s, struct scenario_report *out)
 	persondb_stat(s->db, &out->st);
 	persondb_progress_get(s->db, &populated, &rev);
 
-	/* Re-derive the content and add it up. There is no iteration (K6) and
-	 * no occupancy query (B3), so this is the only route — and it works
-	 * only because the dataset is a pure function of its index. A real
-	 * deployment, whose data comes from outside, could not do this at all. */
+	/* Re-derive the content and add it up: CPU only, where walking the
+	 * store (K6, now possible) would be ~49 s of flash reads on the DK,
+	 * and there is no occupancy query (B3). It works only because the
+	 * dataset is a pure function of its index; a real deployment, whose
+	 * data comes from outside, would have to walk. Persons added by hand
+	 * (persondb tui) are not in this figure. */
 	for (uint32_t i = 0; i < populated; i++) {
 		dataset_person(i, rev, s->n_persons, &p);
 		person_bytes += persondb_person_record_bytes(&p) +
@@ -549,6 +558,41 @@ uint32_t scenario_id_of(uint32_t index)
 const char *scenario_permission_name(uint8_t i)
 {
 	return (i < DATASET_PERM_VOCAB) ? dataset_permission(i) : NULL;
+}
+
+bool scenario_id_reserved(struct scenario *s, uint32_t id)
+{
+	return id >= dataset_id_of(0) && id < dataset_id_of(s->n_persons);
+}
+
+int scenario_free_id(struct scenario *s, uint32_t *id)
+{
+	struct persondb_person p;
+
+	/* Hand-added persons live above the dataset range, so the search
+	 * starts there. Bounded: a store with this many hand-added persons
+	 * in a row is not what this suggestion is for. */
+	for (uint32_t i = 0; i < 256; i++) {
+		uint32_t candidate = dataset_id_of(s->n_persons) + i;
+		int rc = persondb_person_get(s->db, candidate, &p);
+
+		if (rc == -ENOENT) {
+			*id = candidate;
+			return 0;
+		}
+		if (rc != 0) {
+			return rc;
+		}
+	}
+	return -ENOSPC;
+}
+
+int scenario_person_add(struct scenario *s, const struct persondb_person *p)
+{
+	if (scenario_id_reserved(s, p->id)) {
+		return -ERANGE;
+	}
+	return persondb_person_add(s->db, p);
 }
 
 int scenario_card_of(struct scenario *s, uint32_t index, uint8_t slot,

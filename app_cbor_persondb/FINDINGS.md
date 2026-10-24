@@ -24,8 +24,8 @@ remaining open ones are listed in the summary below.
 
 | | |
 |---|---|
-| **Closed by `main`** | B1, B5 (partly), B9, B10, B3 (partly) |
-| **Still open** | B2, B4, B6, B7, B8, B11, B12, K1–K11, **K12**, **K13**, V1–V4, X1 |
+| **Closed by `main`** | B1, B5 (partly), B9, B10, B3 (partly), **K6**, K10 (partly) |
+| **Still open** | B2, B4, B6, B7, B8, B11, B12, K1–K5, K7–K9, K10 (occupancy), K11, **K12**, **K13**, V1–V4, X1 |
 | **Withdrawn** | R1 — `ROOTREG_MAX_ROOTS`'s default was never the problem; the layout that wanted seventeen entries was (`DESIGN.md` §12.1) |
 | **Newly observed** | N1 — transaction count rose sharply as byte count fell (closed on hardware: ~65 µs per transaction) · B12 — compaction lowers the durable id ceiling ([issue #14](https://github.com/wmilek/key_value_db/issues/14)) |
 | **Found by removing a workaround** | **K12** — the largest map the geometry allows cannot be written to · **K13** — the directory blob caps the store at 9 670 persons, half the partition. Both were invisible while the app sharded its person records over sixteen maps; both appeared in the first hour after it stopped (`DESIGN.md` §12.2). |
@@ -446,7 +446,8 @@ Principle P7 states "**No permanent leak (must)** … Long-term accumulation of
 leaked space is not accepted." A device that loses power during enrollment,
 repeatedly, over years, accumulates exactly that.
 
-Direction: either a mark-and-sweep from the registry (needs iteration, K6/B4),
+Direction: either a mark-and-sweep from the registry (needs iteration, K6/B4 —
+the map half of which now exists),
 or a durable creation-intent list that a later mount can roll back —
 `BLOB_CONTAINERS_INTENT` is scaffolded for something like this but not
 implemented.
@@ -586,7 +587,8 @@ and size to 3 σ instead of 5.5 σ.
 
 Chosen from `map_config.initial_capacity` on first create, never changed. A map
 that outgrows its bucket count has no growth path short of rebuild — and rebuild
-needs iteration, which does not exist (K6). Capacity must be planned exactly,
+needed iteration, which did not exist (K6; since closed, the rebuild itself is
+still unwritten). Capacity must be planned exactly,
 before the first insert, at a layer with no visibility into how much flash
 exists (B3).
 
@@ -614,7 +616,43 @@ application has to trade them off with no visibility into either.
 Direction: the directory is a dense array of ids; a bucket's id could be derived
 rather than stored, or the directory chunked so a publish rewrites 64 B.
 
-### K6 — No iteration (major, `read`)
+### K6 — No iteration (major, `read`) — **closed by `main`**
+
+**Closed (2026-10-08, `e895dc3`, `8450778`).** The Map shape now has
+`map_ops.next` — stateless enumeration where the last key returned is the
+cursor, so a walk holds no state, survives a reboot and tolerates inserts and
+deletes between calls — and `map_ops.count`, computed from flash on every call.
+kvhash implements both, and the container contract suite covers them (18 cases
+in `tests/lib/containers`, all passing on `main`).
+
+This application validated it against its own store on `native_sim` at the
+full 8 000 persons, with a throwaway probe over `persondb`'s two maps:
+
+| Check | Result |
+|---|---|
+| Walk the people map | 8 000 entries, `count()` 8 000; every key well-formed, every record decodes to its own id, no duplicate, none missing |
+| Walk the credential map | 19 905 entries = the cards the persons list; every entry resolves to a person who lists that card |
+| Put an id outside the dataset (900001), walk | 8 001, and it is found |
+| Delete it and a dataset person, walk | 7 999, exactly that person missing |
+
+What a walk costs is the new limitation, measured with the I/O counters and
+priced with `app_perf_l0`'s DK model (`l0_timing.py`, flash time only):
+
+| Operation | Flash reads | Predicted on the DK |
+|---|---|---|
+| One `next()` call | 67 reads, 5.8 KB | ~6.1 ms — about one `person_get` (5.8 ms) |
+| A page of 17 | 1 150 reads, 88 KB | 102 ms |
+| Walk all 8 000 persons | 533 008 reads, 46.5 MB | **48.7 s** |
+| `count()` of the people map | 17 693 reads, 3.2 MB | 2.0 s |
+
+So enumeration exists but is a listing tool, as the contract says: order is a
+hash order (not sorted, not insertion), there is no seek to a position, and a
+full walk is most of a minute on the DK. `persondb_person_next()` and
+`persondb_person_count()` wrap it; `persondb tui` lists the store with it
+(DESIGN.md §10). Rebuilding a map at a new geometry — the K3 repair path that
+needed iteration — is now possible in principle, and still unwritten.
+
+**As first recorded:**
 
 `map_ops` has no `iterate`. An application cannot enumerate, back up, migrate,
 fsck or garbage-collect its own data. Every key must be regenerable from outside
@@ -742,8 +780,8 @@ itself: `MAX_BUCKETS`, `DIR_HDR_LEN` and the 8-bytes-per-id are all private to
 create time and persisted (K3), so a wrong value is baked into the store
 forever; the store gives no occupancy signal (K10); and the failure surfaces as
 a `-ENOSPC` from one bucket while the medium is nearly empty (K2), potentially
-hours into a fill, with no repair path short of a rebuild that needs iteration
-(K6) that does not exist.
+hours into a fill, with no repair path short of a rebuild that needed iteration
+(K6) that did not then exist.
 
 **The sharpest edge is cross-Kconfig coupling.**
 `CONFIG_BLOB_DB_MAX_PAYLOAD_LEN` is a single global symbol, and `MAX_BUCKETS`
@@ -788,7 +826,14 @@ toward the headers — the caller declares its population
 derives the geometry — on the grounds that it is the reading a caller is given
 and the only one that lets `tools/sizing.py` be deleted.
 
-### K10 — No entry count or size on a map (moderate, `read`)
+### K10 — No entry count or size on a map (moderate, `read`) — **partly closed**
+
+**The count half closed with K6:** `map_ops.count` reports the exact number of
+keys, from flash, at the cost of reading every bucket (2.0 s on the DK for
+8 000 persons — see K6), and `map_ops.stat` reports the geometry. Peak bucket
+occupancy — the gauge for K2 — is still not reported.
+
+**As first recorded:**
 
 `map_ops` has `create`/`get`/`set`/`del` and nothing else. An application cannot
 ask how many entries a map holds or how close a bucket is to K2's cliff, so it
@@ -907,7 +952,8 @@ reports `-ENOSPC` with no warning first. A near-full bucket signal was
 prototyped and removed (proposal D3d); it would not have helped here in any
 case, having stayed silent through every run above — correctly, because it was
 a *bucket* signal and this is a medium wall. An application still cannot see
-this coming (B3, V3) and still cannot recover from it (K3, K6).
+this coming (B3, V3) and still cannot recover from it (K3; K6 has since given
+it the iteration a rebuild would need, but no rebuild exists).
 
 **Below is the finding as first measured, on the one-level container.**
 

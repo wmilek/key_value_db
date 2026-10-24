@@ -176,10 +176,12 @@ question as though it settled this one.
 re-derives what the store should hold and compares; there is no shadow copy,
 no expected-value table, and no RAM proportional to the dataset.
 
-*What it prevents:* being unable to check your own store. The Map shape has no
-iteration (**K6**), so a store cannot be enumerated — without a regenerable
-dataset, a rerun has no way to discover what a previous boot wrote. It is also
-the only reason `scenario_report_get()` can state how full the flash is.
+*What it prevents:* being unable to check your own store. When this was written
+the Map shape had no iteration (**K6**), so a store could not be enumerated at
+all. It can now (`map_ops.next`), but a walk only says what *is* stored, not
+what *should* be — and at 8 000 persons it is ~49 s of flash reads on the DK. A
+regenerable dataset answers "what should be here" with no flash at all, which
+is also why `scenario_report_get()` can state how full the flash is cheaply.
 
 ### 8. Compare canonical encodings instead of hand-written field comparisons
 

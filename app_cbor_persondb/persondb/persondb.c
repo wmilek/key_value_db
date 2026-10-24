@@ -744,6 +744,85 @@ int persondb_person_delete(struct persondb *db, uint32_t id)
 	return map_del(db, db->people_root, key);
 }
 
+int persondb_person_add(struct persondb *db, const struct persondb_person *p)
+{
+	struct persondb_person existing;
+	uint32_t owner;
+	int rc;
+
+	if (p->name[0] == '\0' || p->valid_until <= p->valid_from) {
+		return -EINVAL;
+	}
+
+	rc = persondb_person_get(db, p->id, &existing);
+	if (rc == 0) {
+		return -EEXIST;
+	}
+	if (rc != -ENOENT) {
+		return rc;
+	}
+
+	for (uint8_t i = 0; i < p->n_cards && i < PERSONDB_CARDS_MAX; i++) {
+		rc = persondb_card_owner(db, p->card[i], &owner);
+		if (rc == 0) {
+			return -EEXIST;
+		}
+		if (rc != -ENOENT) {
+			return rc;
+		}
+	}
+
+	/* Checked, then written: the caller serializes every call (see the
+	 * header), so nothing can take the id or a card in between. */
+	return persondb_person_put(db, p);
+}
+
+/* -- enumeration -------------------------------------------------------- */
+
+int persondb_person_next(struct persondb *db, const uint32_t *after,
+			 struct persondb_person *out)
+{
+	char cursor[PERSON_KEY_SZ];
+	char key[PERSON_KEY_SZ + 1];    /* one spare: detects a longer key */
+	uint8_t buf[PERSON_CBOR_MAX];
+	size_t klen = 0, vlen = 0;
+
+	if (after != NULL) {
+		person_key(cursor, *after);
+	}
+
+	/* Counted as a get: it is one lookup of the cursor plus a forward
+	 * search, which is what the stat block's map traffic means. */
+	db->st.map_gets++;
+
+	int rc = db->ops->next(db->people_root, after ? cursor : NULL,
+			       after ? strlen(cursor) : 0, key, sizeof(key),
+			       &klen, buf, sizeof(buf), &vlen);
+
+	if (rc == -ENODATA) {
+		return rc;
+	}
+	if (rc == -ENOMEM || (rc == 0 && klen != PERSON_KEY_SZ - 1)) {
+		/* The people map holds person keys and nothing else. */
+		return -EIO;
+	}
+	if (rc != 0) {
+		return rc;
+	}
+	return person_cbor_decode(buf, vlen, out) == 0 ? 0 : -EIO;
+}
+
+int persondb_person_count(struct persondb *db, uint32_t *n)
+{
+	size_t count = 0;
+	int rc = db->ops->count(db->people_root, &count);
+
+	if (rc == 0) {
+		*n = (uint32_t)count;
+	}
+	return rc;
+}
+
 /* -- credentials -------------------------------------------------------- */
 
 int persondb_card_assign(struct persondb *db, uint32_t person_id,
