@@ -105,6 +105,41 @@ struct scenario_verify_report {
 int scenario_verify(struct scenario *s, uint32_t samples,
 		    struct scenario_verify_report *out);
 
+/*
+ * Why a stored person is not what the generator says, as a bit set. The
+ * verdict is still the byte comparison above; this is the explanation, so a
+ * failing verify can say which field a hand edit (persondb tui, grant, ...)
+ * changed instead of only that something did.
+ */
+enum scenario_diff {
+	SCENARIO_DIFF_MISSING    = 1u << 0,  /* no record under the id */
+	SCENARIO_DIFF_UNREADABLE = 1u << 1,  /* a record that does not decode */
+	SCENARIO_DIFF_ID         = 1u << 2,
+	SCENARIO_DIFF_NAME       = 1u << 3,
+	SCENARIO_DIFF_DEPT       = 1u << 4,
+	SCENARIO_DIFF_TITLE      = 1u << 5,
+	SCENARIO_DIFF_VALIDITY   = 1u << 6,
+	SCENARIO_DIFF_PIN        = 1u << 7,
+	SCENARIO_DIFF_PERMS      = 1u << 8,  /* a permission added or removed */
+	SCENARIO_DIFF_PERM_ORDER = 1u << 9,  /* same permissions, other order */
+	SCENARIO_DIFF_CARDS      = 1u << 10, /* a card added or removed */
+	SCENARIO_DIFF_CARD_ORDER = 1u << 11, /* same cards, other order */
+	SCENARIO_DIFF_CARD_INDEX = 1u << 12, /* a listed card resolves elsewhere */
+	SCENARIO_DIFF_OTHER      = 1u << 13, /* unequal, and none of the above */
+};
+
+/** Which fields of @p got differ from @p want; 0 when none do. */
+uint32_t scenario_person_diff(const struct persondb_person *want,
+			      const struct persondb_person *got);
+
+/**
+ * @brief Name the bits of @p diff, comma-separated, into @p buf.
+ *
+ * Formatting rather than printing: verify logs it, the shell prints it, and
+ * both say the same words. Truncated to fit; always terminated.
+ */
+void scenario_diff_describe(uint32_t diff, char *buf, size_t sz);
+
 /* -- mutation ----------------------------------------------------------- */
 
 struct scenario_mutate_report {
@@ -217,6 +252,44 @@ int scenario_person_show(struct scenario *s, uint32_t index,
 			 struct persondb_person *out);
 int scenario_card_of(struct scenario *s, uint32_t index, uint8_t slot,
 		     char *out, size_t sz);
+
+struct scenario_repair_report {
+	uint32_t id;
+	uint32_t diff;       /* what was wrong before; 0 = nothing, no write */
+	bool     written;    /* the generator's record is now stored */
+	/* On -EEXIST: the generated card someone else now holds, and who. */
+	char     held_card[PERSONDB_CARD_LEN + 1];
+	uint32_t held_by;
+};
+
+/**
+ * @brief Put person @p person_id back to what the generator says it is at
+ *        the current revision — the one-record form of `bench put`.
+ *
+ * By id, not dataset index, because the id is what verify logs and what
+ * every other per-person command takes.
+ *
+ * Recreates a deleted person, undoes hand edits, and re-points the record's
+ * cards at it in the credential index; a card the stored record lists and the
+ * generated one does not loses its index entry (persondb_person_put()). A
+ * record that already matches, with every card resolving to it, is left
+ * alone and nothing is written.
+ *
+ * Refuses rather than takes a card from someone else: if a card the generator
+ * gives this person is now held by another, that holder's record still lists
+ * it, and re-pointing the index would leave them listing a card that no
+ * longer resolves to them. Unassign it from them first.
+ *
+ * @retval 0       repaired, or nothing to repair (@p out says which)
+ * @retval -EINVAL not a dataset id — e.g. one `persondb tui` added, which
+ *                 has no generated version to go back to
+ * @retval -ERANGE the person is not filled yet — `fill` writes it, not this
+ * @retval -EEXIST a generated card is held by someone else (@p out names it)
+ * @retval -EILSEQ the stored record does not decode, so persondb cannot tell
+ *                 which index entries it owns; only `reset` clears that
+ */
+int scenario_repair(struct scenario *s, uint32_t person_id,
+		    struct scenario_repair_report *out);
 
 /**
  * @brief The dataset index a person id came from.

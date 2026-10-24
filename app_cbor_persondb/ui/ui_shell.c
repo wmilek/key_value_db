@@ -208,6 +208,58 @@ static int cmd_show(const struct shell *sh, size_t argc, char **argv)
 	return 0;
 }
 
+static int cmd_repair(const struct shell *sh, size_t argc, char **argv)
+{
+	struct scenario_repair_report r;
+	char why[96];
+	uint32_t id;
+	int rc = need_open(sh);
+
+	if (rc) {
+		return rc;
+	}
+	if (argc < 2) {
+		shell_error(sh, "usage: persondb repair <person-id>");
+		return -EINVAL;
+	}
+	id = (uint32_t)strtoul(argv[1], NULL, 0);
+
+	rc = scenario_repair(&g_s, id, &r);
+	scenario_diff_describe(r.diff, why, sizeof(why));
+	switch (rc) {
+	case 0:
+		if (r.written) {
+			shell_print(sh, "person %u: %s -> repaired", id, why);
+		} else {
+			shell_print(sh, "person %u already matches the generator",
+				    id);
+		}
+		return 0;
+	case -EINVAL:
+		shell_error(sh, "person %u is not in the dataset (%u..%u), so "
+				"there is nothing to repair it to", id,
+			    scenario_id_of(0), scenario_id_of(g_s.n_persons - 1));
+		break;
+	case -ERANGE:
+		shell_error(sh, "person %u is not filled yet; `persondb fill` "
+				"writes it", id);
+		break;
+	case -EEXIST:
+		shell_error(sh, "person %u: %s; card %s is held by person %u — "
+				"`persondb unassign %s` first", id, why,
+			    r.held_card, r.held_by, r.held_card);
+		break;
+	case -EILSEQ:
+		shell_error(sh, "person %u: record does not decode; only "
+				"`persondb reset` clears it", id);
+		break;
+	default:
+		shell_error(sh, "repair %u: %d", id, rc);
+		break;
+	}
+	return rc;
+}
+
 static int cmd_card(const struct shell *sh, size_t argc, char **argv)
 {
 	uint32_t owner;
@@ -416,6 +468,7 @@ SHELL_STATIC_SUBCMD_SET_CREATE(
 	SHELL_CMD_ARG(mutate, NULL, "Advance one mutation revision", cmd_mutate, 1, 0),
 	SHELL_CMD_ARG(bench, NULL, "bench [kind] [n] — measure", cmd_bench, 1, 2),
 	SHELL_CMD_ARG(show, NULL, "show <index> — print a stored person", cmd_show, 2, 0),
+	SHELL_CMD_ARG(repair, NULL, "repair <person-id> — rewrite from the generator", cmd_repair, 2, 0),
 	SHELL_CMD_ARG(card, NULL, "card <card-id> — resolve to its owner", cmd_card, 2, 0),
 	SHELL_CMD_ARG(cardof, NULL, "cardof <index> [slot] — the card id", cmd_cardof, 2, 1),
 	SHELL_CMD_ARG(check, NULL, "check <card-id> <perm> — the decision", cmd_check, 3, 0),
