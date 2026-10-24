@@ -69,8 +69,9 @@ static int cmd_stat(const struct shell *sh, size_t argc, char **argv)
 	}
 
 	shell_print(sh, "partition   : %zu B", r.st.partition_bytes);
-	shell_print(sh, "maps        : %u person + 1 credential "
-			"(bucket count not observable)", r.st.n_people_maps);
+	shell_print(sh, "maps        : person (depth %u, %u buckets) + "
+			"credential (depth %u, %u buckets)", r.st.people_depth,
+		    r.st.people_buckets, r.st.cred_depth, r.st.cred_buckets);
 	shell_print(sh, "persons     : %u of %u (rev %u)", r.st.populated,
 		    r.st.n_persons, r.st.rev);
 	shell_print(sh, "credentials : %u", r.credentials);
@@ -356,17 +357,16 @@ static int cmd_unassign(const struct shell *sh, size_t argc, char **argv)
 	return rc;
 }
 
+/* The one command that does not need an open store: it is how a store this
+ * build cannot open — one a newer build wrote — gets replaced. */
 static int cmd_reset(const struct shell *sh, size_t argc, char **argv)
 {
 	int rc;
 
 	ARG_UNUSED(argc);
 	ARG_UNUSED(argv);
-	rc = need_open(sh);
-	if (rc) {
-		return rc;
-	}
 	rc = scenario_erase(&g_s);
+	g_open = (rc == 0);
 	shell_print(sh, "reset: %d", rc);
 	return rc;
 }
@@ -397,6 +397,11 @@ int ui_main(void)
 
 	if (rc != 0) {
 		printk("persondb: open failed: %d\n", rc);
+		if (rc == -ENOTSUP) {
+			printk("The log above says what this build cannot "
+			       "read. `persondb reset` erases the store and "
+			       "starts over.\n");
+		}
 		return rc;
 	}
 	g_open = true;
