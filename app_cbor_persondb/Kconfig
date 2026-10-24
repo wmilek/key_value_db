@@ -127,11 +127,14 @@ config APP_CBOR_PERSONDB_BENCH_SAMPLES
 	range 1 65536
 
 config APP_CBOR_PERSONDB_FRESH_START
-	bool "Erase the store at boot (start over)"
+	bool "Wipe the whole blob_db partition at boot (benchmarks)"
 	help
 	  Drop everything before opening, so this run behaves like the very
-	  first one. Use once to reset a board that already holds a store; on
-	  native_sim prefer the --flash_erase command-line option.
+	  first one: the clean start a benchmark measures from. This is a
+	  blob_db_erase_all() of the whole partition, so it also removes
+	  anything else stored there, not only this store — `persondb reset`
+	  is the scoped way to start over. On native_sim prefer the
+	  --flash_erase command-line option.
 
 # Sourced last on purpose. Kconfig resolves a symbol's `default` to the first
 # one it parses, so any Zephyr default this app overrides — see

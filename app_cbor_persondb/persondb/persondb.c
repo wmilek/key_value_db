@@ -501,6 +501,19 @@ static int attach_store(struct persondb *db, const uint8_t *buf, size_t len)
 		return rc;
 	}
 
+	/* A destroy that lost power part-way leaves the directory naming maps
+	 * that are dying or gone — persondb_destroy() releases these two
+	 * first, so a crash anywhere in it shows here. Opened anyway, every
+	 * lookup would answer "not found" and every write fail. */
+	struct map_info info;
+
+	if (db->ops->stat(db->people_root, &info) == -ENOENT ||
+	    db->ops->stat(db->cred_root, &info) == -ENOENT) {
+		LOG_ERR("store was being destroyed; persondb_destroy() "
+			"finishes it");
+		return -EINPROGRESS;
+	}
+
 	/* Version 1 described the same two maps, so upgrading it is a rewrite
 	 * of this one blob: no record moves. */
 	dirty = (db->sb.version != SUPERBLOCK_VERSION);
@@ -544,6 +557,8 @@ int persondb_open(struct persondb **out, uint32_t n_persons)
 		return rc;
 	}
 
+	/* The whole partition, not this store: a benchmark's clean start, and
+	 * the one place this module reaches past its own blobs (Kconfig). */
 	if (IS_ENABLED(CONFIG_APP_CBOR_PERSONDB_FRESH_START)) {
 		rc = blob_db_erase_all();
 		if (rc != 0) {
@@ -566,21 +581,43 @@ int persondb_open(struct persondb **out, uint32_t n_persons)
 
 	db->st.partition_bytes = partition_bytes;
 
-	rc = rootreg_get_or_create(PADB_ROOTREG_KEY, &db->sb_id);
-	if (rc != 0) {
-		LOG_ERR("rootreg: %d", rc);
-		return rc;
-	}
-
 	uint8_t buf[SUPERBLOCK_CBOR_MAX];
 	size_t got = 0;
 
-	rc = blob_db_get(db->sb_id, buf, sizeof(buf), &got);
-	if (rc == -ENOENT || (rc == 0 && got == 0)) {
-		/* Virgin, or a crash before a previous create's commit. */
+	rc = rootreg_get(PADB_ROOTREG_KEY, &db->sb_id);
+	if (rc == 0) {
+		rc = blob_db_get(db->sb_id, buf, sizeof(buf), &got);
+		if (rc == -ENOENT) {
+			/*
+			 * The registry names a superblock that is not there:
+			 * a create that crashed before its commit, or a
+			 * destroy that crashed before unregistering. The two
+			 * look alike, and only the first id may be bound —
+			 * update on a deleted id is undefined (blob_db D3) —
+			 * so drop the entry and build at a fresh one. An id
+			 * that was never bound holds nothing, so dropping it
+			 * leaks nothing.
+			 */
+			rc = rootreg_unregister(PADB_ROOTREG_KEY);
+			if (rc == 0) {
+				rc = -ENOENT;
+			}
+		}
+	}
+	if (rc == -ENOENT) {
+		rc = rootreg_get_or_create(PADB_ROOTREG_KEY, &db->sb_id);
+		if (rc != 0) {
+			LOG_ERR("rootreg: %d", rc);
+			return rc;
+		}
+		rc = create_store(db, n_persons);
+	} else if (rc == 0 && got == 0) {
+		/* Bound, but to nothing: no table was ever published. */
 		rc = create_store(db, n_persons);
 	} else if (rc == 0) {
 		rc = attach_store(db, buf, got);
+	} else {
+		LOG_ERR("store lookup: %d", rc);
 	}
 	if (rc != 0) {
 		return rc;
@@ -600,26 +637,149 @@ int persondb_close(struct persondb *db)
 	return 0;
 }
 
-int persondb_erase(struct persondb **db, uint32_t n_persons)
+static bool table_is_own(const struct sb_table *t)
 {
-	int rc;
+	return t->id == SB_TABLE_PEOPLE || t->id == SB_TABLE_CRED;
+}
 
-	if (db && *db) {
-		(*db)->open = false;
-		*db = NULL;
+/*
+ * Destroy every table the directory lists, this build's or a newer one's.
+ *
+ * Each root is checked before the first is released, so a store this build
+ * cannot take apart is left as it was found (DESIGN.md §12.3's rule, applied
+ * to destroy). The superblock does not say what kind of container a table is;
+ * every one this build knows is a kvhash map, and stat() is the cheapest way
+ * to ask "can I walk this": -ENOENT is a map already released by an earlier,
+ * interrupted destroy, and anything else is a container this build cannot
+ * free.
+ *
+ * This build's own tables go first, because persondb_open() checks those two
+ * for a part-way destroy: the first release must be one it can see.
+ */
+static int tables_destroy(struct persondb *db)
+{
+	for (uint8_t i = 0; i < db->sb.n_tables; i++) {
+		const struct sb_table *t = &db->sb.table[i];
+		struct map_info info;
+		int rc;
+
+		if (t->root == 0 || t->root == BLOB_DB_ROOT_ID ||
+		    t->root == db->sb_id) {
+			LOG_ERR("table %u names root %llu", t->id,
+				(unsigned long long)t->root);
+			return -EIO;
+		}
+		rc = db->ops->stat(t->root, &info);
+		if (rc != 0 && rc != -ENOENT) {
+			LOG_ERR("table %u is not a map this build can "
+				"destroy: %d", t->id, rc);
+			return rc;
+		}
 	}
 
-	/* Logical wipe: one master write, rather than the tens of seconds a
-	 * full-partition erase costs on an 8 MiB QSPI part. */
-	rc = blob_db_erase_all();
-	if (rc != 0) {
+	for (int pass = 0; pass < 2; pass++) {
+		for (uint8_t i = 0; i < db->sb.n_tables; i++) {
+			const struct sb_table *t = &db->sb.table[i];
+
+			if (table_is_own(t) != (pass == 0)) {
+				continue;
+			}
+
+			int rc = db->ops->destroy(t->root);
+
+			if (rc != 0 && rc != -ENOENT) {
+				LOG_ERR("destroying table %u: %d", t->id, rc);
+				return rc;
+			}
+		}
+	}
+	return 0;
+}
+
+/*
+ * Tear down in the order that keeps every step repeatable: the tables while
+ * the superblock still names them, then the superblock, then the registry
+ * entry — the rootreg contract's "teardown before unregistration" (§8). A
+ * crash before the unregister leaves an entry naming a deleted superblock,
+ * which this function and persondb_open() both recognise.
+ */
+int persondb_destroy(struct persondb **out)
+{
+	struct persondb *db = &g_db;
+	uint8_t buf[SUPERBLOCK_CBOR_MAX];
+	size_t got = 0;
+	int rc;
+
+	if (out && *out) {
+		(*out)->open = false;
+		*out = NULL;
+	}
+	db->open = false;
+	db->ops = &kvhash_map_ops;
+
+	rc = blob_db_mount();
+	if (rc != 0 && rc != -EALREADY) {
+		LOG_ERR("blob_db_mount: %d", rc);
 		return rc;
 	}
 	rc = rootreg_init();
 	if (rc != 0) {
+		LOG_ERR("rootreg_init: %d", rc);
 		return rc;
 	}
-	return persondb_open(db, n_persons);
+
+	rc = rootreg_get(PADB_ROOTREG_KEY, &db->sb_id);
+	if (rc == -ENOENT) {
+		return 0;   /* no store */
+	}
+	if (rc != 0) {
+		LOG_ERR("rootreg: %d", rc);
+		return rc;
+	}
+
+	rc = blob_db_get(db->sb_id, buf, sizeof(buf), &got);
+	if (rc == -ENOMEM) {
+		LOG_ERR("superblock larger than this build reads: cannot tell "
+			"which blobs the store owns");
+		return -ENOTSUP;
+	}
+	if (rc != 0 && rc != -ENOENT) {
+		LOG_ERR("superblock lookup: %d", rc);
+		return rc;
+	}
+
+	/* Absent or empty, it names no table: nothing to release but itself
+	 * and the entry. */
+	if (rc == 0 && got > 0) {
+		rc = superblock_cbor_decode(buf, got, &db->sb);
+		if (rc == -ENOTSUP) {
+			LOG_ERR("superblock (version %u) this build cannot "
+				"read in full: cannot tell which blobs the "
+				"store owns", db->sb.version);
+			return rc;
+		}
+		if (rc != 0) {
+			LOG_ERR("superblock unreadable: %d", rc);
+			return -EIO;
+		}
+		rc = tables_destroy(db);
+		if (rc != 0) {
+			return rc;
+		}
+	}
+
+	rc = blob_db_delete(db->sb_id);
+	if (rc != 0 && rc != -ENOENT) {
+		LOG_ERR("deleting the superblock: %d", rc);
+		return rc;
+	}
+	rc = rootreg_unregister(PADB_ROOTREG_KEY);
+	if (rc != 0 && rc != -ENOENT) {
+		LOG_ERR("rootreg_unregister: %d", rc);
+		return rc;
+	}
+	LOG_INF("store destroyed");
+	return 0;
 }
 
 int persondb_prepare(int *buckets_formatted)

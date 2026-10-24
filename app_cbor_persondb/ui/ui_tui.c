@@ -586,7 +586,7 @@ static void draw_detail(void)
 			term_field(DET_DEPT, DET_COL + 1, DET_IN,
 				   " a: add a person, or");
 			term_field(DET_VALID, DET_COL + 1, DET_IN,
-				   " q, then: persondb fill 200");
+				   " q, then: scenario fill 200");
 		}
 		return;
 	}

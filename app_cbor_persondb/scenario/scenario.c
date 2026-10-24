@@ -92,14 +92,19 @@ int scenario_close(struct scenario *s)
 	return 0;
 }
 
-int scenario_erase(struct scenario *s)
+int scenario_reset(struct scenario *s)
 {
-	int rc = persondb_erase(&s->db, N_PERSONS);
+	int rc = persondb_destroy(&s->db);
 
-	if (rc == 0) {
-		s->n_persons = N_PERSONS;
+	if (rc != 0) {
+		return rc;
 	}
-	return rc;
+	return scenario_open(s);
+}
+
+int scenario_destroy(struct scenario *s)
+{
+	return persondb_destroy(&s->db);
 }
 
 int scenario_prepare(struct scenario *s, int *buckets_formatted, int64_t *ms)

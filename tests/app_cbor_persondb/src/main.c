@@ -3,7 +3,8 @@
  * SPDX-License-Identifier: Apache-2.0
  *
  * ztest suite for app_cbor_persondb's superblock: what persondb_open() does
- * with a store written by an older or a newer build (DESIGN.md §12.3).
+ * with a store written by an older or a newer build (DESIGN.md §12.3), and
+ * what persondb_destroy() removes — this store, nothing else (§12.4).
  *
  * Each test starts from a fresh store, rewrites its superblock the way another
  * build would have left it, and reopens. The rule under test is that a store
@@ -171,15 +172,19 @@ static void expect_refused(int want)
 	zassert_mem_equal(after, before, n_before, "refusal wrote the superblock");
 }
 
-/* Erase without opening first: the previous test may have left a store that
- * persondb_open() refuses. */
+/* Wipe the whole partition without opening first: the previous test may have
+ * left a store that persondb_open() refuses, or one persondb_destroy() cannot
+ * remove. The test owns the partition, so this is the fixture's call to make,
+ * not persondb's. */
 static void before(void *f)
 {
 	ARG_UNUSED(f);
 	int rc = blob_db_mount();
 
 	zassert_true(rc == 0 || rc == -EALREADY, "mount: %d", rc);
-	zassert_ok(persondb_erase(&db, N_PERSONS));
+	zassert_ok(blob_db_erase_all());
+	zassert_ok(rootreg_init());
+	zassert_ok(persondb_open(&db, N_PERSONS));
 }
 
 static void after(void *f)
@@ -370,6 +375,156 @@ ZTEST(persondb_superblock, test_missing_table_is_corruption)
 	sb.n_tables = 1;   /* people only */
 	sb_write(&sb);
 	expect_refused(-EIO);
+}
+
+/* -- destroying a store ------------------------------------------------- */
+
+/* Another structure sharing the partition: its own key, its own map. */
+#define OTHER_KEY ROOTREG_KEY(0x4f544852u, 0)   /* 'OTHR' */
+
+/* After a destroy only the registry, at id 1, is left of the store. */
+#define BLOBS_WITHOUT_A_STORE 1u
+
+ZTEST(persondb_superblock, test_destroy_releases_every_blob)
+{
+	struct persondb_person got;
+	uint64_t id;
+
+	put_person(100001);
+	put_person(100002);
+	zassert_ok(persondb_destroy(&db));
+	zassert_is_null(db);
+
+	zassert_equal(rootreg_get(PADB_KEY, &id), -ENOENT);
+	zassert_equal(blob_db_count(), BLOBS_WITHOUT_A_STORE,
+		      "destroy leaked %u blobs",
+		      (unsigned)(blob_db_count() - BLOBS_WITHOUT_A_STORE));
+
+	/* And a fresh store builds in its place. */
+	zassert_ok(persondb_open(&db, N_PERSONS));
+	zassert_equal(persondb_person_get(db, 100001, &got), -ENOENT);
+}
+
+ZTEST(persondb_superblock, test_destroy_leaves_other_structures_alone)
+{
+	size_t before_other = blob_db_count();
+	uint64_t other = make_map();
+	size_t other_blobs = blob_db_count() - before_other;
+	uint64_t id;
+
+	zassert_ok(rootreg_set(OTHER_KEY, other));
+	put_person(100001);
+	zassert_ok(persondb_destroy(&db));
+
+	zassert_ok(rootreg_get(OTHER_KEY, &id));
+	zassert_equal(id, other);
+	zassert_true(map_alive(other), "destroy reached another structure");
+	zassert_equal(blob_db_count(), BLOBS_WITHOUT_A_STORE + other_blobs);
+
+	/* The id counter was not reset: the fresh store's ids are new. */
+	zassert_ok(persondb_open(&db, N_PERSONS));
+	zassert_true(sb_id() > other);
+	zassert_true(map_alive(other));
+}
+
+ZTEST(persondb_superblock, test_destroy_takes_a_newer_builds_tables)
+{
+	uint64_t kept = make_map();
+	uint64_t derived = make_map();
+
+	sb_add_table(9, kept, SB_CLASS_PRESERVE, 1);
+	sb_add_table(10, derived, SB_CLASS_DERIVED, 1);
+	zassert_ok(persondb_destroy(&db));
+
+	zassert_false(map_alive(kept));
+	zassert_false(map_alive(derived));
+	zassert_equal(blob_db_count(), BLOBS_WITHOUT_A_STORE);
+}
+
+/* The store this build refuses to open is the one reset exists for. */
+ZTEST(persondb_superblock, test_destroy_removes_a_store_open_refuses)
+{
+	sb_add_table(9, make_map(), SB_CLASS_REQUIRED, 1);
+	zassert_equal(reopen(), -ENOTSUP);
+
+	zassert_ok(persondb_destroy(&db));
+	zassert_equal(blob_db_count(), BLOBS_WITHOUT_A_STORE);
+}
+
+/* Without a readable superblock it cannot know what it owns. */
+ZTEST(persondb_superblock, test_destroy_refuses_a_newer_superblock_version)
+{
+	static const uint8_t v3[] = { 0xa1, 0x01, 0x03 };
+	uint8_t after[SUPERBLOCK_CBOR_MAX];
+	size_t count;
+
+	zassert_ok(blob_db_update(sb_id(), v3, sizeof(v3)));
+	count = blob_db_count();
+
+	zassert_equal(persondb_destroy(&db), -ENOTSUP);
+	zassert_equal(sb_raw(after, sizeof(after)), sizeof(v3));
+	zassert_mem_equal(after, v3, sizeof(v3));
+	zassert_equal(blob_db_count(), count, "refusal released blobs");
+}
+
+/* A raw blob where a table should be: a container this build cannot walk. */
+ZTEST(persondb_superblock, test_destroy_refuses_before_releasing_anything)
+{
+	struct persondb_person got;
+	struct superblock sb;
+	uint64_t raw = blob_db_alloc_id();
+
+	zassert_not_equal(raw, 0);
+	zassert_ok(blob_db_update(raw, "not a map", 9));
+	put_person(100001);
+	sb_add_table(9, raw, SB_CLASS_PRESERVE, 1);
+
+	zassert_equal(persondb_destroy(&db), -EIO);
+	zassert_true(blob_db_exists(raw));
+
+	/* The store is whole: drop the foreign entry and it opens as before. */
+	sb_read(&sb);
+	sb.n_tables = 2;
+	sb_write(&sb);
+	zassert_ok(persondb_open(&db, N_PERSONS));
+	zassert_ok(persondb_person_get(db, 100001, &got));
+}
+
+/* Power lost after the people map was released. */
+ZTEST(persondb_superblock, test_destroy_resumes_after_a_crash)
+{
+	put_person(100001);
+	zassert_ok(kvhash_map_ops.destroy(table_root(SB_TABLE_PEOPLE)));
+
+	zassert_equal(reopen(), -EINPROGRESS);
+	zassert_ok(persondb_destroy(&db));
+	zassert_equal(blob_db_count(), BLOBS_WITHOUT_A_STORE);
+	zassert_ok(persondb_open(&db, N_PERSONS));
+}
+
+/* Power lost after the superblock was deleted, before the unregister. */
+ZTEST(persondb_superblock, test_open_after_a_destroy_lost_its_last_step)
+{
+	uint64_t old = sb_id();
+
+	zassert_ok(kvhash_map_ops.destroy(table_root(SB_TABLE_PEOPLE)));
+	zassert_ok(kvhash_map_ops.destroy(table_root(SB_TABLE_CRED)));
+	zassert_ok(blob_db_delete(old));
+
+	/* Building at the deleted id would be D3's undefined update. */
+	zassert_ok(reopen());
+	zassert_not_equal(sb_id(), old);
+	put_person(100001);
+
+	zassert_ok(persondb_destroy(&db));
+	zassert_equal(blob_db_count(), BLOBS_WITHOUT_A_STORE);
+}
+
+ZTEST(persondb_superblock, test_destroy_without_a_store)
+{
+	zassert_ok(persondb_destroy(&db));
+	zassert_ok(persondb_destroy(&db));
+	zassert_equal(blob_db_count(), BLOBS_WITHOUT_A_STORE);
 }
 
 /* -- the codec ---------------------------------------------------------- */
