@@ -15,17 +15,17 @@ over-long ids). Those are fixed, and deliberately not recorded here: this
 register is for limitations of the stack, and an application's own bugs do not
 belong in it.
 
-**Five findings are now closed by `main`.** B1, B9 and B10 are fixed outright,
-B5 loses two of its five jobs, and B3 is half-answered by the new
-`blob_db_iostats_get()`. What follows marks them `closed` rather than deleting
+**Six findings are now closed by `main`.** B1, B9 and B10 are fixed outright,
+K6 since the Map shape gained `next`, B5 loses two of its five jobs, and B3 is
+half-answered by the new `blob_db_iostats_get()`. What follows marks them `closed` rather than deleting
 them: the register is the record of what an application hit, and a fixed
 finding with its before/after numbers is more use than a silent gap. The
 remaining open ones are listed in the summary below.
 
 | | |
 |---|---|
-| **Closed by `main`** | B1, B5 (partly), B9, B10, B3 (partly) |
-| **Still open** | B2, B4, B6, B7, B8, B11, B12, K1–K11, **K12**, **K13**, V1–V4, X1 |
+| **Closed by `main`** | B1, B5 (partly), B9, B10, B3 (partly), K6 |
+| **Still open** | B2, B4, B6, B7, B8, B11, B12, K1–K5, K7–K11, **K12**, **K13**, V1–V4, X1 |
 | **Withdrawn** | R1 — `ROOTREG_MAX_ROOTS`'s default was never the problem; the layout that wanted seventeen entries was (`DESIGN.md` §12.1) |
 | **Newly observed** | N1 — transaction count rose sharply as byte count fell (closed on hardware: ~65 µs per transaction) · B12 — compaction lowers the durable id ceiling ([issue #14](https://github.com/wmilek/key_value_db/issues/14)) |
 | **Found by removing a workaround** | **K12** — the largest map the geometry allows cannot be written to · **K13** — the directory blob caps the store at 9 670 persons, half the partition. Both were invisible while the app sharded its person records over sixteen maps; both appeared in the first hour after it stopped (`DESIGN.md` §12.2). |
@@ -446,8 +446,10 @@ Principle P7 states "**No permanent leak (must)** … Long-term accumulation of
 leaked space is not accepted." A device that loses power during enrollment,
 repeatedly, over years, accumulates exactly that.
 
-Direction: either a mark-and-sweep from the registry (needs iteration, K6/B4),
-or a durable creation-intent list that a later mount can roll back —
+Direction: either a mark-and-sweep from the registry — which needs iteration
+over *blobs* at L1, not over a map's entries, so K6's closing does not supply
+it, and pays B4 on every walk — or a durable creation-intent list that a later
+mount can roll back —
 `BLOB_CONTAINERS_INTENT` is scaffolded for something like this but not
 implemented.
 
@@ -585,10 +587,12 @@ and size to 3 σ instead of 5.5 σ.
 ### K3 — `n_buckets` is fixed at create time (major, `read`)
 
 Chosen from `map_config.initial_capacity` on first create, never changed. A map
-that outgrows its bucket count has no growth path short of rebuild — and rebuild
-needs iteration, which does not exist (K6). Capacity must be planned exactly,
-before the first insert, at a layer with no visibility into how much flash
-exists (B3).
+that outgrows its bucket count has no growth path short of rebuild. Since K6
+closed, a rebuild can be written — walk the old map with `map_ops.next` into one
+created at a new geometry — but it is a copy of every entry, needs room for both
+maps at once, and nothing in the stack does it for the application. Capacity
+must still be planned exactly, before the first insert, at a layer with no
+visibility into how much flash exists (B3).
 
 ### K4 — Every `set` rewrites the whole bucket blob (major, `read`)
 
@@ -614,7 +618,7 @@ application has to trade them off with no visibility into either.
 Direction: the directory is a dense array of ids; a bucket's id could be derived
 rather than stored, or the directory chunked so a publish rewrites 64 B.
 
-### K6 — No iteration (major, `read`)
+### K6 — No iteration — **CLOSED by `main`** (was major)
 
 `map_ops` has no `iterate`. An application cannot enumerate, back up, migrate,
 fsck or garbage-collect its own data. Every key must be regenerable from outside
@@ -622,6 +626,34 @@ the store — which this app arranges (F6) by making the dataset a pure function
 of an index, but a deployment with externally-sourced keys cannot.
 
 `doc/layers/l3_interfaces.md` §3 records this as deferred until `kvtree`.
+
+**Closed** by `69f24aa Add map_ops.next (stateless enumeration) and
+map_ops.count, implemented by kvhash (#38)`, which did not wait for `kvtree`.
+`next(root, cursor)` returns the entry after a cursor key, and the key *is* the
+cursor: nothing to open or close, and a walk resumes from a saved key after a
+reboot. Every key present for the whole walk comes back exactly once, and
+`set`/`del` between calls are allowed (`shape_map.h`). `count` gives the exact
+number of keys, computed from flash. Together with `map_ops.destroy` (`3ed2622`,
+#34), a map can now be enumerated, copied to a new geometry, checked, and torn
+down whole.
+
+**What it does not give**, so the finding is not quite gone:
+
+- **Hash order, not sorted.** Sorted scans still wait for `kvtree`, and L3's
+  `kvdb_foreach` is still deferred (`l3_interfaces.md` §3). This app does not
+  use L3, so neither costs it anything.
+- **Not cheap.** Each call is independent — a lookup of its cursor plus a
+  forward search — so a walk of n entries is n calls, each paying what a lookup
+  pays (K11). This app has not measured a walk; the status is `read`.
+- **Map entries, not blobs.** It cannot find blobs that nothing references, so
+  B8's orphans are still invisible.
+
+**What this application does with it.** It does not change F6: `verify` checks
+the store against the generator because that is what verification means here,
+and an enumeration would only report what is stored. The superblock's table
+directory relies on the other half — `destroy` drops a newer build's derived
+table — and rebuilding such a table would walk its sources with `next`
+(`DESIGN.md` §12.3).
 
 ### K7 — Scratch buffers are file-scope and shared across all maps (moderate, `read`)
 
@@ -742,8 +774,8 @@ itself: `MAX_BUCKETS`, `DIR_HDR_LEN` and the 8-bytes-per-id are all private to
 create time and persisted (K3), so a wrong value is baked into the store
 forever; the store gives no occupancy signal (K10); and the failure surfaces as
 a `-ENOSPC` from one bucket while the medium is nearly empty (K2), potentially
-hours into a fill, with no repair path short of a rebuild that needs iteration
-(K6) that does not exist.
+hours into a fill, with no repair path short of copying every entry into a new
+map (K3).
 
 **The sharpest edge is cross-Kconfig coupling.**
 `CONFIG_BLOB_DB_MAX_PAYLOAD_LEN` is a single global symbol, and `MAX_BUCKETS`
@@ -792,7 +824,8 @@ and the only one that lets `tools/sizing.py` be deleted.
 
 `map_ops` has `create`/`get`/`set`/`del` and nothing else. An application cannot
 ask how many entries a map holds or how close a bucket is to K2's cliff, so it
-cannot decide when to add a map. With K6 it cannot even count them by walking.
+cannot decide when to add a map. (It could not count them by walking either,
+until K6 closed; see K6 for `map_ops.next` and `map_ops.count`.)
 
 This is the finding that makes K2 expensive rather than merely present: a
 `map_ops.stat(root)` returning entry count and peak bucket occupancy would let
@@ -907,7 +940,7 @@ reports `-ENOSPC` with no warning first. A near-full bucket signal was
 prototyped and removed (proposal D3d); it would not have helped here in any
 case, having stayed silent through every run above — correctly, because it was
 a *bucket* signal and this is a medium wall. An application still cannot see
-this coming (B3, V3) and still cannot recover from it (K3, K6).
+this coming (B3, V3) and still cannot recover from it (K3).
 
 **Below is the finding as first measured, on the one-level container.**
 
