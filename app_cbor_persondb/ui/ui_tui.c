@@ -7,14 +7,15 @@
  * A frontend, so the same rule as the other two applies: parsing and drawing
  * only, and every action is one call into scenario.h or persondb.h
  * (DESIGN.md F15). What it adds is a way to see a person and change what they
- * may open without typing ids into a command line.
+ * may open — and who they are, and for how long — without typing ids into
+ * a command line.
  *
  *  ┌ Persons ──────────────────────────┐┌ 100042 ───────────────────────┐
  *  │     id  name           dept   P C ││ Anna Kowalska                  │
  *  │ 100042  Anna Kowalska  R&D   18 3 ││ Permissions (18)               │
  *  └───────────────────────────────────┘└────────────────────────────────┘
  *   status: what the last operation did, its return code, its time
- *   keys
+ *   keys: a grant, d revoke, n name, v valid from/to, g goto, c card
  *
  * Three things below are shaped by the store rather than by taste:
  *
@@ -31,7 +32,7 @@
  *    summary per row is kept: the full record (~720 B) is held for the
  *    selected person alone.
  *
- *  - After a grant or revoke the person is read back from the store, never
+ *  - After any write the person is read back from the store, never
  *    patched in RAM. What the screen shows is what was stored — and the
  *    status line reports the return code and the time the write took.
  *
@@ -82,7 +83,7 @@
 #define DET_CTOP    (DET_CHDR + 1)      /* PERSONDB_CARDS_MAX rows follow */
 
 #define STATUS_ROW  22
-#define HELP_ROW    24
+#define HELP_ROW    23                  /* two rows: actions, then movement */
 
 /* How long a lone Esc waits to find out whether it starts an arrow key. At
  * 9600 baud the rest of a sequence is 2 ms behind its first byte; 30 ms is
@@ -122,6 +123,9 @@ enum purpose {
 	FOR_REVOKE_CONFIRM, /* confirm: revoke g.perm */
 	FOR_GOTO,           /* input: a person id or dataset index */
 	FOR_CARD,           /* input: a card id, to jump to its holder */
+	FOR_RENAME,         /* input: the person's new name */
+	FOR_VALID_FROM,     /* input: first valid day, then ... */
+	FOR_VALID_UNTIL,    /* input: ... last valid day */
 };
 
 static const char OTHER[] = "<other...>";
@@ -152,6 +156,8 @@ static struct {
 	struct tui_input     input;
 	struct tui_confirm   confirm;
 	char                 perm[PERSONDB_PERM_MAX + 1];
+	uint32_t             new_from;   /* carried from one validity dialog
+					  * to the next */
 
 	char                 status[TERM_COLS];
 	bool                 status_err;
@@ -209,6 +215,73 @@ static void fmt_date(char *out, size_t sz, uint32_t epoch)
 
 	snprintf(out, sz, "%04d-%02u-%02u", (int)(y + (m <= 2)), m,
 		 (uint8_t)d);
+}
+
+/* The inverse: days since 1970-01-01 for a civil date (days_from_civil). */
+static int64_t days_from_civil(int32_t y, uint32_t m, uint32_t d)
+{
+	y -= m <= 2;
+	int32_t era = (y >= 0 ? y : y - 399) / 400;
+	uint32_t yoe = (uint32_t)(y - era * 400);
+	uint32_t doy = (153 * (m > 2 ? m - 3 : m + 9) + 2) / 5 + d - 1;
+	uint32_t doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+
+	return (int64_t)era * 146097 + doe - 719468;
+}
+
+/**
+ * @brief Parse "YYYY-MM-DD" to the epoch second its day starts at (UTC).
+ *
+ * Strict: exactly that shape, a real calendar day, and a result that fits
+ * the record's uint32_t. Anything else is refused, not guessed at — a typo
+ * in a validity window is a card that silently stops opening doors.
+ *
+ * @retval 0 parsed; @retval -EINVAL not a date this record can hold
+ */
+static int parse_date(const char *s, int64_t *epoch)
+{
+	static const uint8_t dim[] = { 31, 29, 31, 30, 31, 30,
+				       31, 31, 30, 31, 30, 31 };
+	unsigned int y = 0, m = 0, d = 0;
+
+	for (int i = 0; i < 10; i++) {
+		bool dash = (i == 4 || i == 7);
+
+		if (dash ? s[i] != '-' : (s[i] < '0' || s[i] > '9')) {
+			return -EINVAL;
+		}
+	}
+	if (s[10] != '\0') {
+		return -EINVAL;
+	}
+	for (int i = 0; i < 4; i++) {
+		y = y * 10 + (unsigned int)(s[i] - '0');
+	}
+	m = (unsigned int)(s[5] - '0') * 10 + (unsigned int)(s[6] - '0');
+	d = (unsigned int)(s[8] - '0') * 10 + (unsigned int)(s[9] - '0');
+
+	bool leap = (y % 4 == 0 && y % 100 != 0) || y % 400 == 0;
+
+	if (m < 1 || m > 12 || d < 1 || d > dim[m - 1] ||
+	    (m == 2 && d == 29 && !leap)) {
+		return -EINVAL;
+	}
+
+	int64_t t = days_from_civil((int32_t)y, m, d) * 86400;
+
+	if (t < 0 || t > UINT32_MAX) {
+		return -EINVAL;
+	}
+	*epoch = t;
+	return 0;
+}
+
+/* The validity window is [from, until) — until is the first instant that is
+ * no longer valid. People think in last valid days, so that is what the
+ * screen shows and what the dialog asks for. */
+static void fmt_last_day(char *out, size_t sz, uint32_t until)
+{
+	fmt_date(out, sz, until ? until - 1 : 0);
 }
 
 static bool sel_holds(const char *perm)
@@ -353,14 +426,15 @@ static void draw_detail(void)
 	}
 
 	fmt_date(from, sizeof(from), g.sel.valid_from);
-	fmt_date(until, sizeof(until), g.sel.valid_until);
+	fmt_last_day(until, sizeof(until), g.sel.valid_until);
 
 	term_attr(TERM_BOLD);
 	term_fieldf(DET_NAME, DET_COL + 1, DET_IN, " %s", g.sel.name);
 	term_attr(TERM_NORMAL);
 	term_fieldf(DET_DEPT, DET_COL + 1, DET_IN, " %s / %s", g.sel.dept,
 		    g.sel.title);
-	term_fieldf(DET_VALID, DET_COL + 1, DET_IN, " %s .. %s", from, until);
+	term_fieldf(DET_VALID, DET_COL + 1, DET_IN, " valid %s .. %s", from,
+		    until);
 
 	term_attr(TERM_DIM);
 	term_fieldf(DET_PHDR, DET_COL + 1, DET_IN, " Permissions (%u)%s",
@@ -392,15 +466,17 @@ static void draw_status(void)
 
 static void draw_help(void)
 {
+	term_attr(TERM_REVERSE);
+	term_field(HELP_ROW, 1, TERM_COLS,
+		   " a grant  d revoke  n name  v valid from/to  g goto  c card"
+		   "  r reload  q quit");
 	/* 79 columns, not 80: writing the bottom-right cell makes some
 	 * terminals scroll the whole screen up a line. */
-	term_attr(TERM_REVERSE);
-	term_field(HELP_ROW, 1, TERM_COLS - 1,
+	term_field(HELP_ROW + 1, 1, TERM_COLS - 1,
 		   g.focus == FOCUS_LIST ?
-		   " PgUp/PgDn page  Tab perms  a grant  d revoke  g goto"
-		   "  c card  r reload  q quit" :
-		   " arrows move  Tab list  a grant  d/Del revoke selected"
-		   "  g goto  c card  q quit");
+		   " arrows/PgUp/PgDn/Home/End move  Tab to permissions" :
+		   " arrows/PgUp/PgDn move  Tab to list  d/Del revokes the"
+		   " selected permission");
 	term_attr(TERM_NORMAL);
 }
 
@@ -637,15 +713,86 @@ static void do_revoke(const char *perm)
 	}
 }
 
+static void do_rename(const char *name)
+{
+	uint32_t id = g.sel.id;
+
+	set_status(false, "renaming %u ...", id);
+	draw_status();
+	term_flush();
+
+	int64_t t0 = scenario_now_us();
+	int rc = persondb_person_rename(g.s->db, id, name);
+	char took[24];
+
+	snprintf(took, sizeof(took), "%s", dur_since(t0));
+	load_sel();
+
+	switch (rc) {
+	case 0:
+		set_status(false, "%u is now '%s' | %s", id, g.sel.name, took);
+		break;
+	case -EINVAL:
+		set_status(true, "a name is 1..%d characters | rc %d",
+			   PERSONDB_NAME_MAX, rc);
+		break;
+	default:
+		set_status(true, "rename %u failed | rc %d | %s", id, rc, took);
+		break;
+	}
+}
+
+static void do_set_validity(uint32_t from, uint32_t until)
+{
+	uint32_t id = g.sel.id;
+
+	set_status(false, "setting validity of %u ...", id);
+	draw_status();
+	term_flush();
+
+	int64_t t0 = scenario_now_us();
+	int rc = persondb_person_set_validity(g.s->db, id, from, until);
+	char took[24];
+
+	snprintf(took, sizeof(took), "%s", dur_since(t0));
+	load_sel();
+
+	switch (rc) {
+	case 0: {
+		char f[24], u[24];
+
+		fmt_date(f, sizeof(f), g.sel.valid_from);
+		fmt_last_day(u, sizeof(u), g.sel.valid_until);
+		set_status(false, "%u valid %s .. %s | %s", id, f, u, took);
+		break;
+	}
+	case -EINVAL:
+		set_status(true, "the last day cannot be before the first | rc %d",
+			   rc);
+		break;
+	default:
+		set_status(true, "set validity of %u failed | rc %d | %s", id,
+			   rc, took);
+		break;
+	}
+}
+
 /* -- dialogs ------------------------------------------------------------- */
 
 static void open_input(enum purpose why, const char *title, const char *prompt,
-		       uint8_t max)
+		       uint8_t max, const char *initial)
 {
 	memset(&g.input, 0, sizeof(g.input));
 	g.input.title = title;
 	g.input.prompt = prompt;
 	g.input.max = MIN(max, TUI_INPUT_MAX);
+	if (initial != NULL) {
+		/* Pre-filled with the current value: editing a name or a date
+		 * is usually a small change, not a retype. */
+		strncpy(g.input.buf, initial, g.input.max);
+		g.input.buf[g.input.max] = '\0';
+		g.input.len = (uint8_t)strlen(g.input.buf);
+	}
 	g.purpose = why;
 	g.mode = MODE_INPUT;
 	tui_input_draw(&g.input);
@@ -724,6 +871,92 @@ static void open_revoke(void)
 	g.purpose = FOR_REVOKE;
 	g.mode = MODE_PICK;
 	tui_pick_draw(&g.pick);
+}
+
+static bool need_sel(void)
+{
+	if (g.sel_rc != 0) {
+		set_status(true, "no person selected");
+		draw_status();
+		return false;
+	}
+	return true;
+}
+
+static void open_rename(void)
+{
+	static char title[32];
+
+	if (!need_sel()) {
+		return;
+	}
+	snprintf(title, sizeof(title), "Rename %u", g.sel.id);
+	open_input(FOR_RENAME, title, "Name:", PERSONDB_NAME_MAX, g.sel.name);
+}
+
+static void open_validity(void)
+{
+	static char title[32];
+	char from[24];
+
+	if (!need_sel()) {
+		return;
+	}
+	snprintf(title, sizeof(title), "Valid from/to, %u", g.sel.id);
+	fmt_date(from, sizeof(from), g.sel.valid_from);
+	open_input(FOR_VALID_FROM, title, "First valid day (YYYY-MM-DD, UTC):",
+		   10, from);
+}
+
+static void close_dialog(void);
+
+/* A field left as it was pre-filled keeps the stored instant exactly. The
+ * stored window may start or end mid-day (the generated population does),
+ * and re-parsing the date shown would move it to midnight unasked. */
+
+/** @return true if the second dialog is now open */
+static bool validity_from_done(const char *text)
+{
+	char shown[24];
+	int64_t t;
+
+	fmt_date(shown, sizeof(shown), g.sel.valid_from);
+	if (strcmp(text, shown) == 0) {
+		g.new_from = g.sel.valid_from;
+	} else if (parse_date(text, &t) == 0) {
+		g.new_from = (uint32_t)t;
+	} else {
+		set_status(true, "'%s' is not a date: YYYY-MM-DD", text);
+		return false;
+	}
+
+	char until[24];
+	const char *title = g.input.title;
+
+	fmt_last_day(until, sizeof(until), g.sel.valid_until);
+	close_dialog();
+	open_input(FOR_VALID_UNTIL, title, "Last valid day (YYYY-MM-DD, UTC):",
+		   10, until);
+	return true;
+}
+
+static void validity_until_done(const char *text)
+{
+	char shown[24];
+	int64_t t;
+	uint32_t until;
+
+	fmt_last_day(shown, sizeof(shown), g.sel.valid_until);
+	if (strcmp(text, shown) == 0) {
+		until = g.sel.valid_until;
+	} else if (parse_date(text, &t) == 0 && t + 86400 <= UINT32_MAX) {
+		/* Valid through the whole of that day. */
+		until = (uint32_t)(t + 86400);
+	} else {
+		set_status(true, "'%s' is not a date: YYYY-MM-DD", text);
+		return;
+	}
+	do_set_validity(g.new_from, until);
 }
 
 static void close_dialog(void)
@@ -815,7 +1048,7 @@ static void dialog_key(int key)
 			 * open the next. */
 			close_dialog();
 			open_input(FOR_GRANT_OTHER, g.pick.title,
-				   "Permission name:", PERSONDB_PERM_MAX);
+				   "Permission name:", PERSONDB_PERM_MAX, NULL);
 			return;
 		}
 		do_grant(pick);
@@ -843,6 +1076,17 @@ static void dialog_key(int key)
 		goto_card(g.input.buf);
 		draw_status();
 		return;
+	case FOR_RENAME:
+		do_rename(g.input.buf);
+		break;
+	case FOR_VALID_FROM:
+		if (validity_from_done(g.input.buf)) {
+			return;     /* the second dialog is open */
+		}
+		break;
+	case FOR_VALID_UNTIL:
+		validity_until_done(g.input.buf);
+		break;
 	}
 	close_dialog();
 }
@@ -923,13 +1167,19 @@ static void main_key(int key)
 	case TERM_KEY_DEL:
 		open_revoke();
 		return;
+	case 'n':
+		open_rename();
+		return;
+	case 'v':
+		open_validity();
+		return;
 	case 'g':
 		open_input(FOR_GOTO, "Go to person", "Person id or dataset index:",
-			   10);
+			   10, NULL);
 		return;
 	case 'c':
 		open_input(FOR_CARD, "Find card holder", "Card id:",
-			   PERSONDB_CARD_LEN);
+			   PERSONDB_CARD_LEN, NULL);
 		return;
 	default:
 		break;

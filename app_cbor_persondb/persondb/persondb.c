@@ -824,6 +824,52 @@ int persondb_permission_revoke(struct persondb *db, uint32_t person_id,
 	return person_store(db, &p);
 }
 
+/* -- person details ----------------------------------------------------- */
+
+int persondb_person_rename(struct persondb *db, uint32_t person_id,
+			   const char *name)
+{
+	struct persondb_person p;
+	size_t n = name ? strlen(name) : 0;
+
+	if (n == 0 || n > PERSONDB_NAME_MAX) {
+		return -EINVAL;
+	}
+
+	int rc = persondb_person_get(db, person_id, &p);
+
+	if (rc != 0) {
+		return rc;
+	}
+	if (strcmp(p.name, name) == 0) {
+		return 0;
+	}
+	memcpy(p.name, name, n + 1);
+	return person_store(db, &p);
+}
+
+int persondb_person_set_validity(struct persondb *db, uint32_t person_id,
+				 uint32_t valid_from, uint32_t valid_until)
+{
+	struct persondb_person p;
+
+	if (valid_until <= valid_from) {
+		return -EINVAL;
+	}
+
+	int rc = persondb_person_get(db, person_id, &p);
+
+	if (rc != 0) {
+		return rc;
+	}
+	if (p.valid_from == valid_from && p.valid_until == valid_until) {
+		return 0;
+	}
+	p.valid_from = valid_from;
+	p.valid_until = valid_until;
+	return person_store(db, &p);
+}
+
 /* -- the decision ------------------------------------------------------- */
 
 int persondb_check(struct persondb *db, const char *card, const char *perm,

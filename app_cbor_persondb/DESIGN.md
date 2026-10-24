@@ -600,7 +600,11 @@ because §9 exists.
 **`persondb tui` — full-screen, inside the shell frontend.** A page of persons
 on the left, the selected one's permissions and cards on the right, and dialogs
 to grant (pick from the vocabulary, or type a name) and revoke (with a y/N
-confirmation). It takes over the shell's own terminal through the shell's
+confirmation) permissions, rename the person (`n`), and set the days their
+cards are valid (`v`). The validity dialogs ask for the first and the last
+valid day, pre-filled with the stored ones; the last day is stored as the
+following midnight, because the record's window is half-open. A date left as
+it was keeps the stored instant exactly, even when that instant is mid-day. It takes over the shell's own terminal through the shell's
 bypass mode and gives it back on `q`, so it needs no second UART, and it runs
 on the shell thread like every other command, so persondb still has one
 caller. Plain VT100 and DEC line drawing at 80x24 (`ui/term.c`); the dialogs
