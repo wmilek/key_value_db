@@ -72,7 +72,6 @@ struct persondb_stat {
 	uint32_t n_persons;          /* dataset size recorded at create time */
 	uint32_t populated;          /* persons written so far */
 	uint32_t rev;                /* mutation revision */
-	uint8_t  n_people_maps;
 
 	/* The geometry the container chose, read back through map_ops.stat().
 	 * This used to be absent with an apology: the app asked for the largest
@@ -126,12 +125,19 @@ struct persondb;
  * raised B9/B10 and the fix took the question away from callers rather than
  * exporting the constants to them; -ENOTSUP below is that check reporting.
  *
+ * A store written by an older build is upgraded in place; one written by a
+ * newer build is opened if everything it added is marked as safe to keep or
+ * to drop (DESIGN.md §12.3), and refused otherwise.
+ *
  * @param db          (out) handle
  * @param n_persons   dataset size to record when creating; ignored when
  *                    attaching to a store that already exists
  *
  * @retval 0        ready
- * @retval -ENOTSUP the configured payload does not fit this geometry
+ * @retval -ENOTSUP the configured payload does not fit this geometry, or the
+ *                  store needs something this build lacks: a newer superblock
+ *                  format, a table a newer build marked required, a record
+ *                  format it cannot read. persondb_erase() starts over.
  * @retval -EIO     flash error or a corrupt superblock
  */
 int persondb_open(struct persondb **db, uint32_t n_persons);

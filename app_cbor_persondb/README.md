@@ -75,7 +75,7 @@ this one and records which parts survived.
 ### 3. Make every persistent structure reachable from one integer
 
 ```
-rootreg[ROOTREG_KEY('PADB', 0)] -> superblock -> people_root, cred_root
+rootreg[ROOTREG_KEY('PADB', 0)] -> superblock -> table directory -> people, credentials
 ```
 
 `persondb_open()` reads one registry entry and one blob, and has the whole
