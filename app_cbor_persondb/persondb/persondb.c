@@ -763,6 +763,13 @@ int persondb_person_add(struct persondb *db, const struct persondb_person *p)
 	}
 
 	for (uint8_t i = 0; i < p->n_cards && i < PERSONDB_CARDS_MAX; i++) {
+		/* Listed twice in the record itself: stored, it would keep one
+		 * listing after the card's index entry is revoked. */
+		for (uint8_t j = 0; j < i; j++) {
+			if (strcmp(p->card[i], p->card[j]) == 0) {
+				return -EINVAL;
+			}
+		}
 		rc = persondb_card_owner(db, p->card[i], &owner);
 		if (rc == 0) {
 			return -EEXIST;

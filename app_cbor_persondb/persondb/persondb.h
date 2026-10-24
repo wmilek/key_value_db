@@ -194,8 +194,8 @@ int persondb_person_delete(struct persondb *db, uint32_t id);
  *
  * @retval 0       stored
  * @retval -EEXIST the id is taken, or one of @p p's cards is held
- * @retval -EINVAL empty name, a validity window no instant falls in, or what
- *                 persondb_person_put() rejects
+ * @retval -EINVAL empty name, a validity window no instant falls in, a card
+ *                 listed twice, or what persondb_person_put() rejects
  */
 int persondb_person_add(struct persondb *db, const struct persondb_person *p);
 

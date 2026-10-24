@@ -204,6 +204,8 @@ static struct {
 	uint32_t             next_after;
 	bool                 approx;     /* positions may be off since an edit;
 					  * see pages_forget() */
+	uint32_t             walk_stopped; /* a key stopped the last walk after
+					    * this many persons; 0 if not */
 	enum focus           focus;
 	uint8_t              perm_cur;
 	uint8_t              perm_top;
@@ -390,6 +392,33 @@ static void fmt_last_day(char *out, size_t sz, uint32_t until)
 	fmt_date(out, sz, until ? until - 1 : 0);
 }
 
+/**
+ * @brief Parse a decimal person id: digits only, and it must fit uint32_t.
+ *
+ * Not strtoul: unsigned long is 32 bits on both targets, so its overflow
+ * clamps to the largest id rather than failing, and it accepts "-1" by
+ * wrapping it to the same value.
+ */
+static int parse_id(const char *s, uint32_t *out)
+{
+	uint64_t v = 0;
+
+	if (*s == '\0') {
+		return -EINVAL;
+	}
+	for (; *s != '\0'; s++) {
+		if (*s < '0' || *s > '9') {
+			return -EINVAL;
+		}
+		v = v * 10 + (uint64_t)(*s - '0');
+		if (v > UINT32_MAX) {
+			return -ERANGE;
+		}
+	}
+	*out = (uint32_t)v;
+	return 0;
+}
+
 static bool sel_holds(const char *perm)
 {
 	for (uint8_t i = 0; i < g.sel.n_perms; i++) {
@@ -436,6 +465,10 @@ static void draw_title(void)
 
 static void draw_row(int i)
 {
+	if (i < 0 || i >= LIST_ROWS) {
+		return;         /* a selection off this page has no row */
+	}
+
 	const struct row *r = &g.rows[i];
 	uint32_t pos = g.top + (uint32_t)i;
 	int row = LIST_TOP + i;
@@ -792,8 +825,7 @@ static uint32_t seek_page(uint32_t want, bool *has_after, uint32_t *after)
 			draw_status();
 			term_flush();
 			if (key_waiting()) {
-				set_status(false, "stopped after %u persons",
-					   walked);
+				g.walk_stopped = walked;
 				break;
 			}
 		}
@@ -811,7 +843,10 @@ static void load_page(void)
 {
 	bool has;
 	uint32_t after;
-	uint32_t page = seek_page(g.top / LIST_ROWS, &has, &after);
+	uint32_t page;
+
+	g.walk_stopped = 0;
+	page = seek_page(g.top / LIST_ROWS, &has, &after);
 	int64_t t0 = g.cfg.now_us();
 	int rows = 0;
 	int rc = 0;
@@ -852,6 +887,12 @@ static void load_page(void)
 	}
 
 	if (rc != 0 && rc != -ENODATA) {
+		/* Keep the selection on this page whatever happened: every
+		 * draw_row(g.cur - g.top) after this indexes g.rows with it. */
+		if (!g.detached) {
+			g.cur = MIN(MAX(g.cur, g.top),
+				    g.top + (uint32_t)MAX(rows, 1) - 1);
+		}
 		set_status(true, "reading the store failed | rc %d", rc);
 		return;
 	}
@@ -881,6 +922,9 @@ static void load_page(void)
 	cursor_clamp();   /* a reload may find fewer permissions than before */
 	if (g.n == 0) {
 		set_status(false, "the store holds no persons yet");
+	} else if (g.walk_stopped) {
+		set_status(false, "walk stopped by a key after %u persons;"
+			   " this is not the page asked for", g.walk_stopped);
 	} else {
 		set_status(false, "read %d persons in %s", rows, dur_since(t0));
 	}
@@ -1290,6 +1334,7 @@ static void open_input(enum purpose why, const char *title, const char *prompt,
 		strncpy(g.input.buf, initial, g.input.max);
 		g.input.buf[g.input.max] = '\0';
 		g.input.len = (uint8_t)strlen(g.input.buf);
+		g.input.pos = g.input.len;
 	}
 	g.purpose = why;
 	g.mode = MODE_INPUT;
@@ -1478,11 +1523,10 @@ static void close_dialog(void);
 
 static bool new_id_done(const char *text)
 {
-	char *end;
-	unsigned long v = strtoul(text, &end, 10);
+	uint32_t v;
 	struct persondb_person *p = &g_scratch;
 
-	if (text[0] == '\0' || *end != '\0' || v > UINT32_MAX) {
+	if (parse_id(text, &v) != 0) {
 		set_status(true, "'%s' is not an id", text);
 		return false;
 	}
@@ -1492,11 +1536,11 @@ static bool new_id_done(const char *text)
 	}
 	/* Asked now, so a taken id fails before the name is typed; the write
 	 * asks again. */
-	if (persondb_person_get(g.db, (uint32_t)v, p) == 0) {
-		set_status(true, "id %lu is taken by '%s'", v, p->name);
+	if (persondb_person_get(g.db, v, p) == 0) {
+		set_status(true, "id %u is taken by '%s'", v, p->name);
 		return false;
 	}
-	g.new_id = (uint32_t)v;
+	g.new_id = v;
 	close_dialog();
 	open_input(FOR_NEW_NAME, "Add person", "Name:", PERSONDB_NAME_MAX, NULL);
 	return true;
@@ -1606,14 +1650,13 @@ static void close_dialog(void)
 
 static void goto_person(const char *text)
 {
-	char *end;
-	unsigned long v = strtoul(text, &end, 10);
+	uint32_t v;
 
-	if (text[0] == '\0' || *end != '\0' || v > UINT32_MAX) {
+	if (parse_id(text, &v) != 0) {
 		set_status(true, "'%s' is not an id", text);
 		return;
 	}
-	show_person((uint32_t)v);
+	show_person(v);
 }
 
 static void goto_card(const char *card)
@@ -1940,15 +1983,21 @@ static void bypass_cb(const struct shell *sh, uint8_t *data, size_t len,
 		uint8_t buf[8];
 		size_t got = 0;
 
-		for (int ms = 0; ms < ESC_WAIT_MS && got == 0; ms++) {
+		/* Against a deadline, not a count of sleeps: k_msleep(1)
+		 * rounds up to a whole tick, and at 100 Hz (native_sim's
+		 * default) thirty of them were 300 ms of a frozen Esc. */
+		int64_t deadline = k_uptime_get() + ESC_WAIT_MS;
+
+		for (;;) {
 			if (sh->iface->api->read(sh->iface, buf, sizeof(buf),
 						 &got) != 0) {
 				got = 0;
 				break;
 			}
-			if (got == 0) {
-				k_msleep(1);
+			if (got > 0 || k_uptime_get() >= deadline) {
+				break;
 			}
+			k_msleep(1);
 		}
 		if (got > 0) {
 			feed(buf, got);
@@ -2004,9 +2053,21 @@ static void leave(void)
 int ui_tui_enter(const struct shell *sh, const struct ui_tui_config *cfg)
 {
 	struct persondb_stat st;
+	uint32_t n;
 	int rc = persondb_stat(cfg->db, &st);
 
 	if (rc != 0) {
+		return rc;
+	}
+
+	/* The total, counted from flash once (~2 s on the DK at 8 000) and
+	 * kept up to date from here: the container keeps no counter. Counted
+	 * before the terminal is taken, so a failure stays a shell error
+	 * instead of a TUI that believes the store is empty. */
+	shell_print(sh, "persondb tui: counting persons ...");
+	rc = persondb_person_count(cfg->db, &n);
+	if (rc != 0) {
+		shell_error(sh, "persondb tui: counting persons failed: %d", rc);
 		return rc;
 	}
 
@@ -2018,6 +2079,7 @@ int ui_tui_enter(const struct shell *sh, const struct ui_tui_config *cfg)
 	g.populated = st.populated;
 	g.n_persons = st.n_persons;
 	g.rev = st.rev;
+	g.n = n;
 	g.active = true;
 
 	logs_mute(true);
@@ -2026,20 +2088,9 @@ int ui_tui_enter(const struct shell *sh, const struct ui_tui_config *cfg)
 	term_enter();
 	shell_set_bypass(sh, bypass_cb, NULL);
 
-	/* The total, counted from flash once (~2 s on the DK at 8 000) and
-	 * kept up to date from here: the container keeps no counter. */
-	set_status(false, "counting persons ...");
 	draw_all();
-	rc = persondb_person_count(g.db, &g.n);
-	if (rc != 0) {
-		g.n = 0;
-	}
-	draw_title();
 	load_page();
 	draw_detail();
-	if (rc != 0) {
-		set_status(true, "counting persons failed | rc %d", rc);
-	}
 	draw_status();
 	term_flush();
 	return 0;

@@ -196,12 +196,14 @@ enum key_state {
 
 static enum key_state g_ks;
 static unsigned int g_param;
+static bool g_param_done;       /* a ';' ended the first parameter */
 static bool g_after_cr;
 
 void term_key_reset(void)
 {
 	g_ks = KS_GROUND;
 	g_param = 0;
+	g_param_done = false;
 }
 
 bool term_key_pending(void)
@@ -253,6 +255,7 @@ int term_key_feed(uint8_t c)
 		if (c == '[') {
 			g_ks = KS_CSI;
 			g_param = 0;
+			g_param_done = false;
 			return TERM_KEY_NONE;
 		}
 		if (c == 'O') {
@@ -268,14 +271,15 @@ int term_key_feed(uint8_t c)
 
 	case KS_CSI:
 		if (c >= '0' && c <= '9') {
-			if (g_param < 1000) {
+			if (!g_param_done && g_param < 1000) {
 				g_param = g_param * 10 + (c - '0');
 			}
 			return TERM_KEY_NONE;
 		}
 		if (c == ';' || (c >= 0x20 && c <= 0x3f)) {
-			/* Modifier parameters (ESC [ 1 ; 5 A): keep the first
-			 * number, ignore the rest. */
+			/* Modifier parameters (ESC [ 5 ; 5 ~ is Ctrl-PgUp): keep
+			 * the first number, ignore the rest. */
+			g_param_done = true;
 			return TERM_KEY_NONE;
 		}
 		{

@@ -95,7 +95,7 @@ void tui_input_draw(const struct tui_input *w)
 	term_field(INPUT_ROW + 2, DLG_COL + 2, w->max + 1, w->buf);
 	term_attr(TERM_NORMAL);
 
-	term_move(INPUT_ROW + 2, DLG_COL + 2 + w->len);
+	term_move(INPUT_ROW + 2, DLG_COL + 2 + w->pos);
 	term_cursor(true);
 }
 
@@ -107,25 +107,52 @@ enum tui_outcome tui_input_key(struct tui_input *w, int key)
 	case TERM_KEY_ESC:
 	case TERM_KEY_CTRL_C:
 		return TUI_CANCEL;
-	case TERM_KEY_BACKSPACE:
+	/* A real cursor, because the field is often pre-filled: fixing one
+	 * letter of a name or a date must not mean erasing back to it. */
 	case TERM_KEY_LEFT:
-		if (w->len > 0) {
-			w->buf[--w->len] = '\0';
+		if (w->pos > 0) {
+			w->pos--;
 		}
+		break;
+	case TERM_KEY_RIGHT:
+		if (w->pos < w->len) {
+			w->pos++;
+		}
+		break;
+	case TERM_KEY_HOME:
+		w->pos = 0;
+		break;
+	case TERM_KEY_END:
+		w->pos = w->len;
+		break;
+	case TERM_KEY_BACKSPACE:
+		if (w->pos == 0) {
+			return TUI_OPEN;
+		}
+		w->pos--;
+		__fallthrough;
+	case TERM_KEY_DEL:
+		if (w->pos >= w->len) {
+			return TUI_OPEN;
+		}
+		memmove(&w->buf[w->pos], &w->buf[w->pos + 1], w->len - w->pos);
+		w->len--;
 		break;
 	default:
 		if (key < 0x20 || key > 0x7e || w->len >= w->max) {
 			return TUI_OPEN;
 		}
-		w->buf[w->len++] = (char)key;
-		w->buf[w->len] = '\0';
+		memmove(&w->buf[w->pos + 1], &w->buf[w->pos],
+			w->len - w->pos + 1);
+		w->buf[w->pos++] = (char)key;
+		w->len++;
 		break;
 	}
 
 	term_attr(TERM_REVERSE);
 	term_field(INPUT_ROW + 2, DLG_COL + 2, w->max + 1, w->buf);
 	term_attr(TERM_NORMAL);
-	term_move(INPUT_ROW + 2, DLG_COL + 2 + w->len);
+	term_move(INPUT_ROW + 2, DLG_COL + 2 + w->pos);
 	return TUI_OPEN;
 }
 

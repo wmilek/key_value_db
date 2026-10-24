@@ -661,9 +661,11 @@ The storage shapes it as much as the other frontends:
   reports it as a bad record (or, deleted, as missing) if it samples that
   index. That is `verify` working as intended. Persons added by hand are
   outside the dataset, so `verify` and `stat`'s content figure do not see them.
-- `mutate` skips a dataset person who has been deleted. It still stops on
-  `-ENOSPC` if a person in its batch was brought to five cards by hand and has
-  no room for the generated temporary card — the five-card cap, not a fault.
+- `mutate` skips, with a warning, a dataset person whose generated state a
+  hand edit made unreachable: deleted, brought to five cards so the temporary
+  card has no slot, or holding nothing while the temporary card's id was
+  given to someone else. The dataset produces none of these, and stopping
+  would fail every later round at the same person.
 
 **`sample.yaml`.**
 

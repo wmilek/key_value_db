@@ -303,10 +303,16 @@ int scenario_mutate(struct scenario *s, struct scenario_mutate_report *out)
 		}
 		dataset_card(idx, DATASET_TEMP_CARD_SLOT, card);
 		rc = persondb_card_assign(s->db, dataset_id_of(idx), card);
-		if (rc == -ENOENT) {
-			/* Deleted by hand (persondb tui): nobody to give it to.
+		if (rc == -ENOENT || rc == -ENOSPC || rc == -EEXIST) {
+			/* A hand edit (persondb tui) made this person's generated
+			 * state unreachable: deleted (-ENOENT), given a fifth card
+			 * by hand so the temporary one has no slot (-ENOSPC), or
+			 * the temporary card's id assigned to someone else
+			 * (-EEXIST). The dataset never produces any of these.
 			 * Skipped rather than fatal, or every round whose subset
 			 * includes this person would fail forever. */
+			LOG_WRN("mutate: %s for index %u skipped: %d", card, idx,
+				rc);
 			out->skipped++;
 			continue;
 		}

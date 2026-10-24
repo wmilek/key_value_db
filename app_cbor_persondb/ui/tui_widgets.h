@@ -52,6 +52,7 @@ struct tui_input {
 	const char *prompt;
 	char        buf[TUI_INPUT_MAX + 1];
 	uint8_t     len;
+	uint8_t     pos;    /* cursor, 0..len; typing inserts here */
 	uint8_t     max;    /* <= TUI_INPUT_MAX; typing stops there */
 };
 
