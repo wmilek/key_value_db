@@ -889,13 +889,15 @@ Part by part:
   fourth, the code, is what does it. `kvdb_create` forwards the three fields
   unchanged, so the L3 path no longer carries a misleading header with it.
   `app_perf_kvdb` now declares `expected_entries = N_KEYS` where it used to
-  pass `N_KEYS / 2`. Two stale copies remain in the design notes: the
-  `kvdb_config` sketch in `doc/layers/l3_interfaces.md` still shows
-  `initial_capacity; /* hint (hash: bucket count) */`, and the shape summary
-  in `l2_containers.md` §3 still calls `map_config` "create-time hints (e.g.
-  hash bucket count)", one section before its own §4.3 says otherwise.
-  Neither is a header anyone compiles against, but they are where the old
-  reading survives.
+  pass `N_KEYS / 2`. The last two copies of the old reading, both in design
+  notes, have since been corrected too: the `kvdb_config` sketch in
+  `doc/layers/l3_interfaces.md` §3 now shows the three population fields
+  where it showed `initial_capacity; /* hint (hash: bucket count) */`, and
+  the shape summary in `l2_containers.md` §3 now describes `map_config` as a
+  declared population, as its §4.3 does, and lists `stat`. The same pass
+  dropped `CONTAINER_KVHASH_BUCKETS` from that file's §6 Kconfig sketch; no
+  such symbol was ever built, and the undeclared default is `kvhash.c`'s
+  `DEFAULT_BUCKETS`.
 - **(b) The clamp: closed, and turned around.** `shape_map.h` now makes a set
   field binding: "A provider either honours it or fails the create; it must
   never silently deliver something else." `kvhash` returns `-EINVAL` from
@@ -962,8 +964,6 @@ drop has become a loud failure at the first call.
   backend choose, and `stat` reports the 8. The ceiling has not moved,
   though: eight payloads in total (about 128 KB at this app's 16 384 B, a few
   hundred person records), and it is still hit as a `-ENOSPC` from `set`.
-- **Two stale design notes**, `l3_interfaces.md` and `l2_containers.md` §3,
-  as noted under (a).
 
 ### K10 — No entry count or size on a map — **PARTLY CLOSED by `main`** (moderate, `read`)
 

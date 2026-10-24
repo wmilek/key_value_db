@@ -114,11 +114,19 @@ the planned interfaces:
 `create · destroy · open · get(key) · set(key) · del(key) · has(key) · iterate`
 
 > Implemented so far (`include/app/lib/containers/shape_map.h`): the point
-> subset `create(root, map_config) · get · set · del · destroy`, plus
-> `map_config` for create-time hints (e.g. hash bucket count), plus `next` for
-> enumeration and `count` for the number of keys (computed by a walk, never
-> stored — meant for mount and recovery). `open` collapses into "resolve root, then call these"; `has` is
-> an L3 convenience over `get`.
+> subset `create(root, map_config) · get · set · del · destroy`, plus `stat`
+> to read back the geometry the provider built (`struct map_info`: depth,
+> fan-out, bucket count, per-entry byte limit — at most a blob read, never a
+> write), plus `next` for enumeration and `count` for the number of keys
+> (computed by a walk, never stored — meant for mount and recovery). `open`
+> collapses into "resolve root, then call these"; `has` is an L3 convenience
+> over `get`.
+>
+> `map_config` declares the population, not the geometry: `expected_entries`,
+> `typical_entry_bytes` and `max_entry_bytes`, each 0 for "unknown". The
+> provider derives its own shape from them (§4.3 for kvhash). A field that is
+> set binds: `create` either honours it or returns `-EINVAL` without writing
+> anything; it never quietly delivers something smaller.
 >
 > `next` takes the place of a callback `iterate` in the Map shape. It is
 > stateless: the caller passes the last key it saw and gets the one after it,
@@ -330,7 +338,6 @@ config CONTAINER_SEQ               bool "Simple list (sequence)"
 config CONTAINER_KVLIST            bool "Simple key→value list"
 config CONTAINER_KVLIST_INLINE_MAX int  "Inline value limit"    default 64
 config CONTAINER_KVHASH            bool "Key→value hash"        select CONTAINER_KVLIST
-config CONTAINER_KVHASH_BUCKETS    int  "Default bucket count"  default 64
 config CONTAINER_KVTREE            bool "Key→value tree"
 config CONTAINER_KVTREE_FANOUT     int  "B-tree fan-out"        default 8
 config CONTAINER_LOGRING           bool "Bounded circular log"
@@ -339,6 +346,10 @@ config CONTAINER_LOGRING           bool "Bounded circular log"
 `logring` needs no capacity tunable of its own: its ring is one i-node payload,
 so `CONFIG_BLOB_DB_MAX_PAYLOAD_LEN` alone bounds it (a `BUILD_ASSERT` keeps the
 20-byte header + a one-byte record within the payload).
+
+Nor does `kvhash` have a bucket-count tunable: `create` derives the geometry
+from the population declared in `map_config` (§4.3), and a map created with
+no declaration gets the 8-bucket `DEFAULT_BUCKETS` constant in `kvhash.c`.
 
 Each container is its own translation unit under `lib/containers/<name>/`,
 included via `add_subdirectory_ifdef` — a disabled container costs zero flash
