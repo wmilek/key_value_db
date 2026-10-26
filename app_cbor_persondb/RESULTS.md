@@ -1874,3 +1874,94 @@ no growth path (K3), a `kvhash` map has to be sized by enumeration, up front.
 This application can enumerate only because its dataset is a pure function of
 an index. A deployment whose data arrives from outside cannot, and has no
 recourse but to over-provision blindly.
+
+## 10. Scaling sweep — how each operation moves with the number of credentials
+
+Every hardware number above is taken at one scale per run, and §5f shows the
+answer moves with scale — not monotonically. `tools/perf_sweep.py` makes the
+curve a single command: it rebuilds this app at a list of
+`CONFIG_APP_CBOR_PERSONDB_N_PERSONS` values and nothing else, runs each one
+on `native_sim` three times on the same flash image (the fill run, then two
+steady-state reruns), and parses the console into JSON. It also parses DK
+UART captures and the raw captures in §8, so board runs land in the same
+format.
+
+```
+python3 tools/perf_sweep.py run -o sweep.json            # ~15 min on a laptop
+python3 tools/perf_sweep.py results -o dk.json           # §8, parsed
+python3 tools/perf_sweep.py report sweep.json dk.json    # markdown
+```
+
+Taken at `501bd3f` (default UBI backend, 200 samples per bench). Each figure
+is the median over the three runs at that scale. *DK ms* applies the read-path
+model to the counters — 75 µs per flash transaction (`flash_area`'s 65 µs
+plus zephyr-ubi v0.1.0's 7–13 µs, `app_perf_blob_db/RESULTS.md`) + 0.63 µs/B
++ 0.95 ms of CBOR where a record is decoded. **`put` is not projected**; see
+below.
+
+| persons | credentials | live | people / cred depth | check txns | check B | **check DK ms** | byid DK ms | miss DK ms | put txns | put B | put erases | host fill ms/person | status |
+|--:|--:|--:|:-:|--:|--:|--:|--:|--:|--:|--:|--:|--:|---|
+| 250 | 648 | 1.3 % | 1 / 1 | 115.3 | 4 930 | 12.70 | 9.69 | 4.19 | 365.6 | 16 196 | 0.010 | 0.10 | ok |
+| 500 | 1 238 | 2.5 % | 1 / 2 | 154.8 | 5 125 | 15.79 | 6.71 | 8.85 | 497.2 | 17 009 | 0.015 | 0.07 | ok |
+| 1 000 | 2 479 | 5.1 % | 1 / 2 | 215.7 | 6 805 | 21.41 | 9.46 | 11.61 | 669.3 | 18 996 | 0.000 | 0.09 | ok |
+| 2 000 | 4 979 | 10.3 % | 2 / 2 | 354.9 | 8 206 | 32.74 | 14.21 | 18.20 | 1 071.0 | 35 915 | 0.070 | 0.11 | ok |
+| 4 000 | 10 017 | 20.6 % | 2 / 2 | 155.3 | 7 448 | 17.29 | 10.97 | 6.25 | 438.7 | 42 981 | 0.135 | 0.21 | ok |
+| 8 000 | 19 969 | 41.3 % | 2 / 2 | 121.3 | 8 222 | 15.23 | 8.73 | 6.05 | 327.2 | 67 622 | 0.255 | 0.36 | ok |
+| 10 000 | 24 932 | 51.6 % | 2 / 2 | 117.9 | 8 626 | 15.23 | 8.90 | 6.27 | 332.3 | 90 131 | 0.365 | 0.45 | ok |
+| 12 000 | 29 942 | 62.0 % | 2 / 2 | 117.8 | 9 141 | 15.54 | 8.84 | 6.70 | 337.6 | 135 153 | 0.590 | 0.59 | ok |
+| 14 000 | — | — | — | — | — | — | — | — | — | — | — | — | fill stopped at 12 718 |
+| 16 000 | — | — | — | — | — | — | — | — | — | — | — | — | fill stopped at 14 107 |
+
+
+The same data, with the DK points beside it, is the `persondb-performance`
+page of the kvdb_book repository.
+
+### Counters transfer for reads, and at 1 000 persons for writes too
+
+Each §8 two-level capture against the sweep run of the same kind at the same
+scale (sweep firmware is newer than the board's):
+
+| run | `check` txns, DK / sim | `byid` | `miss` | `put` txns | `put` bytes, DK / sim |
+|---|--:|--:|--:|--:|--:|
+| 1 000, fill | 176.2 / 172.1 (0.98×) | 0.97× | 0.96× | 0.98× | 17 636 / 17 496 B (0.99×) |
+| 10 000, fill | 114.9 / 123.8 (1.08×) | 1.08× | 1.07× | 1.03× | 194 721 / 90 131 B (**0.46×**) |
+| 10 000, steady | 117.9 / 117.9 (1.00×) | 1.08× | 0.91× | 0.99× | 194 604 / 89 266 B (**0.46×**) |
+
+The old-fork model (§5c) applied to each capture's own counters lands within
+4 % on every read at every scale; the v0.1.0 model applied to §8c's counters
+predicts §5g's measured 17.13 ms `check` at 18.16 ms (+6 %), `byid` +1 %,
+`miss` +7 %.
+
+### Reads peak at a few thousand persons; writes keep growing
+
+- **`check` is worst at 2 000 persons** — 355 transactions, a projected
+  32.7 ms — and falls to 117–121 from 8 000 up. kvhash sizes both maps from
+  the declared population, so a larger store gets more, shallower buckets
+  (§5f's "reads get faster as the dataset grows", seen here at ten scales).
+  It is also the noisiest point: 262–428 transactions across its three runs.
+- **`put` bytes grow 8×** (16 KB → 132 KB) from 250 to 12 000 persons, and its
+  counted sector erases from 0.01 to 0.59 per operation.
+
+### Writes cannot be projected from these counters
+
+At 10 000 persons `put` moves 2.2× more bytes on the old-fork DK than on
+`native_sim` at `501bd3f`, and §5f's wall clock implies **2.23** sector
+erases per `put` where the sweep counts **0.37**. The read model plus the
+counted erases predicts 583 ms for a `put` measured at 2 564 ms (−77 %). Whether
+the gap is the platform, the old UBI fork, or `blob_db` changes since `ade6a3e`
+is open: settling it needs a DK run of the current firmware at 10 000 persons.
+Until then the write path is reported as counters and board measurements only.
+
+### Where the store stops
+
+| declared persons | fill stops at | credentials stored |
+|--:|--:|--:|
+| 12 000 | completes — 62.0 % live | 29 942 |
+| 14 000 | person 12 718, `-ENOSPC` | 31 648 |
+| 16 000 | person 14 107, `-ENOSPC` | 35 110 |
+
+A bucket fills (`persondb: bucket overflow`, `FINDINGS.md` K2) and the insert
+returns `-ENOSPC`. The ceiling moves with the declared size because the
+declared population sets the bucket count — so "how many credentials fit" has
+no single answer, and the benchmark constant of 8 000 sits well below every
+ceiling measured here.
