@@ -177,6 +177,17 @@ every device; an application with a trusted store (PSA ITS, a monotonic
 counter) overrides it. A refusal fails the mount, or every later write, with
 `-EROFS`. Application data is neither encrypted nor authenticated either way.
 
+**Random source.** UBI draws its image sequence number at format with
+`psa_generate_random()`. Where the board has no entropy driver — the nRF5340
+application core without the Bluetooth host — Mbed TLS's PSA RNG turns on
+`TEST_RANDOM_GENERATOR` and seeds itself from Zephyr's timer-based test
+generator, and Kconfig warns "Not secure symbol TEST_RANDOM_GENERATOR is
+enabled". Every UBI build for the DK in this repository runs that way today.
+The values are then predictable and repeat from boot to boot; a product build
+must supply a real entropy driver (the Bluetooth HCI RNG, or TF-M's PSA RNG on
+`nrf5340dk/nrf5340/cpuapp/ns`). The same generator serves logring's epoch
+(`doc/impl/l2_logring.md` §8).
+
 **Maintenance.** zephyr-ubi has no background thread. A write that finds no
 free block erases one itself, and `ubi_leb_erase()` hands its block straight
 back to the free pool, so blob_db runs no reclaim. A block replaced by

@@ -200,6 +200,15 @@ Two things to know before switching a real device:
   fixed development key that detects damage but not tampering; a product
   provisions its own (`CONFIG_BLOB_DB_UBI_KEY_APP`, see
   [`blob_db_ubi.h`](include/app/lib/blob_db_ubi.h)).
+- On the nRF5340-DK, every build here that has a random generator runs on
+  Zephyr's **insecure test generator**. The application core has no entropy
+  driver without the Bluetooth host, so PSA Crypto turns on
+  `CONFIG_TEST_RANDOM_GENERATOR`, and Kconfig warns "Not secure symbol TEST_RANDOM_GENERATOR is enabled". UBI's
+  image sequence number and logring's epoch then repeat from boot to boot. A
+  product build must replace it with a real entropy source (the Bluetooth
+  HCI RNG, or TF-M's PSA RNG on `nrf5340dk/nrf5340/cpuapp/ns`). A
+  `flash_area` build has no PSA Crypto and so no generator at all: logring
+  then stops in Kconfig (see `CONFIG_BLOB_CONTAINER_LOGRING_RANDOM_SOURCE`).
 - A UBI build refuses a partition holding anything but a UBI device it can
   read — a `flash_area` store, or one written by the UBI release used before
   zephyr-ubi v0.1.0 — with `-ENOTSUP`, and leaves it untouched;

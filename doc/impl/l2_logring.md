@@ -145,6 +145,36 @@ defense-in-depth, not a security control — a crafted value with the live epoch
 is stopped only by
 the caller's own integrity check.
 
+**Random, not derived.** The case the epoch exists for is a reformat, which
+restarts blob_db's ids. Anything computed from the ids (the root's, the
+first entry's) or from a counter read at boot comes out the same after the
+reformat when the application recreates its log the same way, and the stale
+moniker gets through. Only a value drawn from outside the store tells the two
+incarnations apart, so logring keeps `sys_rand32_get()` and requires a random
+source rather than falling back to a derived epoch.
+
+**Boards without a random source.** Selecting `ENTROPY_GENERATOR` does not
+give every board a generator: the nRF5340 application core's
+`zephyr,entropy` is the Bluetooth HCI RNG, which needs the Bluetooth host,
+and without any entropy driver Zephyr builds no `sys_rand32_get()`. logring
+therefore also selects the hidden `BLOB_CONTAINER_LOGRING_RANDOM_SOURCE`,
+whose dependency mirrors Zephyr's `RNG_GENERATOR_CHOICE`
+(`ENTROPY_HAS_DRIVER || TEST_RANDOM_GENERATOR || ARM64_RNG`). Without one, the
+build stops in Kconfig ("... has direct dependencies ... but is currently
+being y-selected by BLOB_CONTAINER_LOGRING") instead of failing to link on
+`z_impl_sys_rand_get`. A plain `depends on` would be the usual form, but
+`ENTROPY_HAS_DRIVER` is set by drivers that themselves need the
+`ENTROPY_GENERATOR` logring selects — a Kconfig dependency loop.
+
+On the DK the default UBI backend never reaches that error: PSA Crypto
+(Mbed TLS) turns on `TEST_RANDOM_GENERATOR` itself when there is no entropy
+driver, and logring draws from the same timer-based generator, so its epochs
+repeat from boot to boot (every UBI build for the DK here runs on it). A `flash_area` build has
+no PSA Crypto and stops at the check. Either way, a product build supplies a
+real entropy driver (the Bluetooth HCI RNG, or TF-M's PSA RNG on
+`nrf5340dk/nrf5340/cpuapp/ns`); `CONFIG_TEST_RANDOM_GENERATOR=y` is for
+development only.
+
 ## 9. Invariant checklist (`l2_containers.md` §5)
 
 1. **Single-integer reachability** — the root id recovers everything; the

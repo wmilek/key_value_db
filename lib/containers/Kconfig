@@ -15,6 +15,7 @@ config BLOB_CONTAINERS_INTENT
 config BLOB_CONTAINER_LOGRING
 	bool "logring — bounded per-entry log container"
 	select ENTROPY_GENERATOR
+	select BLOB_CONTAINER_LOGRING_RANDOM_SOURCE
 	help
 	  A log-specialized container: a forward-linked chain of per-entry
 	  i-nodes with pre-reserved ids, so an append writes one new blob and
@@ -24,11 +25,54 @@ config BLOB_CONTAINER_LOGRING
 	  opaque, portable cursor with a per-log epoch that rejects a stale
 	  moniker. Scales to near the whole partition. Self-contained on L1.
 
-	  Selects ENTROPY_GENERATOR: the per-log epoch is drawn with
-	  sys_rand32_get() (the non-crypto random subsystem — not PSA), so the
-	  module pulls its own randomness regardless of the blob_db backend.
-	  See doc/layers/l2_containers.md §4.5 and
+	  Needs a random source. The per-log epoch is drawn with
+	  sys_rand32_get() (the non-crypto random subsystem, not PSA), so the
+	  module selects ENTROPY_GENERATOR to pull its own randomness whatever
+	  the blob_db backend. That is enough where the board's entropy
+	  driver works on its own (native_sim, nRF52). Where it is not —
+	  nrf5340dk/nrf5340/cpuapp, whose zephyr,entropy is the
+	  Bluetooth HCI RNG and needs the Bluetooth host — there is no
+	  sys_rand32_get() and the build stops in Kconfig on
+	  BLOB_CONTAINER_LOGRING_RANDOM_SOURCE; see that option for the ways
+	  out.
+
+	  The epoch is random, not derived, because its job is to tell a log
+	  from the one a reformat put in its place. A reformat restarts
+	  blob_db's ids, so anything computed from ids or from a boot-time
+	  counter comes out the same and lets a stale moniker through. See
+	  doc/layers/l2_containers.md §4.5 and
 	  doc/proposals/2026-10-08-logring.md.
+
+config BLOB_CONTAINER_LOGRING_RANDOM_SOURCE
+	bool
+	depends on ENTROPY_HAS_DRIVER || TEST_RANDOM_GENERATOR || ARM64_RNG
+	help
+	  Build-time check that sys_rand32_get() exists. It is selected by
+	  BLOB_CONTAINER_LOGRING, and its dependency mirrors the one on
+	  Zephyr's RNG_GENERATOR_CHOICE (subsys/random/Kconfig): with none of
+	  them, Zephyr builds no random generator and logring would fail to
+	  link (undefined z_impl_sys_rand_get). Kconfig reports instead that
+	  this option "has direct dependencies ... but is currently being
+	  y-selected by BLOB_CONTAINER_LOGRING", and Zephyr stops the build.
+	  A select, not a "depends on" on BLOB_CONTAINER_LOGRING itself:
+	  ENTROPY_HAS_DRIVER is set by drivers that need the ENTROPY_GENERATOR
+	  logring selects, which Kconfig rejects as a dependency loop.
+
+	  To satisfy it, enable an entropy driver the board can run
+	  (ENTROPY_HAS_DRIVER). On the nRF5340 application core that is the
+	  Bluetooth host's HCI RNG (BT=y, which also needs the open-amp module
+	  for IPC to the network core; this repository's west.yml does not
+	  fetch it), or the PSA RNG of a TF-M build
+	  (nrf5340dk/nrf5340/cpuapp/ns). For development only,
+	  CONFIG_TEST_RANDOM_GENERATOR=y gives a timer-based generator that is
+	  not random: epochs then repeat from boot to boot and stop guarding
+	  against a reformat, and Zephyr warns "Not secure symbol
+	  TEST_RANDOM_GENERATOR is enabled". A product must not ship with it.
+
+	  On the DK the default UBI backend does not trip this check: PSA
+	  Crypto (Mbed TLS) turns on TEST_RANDOM_GENERATOR itself when the
+	  board has no entropy driver, so logring gets the same insecure
+	  generator. The flash_area backend has no PSA Crypto and stops here.
 
 if BLOB_CONTAINER_LOGRING
 

@@ -301,7 +301,11 @@ cursor exports a public **moniker `{epoch, id}`** the caller serializes and
 integrity-protects itself; the per-log random `epoch` lets `next` reject a
 moniker from another incarnation (e.g. after a reformat, which reuses ids) or a
 random value — `-ESTALE`, not a misread. An evicted position is likewise
-`-ESTALE`.
+`-ESTALE`. The epoch has to be random — ids restart after a reformat, so
+nothing derived from them would differ — so `logring` needs a
+`sys_rand32_get()` source and, on a board without one (the nRF5340
+application core with the `flash_area` backend), stops the build in Kconfig
+(`doc/impl/l2_logring.md` §8).
 
 Cost: `append` = 1 write, 0 reads (warm); `open` = 1 read + a bounded walk;
 `next` = 1–2 reads. Every op is O(1) in the log's size. Design detail:
