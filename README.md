@@ -263,6 +263,7 @@ the source.
 | [`app_perf_mc/`](app_perf_mc) | model-container benchmark (map and list) — the price of the full crash-safe mutation discipline | [`RESULTS.md`](app_perf_mc/RESULTS.md) |
 | [`app_perf_kvdb/`](app_perf_kvdb) | `kvdb` demo + benchmark with **cross-reboot verification**: every value is predicted from a stored generation counter, so a rerun proves the previous run survived — and an interrupted run is detected and proven atomic. Also times kvhash's `count` and a full `next` walk, and proves the walk returns exactly the predicted set | [`RESULTS.md`](app_perf_kvdb/RESULTS.md) |
 | [`app_cbor_persondb/`](app_cbor_persondb) | a CBOR person/credential database — 10 000 people over the L2 Map shape, with the access decision, crash safety and capacity planning a real product needs. Both a **worked example** of building on this stack and a **probe** of it | [`RESULTS.md`](app_cbor_persondb/RESULTS.md) |
+| [`app_footprint/`](app_footprint) | **FLASH footprint**: a Zephyr image on the nRF5340-DK grown one layer at a time by each layer's own Kconfig symbol (flash driver, UBI, blob_db, rootreg, kvhash, logring, kvdb, blobfs), Kconfig toggles as deltas, and `app_cbor_persondb` as the finished app; every byte attributed from the linker map by `footprint.py` | [`RESULTS.md`](app_footprint/RESULTS.md) |
 
 `app_perf_l0` is the one to reach for when a change moves flash traffic and
 there is no board on the desk. It is the only app here that links none of the
@@ -396,6 +397,7 @@ app_perf*/            benchmarks (+ hardware reference RESULTS.md)
                       app_perf_l0/ also carries the L0 timing model:
                       tools/l0_timing.py, models/, geometry/
 app_cbor_persondb/    worked example & probe (README · DESIGN · FINDINGS · RESULTS)
+app_footprint/        FLASH footprint by layer and Kconfig option (footprint.py)
 tests/lib/            ztest suites: blob_db · blob_db_contract · rootreg · kvdb
                       · blobfs
 tests/support/        shared test shims (crash injection)
