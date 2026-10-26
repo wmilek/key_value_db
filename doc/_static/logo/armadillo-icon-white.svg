@@ -1,0 +1,14 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="28 26 144 144" width="144" height="144" role="img">
+<title>key_value_db armadillo icon</title>
+<g fill="#fff">
+<defs>
+<mask id="r-ball" maskUnits="userSpaceOnUse" x="0" y="0" width="200" height="200">
+<rect x="0" y="0" width="200" height="200" fill="#fff"/>
+<g fill="none" stroke="#000" stroke-width="5"><path d="M70 20 Q52 104 70 188"/><path d="M88 20 Q70 104 88 188"/><path d="M106 20 Q88 104 106 188"/><path d="M124 20 Q106 104 124 188"/></g>
+<path d="M132 54 L150 30 L152 68 Z" fill="#000" stroke="#000" stroke-width="4" stroke-linejoin="round"/>
+</mask>
+</defs>
+<g mask="url(#r-ball)"><circle cx="100" cy="104" r="62"/></g>
+<path d="M132 54 L150 30 L152 68 Z"/>
+</g>
+</svg>
