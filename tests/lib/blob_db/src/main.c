@@ -1653,8 +1653,6 @@ ZTEST(blob_db, test_sealed_scratch_is_restored_over_erased_bucket)
  */
 
 #define TEST_N_BUCKETS  2045
-#define TEST_SEG_FLAG   (1u << 3)
-#define TEST_TOMB_FLAG  (1u << 1)
 #define TEST_SEALED     (1u << 0)
 
 /* Live segment slots across the whole partition.
@@ -1663,68 +1661,46 @@ ZTEST(blob_db, test_sealed_scratch_is_restored_over_erased_bucket)
  * (non-tombstone SEGMENT slots) - (tombstone SEGMENT slots) is the live count
  * without needing per-id state. This is what makes "no leaked segments"
  * testable at all — count() and iterate() deliberately cannot see them.
+ *
+ * Walks the buckets through blob_db_inspect, which reads them the way blob_db
+ * does on either backend; a raw partition read would find UBI's headers where
+ * flash_area keeps the buckets, and see no segments at all.
  */
+struct segment_tally {
+	int written;
+	int tombs;
+};
+
+static int tally_segment(const struct blob_db_inspect_slot *s, void *user)
+{
+	struct segment_tally *t = user;
+
+	if (s->segment) {
+		if (s->state == BLOB_DB_INSPECT_TOMBSTONE) {
+			t->tombs++;
+		} else {
+			t->written++;
+		}
+	}
+	return 0;
+}
+
 static void count_segment_slots(int *out_live, int *out_tombs)
 {
-	const struct flash_area *fa;
+	struct blob_db_inspect_info in;
+	struct blob_db_inspect_bucket bs;
+	struct segment_tally t = { 0 };
 
-	zassert_ok(flash_area_open(BLOB_DB_TEST_PARTITION_ID, &fa));
-
-	const size_t align = flash_area_align(fa);
-	int live = 0, tombs = 0;
-
-	for (uint16_t bid = 0; bid < TEST_N_BUCKETS; bid++) {
-		const off_t base = (off_t)(3 + bid) * TEST_SECTOR_SZ;
-		uint8_t bh[4];
-
-		zassert_ok(flash_area_read(fa, base, bh, sizeof(bh)));
-		if (memcmp(bh, "BDBH", 4) != 0) {
-			continue;
-		}
-
-		off_t cursor = 16;
-
-		for (;;) {
-			struct __packed {
-				uint8_t  flags;
-				uint8_t  reserved;
-				uint16_t val_len;
-				uint64_t id;
-			} head;
-
-			if (cursor + 14 > TEST_SECTOR_SZ) {
-				break;
-			}
-			zassert_ok(flash_area_read(fa, base + cursor, &head,
-						   sizeof(head)));
-			if (head.flags == 0xff || !(head.flags & TEST_SEALED) ||
-			    head.val_len > CONFIG_BLOB_DB_MAX_PAYLOAD_LEN) {
-				break;
-			}
-
-			size_t ssz = 14 + head.val_len;
-
-			ssz = (ssz + align - 1) & ~(align - 1);
-			if (cursor + (off_t)ssz > TEST_SECTOR_SZ) {
-				break;
-			}
-			if (head.flags & TEST_SEG_FLAG) {
-				if (head.flags & TEST_TOMB_FLAG) {
-					tombs++;
-				} else {
-					live++;
-				}
-			}
-			cursor += ssz;
-		}
+	zassert_ok(blob_db_inspect_info_get(&in));
+	for (uint16_t bid = 0; bid < in.n_buckets; bid++) {
+		zassert_ok(blob_db_inspect_bucket_get(bid, &bs, tally_segment, &t));
 	}
 
-	flash_area_close(fa);
 	if (out_live) {
-		*out_live = live - tombs;
+		*out_live = t.written - t.tombs;
 	}
 	if (out_tombs) {
-		*out_tombs = tombs;
+		*out_tombs = t.tombs;
 	}
 }
 
@@ -2651,56 +2627,28 @@ static void forge_torn_append(uint16_t bid, uint64_t id, uint16_t val_len)
 /* Find an internal segment id by walking the store the way the sweep does.
  * These ids are consumed from the same counter as user ids but never returned
  * by alloc_id(), so nothing above L1 should ever hold one. */
+static int pick_live_segment(const struct blob_db_inspect_slot *s, void *user)
+{
+	if (s->segment && s->state == BLOB_DB_INSPECT_LIVE) {
+		*(uint64_t *)user = s->id;
+		return 1;
+	}
+	return 0;
+}
+
 static uint64_t first_segment_id(void)
 {
-	const struct flash_area *fa;
-
-	zassert_ok(flash_area_open(BLOB_DB_TEST_PARTITION_ID, &fa));
-
-	const size_t align = flash_area_align(fa);
+	struct blob_db_inspect_info in;
+	struct blob_db_inspect_bucket bs;
 	uint64_t found = 0;
 
-	for (uint16_t bid = 0; bid < TEST_N_BUCKETS && !found; bid++) {
-		const off_t base = (off_t)(3 + bid) * TEST_SECTOR_SZ;
-		uint8_t bh[4];
+	zassert_ok(blob_db_inspect_info_get(&in));
+	for (uint16_t bid = 0; bid < in.n_buckets && !found; bid++) {
+		int rc = blob_db_inspect_bucket_get(bid, &bs, pick_live_segment,
+						    &found);
 
-		zassert_ok(flash_area_read(fa, base, bh, sizeof(bh)));
-		if (memcmp(bh, "BDBH", 4) != 0) {
-			continue;
-		}
-
-		off_t cursor = 16;
-
-		for (;;) {
-			struct test_slot_head head;
-
-			if (cursor + 14 > TEST_SECTOR_SZ) {
-				break;
-			}
-			zassert_ok(flash_area_read(fa, base + cursor, &head,
-						   sizeof(head)));
-			if (head.flags == 0xff ||
-			    !(head.flags & TEST_SEALED) ||
-			    head.val_len > CONFIG_BLOB_DB_MAX_PAYLOAD_LEN) {
-				break;
-			}
-			if ((head.flags & TEST_SEG_FLAG) &&
-			    !(head.flags & TEST_TOMB_FLAG)) {
-				found = head.id;
-				break;
-			}
-
-			size_t ssz = 14 + head.val_len;
-
-			ssz = (ssz + align - 1) & ~(align - 1);
-			if (cursor + (off_t)ssz > TEST_SECTOR_SZ) {
-				break;
-			}
-			cursor += ssz;
-		}
+		zassert_true(rc == 0 || rc == 1, "inspect bucket %u: %d", bid, rc);
 	}
-
-	flash_area_close(fa);
 	return found;
 }
 
@@ -2710,8 +2658,6 @@ static uint64_t first_segment_id(void)
  * were the caller's payload is worse than an error. */
 ZTEST(blob_db, test_segment_ids_are_not_visible_through_the_api)
 {
-	SKIP_UNLESS_RAW_PARTITION();
-
 	fill_pattern(big_src, BIG_LEN, 0x6d);
 
 	uint64_t owner = put_blob(big_src, BIG_LEN);
