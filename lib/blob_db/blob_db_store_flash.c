@@ -135,3 +135,13 @@ bool blob_db_store_open_found_damage(off_t off)
 	ARG_UNUSED(off);
 	return false;
 }
+
+/* Every erase happens on the write path, so nothing is ever deferred. */
+int blob_db_store_maintain(uint32_t budget, uint32_t *performed, bool *more)
+{
+	ARG_UNUSED(budget);
+
+	*performed = 0;
+	*more = false;
+	return 0;
+}

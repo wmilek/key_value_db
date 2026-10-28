@@ -3785,3 +3785,24 @@ int blob_db_prepare(size_t n)
 		n, prepared, (unsigned long long)st.next_id);
 	return (int)prepared;
 }
+
+int blob_db_maintain(uint32_t budget, struct blob_db_maint_result *result)
+{
+	struct blob_db_maint_result res = { 0 };
+	int rc;
+
+	if (!st.mounted) {
+		rc = -ENODEV;
+	} else if (st.wedged) {
+		rc = -EIO;   /* torn compaction; see compact_commit() */
+	} else {
+		/* Below blob_db's view: every block reads the same afterwards,
+		 * so no cached bucket or index state goes stale. */
+		rc = blob_db_store_maintain(budget, &res.performed, &res.more);
+	}
+
+	if (result != NULL) {
+		*result = res;
+	}
+	return rc;
+}

@@ -469,6 +469,46 @@ int blob_db_erase_all(void);
  */
 int blob_db_prepare(size_t n);
 
+/**
+ * @brief Outcome of one `blob_db_maintain()` call.
+ */
+struct blob_db_maint_result {
+	/** Steps run, at most the budget. */
+	uint32_t performed;
+	/** Work may be left. A call that finds none clears it. */
+	bool more;
+};
+
+/**
+ * @brief Do up to @p budget steps of the erases blob_db can do ahead of time.
+ *
+ * Some erases need not happen inside the call that would otherwise pay for
+ * them. This runs them now, so that an application can keep them out of its
+ * real operations by calling it while the system is idle, until `more` is
+ * false. One step erases at most one block; on large-sector NOR that is up to
+ * a second.
+ *
+ * What a step does depends on the storage backend, not on the caller:
+ * - **UBI:** erases one block waiting for reclaim, and once none is left
+ *   moves one block for wear levelling. Nothing else asks UBI to reclaim:
+ *   without these calls its free pool stays empty and every write that needs
+ *   a fresh block erases one first.
+ * - **flash_area:** nothing yet; `blob_db_prepare()` formats buckets ahead.
+ *
+ * Nothing it does changes what blob_db reads back. Not thread-safe, like the
+ * rest of blob_db: serialize it with every other call.
+ *
+ * @param budget  most steps to run; 0 runs none and only reports `more`
+ * @param result  steps run and whether work is left; may be NULL
+ *
+ * @retval 0       success, including nothing to do
+ * @retval -ENODEV not mounted
+ * @retval -EIO    flash I/O error, or a torn compaction refuses writes
+ * @retval <0      other negative errno from the backend (UBI: -EROFS once
+ *                 the device is read-only)
+ */
+int blob_db_maintain(uint32_t budget, struct blob_db_maint_result *result);
+
 /** @} */ /* end of lib_blob_db */
 
 #ifdef __cplusplus
