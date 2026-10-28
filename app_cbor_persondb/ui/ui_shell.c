@@ -396,6 +396,25 @@ static int cmd_card_owner(const struct shell *sh, size_t argc, char **argv)
 	return 0;
 }
 
+static int cmd_card_count(const struct shell *sh, size_t argc, char **argv)
+{
+	uint32_t n;
+	int rc = need_open(sh);
+
+	ARG_UNUSED(argc);
+	ARG_UNUSED(argv);
+	if (rc) {
+		return rc;
+	}
+	rc = persondb_card_count(g_s.db, &n);
+	if (rc != 0) {
+		shell_error(sh, "count: %d", rc);
+		return rc;
+	}
+	shell_print(sh, "%u cards", n);
+	return 0;
+}
+
 static int cmd_card_assign(const struct shell *sh, size_t argc, char **argv)
 {
 	uint32_t id;
@@ -562,6 +581,8 @@ SHELL_STATIC_SUBCMD_SET_CREATE(
 SHELL_STATIC_SUBCMD_SET_CREATE(
 	card_cmds,
 	SHELL_CMD_ARG(owner, NULL, "owner <card>", cmd_card_owner, 2, 0),
+	SHELL_CMD_ARG(count, NULL, "count — reads every bucket", cmd_card_count,
+		      1, 0),
 	SHELL_CMD_ARG(assign, NULL, "assign <person-id> <card>", cmd_card_assign,
 		      3, 0),
 	SHELL_CMD_ARG(revoke, NULL, "revoke <card> — holder found through the "
