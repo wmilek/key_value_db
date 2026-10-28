@@ -250,9 +250,8 @@ ZTEST(blob_db, test_boundary_payload_len)
 		      "a payload past the configured cap must be rejected");
 }
 
-/* 10. Corrupting a byte in a slot causes that slot (and everything after
- *     it in the same bucket) to drop out on next mount. A blob in a
- *     different bucket is unaffected. */
+/* 10. Corrupting a byte in a slot causes that slot to drop out on next
+ *     mount. A blob in a different bucket is unaffected. */
 ZTEST(blob_db, test_corrupted_slot_is_invisible)
 {
 	SKIP_UNLESS_RAW_PARTITION();

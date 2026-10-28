@@ -188,9 +188,37 @@ ZTEST(blob_db_torn_append, test_append_after_a_torn_append_is_kept)
 	}
 }
 
+/* Rewrite @p id, alternating two values, until bucket @p bid compacts; the
+ * last value written is 0x44. */
+static void ta_rewrite_until_compacted(uint64_t id, uint16_t bid)
+{
+	struct blob_db_inspect_bucket bs;
+	uint8_t v[TA_LEN];
+
+	zassert_ok(blob_db_inspect_bucket_get(bid, &bs, NULL, NULL));
+
+	const uint32_t gen = bs.gen;
+
+	for (int n = 0; n < 400; n++) {
+		memset(v, 0x44, sizeof(v));
+		zassert_ok(blob_db_update(id, v, ta_len(0x44)));
+		zassert_ok(blob_db_inspect_bucket_get(bid, &bs, NULL, NULL));
+		if (bs.gen > gen) {
+			return;
+		}
+		memset(v, 0x22, sizeof(v));
+		zassert_ok(blob_db_update(id, v, ta_len(0x22)));
+	}
+	zassert_unreachable("the bucket never compacted");
+}
+
 /* A slot that rots after it was written (a CRC failure on a slot whose header
  * is intact) is skipped by readers, which then still find the slots after it.
- * Compaction must do the same: drop the rotten slot, keep everything after. */
+ * Compaction must do the same: drop the rotten slot, keep everything after.
+ *
+ * `third` is never rewritten: the update that triggers the compaction appends
+ * into the compacted bucket, so only a slot written before it and after the
+ * rotten one shows whether compaction kept the slots behind the rot. */
 ZTEST(blob_db_torn_append, test_compaction_keeps_slots_after_a_rotten_one)
 {
 	Z_TEST_SKIP_IFNDEF(CONFIG_BLOB_DB_BACKEND_FLASH_AREA);
@@ -201,19 +229,20 @@ ZTEST(blob_db_torn_append, test_compaction_keeps_slots_after_a_rotten_one)
 	zassert_ok(blob_db_inspect_info_get(&in));
 
 	const uint64_t first = blob_db_alloc_id();
-	uint64_t second;
+	uint64_t second, third;
 
 	do {
 		second = blob_db_alloc_id();
 	} while (second % in.n_buckets != first % in.n_buckets);
+	do {
+		third = blob_db_alloc_id();
+	} while (third % in.n_buckets != first % in.n_buckets);
 	ta_put(first, 0x11);
 	ta_put(second, 0x22);
+	ta_put(third, 0x55);
 
+	const size_t count = blob_db_count();
 	const uint16_t bid = (uint16_t)(first % in.n_buckets);
-
-	zassert_ok(blob_db_inspect_bucket_get(bid, &bs, NULL, NULL));
-
-	const uint32_t gen = bs.gen;
 
 	blob_db_unmount();
 	/* first is the bucket's first slot: header 16 B, slot head 12 B. */
@@ -228,23 +257,81 @@ ZTEST(blob_db_torn_append, test_compaction_keeps_slots_after_a_rotten_one)
 	flash_area_close(fa);
 	zassert_ok(blob_db_mount());
 	zassert_true(ta_is(second, 0x22), "second unreachable after first rotted");
+	zassert_true(ta_is(third, 0x55), "third unreachable after first rotted");
+	zassert_equal(blob_db_count(), count - 1, "count() stopped at the rotten slot");
+	zassert_ok(blob_db_inspect_bucket_get(bid, &bs, NULL, NULL));
+	zassert_equal(bs.rotten, 1);
+	zassert_equal(bs.tail_bytes, 0, "inspect stopped at the rotten slot");
 
-	/* Rewrite second until the bucket compacts. */
-	uint8_t v[TA_LEN];
-
-	for (int n = 0; n < 400; n++) {
-		memset(v, 0x44, sizeof(v));
-		zassert_ok(blob_db_update(second, v, ta_len(0x44)));
-		zassert_ok(blob_db_inspect_bucket_get(bid, &bs, NULL, NULL));
-		if (bs.gen > gen) {
-			break;
-		}
-		memset(v, 0x22, sizeof(v));
-		zassert_ok(blob_db_update(second, v, ta_len(0x22)));
-	}
-	zassert_true(bs.gen > gen, "the bucket never compacted");
-	zassert_true(ta_is(second, 0x44), "compaction lost the slots after the rotten one");
+	ta_rewrite_until_compacted(second, bid);
+	zassert_true(ta_is(second, 0x44));
+	zassert_true(ta_is(third, 0x55), "compaction lost the slots after the rotten one");
+	zassert_equal(blob_db_count(), count - 1);
+	zassert_ok(blob_db_inspect_bucket_get(bid, &bs, NULL, NULL));
+	zassert_equal(bs.rotten, 0, "compaction kept the rotten slot");
 	blob_db_unmount();
 	zassert_ok(blob_db_mount());
-	zassert_true(ta_is(second, 0x44), "compaction lost the slots after the rotten one");
+	zassert_true(ta_is(second, 0x44));
+	zassert_true(ta_is(third, 0x55), "compaction lost the slots after the rotten one");
+	zassert_equal(blob_db_count(), count - 1);
+}
+
+/* The same through a power cut, on every backend: an append torn after its
+ * header leaves a slot the walk can size but whose CRC fails. Writes after it
+ * are acknowledged, so the bucket's next compaction must keep them. */
+ZTEST(blob_db_torn_append, test_compaction_keeps_slots_after_a_torn_one)
+{
+	struct blob_db_inspect_info in;
+	struct blob_db_inspect_bucket bs;
+
+	zassert_ok(blob_db_inspect_info_get(&in));
+
+	const uint64_t a = blob_db_alloc_id();
+	uint64_t b, c;
+
+	do {
+		b = blob_db_alloc_id();
+	} while (b % in.n_buckets != a % in.n_buckets);
+	do {
+		c = blob_db_alloc_id();
+	} while (c % in.n_buckets != a % in.n_buckets);
+	ta_put(a, 0x11);
+	ta_put(b, 0x22);
+
+	const size_t count = blob_db_count();
+	const uint16_t bid = (uint16_t)(a % in.n_buckets);
+
+	/* Cut halfway through a's new payload: the 12-byte slot head is on
+	 * flash, the rest of the payload and the CRC are not. */
+	ta.budget = sizeof(uint32_t) + sizeof(uint64_t) + TA_LEN / 2;
+	ta.armed = true;
+
+	uint8_t v[TA_LEN];
+
+	memset(v, 0x33, sizeof(v));
+	(void)blob_db_update(a, v, sizeof(v));
+	zassert_true(ta.cut, "the append finished before the cut");
+	ta.armed = false;
+	ta.cut = false;
+	blob_db_unmount();
+	zassert_ok(blob_db_mount());
+	zassert_ok(blob_db_inspect_bucket_get(bid, &bs, NULL, NULL));
+	zassert_equal(bs.rotten, 1, "the cut left no sized, rotten slot");
+	zassert_true(ta_is(a, 0x11), "a is not its old value");
+
+	/* Appended after the torn slot, and acknowledged. */
+	ta_put(c, 0x55);
+	zassert_true(ta_is(c, 0x55));
+	zassert_equal(blob_db_count(), count + 1, "count() stopped at the torn slot");
+
+	ta_rewrite_until_compacted(b, bid);
+	zassert_true(ta_is(c, 0x55), "compaction lost the slots after the torn one");
+	zassert_true(ta_is(a, 0x11), "compaction lost the slots before the torn one");
+	zassert_true(ta_is(b, 0x44));
+	zassert_equal(blob_db_count(), count + 1);
+	blob_db_unmount();
+	zassert_ok(blob_db_mount());
+	zassert_true(ta_is(c, 0x55), "compaction lost the slots after the torn one");
+	zassert_true(ta_is(a, 0x11));
+	zassert_equal(blob_db_count(), count + 1);
 }
