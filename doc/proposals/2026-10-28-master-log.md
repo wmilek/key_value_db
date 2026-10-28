@@ -266,6 +266,58 @@ store geometry == device geometry        # else -ENOTSUP
 `store.incompat` is the union of the header and the newest record that
 verifies. Every refusal writes nothing.
 
+### 4.5 Atomic replace is a store property (to resolve)
+
+`CONFIG_BLOB_DB_UBI_ATOMIC_REPLACE` (default `y` since PR #51) looks like write
+policy, which §4.1 keeps out of the feature sets. It is not. A block written
+by `ubi_leb_change()` carries UBI's seal: its VID header holds `data_size` and
+`data_crc` over the replaced length, and the block it replaced waits in UBI's
+reclaim queue. Appends past that length are fine, and §3.4 relies on them.
+Bytes inside it must never change again.
+
+A build with the option off breaks that rule in one place: `invalidate_buckets()`,
+called by `blob_db_erase_all()`, zeroes each bucket's `BDBH` magic in place.
+On a bucket last written by `ubi_leb_change()`:
+
+1. the newest copy no longer matches its seal, so the next attach reports
+   `UBI_EVENT_DATA_CORRUPT` and drops it;
+2. if the block it replaced has not been reclaimed yet, UBI maps that one
+   back, and the blobs `erase_all` deleted are live again.
+
+`doc/impl/l0_backends.md` §3 only says that a build that disables the option
+has to format the store first. Nothing on flash records that the store was
+written that way, so nothing enforces it. The in-place zero is also the one
+write in blob_db that programs over programmed bits, which §8 and D9 rule out
+for the new format.
+
+| | A. `ro_compat` bit `SEALED_REPLACE` | B. wipe generation |
+|---|---|---|
+| How | a record marks the bit before the first replace that `ubi_leb_change()` serves (persist first, then use, §4.2) | records carry `wipe_gen`; each bucket header carries the `wipe_gen` it was formatted under; a bucket whose value differs from the store's reads as unformatted |
+| `erase_all` | unchanged: a replace per formatted bucket on UBI, an in-place zero on `flash_area` | one record append (`wipe_gen + 1`), then the root rebind; no bucket is written |
+| Option turned off on a store that used it | refused with `-ENOTSUP` (no read-only mount yet, open item 2) | safe: no in-place write is left, so the option is write policy again and stays out of the feature sets |
+| §8 / D9 | still broken on `flash_area` | met on every backend |
+| Format change | one registry bit | 4 B in the record and in the bucket header. Major 5 changes both anyway, and `reserved[2]` is too small to rule out a wrap |
+| Crash | as for any feature bit (§7) | a torn `wipe_gen` record is an `erase_all` not acknowledged, and the old buckets stand. Once it lands, every older bucket is gone at once, so `erase_all` becomes crash-atomic, which it is not today |
+| Mount and read cost | none | a compare on the bucket header every reader already checks |
+
+Still open within B:
+
+- With both masters blank there is no `wipe_gen` to compare against, so the
+  format path (`l1_bucketlog.md` §3.1) still has to clear what is present. It
+  can erase (`ubi_leb_erase()` destroys every copy), since formatting is rare.
+  Or the bucket header could carry `store_uuid`, which brings back open item 3.
+- Compaction copies the bucket's `wipe_gen` into the new image.
+- A stale bucket keeps its bytes on flash until it is formatted again, as a
+  zeroed bucket does today.
+- In a protected store `wipe_gen` is under the record and bucket header MACs.
+  Rolling the master back to an older `wipe_gen` would bring buckets back,
+  which is the rollback PR #63's anchor already has to cover.
+
+Leaning: B in phase 1, since it also removes the last in-place write and the
+per-bucket cost of `erase_all`. If B is deferred, A should land in phase 1
+instead, so that a build with the option off refuses the store rather than
+reviving deleted blobs.
+
 ## 5. Large payloads
 
 ### 5.1 The window as two records (decision)
@@ -370,6 +422,7 @@ QSPI, about 0.53 s per 64 KB erase):
 | churn on UBI, atomic replace | 8 erases, 0 master | unchanged |
 | AEAD compaction on 64 KB blocks (PR #63) | about +1 erase per compaction (not measured) | 0 |
 | id ceiling | 1 erase per 256 new ids | 1 record program per 256 new ids |
+| `erase_all`, UBI with atomic replace, 200 of 2 038 buckets formatted (`native_sim`, `l0_backends.md` §3) | 13.8 KB written, ~200 blocks left to reclaim | with §4.5 option B: 1 record program + the root rebind |
 | mount | 2 header reads | 2 header reads + ~7–11 record reads |
 | RAM | — | a cursor (2 B) and the active sector's `rot_gen` |
 | flash wear on the master sectors | 1 erase per update | 1 erase per 62–1 362 updates |
@@ -384,6 +437,7 @@ QSPI, about 0.53 s per 64 KB erase):
 | PR #62 | `DELTA` moves to slot flag bit 5 and is marked on first use |
 | `lib/blob_db/blob_db_inspect.c`, shell | show features, suite, geometry, log fill and rotation generation |
 | `doc/impl/l1_bucketlog.md` | §3.1, §5.1, §5.6, §5.6a, §6 and §13.1 rewritten for the log |
+| `doc/impl/l0_backends.md` | §3: the shortcomings of atomic replace that §4.5 resolves are struck |
 
 ## 11. Test plan (P8; `native_sim`, both backends)
 
@@ -410,6 +464,11 @@ QSPI, about 0.53 s per 64 KB erase):
 8. **AEAD nonces**: PR #63's recorder sees no nonce repeat across remounts and
    repeated compactions, and compaction writes no master on either path.
 9. **Registry**: a `BUILD_ASSERT` that no two features own a slot flag.
+10. **Atomic replace turned off** (§4.5): on UBI, write and compact with the
+    option on, `erase_all` with it off, remount before reclaim runs. With A
+    the second build refuses the store; with B no deleted blob comes back. A
+    power cut at every byte of the `wipe_gen` record leaves all buckets or
+    none.
 
 ## 12. Phases
 
@@ -435,3 +494,7 @@ QSPI, about 0.53 s per 64 KB erase):
 5. **The id ceiling step**: with records cheap, `BLOB_DB_ID_HINT_STEP`
    (configurable in PR #62) mostly trades ids skipped at mount against
    records. 64-bit ids make the skip irrelevant, so 256 can stay.
+6. **Atomic replace as a store property** (§4.5): choose between an
+   `ro_compat` bit that refuses a build with the option off, and a wipe
+   generation that makes `erase_all` one record and removes the last in-place
+   write. Either one belongs in phase 1.
