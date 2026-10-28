@@ -69,8 +69,8 @@ Power can fail at any instruction. In order of strength:
   i-nodes of one interrupted mutation and is reclaimed by bounded, idempotent
   recovery. Long-term accumulation of leaked space is not accepted.
 - **Self-healing (advisable).** On detecting residue that should be
-  impossible (e.g. a dangling reference), repair it — drop the entry and
-  report what was dropped — rather than carry it.
+  impossible (e.g. a dangling reference), repair it — drop the entry — rather
+  than carry it.
 - **Avoidance first (advisable).** Order operations so the windows in which
   residue can arise are as few and as small as possible.
 
@@ -81,15 +81,12 @@ exercised (torn writes, corruption, remount), not just argued.
 
 ## P9 — No destruction without intervention
 
-blob_db erases only what it can show is garbage: data that a later committed
-write replaced or deleted, and the residue of its own interrupted writes (P7).
-Everything else is kept until the application asks for it to go —
-`blob_db_format()` at run time, or an explicit Kconfig opt-in such as
-`CONFIG_BLOB_DB_AUTOFORMAT_ON_CORRUPT`. That covers a store it did not write or
-does not recognize, and committed data that has become unreadable.
+No layer destroys data on its own unless it can show the data is garbage: data
+that a later committed write replaced or deleted, or the residue of an
+interrupted write (P7). Anything else — a store that is not recognized, data
+that has become unreadable — is reported and kept: it may hold the only copy of
+something, and it is the evidence of what happened.
 
-Mount refuses such a store with nothing written. Damage inside a mounted store
-is reported and left in place: it may hold the only copy of something, and it
-is the evidence of what happened. Mount formats on its own only a partition
-with nothing to lose — both masters blank, together with whatever buckets an
-interrupted format left behind them.
+Destroying it takes a deliberate decision by the application: a call made for
+that purpose, such as `blob_db_format()`, or a build option that opts out of
+this principle, such as `CONFIG_BLOB_DB_AUTOFORMAT_ON_CORRUPT`.
