@@ -715,7 +715,9 @@ ZTEST(blob_db, test_compaction_does_not_lower_id_ceiling)
 /* A lookup reads its bucket a window at a time, not one 12-byte slot head per
  * read: a bucket of nine short slots costs the header, one window and one read
  * of the target's payload and CRC. It used to cost the header, nine heads, the
- * payload and the CRC. */
+ * payload and the CRC. A slot index hit costs less (the head, then payload and
+ * CRC); CONFIG_BLOB_DB_SLOT_INDEX_VERIFY adds the walk it checks the hit
+ * against, one window. */
 ZTEST(blob_db, test_lookup_reads_a_window_not_each_slot_head)
 {
 	struct blob_db_iostats io;
@@ -736,7 +738,10 @@ ZTEST(blob_db, test_lookup_reads_a_window_not_each_slot_head)
 
 	zassert_equal(got, 5);
 	zassert_mem_equal(buf, "v0008", 5);
-	zassert_true(io.reads <= 3, "a lookup over 9 slots took %u reads",
+	const uint32_t most =
+		IS_ENABLED(CONFIG_BLOB_DB_SLOT_INDEX_VERIFY) ? 4 : 3;
+
+	zassert_true(io.reads <= most, "a lookup over 9 slots took %u reads",
 		     io.reads);
 }
 
