@@ -1,7 +1,10 @@
 # Design Principles
 
 Status: v1 · Applies to every layer of the stack (see `doc/architecture.md`).
-When two principles conflict, the earlier-numbered one wins.
+When two principles conflict, neither wins by rank or number. The conflict is
+decided deliberately, where it arises, and the decision and its reason are
+written down there. Numbers are permanent labels: a new principle takes the
+next free number, and none is reused or renumbered.
 
 ## P1 — Zephyr-based
 
@@ -78,13 +81,12 @@ exercised (torn writes, corruption, remount), not just argued.
 
 ## P9 — No destruction without intervention
 
-blob_db never erases data it did not just write, or data it cannot read,
-unless the application asks for it: `blob_db_format()` at run time, or an
-explicit Kconfig opt-in such as `CONFIG_BLOB_DB_AUTOFORMAT_ON_CORRUPT`. A store
-that is foreign, corrupt, unreadable under this key or damaged past what the
-backend will attach is refused with nothing written. Damaged blocks are reported
-and kept: they may hold the only copy of something, and they are the evidence
-of what happened to the device. Mount formats on its own only where it can show
-there is nothing to lose: a blank partition, or what is left of a format of a
-blank partition that a power cut interrupted. P7's self-healing never reaches as
-far as erasing; this rule stands even where P7 would otherwise win.
+No layer destroys data on its own unless it can show the data is garbage: data
+that a later committed write replaced or deleted, or the residue of an
+interrupted write (P7). Anything else — a store that is not recognized, data
+that has become unreadable — is reported and kept: it may hold the only copy of
+something, and it is the evidence of what happened.
+
+Destroying it takes a deliberate decision by the application: a call made for
+that purpose, such as `blob_db_format()`, or a build option that opts out of
+this principle, such as `CONFIG_BLOB_DB_AUTOFORMAT_ON_CORRUPT`.
