@@ -1,7 +1,10 @@
 # Design Principles
 
 Status: v1 · Applies to every layer of the stack (see `doc/architecture.md`).
-When two principles conflict, the earlier-numbered one wins.
+When two principles conflict, neither wins by rank or number. The conflict is
+decided deliberately, where it arises, and the decision and its reason are
+written down there. Numbers are permanent labels: a new principle takes the
+next free number, and none is reused or renumbered.
 
 ## P1 — Zephyr-based
 
@@ -66,8 +69,8 @@ Power can fail at any instruction. In order of strength:
   i-nodes of one interrupted mutation and is reclaimed by bounded, idempotent
   recovery. Long-term accumulation of leaked space is not accepted.
 - **Self-healing (advisable).** On detecting residue that should be
-  impossible (e.g. a dangling reference), repair it — drop the entry — rather
-  than carry it.
+  impossible (e.g. a dangling reference), repair it — drop the entry and
+  report what was dropped — rather than carry it.
 - **Avoidance first (advisable).** Order operations so the windows in which
   residue can arise are as few and as small as possible.
 
@@ -75,3 +78,21 @@ Power can fail at any instruction. In order of strength:
 
 Each module ships a ztest suite; crash-recovery and persistence claims are
 exercised (torn writes, corruption, remount), not just argued.
+
+## P9 — No destruction without intervention
+
+blob_db erases only what it can show is garbage: data that a later committed
+write replaced or deleted, and the residue of its own interrupted writes (P7).
+Everything else is kept until the application asks for it to go —
+`blob_db_format()` at run time, or an explicit Kconfig opt-in such as
+`CONFIG_BLOB_DB_AUTOFORMAT_ON_CORRUPT`. That covers a store it did not write or
+does not recognize, and committed data that has become unreadable.
+
+Mount refuses such a store with nothing written. Damage inside a mounted store
+is reported and left in place: it may hold the only copy of something, and it
+is the evidence of what happened. Mount formats on its own only a partition
+with nothing to lose — both masters blank, together with whatever buckets an
+interrupted format left behind them.
+
+Where the implementation still falls short of this:
+`doc/impl/l1_bucketlog.md` §13.8.
