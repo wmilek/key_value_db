@@ -93,6 +93,3 @@ is reported and left in place: it may hold the only copy of something, and it
 is the evidence of what happened. Mount formats on its own only a partition
 with nothing to lose — both masters blank, together with whatever buckets an
 interrupted format left behind them.
-
-Where the implementation still falls short of this:
-`doc/impl/l1_bucketlog.md` §13.8.

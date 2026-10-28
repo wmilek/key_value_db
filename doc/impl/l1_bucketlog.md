@@ -797,22 +797,6 @@ draft implementation and will be reworked against the final API; the
    on-flash format change — cheap now, since the prefix already carries
    `hdr_len` and reserved space, and it needs a `format_minor` bump at
    most.
-8. **Unreadable data inside a mounted store is still discarded** — gaps
-   against P9 (`doc/principles.md`), which keeps damage in place until the
-   application asks for it to go:
-   - *A bucket whose header fails its CRC is erased by the next write to it.*
-     `scan_bucket()` ignores it with a warning, `read_bucket_hdr()` reports it
-     unformatted, and every writer then calls `format_bucket()`, erasing every
-     slot in the sector. Candidate fix: writers refuse such a bucket with
-     `-EIO` rather than format it. Small, and no format change.
-   - *Compaction drops a rotten slot even when it is the only copy of its id*
-     (§3.4, §10). Dropping one that a newer intact slot supersedes loses
-     nothing; dropping the only copy does. Keeping it means carrying bytes
-     compaction cannot interpret into the new image.
-   - *A slot header with an implausible `val_len` ends the log* (§3.4): what
-     follows is treated as torn tail and goes at the next compaction, since
-     the walk has no stride past it. Here rot and a torn write cannot be told
-     apart. Test-plan item 10 (§11) asserts the current behavior.
 
 ---
 
