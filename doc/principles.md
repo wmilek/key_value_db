@@ -1,7 +1,10 @@
 # Design Principles
 
 Status: v1 · Applies to every layer of the stack (see `doc/architecture.md`).
-When two principles conflict, the earlier-numbered one wins.
+When two principles conflict, neither wins by rank or number. The conflict is
+decided deliberately, where it arises, and the decision and its reason are
+written down there. Numbers are permanent labels: a new principle takes the
+next free number, and none is reused or renumbered.
 
 ## P1 — Zephyr-based
 
@@ -75,3 +78,15 @@ Power can fail at any instruction. In order of strength:
 
 Each module ships a ztest suite; crash-recovery and persistence claims are
 exercised (torn writes, corruption, remount), not just argued.
+
+## P9 — No destruction without intervention
+
+No layer destroys data on its own unless it can show the data is garbage: data
+that a later committed write replaced or deleted, or the residue of an
+interrupted write (P7). Anything else — a store that is not recognized, data
+that has become unreadable — is reported and kept: it may hold the only copy of
+something, and it is the evidence of what happened.
+
+Destroying it takes a deliberate decision by the application: a call made for
+that purpose, such as `blob_db_format()`, or a build option that opts out of
+this principle, such as `CONFIG_BLOB_DB_AUTOFORMAT_ON_CORRUPT`.
