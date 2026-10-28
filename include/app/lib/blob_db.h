@@ -469,6 +469,64 @@ int blob_db_erase_all(void);
  */
 int blob_db_prepare(size_t n);
 
+/** Deferred housekeeping of the backing store; see blob_db_maintain(). */
+enum blob_db_maint_op {
+	/** Erase blocks whose contents are dead (replaced, unmapped) and
+	 *  return them to the free pool. Run whenever the device is idle: with
+	 *  the pool empty, every write that needs a fresh block erases one
+	 *  first. */
+	BLOB_DB_MAINT_RECLAIM,
+	/** Level wear: move rarely rewritten data off the least worn blocks.
+	 *  Each step copies a block and erases one. */
+	BLOB_DB_MAINT_RELOCATE,
+	/** Bring the backend's own metadata copies back into agreement and
+	 *  give retired blocks another chance. Mount already runs it. */
+	BLOB_DB_MAINT_REPAIR,
+	/** Erase blocks kept as corrupt and put them back in service, once
+	 *  whatever they held is no longer wanted. */
+	BLOB_DB_MAINT_DISCARD,
+};
+
+/** Outcome of one blob_db_maintain() call. */
+struct blob_db_maint_result {
+	uint32_t performed;  /**< steps carried out, never more than the budget */
+	uint32_t remaining;  /**< steps still outstanding; 0 = nothing left */
+};
+
+/**
+ * @brief Run up to @p budget steps of deferred backend housekeeping.
+ *
+ * Nothing runs in the background: on the UBI backend this is
+ * ubi_maintenance(), and only the caller knows when the latency is
+ * affordable. A step usually costs one erase (~1 s on the nRF5340-DK's
+ * QSPI NOR in its default power mode), so a budget of one is a reasonable
+ * slice. A budget of zero performs nothing and only reports what is waiting.
+ *
+ * Blob contents are unchanged by every operation: relocation moves a block's
+ * data and reads the same afterwards. Erases done here bypass the
+ * flash-level counters of blob_db_iostats_get(), which count blob_db's own
+ * traffic only.
+ *
+ * The flash_area backend has no deferred work: every call succeeds with
+ * nothing performed and nothing remaining.
+ *
+ * Not thread-safe, like the rest of blob_db: serialize it with every other
+ * call.
+ *
+ * @param op      operation to run
+ * @param budget  most steps to perform; 0 only reports
+ * @param out     filled on every return but -ENODEV and -EINVAL
+ *
+ * @retval 0       done, including when there was nothing to do
+ * @retval -ENODEV not mounted
+ * @retval -EINVAL unknown @p op or NULL @p out
+ * @retval -EROFS  the backend went read-only (a failed erase)
+ * @retval -EIO    flash error
+ * @retval <0      other backend errors (UBI: -EBADMSG, -EFAULT)
+ */
+int blob_db_maintain(enum blob_db_maint_op op, uint32_t budget,
+		     struct blob_db_maint_result *out);
+
 /** @} */ /* end of lib_blob_db */
 
 #ifdef __cplusplus

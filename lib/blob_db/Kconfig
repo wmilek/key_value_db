@@ -274,15 +274,18 @@ config BLOB_DB_INSPECT
 	  interfaces must not depend on it.
 
 config BLOB_DB_SHELL
-	bool "Shell commands to inspect the store"
+	bool "Shell commands to inspect and maintain the store"
 	depends on SHELL
 	select BLOB_DB_INSPECT
 	help
 	  Add a `blob_db` shell command group: geometry and master state, a
 	  whole-store occupancy summary with the fill distribution across
 	  buckets, a per-bucket table, a slot-by-slot view of one bucket, where
-	  an id lives, and a hex dump of a blob. Read-only: no command writes
-	  to flash.
+	  an id lives, and a hex dump of a blob. All of those are read-only.
+
+	  `blob_db maintain` reports the backend's deferred work and, given an
+	  operation, runs it through blob_db_maintain(). That is the one
+	  command that writes: a step usually erases a block.
 
 	  blob_db is not thread-safe and the shell runs on its own thread, so
 	  use these while the application is not calling blob_db. A full-store

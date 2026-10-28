@@ -36,6 +36,7 @@
 #include <psa/crypto.h>
 #include <ubi/ubi.h>
 
+#include <app/lib/blob_db.h>
 #include <app/lib/blob_db_ubi.h>
 
 #include "blob_db_store.h"
@@ -513,4 +514,21 @@ bool blob_db_store_open_found_damage(off_t off)
 
 	return g_damaged_unplaced ||
 	       (lnum < 32 && (g_damaged_lebs & BIT(lnum)) != 0);
+}
+
+int blob_db_store_maintain(int op, uint32_t budget, uint32_t *performed,
+			   uint32_t *remaining)
+{
+	static const enum ubi_maintenance_op ubi_op[] = {
+		[BLOB_DB_MAINT_RECLAIM]  = UBI_MAINTENANCE_RECLAIM,
+		[BLOB_DB_MAINT_RELOCATE] = UBI_MAINTENANCE_RELOCATE,
+		[BLOB_DB_MAINT_REPAIR]   = UBI_MAINTENANCE_REPAIR,
+		[BLOB_DB_MAINT_DISCARD]  = UBI_MAINTENANCE_DISCARD,
+	};
+	struct ubi_maintenance_result res = { 0 };
+	const int rc = ubi_maintenance(g_ubi, ubi_op[op], budget, &res);
+
+	*performed = res.performed;
+	*remaining = res.remaining;
+	return rc;
 }
