@@ -1,0 +1,38 @@
+*** Booting Zephyr OS build 4a405846193f ***
+
+persondb 1.0.0 — CBOR person/credential database
+[00:00:00.547,882] [0m<inf> ubi: attached partition 3: image_seq=0x6d0b4b7a, 1 volumes, revision 2[0m
+ubi-ec: image_seq=1829456762 rev=2 pebs=128 healthy=128 free=0 reclaimable=6 bad=0 corrupt=0 ec_min=2 ec_max=16 ec_total=1909
+[00:02:23.089,538] [0m<inf> persondb: created store for 2000 persons: people map depth 2, 256 buckets; credential map depth 2, 256 buckets[0m
+open         : 143881 ms
+prepare      :  86684 ms (82 buckets formatted)
+fill         : 173225 ms  2000 written, 2000/2000 total, 8 commits
+verify       :  14626 ms  256 persons, 623 cards
+VERIFY PASS
+mutate       :  10142 ms  rev 0 -> 1  (0 revoked, 64 assigned)
+re-verify    :  14989 ms  256 persons, 631 cards
+VERIFY PASS
+
+bench check :   200 ops in  6873382 us ->    29.10 ops/s    34366 us/op   400 store ops  85653 flash ops   1817808 B  amp 22x
+io check       : rd  85653 ops/  1817808 B  wr      0 ops/        0 B  er     0 ops/        0 B
+             : 199 granted, 0 denied, 0 unknown, 1 expired
+bench byid  :   200 ops in  3624298 us ->    55.18 ops/s    18121 us/op   200 store ops  41939 flash ops   1154374 B  amp 15x
+io byid        : rd  41939 ops/  1154374 B  wr      0 ops/        0 B  er     0 ops/        0 B
+bench miss  :   200 ops in  3322448 us ->    60.20 ops/s    16612 us/op   200 store ops  43473 flash ops    654171 B  amp 142x
+io miss        : rd  43473 ops/   654171 B  wr      0 ops/        0 B  er     0 ops/        0 B
+bench put   :   200 ops in 43194763 us ->     4.63 ops/s   215973 us/op   906 store ops  247875 flash ops   7182443 B  amp 81x
+io put         : rd 247145 ops/  5406531 B  wr    718 ops/   991016 B  er    12 ops/   784896 B
+bench cbor  :   200 ops in   191650 us ->  1043.57 ops/s      958 us/op     0 store ops      0 flash ops         0 B  amp 0x
+io cbor        : rd      0 ops/        0 B  wr      0 ops/        0 B  er     0 ops/        0 B
+
+store
+  partition   : 8388608 B (8192 KiB)
+  maps        : person (depth 2, 256 buckets) + credential (depth 2, 256 buckets)
+  persons     : 2000 of 2000   credentials: 4979
+  mean entry  : 433 B
+  live content: 866385 B = 10.3 % of the partition
+  bucket overflows: 0
+  NOTE: physical occupancy (live + uncompacted garbage) is not
+        observable through the API — see FINDINGS.md B3.
+
+persondb: done — store at rev 1; rerun to prove persistence

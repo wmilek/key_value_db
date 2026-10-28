@@ -304,6 +304,7 @@ persondb/   persondb.c                       the person management API
             person_cbor.c                    the wire format — private here
 dataset/    dataset.c                        pure generator: index -> person
 tools/      sizing.py                        offline capacity check (not built)
+            perf_sweep.py                    performance across scales (not built)
 ```
 
 Dependencies point one way only, mirroring the stack's own P6 — and because
@@ -400,6 +401,20 @@ Worth stating, because a practices guide is read as a checklist:
   5 000 — both of the *sixteen-shard* build. Acceptance criterion **A4** is not
   met until a full-scale run of the current two-instance layout exists, at the
   re-sized 8 000 persons (`DESIGN.md` §6.5).
+
+## Measuring across scales
+
+The benchmark answers at one scale. `tools/perf_sweep.py` answers how each
+operation moves as the number of credentials grows: it rebuilds the app at a
+list of person counts on `native_sim`, runs each three times, and reports
+flash counters per operation with the DK time they project to (reads only —
+writes are erase-bound and do not project). It parses DK UART captures and
+`RESULTS.md` §8 into the same JSON. Results and caveats: `RESULTS.md` §10.
+
+```
+python3 tools/perf_sweep.py run -o sweep.json
+python3 tools/perf_sweep.py report sweep.json
+```
 
 ## Rerunning
 
