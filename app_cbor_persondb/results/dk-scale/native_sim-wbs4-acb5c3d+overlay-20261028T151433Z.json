@@ -1,0 +1,1435 @@
+{
+ "schema": "persondb-perf/1",
+ "generated": "2026-10-28T15:14:33+00:00",
+ "source": {
+  "kind": "native_sim",
+  "board": "native_sim",
+  "commit": null,
+  "dirty": false,
+  "host": {
+   "machine": "x86_64",
+   "cpu": "Intel(R) Celeron(R) J4105 CPU @ 1.50GHz",
+   "python": "3.12.3"
+  },
+  "samples": 200,
+  "steady_runs": 2,
+  "work": "/s/work",
+  "config": [],
+  "note": "I/O counters transfer to the DK (RESULTS.md \u00a71, \u00a73b); host microseconds do not."
+ },
+ "models": {
+  "ubi-v0.1.0": {
+   "label": "nRF5340-DK, UBI backend on zephyr-ubi v0.1.0 (the default)",
+   "txn_us": 75.0,
+   "byte_us": 0.63,
+   "cbor_us": 950.0,
+   "source": "app_perf_blob_db/RESULTS.md: flash_area 65 us/transaction and 0.63 us/B (run 2), plus UBI v0.1.0's 7-13 us per access (midpoint 10); cbor from app_cbor_persondb/RESULTS.md \u00a75g"
+  },
+  "ubi-fork": {
+   "label": "nRF5340-DK, UBI backend on the old wmilek/ubi fork",
+   "txn_us": 178.0,
+   "byte_us": 0.616,
+   "cbor_us": 950.0,
+   "source": "app_cbor_persondb/RESULTS.md \u00a75c, validated in \u00a75e/\u00a75f"
+  },
+  "flash_area": {
+   "label": "nRF5340-DK, raw flash_area backend",
+   "txn_us": 65.0,
+   "byte_us": 0.63,
+   "cbor_us": 950.0,
+   "source": "app_perf_blob_db/RESULTS.md run 2; FINDINGS.md N1"
+  }
+ },
+ "runs": [
+  {
+   "zephyr": "4a405846193f",
+   "app_version": "1.0.0",
+   "persons": 1000,
+   "credentials": 2479,
+   "kind": "fill",
+   "phases": {
+    "open": {
+     "ms": 28
+    },
+    "prepare": {
+     "ms": 2,
+     "buckets": 98
+    },
+    "fill": {
+     "ms": 124,
+     "written": 1000,
+     "populated": 1000,
+     "target": 1000,
+     "commits": 4
+    },
+    "verify": {
+     "ms": 21,
+     "persons": 256,
+     "cards": 602
+    },
+    "mutate": {
+     "ms": 8,
+     "rev_from": 0,
+     "rev_to": 1,
+     "revoked": 0,
+     "assigned": 64
+    },
+    "reverify": {
+     "ms": 22,
+     "persons": 256,
+     "cards": 618
+    }
+   },
+   "bench": {
+    "check": {
+     "ops": 200,
+     "us": 11418,
+     "store_ops": 400,
+     "flash_ops": 34416,
+     "flash_bytes": 1256149,
+     "measured": true,
+     "amp": 15,
+     "io": {
+      "reads": 34416,
+      "bytes_read": 1256149,
+      "writes": 0,
+      "bytes_written": 0,
+      "erases": 0,
+      "bytes_erased": 0
+     },
+     "decisions": {
+      "granted": 200,
+      "denied": 0,
+      "unknown": 0,
+      "expired": 0
+     }
+    },
+    "byid": {
+     "ops": 200,
+     "us": 7196,
+     "store_ops": 200,
+     "flash_ops": 11207,
+     "flash_bytes": 882866,
+     "measured": true,
+     "amp": 11,
+     "io": {
+      "reads": 11207,
+      "bytes_read": 882866,
+      "writes": 0,
+      "bytes_written": 0,
+      "erases": 0,
+      "bytes_erased": 0
+     }
+    },
+    "miss": {
+     "ops": 200,
+     "us": 4769,
+     "store_ops": 200,
+     "flash_ops": 22826,
+     "flash_bytes": 361511,
+     "measured": true,
+     "amp": 78,
+     "io": {
+      "reads": 22826,
+      "bytes_read": 361511,
+      "writes": 0,
+      "bytes_written": 0,
+      "erases": 0,
+      "bytes_erased": 0
+     }
+    },
+    "put": {
+     "ops": 200,
+     "us": 33487,
+     "store_ops": 864,
+     "flash_ops": 108912,
+     "flash_bytes": 3500158,
+     "measured": true,
+     "amp": 40,
+     "io": {
+      "reads": 108248,
+      "bytes_read": 3017722,
+      "writes": 664,
+      "bytes_written": 482436,
+      "erases": 0,
+      "bytes_erased": 0
+     }
+    },
+    "cbor": {
+     "ops": 200,
+     "us": 2173,
+     "store_ops": 0,
+     "flash_ops": 0,
+     "flash_bytes": 0,
+     "measured": true,
+     "amp": 0,
+     "io": {
+      "reads": 0,
+      "bytes_read": 0,
+      "writes": 0,
+      "bytes_written": 0,
+      "erases": 0,
+      "bytes_erased": 0
+     }
+    }
+   },
+   "store": {
+    "partition_bytes": 8388608,
+    "people_depth": 1,
+    "people_buckets": 250,
+    "cred_depth": 2,
+    "cred_buckets": 256,
+    "populated": 1000,
+    "n_persons": 1000,
+    "credentials": 2479,
+    "mean_entry": 432,
+    "live_bytes": 432759,
+    "fill_pct": 5.1,
+    "overflows": 0,
+    "rev": 1
+   },
+   "created": {
+    "persons": 1000,
+    "people_depth": 1,
+    "people_buckets": 250,
+    "cred_depth": 2,
+    "cred_buckets": 256
+   },
+   "verify_pass": 2,
+   "status": "ok",
+   "error": null,
+   "label": "native_sim n=1000 run 1",
+   "log": "logs/n1000-run1.log",
+   "exit": 0
+  },
+  {
+   "zephyr": "4a405846193f",
+   "app_version": "1.0.0",
+   "persons": 1000,
+   "credentials": 2479,
+   "kind": "steady",
+   "phases": {
+    "open": {
+     "ms": 3
+    },
+    "prepare": {
+     "ms": 0,
+     "buckets": 0
+    },
+    "fill": {
+     "ms": 0,
+     "written": 0,
+     "populated": 1000,
+     "target": 1000,
+     "commits": 0
+    },
+    "verify": {
+     "ms": 25,
+     "persons": 256,
+     "cards": 618
+    },
+    "mutate": {
+     "ms": 18,
+     "rev_from": 1,
+     "rev_to": 2,
+     "revoked": 64,
+     "assigned": 64
+    },
+    "reverify": {
+     "ms": 24,
+     "persons": 256,
+     "cards": 619
+    }
+   },
+   "bench": {
+    "check": {
+     "ops": 200,
+     "us": 12628,
+     "store_ops": 400,
+     "flash_ops": 43139,
+     "flash_bytes": 1361029,
+     "measured": true,
+     "amp": 16,
+     "io": {
+      "reads": 43139,
+      "bytes_read": 1361029,
+      "writes": 0,
+      "bytes_written": 0,
+      "erases": 0,
+      "bytes_erased": 0
+     },
+     "decisions": {
+      "granted": 200,
+      "denied": 0,
+      "unknown": 0,
+      "expired": 0
+     }
+    },
+    "byid": {
+     "ops": 200,
+     "us": 7833,
+     "store_ops": 200,
+     "flash_ops": 14892,
+     "flash_bytes": 927221,
+     "measured": true,
+     "amp": 12,
+     "io": {
+      "reads": 14892,
+      "bytes_read": 927221,
+      "writes": 0,
+      "bytes_written": 0,
+      "erases": 0,
+      "bytes_erased": 0
+     }
+    },
+    "miss": {
+     "ops": 200,
+     "us": 5292,
+     "store_ops": 200,
+     "flash_ops": 27463,
+     "flash_bytes": 416971,
+     "measured": true,
+     "amp": 90,
+     "io": {
+      "reads": 27463,
+      "bytes_read": 416971,
+      "writes": 0,
+      "bytes_written": 0,
+      "erases": 0,
+      "bytes_erased": 0
+     }
+    },
+    "put": {
+     "ops": 200,
+     "us": 38385,
+     "store_ops": 864,
+     "flash_ops": 133859,
+     "flash_bytes": 3800266,
+     "measured": true,
+     "amp": 43,
+     "io": {
+      "reads": 133195,
+      "bytes_read": 3317494,
+      "writes": 664,
+      "bytes_written": 482772,
+      "erases": 0,
+      "bytes_erased": 0
+     }
+    },
+    "cbor": {
+     "ops": 200,
+     "us": 2219,
+     "store_ops": 0,
+     "flash_ops": 0,
+     "flash_bytes": 0,
+     "measured": true,
+     "amp": 0,
+     "io": {
+      "reads": 0,
+      "bytes_read": 0,
+      "writes": 0,
+      "bytes_written": 0,
+      "erases": 0,
+      "bytes_erased": 0
+     }
+    }
+   },
+   "store": {
+    "partition_bytes": 8388608,
+    "people_depth": 1,
+    "people_buckets": 250,
+    "cred_depth": 2,
+    "cred_buckets": 256,
+    "populated": 1000,
+    "n_persons": 1000,
+    "credentials": 2479,
+    "mean_entry": 432,
+    "live_bytes": 432759,
+    "fill_pct": 5.1,
+    "overflows": 0,
+    "rev": 2
+   },
+   "created": null,
+   "verify_pass": 2,
+   "status": "ok",
+   "error": null,
+   "label": "native_sim n=1000 run 2",
+   "log": "logs/n1000-run2.log",
+   "exit": 0
+  },
+  {
+   "zephyr": "4a405846193f",
+   "app_version": "1.0.0",
+   "persons": 1000,
+   "credentials": 2479,
+   "kind": "steady",
+   "phases": {
+    "open": {
+     "ms": 3
+    },
+    "prepare": {
+     "ms": 0,
+     "buckets": 0
+    },
+    "fill": {
+     "ms": 0,
+     "written": 0,
+     "populated": 1000,
+     "target": 1000,
+     "commits": 0
+    },
+    "verify": {
+     "ms": 27,
+     "persons": 256,
+     "cards": 619
+    },
+    "mutate": {
+     "ms": 20,
+     "rev_from": 2,
+     "rev_to": 3,
+     "revoked": 64,
+     "assigned": 64
+    },
+    "reverify": {
+     "ms": 27,
+     "persons": 256,
+     "cards": 618
+    }
+   },
+   "bench": {
+    "check": {
+     "ops": 200,
+     "us": 13617,
+     "store_ops": 400,
+     "flash_ops": 51874,
+     "flash_bytes": 1465756,
+     "measured": true,
+     "amp": 18,
+     "io": {
+      "reads": 51874,
+      "bytes_read": 1465756,
+      "writes": 0,
+      "bytes_written": 0,
+      "erases": 0,
+      "bytes_erased": 0
+     },
+     "decisions": {
+      "granted": 200,
+      "denied": 0,
+      "unknown": 0,
+      "expired": 0
+     }
+    },
+    "byid": {
+     "ops": 200,
+     "us": 8342,
+     "store_ops": 200,
+     "flash_ops": 18589,
+     "flash_bytes": 971630,
+     "measured": true,
+     "amp": 12,
+     "io": {
+      "reads": 18589,
+      "bytes_read": 971630,
+      "writes": 0,
+      "bytes_written": 0,
+      "erases": 0,
+      "bytes_erased": 0
+     }
+    },
+    "miss": {
+     "ops": 200,
+     "us": 5967,
+     "store_ops": 200,
+     "flash_ops": 32071,
+     "flash_bytes": 472244,
+     "measured": true,
+     "amp": 102,
+     "io": {
+      "reads": 32071,
+      "bytes_read": 472244,
+      "writes": 0,
+      "bytes_written": 0,
+      "erases": 0,
+      "bytes_erased": 0
+     }
+    },
+    "put": {
+     "ops": 200,
+     "us": 46986,
+     "store_ops": 864,
+     "flash_ops": 157544,
+     "flash_bytes": 4495372,
+     "measured": true,
+     "amp": 51,
+     "io": {
+      "reads": 156874,
+      "bytes_read": 3797736,
+      "writes": 667,
+      "bytes_written": 501412,
+      "erases": 3,
+      "bytes_erased": 196224
+     }
+    },
+    "cbor": {
+     "ops": 200,
+     "us": 2255,
+     "store_ops": 0,
+     "flash_ops": 0,
+     "flash_bytes": 0,
+     "measured": true,
+     "amp": 0,
+     "io": {
+      "reads": 0,
+      "bytes_read": 0,
+      "writes": 0,
+      "bytes_written": 0,
+      "erases": 0,
+      "bytes_erased": 0
+     }
+    }
+   },
+   "store": {
+    "partition_bytes": 8388608,
+    "people_depth": 1,
+    "people_buckets": 250,
+    "cred_depth": 2,
+    "cred_buckets": 256,
+    "populated": 1000,
+    "n_persons": 1000,
+    "credentials": 2479,
+    "mean_entry": 432,
+    "live_bytes": 432759,
+    "fill_pct": 5.1,
+    "overflows": 0,
+    "rev": 3
+   },
+   "created": null,
+   "verify_pass": 2,
+   "status": "ok",
+   "error": null,
+   "label": "native_sim n=1000 run 3",
+   "log": "logs/n1000-run3.log",
+   "exit": 0
+  },
+  {
+   "zephyr": "4a405846193f",
+   "app_version": "1.0.0",
+   "persons": 12000,
+   "credentials": 29942,
+   "kind": "fill",
+   "phases": {
+    "open": {
+     "ms": 29
+    },
+    "prepare": {
+     "ms": 1,
+     "buckets": 64
+    },
+    "fill": {
+     "ms": 9578,
+     "written": 12000,
+     "populated": 12000,
+     "target": 12000,
+     "commits": 47
+    },
+    "verify": {
+     "ms": 29,
+     "persons": 256,
+     "cards": 656
+    },
+    "mutate": {
+     "ms": 84,
+     "rev_from": 0,
+     "rev_to": 1,
+     "revoked": 0,
+     "assigned": 64
+    },
+    "reverify": {
+     "ms": 28,
+     "persons": 256,
+     "cards": 658
+    }
+   },
+   "bench": {
+    "check": {
+     "ops": 200,
+     "us": 13918,
+     "store_ops": 400,
+     "flash_ops": 23952,
+     "flash_bytes": 1833147,
+     "measured": true,
+     "amp": 23,
+     "io": {
+      "reads": 23952,
+      "bytes_read": 1833147,
+      "writes": 0,
+      "bytes_written": 0,
+      "erases": 0,
+      "bytes_erased": 0
+     },
+     "decisions": {
+      "granted": 200,
+      "denied": 0,
+      "unknown": 0,
+      "expired": 0
+     }
+    },
+    "byid": {
+     "ops": 200,
+     "us": 8708,
+     "store_ops": 200,
+     "flash_ops": 12290,
+     "flash_bytes": 1102985,
+     "measured": true,
+     "amp": 14,
+     "io": {
+      "reads": 12290,
+      "bytes_read": 1102985,
+      "writes": 0,
+      "bytes_written": 0,
+      "erases": 0,
+      "bytes_erased": 0
+     }
+    },
+    "miss": {
+     "ops": 200,
+     "us": 6096,
+     "store_ops": 200,
+     "flash_ops": 11720,
+     "flash_bytes": 723061,
+     "measured": true,
+     "amp": 157,
+     "io": {
+      "reads": 11720,
+      "bytes_read": 723061,
+      "writes": 0,
+      "bytes_written": 0,
+      "erases": 0,
+      "bytes_erased": 0
+     }
+    },
+    "put": {
+     "ops": 200,
+     "us": 423039,
+     "store_ops": 871,
+     "flash_ops": 67386,
+     "flash_bytes": 26676138,
+     "measured": true,
+     "amp": 313,
+     "io": {
+      "reads": 66483,
+      "bytes_read": 11683274,
+      "writes": 787,
+      "bytes_written": 7405536,
+      "erases": 116,
+      "bytes_erased": 7587328
+     }
+    },
+    "cbor": {
+     "ops": 200,
+     "us": 2200,
+     "store_ops": 0,
+     "flash_ops": 0,
+     "flash_bytes": 0,
+     "measured": true,
+     "amp": 0,
+     "io": {
+      "reads": 0,
+      "bytes_read": 0,
+      "writes": 0,
+      "bytes_written": 0,
+      "erases": 0,
+      "bytes_erased": 0
+     }
+    }
+   },
+   "store": {
+    "partition_bytes": 8388608,
+    "people_depth": 2,
+    "people_buckets": 1156,
+    "cred_depth": 2,
+    "cred_buckets": 256,
+    "populated": 12000,
+    "n_persons": 12000,
+    "credentials": 29942,
+    "mean_entry": 433,
+    "live_bytes": 5205696,
+    "fill_pct": 62.0,
+    "overflows": 0,
+    "rev": 1
+   },
+   "created": {
+    "persons": 12000,
+    "people_depth": 2,
+    "people_buckets": 1156,
+    "cred_depth": 2,
+    "cred_buckets": 256
+   },
+   "verify_pass": 2,
+   "status": "ok",
+   "error": null,
+   "label": "native_sim n=12000 run 1",
+   "log": "logs/n12000-run1.log",
+   "exit": 0
+  },
+  {
+   "zephyr": "4a405846193f",
+   "app_version": "1.0.0",
+   "persons": 12000,
+   "credentials": 29942,
+   "kind": "steady",
+   "phases": {
+    "open": {
+     "ms": 34
+    },
+    "prepare": {
+     "ms": 0,
+     "buckets": 0
+    },
+    "fill": {
+     "ms": 0,
+     "written": 0,
+     "populated": 12000,
+     "target": 12000,
+     "commits": 0
+    },
+    "verify": {
+     "ms": 29,
+     "persons": 256,
+     "cards": 658
+    },
+    "mutate": {
+     "ms": 207,
+     "rev_from": 1,
+     "rev_to": 2,
+     "revoked": 64,
+     "assigned": 64
+    },
+    "reverify": {
+     "ms": 28,
+     "persons": 256,
+     "cards": 658
+    }
+   },
+   "bench": {
+    "check": {
+     "ops": 200,
+     "us": 14232,
+     "store_ops": 400,
+     "flash_ops": 23214,
+     "flash_bytes": 1824034,
+     "measured": true,
+     "amp": 23,
+     "io": {
+      "reads": 23214,
+      "bytes_read": 1824034,
+      "writes": 0,
+      "bytes_written": 0,
+      "erases": 0,
+      "bytes_erased": 0
+     },
+     "decisions": {
+      "granted": 200,
+      "denied": 0,
+      "unknown": 0,
+      "expired": 0
+     }
+    },
+    "byid": {
+     "ops": 200,
+     "us": 8638,
+     "store_ops": 200,
+     "flash_ops": 11479,
+     "flash_bytes": 1093088,
+     "measured": true,
+     "amp": 14,
+     "io": {
+      "reads": 11479,
+      "bytes_read": 1093088,
+      "writes": 0,
+      "bytes_written": 0,
+      "erases": 0,
+      "bytes_erased": 0
+     }
+    },
+    "miss": {
+     "ops": 200,
+     "us": 5954,
+     "store_ops": 200,
+     "flash_ops": 11694,
+     "flash_bytes": 722542,
+     "measured": true,
+     "amp": 157,
+     "io": {
+      "reads": 11694,
+      "bytes_read": 722542,
+      "writes": 0,
+      "bytes_written": 0,
+      "erases": 0,
+      "bytes_erased": 0
+     }
+    },
+    "put": {
+     "ops": 200,
+     "us": 428741,
+     "store_ops": 871,
+     "flash_ops": 67427,
+     "flash_bytes": 26701021,
+     "measured": true,
+     "amp": 313,
+     "io": {
+      "reads": 66524,
+      "bytes_read": 11683045,
+      "writes": 787,
+      "bytes_written": 7430648,
+      "erases": 116,
+      "bytes_erased": 7587328
+     }
+    },
+    "cbor": {
+     "ops": 200,
+     "us": 2145,
+     "store_ops": 0,
+     "flash_ops": 0,
+     "flash_bytes": 0,
+     "measured": true,
+     "amp": 0,
+     "io": {
+      "reads": 0,
+      "bytes_read": 0,
+      "writes": 0,
+      "bytes_written": 0,
+      "erases": 0,
+      "bytes_erased": 0
+     }
+    }
+   },
+   "store": {
+    "partition_bytes": 8388608,
+    "people_depth": 2,
+    "people_buckets": 1156,
+    "cred_depth": 2,
+    "cred_buckets": 256,
+    "populated": 12000,
+    "n_persons": 12000,
+    "credentials": 29942,
+    "mean_entry": 433,
+    "live_bytes": 5205696,
+    "fill_pct": 62.0,
+    "overflows": 0,
+    "rev": 2
+   },
+   "created": null,
+   "verify_pass": 2,
+   "status": "ok",
+   "error": null,
+   "label": "native_sim n=12000 run 2",
+   "log": "logs/n12000-run2.log",
+   "exit": 0
+  },
+  {
+   "zephyr": "4a405846193f",
+   "app_version": "1.0.0",
+   "persons": 12000,
+   "credentials": 29942,
+   "kind": "steady",
+   "phases": {
+    "open": {
+     "ms": 35
+    },
+    "prepare": {
+     "ms": 0,
+     "buckets": 0
+    },
+    "fill": {
+     "ms": 0,
+     "written": 0,
+     "populated": 12000,
+     "target": 12000,
+     "commits": 0
+    },
+    "verify": {
+     "ms": 28,
+     "persons": 256,
+     "cards": 658
+    },
+    "mutate": {
+     "ms": 200,
+     "rev_from": 2,
+     "rev_to": 3,
+     "revoked": 64,
+     "assigned": 64
+    },
+    "reverify": {
+     "ms": 28,
+     "persons": 256,
+     "cards": 658
+    }
+   },
+   "bench": {
+    "check": {
+     "ops": 200,
+     "us": 14072,
+     "store_ops": 400,
+     "flash_ops": 23443,
+     "flash_bytes": 1826757,
+     "measured": true,
+     "amp": 23,
+     "io": {
+      "reads": 23443,
+      "bytes_read": 1826757,
+      "writes": 0,
+      "bytes_written": 0,
+      "erases": 0,
+      "bytes_erased": 0
+     },
+     "decisions": {
+      "granted": 200,
+      "denied": 0,
+      "unknown": 0,
+      "expired": 0
+     }
+    },
+    "byid": {
+     "ops": 200,
+     "us": 8447,
+     "store_ops": 200,
+     "flash_ops": 11761,
+     "flash_bytes": 1096562,
+     "measured": true,
+     "amp": 14,
+     "io": {
+      "reads": 11761,
+      "bytes_read": 1096562,
+      "writes": 0,
+      "bytes_written": 0,
+      "erases": 0,
+      "bytes_erased": 0
+     }
+    },
+    "miss": {
+     "ops": 200,
+     "us": 6017,
+     "store_ops": 200,
+     "flash_ops": 11738,
+     "flash_bytes": 723806,
+     "measured": true,
+     "amp": 157,
+     "io": {
+      "reads": 11738,
+      "bytes_read": 723806,
+      "writes": 0,
+      "bytes_written": 0,
+      "erases": 0,
+      "bytes_erased": 0
+     }
+    },
+    "put": {
+     "ops": 200,
+     "us": 428423,
+     "store_ops": 871,
+     "flash_ops": 67518,
+     "flash_bytes": 26658676,
+     "measured": true,
+     "amp": 313,
+     "io": {
+      "reads": 66615,
+      "bytes_read": 11684892,
+      "writes": 787,
+      "bytes_written": 7386456,
+      "erases": 116,
+      "bytes_erased": 7587328
+     }
+    },
+    "cbor": {
+     "ops": 200,
+     "us": 2213,
+     "store_ops": 0,
+     "flash_ops": 0,
+     "flash_bytes": 0,
+     "measured": true,
+     "amp": 0,
+     "io": {
+      "reads": 0,
+      "bytes_read": 0,
+      "writes": 0,
+      "bytes_written": 0,
+      "erases": 0,
+      "bytes_erased": 0
+     }
+    }
+   },
+   "store": {
+    "partition_bytes": 8388608,
+    "people_depth": 2,
+    "people_buckets": 1156,
+    "cred_depth": 2,
+    "cred_buckets": 256,
+    "populated": 12000,
+    "n_persons": 12000,
+    "credentials": 29942,
+    "mean_entry": 433,
+    "live_bytes": 5205696,
+    "fill_pct": 62.0,
+    "overflows": 0,
+    "rev": 3
+   },
+   "created": null,
+   "verify_pass": 2,
+   "status": "ok",
+   "error": null,
+   "label": "native_sim n=12000 run 3",
+   "log": "logs/n12000-run3.log",
+   "exit": 0
+  }
+ ],
+ "points": [
+  {
+   "persons": 1000,
+   "credentials": 2479,
+   "status": "ok",
+   "runs": 3,
+   "steady_runs": 2,
+   "store": {
+    "partition_bytes": 8388608,
+    "people_depth": 1,
+    "people_buckets": 250,
+    "cred_depth": 2,
+    "cred_buckets": 256,
+    "populated": 1000,
+    "n_persons": 1000,
+    "credentials": 2479,
+    "mean_entry": 432,
+    "live_bytes": 432759,
+    "fill_pct": 5.1,
+    "overflows": 0,
+    "rev": 3
+   },
+   "created": {
+    "persons": 1000,
+    "people_depth": 1,
+    "people_buckets": 250,
+    "cred_depth": 2,
+    "cred_buckets": 256
+   },
+   "fill": {
+    "ms": 124,
+    "written": 1000,
+    "ms_per_person": 0.124,
+    "commits": 4
+   },
+   "phases": {
+    "open": {
+     "ms": 28
+    },
+    "prepare": {
+     "ms": 2,
+     "buckets": 98
+    },
+    "verify": {
+     "ms": 21,
+     "persons": 256,
+     "cards": 602
+    },
+    "mutate": {
+     "ms": 8,
+     "rev_from": 0,
+     "rev_to": 1,
+     "revoked": 0,
+     "assigned": 64
+    },
+    "reverify": {
+     "ms": 22,
+     "persons": 256,
+     "cards": 618
+    }
+   },
+   "bench": {
+    "check": {
+     "us_per_op": 63.14,
+     "ops_per_s": 15837.820715869497,
+     "store_ops": 2.0,
+     "flash_ops": 215.695,
+     "flash_bytes": 6805.145,
+     "amp": 16,
+     "reads": 215.695,
+     "bytes_read": 6805.145,
+     "writes": 0.0,
+     "bytes_written": 0.0,
+     "erases": 0.0,
+     "bytes_erased": 0.0,
+     "spread_us_per_op": [
+      57.09,
+      68.085
+     ],
+     "spread_flash_ops": [
+      172.08,
+      259.37
+     ],
+     "spread_flash_bytes": [
+      6280.745,
+      7328.78
+     ],
+     "spread_erases": [
+      0.0,
+      0.0
+     ],
+     "samples": 200,
+     "runs": 3
+    },
+    "byid": {
+     "us_per_op": 39.165,
+     "ops_per_s": 25533.001404315077,
+     "store_ops": 1.0,
+     "flash_ops": 74.46,
+     "flash_bytes": 4636.105,
+     "amp": 12,
+     "reads": 74.46,
+     "bytes_read": 4636.105,
+     "writes": 0.0,
+     "bytes_written": 0.0,
+     "erases": 0.0,
+     "bytes_erased": 0.0,
+     "spread_us_per_op": [
+      35.98,
+      41.71
+     ],
+     "spread_flash_ops": [
+      56.035,
+      92.945
+     ],
+     "spread_flash_bytes": [
+      4414.33,
+      4858.15
+     ],
+     "spread_erases": [
+      0.0,
+      0.0
+     ],
+     "samples": 200,
+     "runs": 3
+    },
+    "miss": {
+     "us_per_op": 26.46,
+     "ops_per_s": 37792.894935752076,
+     "store_ops": 1.0,
+     "flash_ops": 137.315,
+     "flash_bytes": 2084.855,
+     "amp": 90,
+     "reads": 137.315,
+     "bytes_read": 2084.855,
+     "writes": 0.0,
+     "bytes_written": 0.0,
+     "erases": 0.0,
+     "bytes_erased": 0.0,
+     "spread_us_per_op": [
+      23.845,
+      29.835
+     ],
+     "spread_flash_ops": [
+      114.13,
+      160.355
+     ],
+     "spread_flash_bytes": [
+      1807.555,
+      2361.22
+     ],
+     "spread_erases": [
+      0.0,
+      0.0
+     ],
+     "samples": 200,
+     "runs": 3
+    },
+    "put": {
+     "us_per_op": 191.925,
+     "ops_per_s": 5210.368633580826,
+     "store_ops": 4.32,
+     "flash_ops": 669.295,
+     "flash_bytes": 19001.33,
+     "amp": 43,
+     "reads": 665.975,
+     "bytes_read": 16587.47,
+     "writes": 3.32,
+     "bytes_written": 2413.86,
+     "erases": 0.0,
+     "bytes_erased": 0.0,
+     "spread_us_per_op": [
+      167.435,
+      234.93
+     ],
+     "spread_flash_ops": [
+      544.56,
+      787.72
+     ],
+     "spread_flash_bytes": [
+      17500.79,
+      22476.86
+     ],
+     "spread_erases": [
+      0.0,
+      0.015
+     ],
+     "samples": 200,
+     "runs": 3
+    },
+    "cbor": {
+     "us_per_op": 11.095,
+     "ops_per_s": 90130.68949977467,
+     "store_ops": 0.0,
+     "flash_ops": 0.0,
+     "flash_bytes": 0.0,
+     "amp": 0,
+     "reads": 0.0,
+     "bytes_read": 0.0,
+     "writes": 0.0,
+     "bytes_written": 0.0,
+     "erases": 0.0,
+     "bytes_erased": 0.0,
+     "spread_us_per_op": [
+      10.865,
+      11.275
+     ],
+     "spread_flash_ops": [
+      0.0,
+      0.0
+     ],
+     "spread_flash_bytes": [
+      0.0,
+      0.0
+     ],
+     "spread_erases": [
+      0.0,
+      0.0
+     ],
+     "samples": 200,
+     "runs": 3
+    }
+   }
+  },
+  {
+   "persons": 12000,
+   "credentials": 29942,
+   "status": "ok",
+   "runs": 3,
+   "steady_runs": 2,
+   "store": {
+    "partition_bytes": 8388608,
+    "people_depth": 2,
+    "people_buckets": 1156,
+    "cred_depth": 2,
+    "cred_buckets": 256,
+    "populated": 12000,
+    "n_persons": 12000,
+    "credentials": 29942,
+    "mean_entry": 433,
+    "live_bytes": 5205696,
+    "fill_pct": 62.0,
+    "overflows": 0,
+    "rev": 3
+   },
+   "created": {
+    "persons": 12000,
+    "people_depth": 2,
+    "people_buckets": 1156,
+    "cred_depth": 2,
+    "cred_buckets": 256
+   },
+   "fill": {
+    "ms": 9578,
+    "written": 12000,
+    "ms_per_person": 0.7981666666666667,
+    "commits": 47
+   },
+   "phases": {
+    "open": {
+     "ms": 29
+    },
+    "prepare": {
+     "ms": 1,
+     "buckets": 64
+    },
+    "verify": {
+     "ms": 29,
+     "persons": 256,
+     "cards": 656
+    },
+    "mutate": {
+     "ms": 84,
+     "rev_from": 0,
+     "rev_to": 1,
+     "revoked": 0,
+     "assigned": 64
+    },
+    "reverify": {
+     "ms": 28,
+     "persons": 256,
+     "cards": 658
+    }
+   },
+   "bench": {
+    "check": {
+     "us_per_op": 70.36,
+     "ops_per_s": 14212.620807276862,
+     "store_ops": 2.0,
+     "flash_ops": 117.215,
+     "flash_bytes": 9133.785,
+     "amp": 23,
+     "reads": 117.215,
+     "bytes_read": 9133.785,
+     "writes": 0.0,
+     "bytes_written": 0.0,
+     "erases": 0.0,
+     "bytes_erased": 0.0,
+     "spread_us_per_op": [
+      69.59,
+      71.16
+     ],
+     "spread_flash_ops": [
+      116.07,
+      119.76
+     ],
+     "spread_flash_bytes": [
+      9120.17,
+      9165.735
+     ],
+     "spread_erases": [
+      0.0,
+      0.0
+     ],
+     "samples": 200,
+     "runs": 3
+    },
+    "byid": {
+     "us_per_op": 43.19,
+     "ops_per_s": 23153.507756425097,
+     "store_ops": 1.0,
+     "flash_ops": 58.805,
+     "flash_bytes": 5482.81,
+     "amp": 14,
+     "reads": 58.805,
+     "bytes_read": 5482.81,
+     "writes": 0.0,
+     "bytes_written": 0.0,
+     "erases": 0.0,
+     "bytes_erased": 0.0,
+     "spread_us_per_op": [
+      42.235,
+      43.54
+     ],
+     "spread_flash_ops": [
+      57.395,
+      61.45
+     ],
+     "spread_flash_bytes": [
+      5465.44,
+      5514.925
+     ],
+     "spread_erases": [
+      0.0,
+      0.0
+     ],
+     "samples": 200,
+     "runs": 3
+    },
+    "miss": {
+     "us_per_op": 30.085,
+     "ops_per_s": 33239.15572544457,
+     "store_ops": 1.0,
+     "flash_ops": 58.6,
+     "flash_bytes": 3615.305,
+     "amp": 157,
+     "reads": 58.6,
+     "bytes_read": 3615.305,
+     "writes": 0.0,
+     "bytes_written": 0.0,
+     "erases": 0.0,
+     "bytes_erased": 0.0,
+     "spread_us_per_op": [
+      29.77,
+      30.48
+     ],
+     "spread_flash_ops": [
+      58.47,
+      58.69
+     ],
+     "spread_flash_bytes": [
+      3612.71,
+      3619.03
+     ],
+     "spread_erases": [
+      0.0,
+      0.0
+     ],
+     "samples": 200,
+     "runs": 3
+    },
+    "put": {
+     "us_per_op": 2142.115,
+     "ops_per_s": 466.82834488344463,
+     "store_ops": 4.355,
+     "flash_ops": 337.135,
+     "flash_bytes": 133380.69,
+     "amp": 313,
+     "reads": 332.62,
+     "bytes_read": 58416.37,
+     "writes": 3.935,
+     "bytes_written": 37027.68,
+     "erases": 0.58,
+     "bytes_erased": 37936.64,
+     "spread_us_per_op": [
+      2115.195,
+      2143.705
+     ],
+     "spread_flash_ops": [
+      336.93,
+      337.59
+     ],
+     "spread_flash_bytes": [
+      133293.38,
+      133505.105
+     ],
+     "spread_erases": [
+      0.58,
+      0.58
+     ],
+     "samples": 200,
+     "runs": 3
+    },
+    "cbor": {
+     "us_per_op": 11.0,
+     "ops_per_s": 90909.09090909091,
+     "store_ops": 0.0,
+     "flash_ops": 0.0,
+     "flash_bytes": 0.0,
+     "amp": 0,
+     "reads": 0.0,
+     "bytes_read": 0.0,
+     "writes": 0.0,
+     "bytes_written": 0.0,
+     "erases": 0.0,
+     "bytes_erased": 0.0,
+     "spread_us_per_op": [
+      10.725,
+      11.065
+     ],
+     "spread_flash_ops": [
+      0.0,
+      0.0
+     ],
+     "spread_flash_bytes": [
+      0.0,
+      0.0
+     ],
+     "spread_erases": [
+      0.0,
+      0.0
+     ],
+     "samples": 200,
+     "runs": 3
+    }
+   }
+  }
+ ]
+}
