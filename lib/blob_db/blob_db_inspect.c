@@ -94,8 +94,8 @@ int blob_db_inspect_bucket_get(uint16_t bid,
 	out->formatted = true;
 	out->gen = ((const struct blob_db_bucket_hdr *)buf)->gen;
 
-	/* Same liveness rule as compaction: a slot is kept iff it is the newest
-	 * for its id and not a tombstone. */
+	/* Same liveness rule as compaction: a slot is kept iff it is intact,
+	 * the newest intact one for its id, and not a tombstone. */
 	off_t cursor = BLOB_DB_BUCKET_DATA_OFF;
 
 	for (;;) {
@@ -108,13 +108,13 @@ int blob_db_inspect_bucket_get(uint16_t bid,
 		bool superseded = false;
 		off_t scan = cursor + sv.total_size;
 
-		for (;;) {
+		while (sv.intact) {
 			struct blob_db_core_slot future;
 
 			if (!blob_db_core_slot_at(buf, scan, &future)) {
 				break;
 			}
-			if (future.id == sv.id) {
+			if (future.intact && future.id == sv.id) {
 				superseded = true;
 				break;
 			}
@@ -133,7 +133,11 @@ int blob_db_inspect_bucket_get(uint16_t bid,
 				   (sv.flags & BLOB_DB_SLOT_F_INDEXED),
 		};
 
-		if (sv.flags & BLOB_DB_SLOT_F_TOMBSTONE) {
+		if (!sv.intact) {
+			si.state = BLOB_DB_INSPECT_ROTTEN;
+			out->rotten++;
+			out->garbage_bytes += si.size;
+		} else if (sv.flags & BLOB_DB_SLOT_F_TOMBSTONE) {
 			si.state = BLOB_DB_INSPECT_TOMBSTONE;
 			out->tombstones++;
 			out->garbage_bytes += si.size;
@@ -162,9 +166,9 @@ int blob_db_inspect_bucket_get(uint16_t bid,
 		cursor += sv.total_size;
 	}
 
-	/* Anything programmed past the readable log — a torn append, or a slot
-	 * whose CRC failed and everything behind it — is neither live nor free:
-	 * it is reclaimed only by the next compaction. */
+	/* Anything programmed past the end of the log — a torn append whose
+	 * header cannot size it — is neither live nor free: it is reclaimed
+	 * only by the next compaction. */
 	off_t end = (off_t)st.peb_size;
 
 	while (end > cursor && buf[end - 1] == 0xff) {

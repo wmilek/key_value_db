@@ -79,6 +79,8 @@ static const char *state_str(const struct blob_db_inspect_slot *s)
 		return "stale";
 	case BLOB_DB_INSPECT_TOMBSTONE:
 		return "tomb";
+	case BLOB_DB_INSPECT_ROTTEN:
+		return "rotten";
 	}
 	return "?";
 }
@@ -171,6 +173,7 @@ static int cmd_stats(const struct shell *sh, size_t argc, char **argv)
 
 	uint64_t live = 0, payload = 0, garbage = 0, tail = 0, free_b = 0;
 	uint32_t objects = 0, segments = 0, superseded = 0, tombs = 0;
+	uint32_t rotten = 0;
 	uint32_t formatted = 0, compactions = 0, io_err = 0;
 	uint32_t obj_min = UINT32_MAX, obj_max = 0;
 	uint32_t hist[HIST_BINS] = { 0 };
@@ -195,6 +198,7 @@ static int cmd_stats(const struct shell *sh, size_t argc, char **argv)
 		segments += bs.segments;
 		superseded += bs.superseded;
 		tombs += bs.tombstones;
+		rotten += bs.rotten;
 		obj_min = MIN(obj_min, (uint32_t)bs.objects);
 		obj_max = MAX(obj_max, (uint32_t)bs.objects);
 
@@ -225,8 +229,8 @@ static int cmd_stats(const struct shell *sh, size_t argc, char **argv)
 	}
 	shell_print(sh, "objects     : %u live ids, %u segments",
 		    objects, segments);
-	shell_print(sh, "dead slots  : %u stale, %u tombstones",
-		    superseded, tombs);
+	shell_print(sh, "dead slots  : %u stale, %u tombstones, %u rotten",
+		    superseded, tombs, rotten);
 	shell_print(sh, "compactions : %u since the buckets were formatted",
 		    compactions);
 	shell_print(sh, "");
@@ -400,8 +404,8 @@ static int cmd_bucket(const struct shell *sh, size_t argc, char **argv)
 	const uint32_t used = bs.capacity - bs.free_bytes;
 
 	shell_print(sh, "generation %u: %u ids, %u segments, %u stale, "
-		    "%u tombstones", bs.gen, bs.objects, bs.segments,
-		    bs.superseded, bs.tombstones);
+		    "%u tombstones, %u rotten", bs.gen, bs.objects,
+		    bs.segments, bs.superseded, bs.tombstones, bs.rotten);
 	shell_print(sh, "live %u B (payload %u B), garbage %u B, torn %u B, "
 		    "free %u B of %u B — " PM_FMT " used", bs.live_bytes,
 		    bs.payload_bytes, bs.garbage_bytes, bs.tail_bytes,
