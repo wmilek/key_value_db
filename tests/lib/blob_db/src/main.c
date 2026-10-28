@@ -974,41 +974,31 @@ ZTEST(blob_db, test_prepare_survives_remount)
 	zassert_equal(blob_db_prepare(4), 0);
 }
 
-/* maintain — the backend's deferred housekeeping, run when the caller can
- * afford it. */
-ZTEST(blob_db, test_maintain_rejects_bad_args)
-{
-	struct blob_db_maint_result res;
-
-	zassert_equal(blob_db_maintain(BLOB_DB_MAINT_DISCARD + 1, 0, &res),
-		      -EINVAL);
-	zassert_equal(blob_db_maintain(BLOB_DB_MAINT_RECLAIM, 0, NULL), -EINVAL);
-}
-
+/* maintain — the erases blob_db can do ahead of time, run when the caller
+ * can afford them. */
 ZTEST(blob_db, test_maintain_needs_mount)
 {
 	struct blob_db_maint_result res;
 
 	zassert_ok(blob_db_unmount());
-	zassert_equal(blob_db_maintain(BLOB_DB_MAINT_RECLAIM, 1, &res), -ENODEV);
+	zassert_equal(blob_db_maintain(1, &res), -ENODEV);
 }
 
-/* Budget 0 is a question, not a request: nothing is performed. */
+/* Budget 0 is a question, not a request; the result may be left out. */
 ZTEST(blob_db, test_maintain_budget_zero_only_reports)
 {
 	struct blob_db_maint_result res;
 
-	for (int op = BLOB_DB_MAINT_RECLAIM; op <= BLOB_DB_MAINT_DISCARD; op++) {
-		zassert_ok(blob_db_maintain(op, 0, &res), "op %d", op);
-		zassert_equal(res.performed, 0, "op %d", op);
-	}
+	zassert_ok(blob_db_maintain(0, &res));
+	zassert_equal(res.performed, 0);
+	zassert_ok(blob_db_maintain(0, NULL));
 }
 
 /* Every compaction on UBI with atomic replace leaves the replaced block to
- * reclaim; nothing else erases it. Reclaim drains that backlog and no blob
+ * reclaim, and nothing else erases it. maintain() drains that, and no blob
  * reads differently afterwards, before or after a remount. On flash_area
- * there is never anything to do. */
-ZTEST(blob_db, test_maintain_reclaim_drains_backlog_and_keeps_data)
+ * there is nothing to do. */
+ZTEST(blob_db, test_maintain_drains_and_keeps_data)
 {
 	struct blob_db_maint_result res;
 	uint64_t id = put_blob("v0000", 5);
@@ -1019,20 +1009,22 @@ ZTEST(blob_db, test_maintain_reclaim_drains_backlog_and_keeps_data)
 		zassert_ok(blob_db_update(id, val, 5), "update #%d failed", i);
 	}
 
-	zassert_ok(blob_db_maintain(BLOB_DB_MAINT_RECLAIM, 0, &res));
-	const uint32_t backlog = res.remaining;
-
+	zassert_ok(blob_db_maintain(0, &res));
 	if (IS_ENABLED(CONFIG_BLOB_DB_BACKEND_UBI) &&
 	    IS_ENABLED(CONFIG_BLOB_DB_UBI_ATOMIC_REPLACE)) {
-		zassert_true(backlog > 0, "500 rebinds left nothing to reclaim");
+		zassert_true(res.more, "500 rebinds left nothing to reclaim");
+		zassert_ok(blob_db_maintain(1, &res));
+		zassert_equal(res.performed, 1);
 	} else if (IS_ENABLED(CONFIG_BLOB_DB_BACKEND_FLASH_AREA)) {
-		zassert_equal(backlog, 0);
+		zassert_false(res.more);
 	}
 
-	zassert_ok(blob_db_maintain(BLOB_DB_MAINT_RECLAIM, 1, &res));
-	zassert_equal(res.performed, MIN(backlog, 1));
-	zassert_ok(blob_db_maintain(BLOB_DB_MAINT_RECLAIM, UINT32_MAX, &res));
-	zassert_equal(res.remaining, 0);
+	int steps = 0;
+
+	do {
+		zassert_ok(blob_db_maintain(1, &res));
+		zassert_true(++steps < 4096, "maintain never runs out of work");
+	} while (res.more);
 
 	uint8_t buf[16];
 	size_t got;
@@ -1045,8 +1037,8 @@ ZTEST(blob_db, test_maintain_reclaim_drains_backlog_and_keeps_data)
 	zassert_ok(blob_db_mount());
 	zassert_ok(blob_db_get(id, buf, sizeof(buf), &got));
 	zassert_mem_equal(buf, "v0499", 5);
-	zassert_ok(blob_db_maintain(BLOB_DB_MAINT_RECLAIM, 0, &res));
-	zassert_equal(res.remaining, 0, "reclaimed blocks came back on remount");
+	zassert_ok(blob_db_maintain(0, &res));
+	zassert_false(res.more, "work came back on remount");
 }
 
 

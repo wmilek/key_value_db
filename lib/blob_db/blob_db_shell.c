@@ -6,7 +6,7 @@
  *
  * Parsing and printing only, over the public introspection API
  * (<app/lib/blob_db_inspect.h>, CONFIG_BLOB_DB_INSPECT) and
- * blob_db_maintain(). Only `maintain` with an operation writes to flash.
+ * blob_db_maintain(). Only `maintain` with a budget writes to flash.
  * blob_db is not thread-safe and this runs on the shell thread, so use it
  * while the application is not calling blob_db.
  */
@@ -517,73 +517,37 @@ static int cmd_dump(const struct shell *sh, size_t argc, char **argv)
 	return 0;
 }
 
-/* blob_db maintain [op [budget]] ------------------------------------------ */
+/* blob_db maintain [budget] ----------------------------------------------- */
 
-static const char *const maint_names[] = {
-	[BLOB_DB_MAINT_RECLAIM]  = "reclaim",
-	[BLOB_DB_MAINT_RELOCATE] = "relocate",
-	[BLOB_DB_MAINT_REPAIR]   = "repair",
-	[BLOB_DB_MAINT_DISCARD]  = "discard",
-};
-
-/* The one command that writes: each step usually erases a block. With no
- * operation it asks every one for budget 0, which only reports the backlog. */
+/* The one command that writes: each step usually erases a block. Without a
+ * budget it asks for 0 steps, which only reports whether work is waiting. */
 static int cmd_maintain(const struct shell *sh, size_t argc, char **argv)
 {
 	struct blob_db_maint_result res;
-	uint64_t budget = 1;
-	int op = -1;
+	uint64_t budget = 0;
 	int rc;
 
-	if (argc == 1) {
-		for (int i = 0; i < (int)ARRAY_SIZE(maint_names); i++) {
-			rc = blob_db_maintain((enum blob_db_maint_op)i, 0, &res);
-			if (rc == -ENODEV) {
-				shell_error(sh, "blob_db not mounted");
-				return rc;
-			}
-			if (rc < 0) {
-				shell_error(sh, "%-8s : %d", maint_names[i], rc);
-				continue;
-			}
-			shell_print(sh, "%-8s : %u pending", maint_names[i],
-				    res.remaining);
-		}
-		return 0;
-	}
-
-	for (int i = 0; i < (int)ARRAY_SIZE(maint_names); i++) {
-		if (strcmp(argv[1], maint_names[i]) == 0) {
-			op = i;
-		}
-	}
-	if (op < 0) {
-		shell_error(sh, "usage: blob_db maintain "
-			    "[reclaim|relocate|repair|discard [budget]]");
-		return -EINVAL;
-	}
-	if (argc > 2 && (rc = parse_u64(sh, argv[2], &budget)) != 0) {
+	if (argc > 1 && (rc = parse_u64(sh, argv[1], &budget)) != 0) {
 		return rc;
 	}
 	if (budget > UINT32_MAX) {
-		shell_error(sh, "budget too large: %s", argv[2]);
+		shell_error(sh, "budget too large: %s", argv[1]);
 		return -EINVAL;
 	}
 
 	const int64_t t0 = k_uptime_get();
 
-	rc = blob_db_maintain((enum blob_db_maint_op)op, (uint32_t)budget, &res);
+	rc = blob_db_maintain((uint32_t)budget, &res);
 	if (rc == -ENODEV) {
 		shell_error(sh, "blob_db not mounted");
 		return rc;
 	}
 	if (rc < 0) {
-		shell_error(sh, "%s: %d (%u done, %u left)", maint_names[op], rc,
-			    res.performed, res.remaining);
+		shell_error(sh, "maintain: %d (%u done)", rc, res.performed);
 		return rc;
 	}
-	shell_print(sh, "%s: %u done, %u left, %lld ms", maint_names[op],
-		    res.performed, res.remaining,
+	shell_print(sh, "%u steps done, %s, %lld ms", res.performed,
+		    res.more ? "more waiting" : "nothing left",
 		    (long long)(k_uptime_get() - t0));
 	return 0;
 }
@@ -645,11 +609,9 @@ SHELL_STATIC_SUBCMD_SET_CREATE(sub_blob_db,
 		"usage: dump <id> [max_bytes]  (default 256)",
 		cmd_dump, 2, 1),
 	SHELL_CMD_ARG(maintain, NULL,
-		"Backend housekeeping; WRITES: a step usually erases a block\n"
-		"usage: maintain  (pending work only, writes nothing)\n"
-		"       maintain <reclaim|relocate|repair|discard> [budget]"
-		"  (default 1)",
-		cmd_maintain, 1, 2),
+		"Run erases ahead of time; WRITES: a step erases a block\n"
+		"usage: maintain [budget]  (default 0: report only)",
+		cmd_maintain, 1, 1),
 #if defined(CONFIG_BLOB_DB_IOSTATS)
 	SHELL_CMD_ARG(iostats, NULL,
 		"Flash I/O counters\n"

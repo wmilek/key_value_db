@@ -91,14 +91,12 @@ bool blob_db_store_replace_is_atomic(void);
 bool blob_db_store_open_found_damage(off_t off);
 
 /*
- * Run up to budget steps of the backend's deferred housekeeping
- * (blob_db_maintain(); op is an enum blob_db_maint_op, already validated).
- * Fills *performed and *remaining on every return. Contents read through
- * blob_db_store_read() must not change. A backend with nothing deferred
- * reports 0 and 0.
+ * Run up to budget steps of the backend's own deferred work; one step erases
+ * at most one block. *performed is set to the steps run, *more to whether
+ * work is left. The work must not change what blob_db reads back. A backend
+ * with nothing to defer reports 0 and false.
  */
-int blob_db_store_maintain(int op, uint32_t budget, uint32_t *performed,
-			   uint32_t *remaining);
+int blob_db_store_maintain(uint32_t budget, uint32_t *performed, bool *more);
 
 /* I/O accounting, counted here so it covers both backends and every caller
  * uniformly (CONFIG_BLOB_DB_IOSTATS; compiles to nothing when disabled). */

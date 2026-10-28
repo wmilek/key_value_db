@@ -3786,24 +3786,23 @@ int blob_db_prepare(size_t n)
 	return (int)prepared;
 }
 
-int blob_db_maintain(enum blob_db_maint_op op, uint32_t budget,
-		     struct blob_db_maint_result *out)
+int blob_db_maintain(uint32_t budget, struct blob_db_maint_result *result)
 {
+	struct blob_db_maint_result res = { 0 };
+	int rc;
+
 	if (!st.mounted) {
-		return -ENODEV;
-	}
-	if (out == NULL || (unsigned int)op > BLOB_DB_MAINT_DISCARD) {
-		return -EINVAL;
+		rc = -ENODEV;
+	} else if (st.wedged) {
+		rc = -EIO;   /* torn compaction; see compact_commit() */
+	} else {
+		/* Below blob_db's view: every block reads the same afterwards,
+		 * so no cached bucket or index state goes stale. */
+		rc = blob_db_store_maintain(budget, &res.performed, &res.more);
 	}
 
-	/* Below blob_db's view: every block reads the same afterwards, so no
-	 * cached bucket or index state goes stale. */
-	int rc = blob_db_store_maintain((int)op, budget, &out->performed,
-					&out->remaining);
-
-	if (rc < 0) {
-		LOG_WRN("maintain(%d, %u): %d (%u done, %u left)", (int)op,
-			budget, rc, out->performed, out->remaining);
+	if (result != NULL) {
+		*result = res;
 	}
 	return rc;
 }

@@ -283,9 +283,9 @@ config BLOB_DB_SHELL
 	  buckets, a per-bucket table, a slot-by-slot view of one bucket, where
 	  an id lives, and a hex dump of a blob. All of those are read-only.
 
-	  `blob_db maintain` reports the backend's deferred work and, given an
-	  operation, runs it through blob_db_maintain(). That is the one
-	  command that writes: a step usually erases a block.
+	  `blob_db maintain [budget]` runs blob_db_maintain(): without a budget
+	  it only reports whether work is waiting; with one it is the one
+	  command that writes, a step erasing a block.
 
 	  blob_db is not thread-safe and the shell runs on its own thread, so
 	  use these while the application is not calling blob_db. A full-store

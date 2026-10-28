@@ -469,63 +469,45 @@ int blob_db_erase_all(void);
  */
 int blob_db_prepare(size_t n);
 
-/** Deferred housekeeping of the backing store; see blob_db_maintain(). */
-enum blob_db_maint_op {
-	/** Erase blocks whose contents are dead (replaced, unmapped) and
-	 *  return them to the free pool. Run whenever the device is idle: with
-	 *  the pool empty, every write that needs a fresh block erases one
-	 *  first. */
-	BLOB_DB_MAINT_RECLAIM,
-	/** Level wear: move rarely rewritten data off the least worn blocks.
-	 *  Each step copies a block and erases one. */
-	BLOB_DB_MAINT_RELOCATE,
-	/** Bring the backend's own metadata copies back into agreement and
-	 *  give retired blocks another chance. Mount already runs it. */
-	BLOB_DB_MAINT_REPAIR,
-	/** Erase blocks kept as corrupt and put them back in service, once
-	 *  whatever they held is no longer wanted. */
-	BLOB_DB_MAINT_DISCARD,
-};
-
-/** Outcome of one blob_db_maintain() call. */
+/**
+ * @brief Outcome of one `blob_db_maintain()` call.
+ */
 struct blob_db_maint_result {
-	uint32_t performed;  /**< steps carried out, never more than the budget */
-	uint32_t remaining;  /**< steps still outstanding; 0 = nothing left */
+	/** Steps run, at most the budget. */
+	uint32_t performed;
+	/** Work may be left. A call that finds none clears it. */
+	bool more;
 };
 
 /**
- * @brief Run up to @p budget steps of deferred backend housekeeping.
+ * @brief Do up to @p budget steps of the erases blob_db can do ahead of time.
  *
- * Nothing runs in the background: on the UBI backend this is
- * ubi_maintenance(), and only the caller knows when the latency is
- * affordable. A step usually costs one erase (~1 s on the nRF5340-DK's
- * QSPI NOR in its default power mode), so a budget of one is a reasonable
- * slice. A budget of zero performs nothing and only reports what is waiting.
+ * Some erases need not happen inside the call that would otherwise pay for
+ * them. This runs them now, so that an application can keep them out of its
+ * real operations by calling it while the system is idle, until `more` is
+ * false. One step erases at most one block; on large-sector NOR that is up to
+ * a second.
  *
- * Blob contents are unchanged by every operation: relocation moves a block's
- * data and reads the same afterwards. Erases done here bypass the
- * flash-level counters of blob_db_iostats_get(), which count blob_db's own
- * traffic only.
+ * What a step does depends on the storage backend, not on the caller:
+ * - **UBI:** erases one block waiting for reclaim, and once none is left
+ *   moves one block for wear levelling. Nothing else asks UBI to reclaim:
+ *   without these calls its free pool stays empty and every write that needs
+ *   a fresh block erases one first.
+ * - **flash_area:** nothing yet; `blob_db_prepare()` formats buckets ahead.
  *
- * The flash_area backend has no deferred work: every call succeeds with
- * nothing performed and nothing remaining.
+ * Nothing it does changes what blob_db reads back. Not thread-safe, like the
+ * rest of blob_db: serialize it with every other call.
  *
- * Not thread-safe, like the rest of blob_db: serialize it with every other
- * call.
+ * @param budget  most steps to run; 0 runs none and only reports `more`
+ * @param result  steps run and whether work is left; may be NULL
  *
- * @param op      operation to run
- * @param budget  most steps to perform; 0 only reports
- * @param out     filled on every return but -ENODEV and -EINVAL
- *
- * @retval 0       done, including when there was nothing to do
+ * @retval 0       success, including nothing to do
  * @retval -ENODEV not mounted
- * @retval -EINVAL unknown @p op or NULL @p out
- * @retval -EROFS  the backend went read-only (a failed erase)
- * @retval -EIO    flash error
- * @retval <0      other backend errors (UBI: -EBADMSG, -EFAULT)
+ * @retval -EIO    flash I/O error, or a torn compaction refuses writes
+ * @retval <0      other negative errno from the backend (UBI: -EROFS once
+ *                 the device is read-only)
  */
-int blob_db_maintain(enum blob_db_maint_op op, uint32_t budget,
-		     struct blob_db_maint_result *out);
+int blob_db_maintain(uint32_t budget, struct blob_db_maint_result *result);
 
 /** @} */ /* end of lib_blob_db */
 

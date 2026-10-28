@@ -36,7 +36,6 @@
 #include <psa/crypto.h>
 #include <ubi/ubi.h>
 
-#include <app/lib/blob_db.h>
 #include <app/lib/blob_db_ubi.h>
 
 #include "blob_db_store.h"
@@ -516,19 +515,36 @@ bool blob_db_store_open_found_damage(off_t off)
 	       (lnum < 32 && (g_damaged_lebs & BIT(lnum)) != 0);
 }
 
-int blob_db_store_maintain(int op, uint32_t budget, uint32_t *performed,
-			   uint32_t *remaining)
+/* Refill the free pool first, then level wear: a relocation needs a free
+ * block to move onto, and the fuller the pool the more worn the block it
+ * finds. -EBADMSG is a block relocation refused to move; UBI never picks it
+ * again, so it is not a reason to stop. */
+int blob_db_store_maintain(uint32_t budget, uint32_t *performed, bool *more)
 {
-	static const enum ubi_maintenance_op ubi_op[] = {
-		[BLOB_DB_MAINT_RECLAIM]  = UBI_MAINTENANCE_RECLAIM,
-		[BLOB_DB_MAINT_RELOCATE] = UBI_MAINTENANCE_RELOCATE,
-		[BLOB_DB_MAINT_REPAIR]   = UBI_MAINTENANCE_REPAIR,
-		[BLOB_DB_MAINT_DISCARD]  = UBI_MAINTENANCE_DISCARD,
+	static const enum ubi_maintenance_op ops[] = {
+		UBI_MAINTENANCE_RECLAIM,
+		UBI_MAINTENANCE_RELOCATE,
 	};
-	struct ubi_maintenance_result res = { 0 };
-	const int rc = ubi_maintenance(g_ubi, ubi_op[op], budget, &res);
 
-	*performed = res.performed;
-	*remaining = res.remaining;
-	return rc;
+	*performed = 0;
+	*more = false;
+
+	for (size_t i = 0; i < ARRAY_SIZE(ops); i++) {
+		struct ubi_maintenance_result res = { 0 };
+		const int rc = ubi_maintenance(g_ubi, ops[i], budget - *performed,
+					       &res);
+
+		*performed += res.performed;
+		if (res.remaining != 0) {
+			*more = true;
+		}
+		if (rc == -EBADMSG) {
+			LOG_WRN("ubi_maintenance(%d): a block failed verification "
+				"and stays where it is", (int)ops[i]);
+		} else if (rc != 0) {
+			LOG_ERR("ubi_maintenance(%d): %d", (int)ops[i], rc);
+			return rc;
+		}
+	}
+	return 0;
 }
