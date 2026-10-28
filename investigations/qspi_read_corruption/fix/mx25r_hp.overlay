@@ -1,0 +1,3 @@
+&mx25r64 {
+	mxicy,mx25r-power-mode = "high-performance";
+};
