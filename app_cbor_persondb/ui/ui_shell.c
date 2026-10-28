@@ -541,6 +541,9 @@ static int cmd_tui(const struct shell *sh, size_t argc, char **argv)
 	 * shell's bypass callback until 'q' hands the terminal back. */
 	return ui_tui_enter(sh, &cfg);
 }
+#else
+/* SHELL_COND_CMD_ARG below still names the handler when the flag is off. */
+#define cmd_tui NULL
 #endif
 
 SHELL_STATIC_SUBCMD_SET_CREATE(
