@@ -28,6 +28,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 
+#include <zephyr/drivers/flash.h>
 #include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
 #include <zephyr/storage/flash_map.h>
@@ -175,12 +176,60 @@ static void key_release(psa_key_id_t key_id)
 }
 #endif
 
-/* True when every byte of the partition reads as erased. Read in small
- * pieces: this runs only when UBI found no device of its own, which is the
- * first boot or a substrate that is not ours. */
-static int partition_is_blank(uint8_t fa_id, bool *blank)
+/* What a partition holds when UBI cannot attach it. */
+enum substrate {
+	SUBSTRATE_BLANK,        /* every byte erased                        */
+	SUBSTRATE_FORMAT_TORN,  /* only what a first format writes, torn     */
+	SUBSTRATE_OTHER,        /* anything else: never formatted unasked    */
+};
+
+/* The leading bytes of UBI's erase counter header, "UBI#" (zephyr-ubi,
+ * library/ubi_header.c), which a format stamps at the start of each block it
+ * prepares. */
+static const uint8_t g_ec_magic[] = { 0x55, 0x42, 0x49, 0x23 };
+
+/* A format of a blank partition writes only the blocks that take the two
+ * volume table copies, the lowest it can prepare (zephyr-ubi's
+ * device_format_copies()); blob_db creates its volume only after that. */
+#define BLOB_DB_UBI_FORMAT_PEBS 2
+
+/* Whether @p head, the first bytes of a block, can be a header UBI started:
+ * the erase counter magic, or a prefix of it with the rest still erased. */
+static bool starts_as_ec_header(const uint8_t *head, size_t n, uint8_t erased)
+{
+	size_t i = 0;
+
+	while (i < MIN(n, sizeof(g_ec_magic)) && head[i] == g_ec_magic[i]) {
+		i++;
+	}
+	if (i == sizeof(g_ec_magic)) {
+		return true;
+	}
+	while (i < n && head[i] == erased) {
+		i++;
+	}
+	return i == n;
+}
+
+/* Classify a partition UBI did not attach, from its bytes alone.
+ *
+ * A first format interrupted by a power cut leaves the start of one or two
+ * blocks programmed: an erase counter header, a volume table header, part of
+ * a table copy. zephyr-ubi then answers -ENODEV or -EBADMSG, the latter also
+ * meaning a wrong key. Neither error says what else the partition holds, so
+ * this reads all of it: when every block is erased except some of the first
+ * BLOB_DB_UBI_FORMAT_PEBS, and those begin as an erase counter header, the
+ * partition holds nothing but that format, and nothing is lost by formatting
+ * it again. A store blob_db has ever mounted holds its masters past those
+ * blocks, so a wrong key, another backend's store or the previous UBI format
+ * classifies as SUBSTRATE_OTHER.
+ *
+ * Read in small pieces, never across a block boundary: this runs only when UBI
+ * found no device of its own. */
+static int partition_classify(uint8_t fa_id, enum substrate *out)
 {
 	const struct flash_area *fa;
+	struct flash_pages_info page;
 	uint8_t chunk[256];
 	int rc = flash_area_open(fa_id, &fa);
 
@@ -188,22 +237,38 @@ static int partition_is_blank(uint8_t fa_id, bool *blank)
 		return rc;
 	}
 
-	const uint8_t erased = flash_area_erased_val(fa);
+	rc = flash_get_page_info_by_offs(flash_area_get_device(fa), fa->fa_off,
+					 &page);
+	if (rc != 0 || page.size == 0) {
+		flash_area_close(fa);
+		return rc != 0 ? rc : -EIO;
+	}
 
-	*blank = true;
-	for (size_t off = 0; off < fa->fa_size && *blank; off += sizeof(chunk)) {
-		const size_t n = MIN(sizeof(chunk), fa->fa_size - off);
+	const uint8_t erased = flash_area_erased_val(fa);
+	bool head_ok = false;
+
+	*out = SUBSTRATE_BLANK;
+	for (size_t off = 0; off < fa->fa_size && *out != SUBSTRATE_OTHER;) {
+		const size_t in_block = off % page.size;
+		const size_t n = MIN(MIN(sizeof(chunk), fa->fa_size - off),
+				     page.size - in_block);
 
 		rc = flash_area_read(fa, off, chunk, n);
 		if (rc != 0) {
 			break;
 		}
+		if (in_block == 0) {
+			head_ok = off / page.size < BLOB_DB_UBI_FORMAT_PEBS &&
+				  starts_as_ec_header(chunk, n, erased);
+		}
 		for (size_t i = 0; i < n; i++) {
 			if (chunk[i] != erased) {
-				*blank = false;
+				*out = head_ok ? SUBSTRATE_FORMAT_TORN
+					       : SUBSTRATE_OTHER;
 				break;
 			}
 		}
+		off += n;
 	}
 
 	flash_area_close(fa);
@@ -215,8 +280,12 @@ static int partition_is_blank(uint8_t fa_id, bool *blank)
  * UBI answers -ENODEV both for a blank partition and for one holding someone
  * else's bytes: a flash_area blob_db store, or one written by the previous UBI
  * backend (wmilek/ubi, whose headers this release does not recognise). Mount
- * formats only the first; the others are refused with -ENOTSUP and left
- * untouched, as blob_db refuses any format it does not understand.
+ * formats a blank partition, and one holding only a first format a power cut
+ * interrupted, which UBI answers with -ENODEV or -EBADMSG
+ * (partition_classify()). Anything else is refused and left untouched: with
+ * -ENOTSUP where UBI found no device, as blob_db refuses any format it does
+ * not understand, and with UBI's -EBADMSG where it found one that will not
+ * verify, which may be a wrong key.
  *
  * With discard (blob_db_format()) the caller has asked for the store to go,
  * so anything UBI cannot attach for want of a readable device of its own is
@@ -238,24 +307,35 @@ static int attach(const struct ubi_config *config, bool discard)
 		}
 		LOG_WRN("discarding a partition UBI cannot attach (%d)", rc);
 	} else {
-		bool blank = false;
+		const int attach_rc = rc;
+		enum substrate what;
 
-		if (rc != -ENODEV) {
+		if (rc != -ENODEV && rc != -EBADMSG) {
 			return rc;
 		}
 
-		rc = partition_is_blank(config->flash_area_id, &blank);
+		rc = partition_classify(config->flash_area_id, &what);
 		if (rc != 0) {
 			LOG_ERR("reading the partition: %d", rc);
 			return rc;
 		}
-		if (!blank) {
+		if (what == SUBSTRATE_OTHER && attach_rc == -EBADMSG) {
+			LOG_ERR("UBI device does not verify (wrong key, or "
+				"damaged metadata); blob_db_format() discards it");
+			return attach_rc;
+		}
+		if (what == SUBSTRATE_OTHER) {
 			LOG_ERR("partition holds data but no UBI device this release "
 				"can read (another backend's store, or the previous "
 				"UBI format); blob_db_format() discards it");
 			return -ENOTSUP;
 		}
-		LOG_INF("blank partition, formatting it as a UBI device");
+		if (what == SUBSTRATE_BLANK) {
+			LOG_INF("blank partition, formatting a UBI device");
+		} else {
+			LOG_WRN("partition holds only an interrupted UBI "
+				"format (%d), formatting it again", attach_rc);
+		}
 	}
 
 	rc = ubi_device_format(config);

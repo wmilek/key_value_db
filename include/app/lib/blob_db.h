@@ -122,6 +122,11 @@ extern "C" {
  * store; with `CONFIG_BLOB_DB_AUTOFORMAT_ON_CORRUPT` (default `n`) mount does
  * that itself, erasing every blob.
  *
+ * On the UBI backend the same holds one level down: mount formats a blank
+ * partition, and one holding nothing but a first format a power cut
+ * interrupted; anything else UBI cannot attach is refused with nothing
+ * written.
+ *
  * @retval 0       success
  * @retval -EALREADY already mounted
  * @retval -EIO    flash I/O error, partition not found, or no usable master
@@ -131,6 +136,12 @@ extern "C" {
  *                 `CONFIG_BLOB_DB_SECTOR_BUF_SIZE`, or a payload cap the
  *                 partition geometry cannot sustain
  * @retval -ENODEV partition_label not present in the device tree
+ * @retval -EBADMSG (UBI) a device that does not verify: the wrong key, or
+ *                 damaged UBI metadata; `blob_db_format()` discards it
+ * @retval -EINVAL (UBI) from zephyr-ubi: a partition that is not whole erase
+ *                 blocks of one size, a geometry other than the one formatted,
+ *                 or too many corrupt blocks; `blob_db_format()` refuses it
+ *                 too
  */
 int blob_db_mount(void);
 

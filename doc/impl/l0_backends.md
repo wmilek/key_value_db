@@ -230,10 +230,17 @@ written by the previous UBI backend, `wmilek/ubi`):
 
 zephyr-ubi answers `-ENODEV` for a blank partition and for one holding
 someone else's bytes alike, and documents `-ENODEV` as the one error that may
-be met with a format. The backend tells the two apart itself — mount formats
-only a partition that reads erased end to end, a scan that runs only on that
-error path — and passes the rest to `blob_db_format()`, which tells the backend
-it is discarding the store (`blob_db_store_open(…, discard)`). Errors that say
+be met with a format. The backend tells the two apart itself, by reading the
+partition end to end on that error path. Mount formats a partition that reads
+erased, and one holding nothing but a first format a power cut interrupted:
+every block erased except some of the first two, the blocks a format of a blank
+partition writes, and those beginning with UBI's erase counter magic `UBI#` or
+a torn prefix of it. Such a partition attaches as `-ENODEV`, or as `-EBADMSG`
+when the cut tore the first volume table copy; any other `-EBADMSG`, a wrong
+key among them, is returned as it is. A store blob_db has mounted holds its
+masters past those two blocks, so it never classifies as a torn format. The rest
+goes to `blob_db_format()`, which tells the backend it is discarding the store
+(`blob_db_store_open(…, discard)`). Errors that say
 nothing about what the partition holds (a flash or crypto failure, no heap, a
 refused state check) are returned on either path. `tests/lib/blob_db/src/ubi.c`
 covers both rows of that decision.
