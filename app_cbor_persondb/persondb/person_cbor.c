@@ -16,9 +16,10 @@
 
 #include "person_cbor.h"
 
-/* Nesting never exceeds map -> list, so two backups is enough; a third costs
- * one state struct and removes the need to think about it again. */
-#define NBACKUPS 3
+/* The deepest nesting is the superblock's map -> directory map -> entry map,
+ * so three backups are needed; a fourth costs one state struct and removes the
+ * need to think about it again. */
+#define NBACKUPS 4
 
 /* Map keys. Never renumber: the store outlives the build that wrote it, and
  * the superblock carries a version for exactly the case where they must. */
@@ -28,11 +29,23 @@ enum {
 };
 #define PERSON_PAIRS 9
 
+/* Superblock keys, version 2. */
 enum {
-	SB_VERSION = 1, SB_PEOPLE_ROOTS, SB_CRED_ROOT,
-	SB_N_PERSONS, SB_POPULATED, SB_REV,
+	SB_VERSION = 1, SB_TABLES, SB_N_PERSONS, SB_POPULATED, SB_REV,
 };
-#define SB_PAIRS 6
+#define SB_PAIRS 5
+
+/* Directory entry keys. */
+enum {
+	TE_ROOT = 1, TE_CLASS, TE_SCHEMA,
+};
+#define TE_PAIRS 3
+
+/* Superblock keys, version 1 — read only, to upgrade. */
+enum {
+	SB1_VERSION = 1, SB1_PEOPLE_ROOTS, SB1_CRED_ROOT,
+	SB1_N_PERSONS, SB1_POPULATED, SB1_REV,
+};
 
 /* Copy a decoded text slice into a fixed field, rejecting anything that would
  * not fit. A silent truncation here would surface as a verification failure
@@ -196,25 +209,38 @@ int cred_cbor_decode(const uint8_t *buf, size_t len, uint32_t *person_id)
 int superblock_cbor_encode(const struct superblock *sb, uint8_t *buf,
 			   size_t buf_sz, size_t *out_len)
 {
-	if (sb->n_people_maps > ARRAY_SIZE(sb->people_root)) {
+	if (sb->n_tables > SB_TABLES_MAX) {
 		return -EINVAL;
+	}
+	for (uint8_t i = 1; i < sb->n_tables; i++) {
+		if (sb->table[i].id <= sb->table[i - 1].id) {
+			return -EINVAL;
+		}
 	}
 
 	ZCBOR_STATE_E(zs, NBACKUPS, buf, buf_sz, 1);
 
 	bool ok = zcbor_map_start_encode(zs, SB_PAIRS) &&
 		  zcbor_uint32_put(zs, SB_VERSION) &&
-		  zcbor_uint32_put(zs, sb->version) &&
-		  zcbor_uint32_put(zs, SB_PEOPLE_ROOTS) &&
-		  zcbor_list_start_encode(zs, ARRAY_SIZE(sb->people_root));
+		  zcbor_uint32_put(zs, SUPERBLOCK_VERSION) &&
+		  zcbor_uint32_put(zs, SB_TABLES) &&
+		  zcbor_map_start_encode(zs, SB_TABLES_MAX);
 
-	for (uint8_t i = 0; ok && i < sb->n_people_maps; i++) {
-		ok = zcbor_uint64_put(zs, sb->people_root[i]);
+	for (uint8_t i = 0; ok && i < sb->n_tables; i++) {
+		const struct sb_table *t = &sb->table[i];
+
+		ok = zcbor_uint32_put(zs, t->id) &&
+		     zcbor_map_start_encode(zs, TE_PAIRS) &&
+		     zcbor_uint32_put(zs, TE_ROOT) &&
+		     zcbor_uint64_put(zs, t->root) &&
+		     zcbor_uint32_put(zs, TE_CLASS) &&
+		     zcbor_uint32_put(zs, t->cls) &&
+		     zcbor_uint32_put(zs, TE_SCHEMA) &&
+		     zcbor_uint32_put(zs, t->schema) &&
+		     zcbor_map_end_encode(zs, TE_PAIRS);
 	}
 
-	ok = ok && zcbor_list_end_encode(zs, ARRAY_SIZE(sb->people_root)) &&
-	     zcbor_uint32_put(zs, SB_CRED_ROOT) &&
-	     zcbor_uint64_put(zs, sb->cred_root) &&
+	ok = ok && zcbor_map_end_encode(zs, SB_TABLES_MAX) &&
 	     zcbor_uint32_put(zs, SB_N_PERSONS) &&
 	     zcbor_uint32_put(zs, sb->n_persons) &&
 	     zcbor_uint32_put(zs, SB_POPULATED) &&
@@ -231,6 +257,97 @@ int superblock_cbor_encode(const struct superblock *sb, uint8_t *buf,
 	return 0;
 }
 
+/* Version 1, after its version key: the roots, as a two-table directory. Its
+ * people "map" was an array because it was once sixteen shards; one is the
+ * only count that maps onto a single table without moving a record. */
+static int superblock_v1_decode(zcbor_state_t *zs, struct superblock *out)
+{
+	uint64_t roots[2];
+	uint32_t n = 0;
+
+	if (!zcbor_uint32_expect(zs, SB1_PEOPLE_ROOTS) ||
+	    !zcbor_list_start_decode(zs)) {
+		return -EILSEQ;
+	}
+	while (!zcbor_array_at_end(zs)) {
+		if (n == ARRAY_SIZE(roots) || !zcbor_uint64_decode(zs, &roots[n])) {
+			return -EILSEQ;
+		}
+		n++;
+	}
+	if (!zcbor_list_end_decode(zs)) {
+		return -EILSEQ;
+	}
+	if (n != 1) {
+		return n == 0 ? -EILSEQ : -ENOTSUP;
+	}
+
+	out->n_tables = 2;
+	out->table[0] = (struct sb_table){
+		.id = SB_TABLE_PEOPLE, .root = roots[0],
+		.cls = SB_CLASS_REQUIRED, .schema = SB_SCHEMA_PEOPLE,
+	};
+	out->table[1] = (struct sb_table){
+		.id = SB_TABLE_CRED, .cls = SB_CLASS_REQUIRED,
+		.schema = SB_SCHEMA_CRED,
+	};
+
+	bool ok = zcbor_uint32_expect(zs, SB1_CRED_ROOT) &&
+		  zcbor_uint64_decode(zs, &out->table[1].root) &&
+		  zcbor_uint32_expect(zs, SB1_N_PERSONS) &&
+		  zcbor_uint32_decode(zs, &out->n_persons) &&
+		  zcbor_uint32_expect(zs, SB1_POPULATED) &&
+		  zcbor_uint32_decode(zs, &out->populated) &&
+		  zcbor_uint32_expect(zs, SB1_REV) &&
+		  zcbor_uint32_decode(zs, &out->rev) && zcbor_map_end_decode(zs);
+
+	return ok ? 0 : -EILSEQ;
+}
+
+/* Version 2, after its version key. */
+static int superblock_v2_decode(zcbor_state_t *zs, struct superblock *out)
+{
+	if (!zcbor_uint32_expect(zs, SB_TABLES) || !zcbor_map_start_decode(zs)) {
+		return -EILSEQ;
+	}
+	while (!zcbor_array_at_end(zs)) {
+		struct sb_table t;
+
+		if (!zcbor_uint32_decode(zs, &t.id) ||
+		    !zcbor_map_start_decode(zs) ||
+		    !zcbor_uint32_expect(zs, TE_ROOT) ||
+		    !zcbor_uint64_decode(zs, &t.root) ||
+		    !zcbor_uint32_expect(zs, TE_CLASS) ||
+		    !zcbor_uint32_decode(zs, &t.cls) ||
+		    !zcbor_uint32_expect(zs, TE_SCHEMA) ||
+		    !zcbor_uint32_decode(zs, &t.schema) ||
+		    !zcbor_map_end_decode(zs)) {
+			return -EILSEQ;
+		}
+		/* Ascending, so a duplicate id is caught here too. */
+		if (out->n_tables > 0 &&
+		    t.id <= out->table[out->n_tables - 1].id) {
+			return -EILSEQ;
+		}
+		/* Written by a build with a bigger directory. Dropping the
+		 * excess would lose whatever its class protects. */
+		if (out->n_tables == SB_TABLES_MAX) {
+			return -ENOTSUP;
+		}
+		out->table[out->n_tables++] = t;
+	}
+
+	bool ok = zcbor_map_end_decode(zs) &&
+		  zcbor_uint32_expect(zs, SB_N_PERSONS) &&
+		  zcbor_uint32_decode(zs, &out->n_persons) &&
+		  zcbor_uint32_expect(zs, SB_POPULATED) &&
+		  zcbor_uint32_decode(zs, &out->populated) &&
+		  zcbor_uint32_expect(zs, SB_REV) &&
+		  zcbor_uint32_decode(zs, &out->rev) && zcbor_map_end_decode(zs);
+
+	return ok ? 0 : -EILSEQ;
+}
+
 int superblock_cbor_decode(const uint8_t *buf, size_t len,
 			   struct superblock *out)
 {
@@ -238,30 +355,17 @@ int superblock_cbor_decode(const uint8_t *buf, size_t len,
 
 	ZCBOR_STATE_D(zs, NBACKUPS, buf, len, 1, 0);
 
-	bool ok = zcbor_map_start_decode(zs) &&
-		  zcbor_uint32_expect(zs, SB_VERSION) &&
-		  zcbor_uint32_decode(zs, &out->version) &&
-		  zcbor_uint32_expect(zs, SB_PEOPLE_ROOTS) &&
-		  zcbor_list_start_decode(zs);
-
-	while (ok && !zcbor_array_at_end(zs)) {
-		if (out->n_people_maps >= ARRAY_SIZE(out->people_root) ||
-		    !zcbor_uint64_decode(zs,
-					 &out->people_root[out->n_people_maps])) {
-			return -EILSEQ;
-		}
-		out->n_people_maps++;
+	if (!zcbor_map_start_decode(zs) || !zcbor_uint32_expect(zs, SB_VERSION) ||
+	    !zcbor_uint32_decode(zs, &out->version)) {
+		return -EILSEQ;
 	}
 
-	ok = ok && zcbor_list_end_decode(zs) &&
-	     zcbor_uint32_expect(zs, SB_CRED_ROOT) &&
-	     zcbor_uint64_decode(zs, &out->cred_root) &&
-	     zcbor_uint32_expect(zs, SB_N_PERSONS) &&
-	     zcbor_uint32_decode(zs, &out->n_persons) &&
-	     zcbor_uint32_expect(zs, SB_POPULATED) &&
-	     zcbor_uint32_decode(zs, &out->populated) &&
-	     zcbor_uint32_expect(zs, SB_REV) &&
-	     zcbor_uint32_decode(zs, &out->rev) && zcbor_map_end_decode(zs);
-
-	return ok ? 0 : -EILSEQ;
+	switch (out->version) {
+	case 1:
+		return superblock_v1_decode(zs, out);
+	case SUPERBLOCK_VERSION:
+		return superblock_v2_decode(zs, out);
+	default:
+		return -ENOTSUP;
+	}
 }

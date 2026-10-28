@@ -1874,3 +1874,317 @@ no growth path (K3), a `kvhash` map has to be sized by enumeration, up front.
 This application can enumerate only because its dataset is a pure function of
 an index. A deployment whose data arrives from outside cannot, and has no
 recourse but to over-provision blindly.
+
+## 10. Scaling sweep — how each operation moves with the number of credentials
+
+Every hardware number above is taken at one scale per run, and §5f shows the
+answer moves with scale — not monotonically. `tools/perf_sweep.py` makes the
+curve a single command: it rebuilds this app at a list of
+`CONFIG_APP_CBOR_PERSONDB_N_PERSONS` values and nothing else, runs each one
+on `native_sim` three times on the same flash image (the fill run, then two
+steady-state reruns), and parses the console into JSON. It also parses DK
+UART captures and the raw captures in §8, so board runs land in the same
+format.
+
+```
+python3 tools/perf_sweep.py run -o sweep.json            # ~15 min on a laptop
+python3 tools/perf_sweep.py results -o dk.json           # §8, parsed
+python3 tools/perf_sweep.py report sweep.json dk.json    # markdown
+```
+
+Taken at `501bd3f` (default UBI backend, 200 samples per bench). Each figure
+is the median over the three runs at that scale. *DK ms* applies the read-path
+model to the counters — 75 µs per flash transaction (`flash_area`'s 65 µs
+plus zephyr-ubi v0.1.0's 7–13 µs, `app_perf_blob_db/RESULTS.md`) + 0.63 µs/B
++ 0.95 ms of CBOR where a record is decoded. **`put` is not projected**; see
+below.
+
+| persons | credentials | live | people / cred depth | check txns | check B | **check DK ms** | byid DK ms | miss DK ms | put txns | put B | put erases | host fill ms/person | status |
+|--:|--:|--:|:-:|--:|--:|--:|--:|--:|--:|--:|--:|--:|---|
+| 250 | 648 | 1.3 % | 1 / 1 | 115.3 | 4 930 | 12.70 | 9.69 | 4.19 | 365.6 | 16 196 | 0.010 | 0.10 | ok |
+| 500 | 1 238 | 2.5 % | 1 / 2 | 154.8 | 5 125 | 15.79 | 6.71 | 8.85 | 497.2 | 17 009 | 0.015 | 0.07 | ok |
+| 1 000 | 2 479 | 5.1 % | 1 / 2 | 215.7 | 6 805 | 21.41 | 9.46 | 11.61 | 669.3 | 18 996 | 0.000 | 0.09 | ok |
+| 2 000 | 4 979 | 10.3 % | 2 / 2 | 354.9 | 8 206 | 32.74 | 14.21 | 18.20 | 1 071.0 | 35 915 | 0.070 | 0.11 | ok |
+| 4 000 | 10 017 | 20.6 % | 2 / 2 | 155.3 | 7 448 | 17.29 | 10.97 | 6.25 | 438.7 | 42 981 | 0.135 | 0.21 | ok |
+| 8 000 | 19 969 | 41.3 % | 2 / 2 | 121.3 | 8 222 | 15.23 | 8.73 | 6.05 | 327.2 | 67 622 | 0.255 | 0.36 | ok |
+| 10 000 | 24 932 | 51.6 % | 2 / 2 | 117.9 | 8 626 | 15.23 | 8.90 | 6.27 | 332.3 | 90 131 | 0.365 | 0.45 | ok |
+| 12 000 | 29 942 | 62.0 % | 2 / 2 | 117.8 | 9 141 | 15.54 | 8.84 | 6.70 | 337.6 | 135 153 | 0.590 | 0.59 | ok |
+| 14 000 | — | — | — | — | — | — | — | — | — | — | — | — | fill stopped at 12 718 |
+| 16 000 | — | — | — | — | — | — | — | — | — | — | — | — | fill stopped at 14 107 |
+
+
+The same data, with the DK points beside it, is the `persondb-performance`
+page of the kvdb_book repository.
+
+### Counters transfer for reads, and at 1 000 persons for writes too
+
+Each §8 two-level capture against the sweep run of the same kind at the same
+scale (sweep firmware is newer than the board's):
+
+| run | `check` txns, DK / sim | `byid` | `miss` | `put` txns | `put` bytes, DK / sim |
+|---|--:|--:|--:|--:|--:|
+| 1 000, fill | 176.2 / 172.1 (0.98×) | 0.97× | 0.96× | 0.98× | 17 636 / 17 496 B (0.99×) |
+| 10 000, fill | 114.9 / 123.8 (1.08×) | 1.08× | 1.07× | 1.03× | 194 721 / 90 131 B (**0.46×**) |
+| 10 000, steady | 117.9 / 117.9 (1.00×) | 1.08× | 0.91× | 0.99× | 194 604 / 89 266 B (**0.46×**) |
+
+The old-fork model (§5c) applied to each capture's own counters lands within
+4 % on every read at every scale; the v0.1.0 model applied to §8c's counters
+predicts §5g's measured 17.13 ms `check` at 18.16 ms (+6 %), `byid` +1 %,
+`miss` +7 %.
+
+### Reads peak at a few thousand persons; writes keep growing
+
+- **`check` is worst at 2 000 persons** — 355 transactions, a projected
+  32.7 ms — and falls to 117–121 from 8 000 up. kvhash sizes both maps from
+  the declared population, so a larger store gets more, shallower buckets
+  (§5f's "reads get faster as the dataset grows", seen here at ten scales).
+  It is also the noisiest point: 262–428 transactions across its three runs.
+- **`put` bytes grow 8×** (16 KB → 132 KB) from 250 to 12 000 persons, and its
+  counted sector erases from 0.01 to 0.59 per operation.
+
+### Writes cannot be projected from these counters
+
+At 10 000 persons `put` moves 2.2× more bytes on the old-fork DK than on
+`native_sim` at `501bd3f`, and §5f's wall clock implies **2.23** sector
+erases per `put` where the sweep counts **0.37**. The read model plus the
+counted erases predicts 583 ms for a `put` measured at 2 564 ms (−77 %). Whether
+the gap is the platform, the old UBI fork, or `blob_db` changes since `ade6a3e`
+is open: settling it needs a DK run of the current firmware at 10 000 persons.
+Until then the write path is reported as counters and board measurements only.
+*§10a has that run: on current firmware the board's `put` counters match
+`native_sim`'s, and `put` time follows read cost + bytes programmed + erases.*
+
+### Where the store stops
+
+| declared persons | fill stops at | credentials stored |
+|--:|--:|--:|
+| 12 000 | completes — 62.0 % live | 29 942 |
+| 14 000 | person 12 718, `-ENOSPC` | 31 648 |
+| 16 000 | person 14 107, `-ENOSPC` | 35 110 |
+
+A bucket fills (`persondb: bucket overflow`, `FINDINGS.md` K2) and the insert
+returns `-ENOSPC`. The ceiling moves with the declared size because the
+declared population sets the bucket count — so "how many credentials fit" has
+no single answer, and the benchmark constant of 8 000 sits well below every
+ceiling measured here.
+
+## 10a. The sweep on the nRF5340-DK — six scales, two boards
+
+§10 projects every scale from `native_sim` counters, and until now the board
+had confirmed one point: §5g, 1 000 persons at `99a2ca6`. This section measures
+the same sweep on the board — 250, 1 000, 2 000, 4 000, 8 000 and 12 000
+persons, each a fill run and two steady-state reruns as `perf_sweep.py run`
+does — and checks §10's projection against it, op by op.
+
+### Setup
+
+- **Boards**: two nRF5340-DK PCA10095, J-Link SN 960115021 ("board 1", the
+  board of §5g and §8c) and 1050091053 ("board 2"); store on the on-board
+  MX25R6435F, whole chip as `storage_partition`, UBI on zephyr-ubi `v0.1.0`,
+  two-level `kvhash`. Board 1 ran 250, 1 000 and 12 000 persons; board 2 ran
+  1 000, 2 000, 4 000 and 8 000. 1 000 ran on both as the control.
+- **Firmware**: `501bd3f` (main) plus one DK-local line, not on any branch:
+  a `printk` at UBI attach in `blob_db_store_ubi.c` printing
+  `ubi_device_get_info()` — `image_seq`, PEB health, min/max/total erase count
+  (the `ubi-ec:` line in every log). Built as `0c441f0`; nothing else differs,
+  and `perf_sweep.py` (host-side) is the only other commit on top of `501bd3f`.
+  Zephyr `4a405846193f`, SDK 1.0.1. QSPI in its default low-power mode (no #49
+  patch) — the mode the read model was fitted in.
+- **Scale**: `-DCONFIG_APP_CBOR_PERSONDB_N_PERSONS=<n>
+  -DCONFIG_APP_CBOR_PERSONDB_BENCH_SAMPLES=200`, the switches `perf_sweep.py`
+  uses, so board and sweep build the same benchmark. No code change was needed.
+- **Runs per scale**: (1) program a `FRESH_START=y` image — the fill run;
+  (2) program the same `N` without `FRESH_START`; (3) reset. The console is
+  captured from before each program/reset, one log per boot.
+- **Clean start keeps UBI.** `FRESH_START` is `blob_db_erase_all()`: bucket
+  magics invalidated in place and a new master, no partition erase and no UBI
+  format. Each board's UBI device — and its erase counters — carried through
+  every run: `image_seq` never changed (board 1 `0x27534cfe`, board 2
+  `0x6d0b4b7a`), every PEB stayed healthy, 0 bad, 0 corrupt. This is a
+  deliberate difference from §5g, which raw-erased the partition first: wear
+  history is part of the result, and it changes `open` (below).
+- **native_sim**: `perf_sweep.py run --persons 250,1000,2000,4000,8000,12000`
+  on the same tree, in the Zephyr CI container. Every point reproduces §10's
+  table to the last digit.
+
+Files: `results/dk-scale/` — per scale and board,
+`b<board>-n<persons>-<commit>-<UTC start>-run{1,2,3}.log` (raw UART, ANSI and
+CR as captured) and `…-<UTC start>.json` (`perf_sweep.py parse` of the three
+logs, plus a `dk` block: board, commit, local changes, per-boot status, wall
+time and `ubi-ec` line); and `native_sim-0c441f0-<UTC>.json`, the sweep. The
+`log` paths inside the JSON are absolute paths on the capture host.
+
+### Reads: within the 15 % warn mark everywhere, within 5 % only for `miss` from 4 000 up
+
+Projected = the read model on the **`native_sim`** counters (75 µs per
+transaction + 0.63 µs/B + 0.95 ms CBOR for `check`/`byid`), exactly as §10
+computes it. Board = measured. Median over the three runs, min–max beside it;
+the spread is the steady-state drift of §10, not noise — it is the same on both
+boards and on `native_sim`. Pass ≤ 5 %, warn ≤ 15 %.
+
+**`check`**
+
+| persons | credentials | board | board ms, median (min–max) | projected ms, median (min–max) | error |
+|--:|--:|:-:|--:|--:|--:|
+| 250 | 648 | 1 | 12.01 (10.77–14.55) | 12.70 (11.22–15.45) | +5.8 % warn |
+| 1 000 | 2 479 | 1 | 19.75 (16.38–22.90) | 21.41 (17.81–25.02) | +8.4 % warn |
+| 1 000 | 2 479 | 2 | 19.43 (16.12–22.55) | 21.41 (17.81–25.02) | +10.2 % warn |
+| 2 000 | 4 979 | 2 | 29.28 (22.64–34.37) | 32.74 (25.09–38.80) | +11.8 % warn |
+| 4 000 | 10 017 | 2 | 15.92 (14.13–16.10) | 17.29 (15.34–17.78) | +8.6 % warn |
+| 8 000 | 19 969 | 2 | 14.23 (13.58–14.27) | 15.23 (14.47–15.36) | +7.0 % warn |
+| 12 000 | 29 942 | 1 | 14.79 (14.71–14.80) | 15.54 (15.37–15.78) | +5.1 % warn |
+
+**`byid`**
+
+| persons | credentials | board | board ms, median (min–max) | projected ms, median (min–max) | error |
+|--:|--:|:-:|--:|--:|--:|
+| 250 | 648 | 1 | 9.04 (5.57–10.38) | 9.69 (5.73–11.12) | +7.3 % warn |
+| 1 000 | 2 479 | 1 | 8.89 (7.48–10.20) | 9.46 (7.93–10.98) | +6.4 % warn |
+| 1 000 | 2 479 | 2 | 8.74 (7.36–10.04) | 9.46 (7.93–10.98) | +8.1 % warn |
+| 2 000 | 4 979 | 2 | 12.91 (12.32–18.12) | 14.21 (13.53–20.31) | +10.1 % warn |
+| 4 000 | 10 017 | 2 | 10.03 (8.38–10.32) | 10.97 (9.03–11.23) | +9.4 % warn |
+| 8 000 | 19 969 | 2 | 8.19 (8.07–8.60) | 8.73 (8.61–9.26) | +6.6 % warn |
+| 12 000 | 29 942 | 1 | 8.37 (8.27–8.52) | 8.84 (8.70–9.04) | +5.6 % warn |
+
+**`miss`**
+
+| persons | credentials | board | board ms, median (min–max) | projected ms, median (min–max) | error |
+|--:|--:|:-:|--:|--:|--:|
+| 250 | 648 | 1 | 4.48 (3.33–5.46) | 4.19 (2.92–5.28) | -6.5 % warn |
+| 1 000 | 2 479 | 1 | 10.96 (9.21–12.65) | 11.61 (9.70–13.51) | +5.9 % warn |
+| 1 000 | 2 479 | 2 | 10.79 (9.07–12.44) | 11.61 (9.70–13.51) | +7.6 % warn |
+| 2 000 | 4 979 | 2 | 16.55 (10.86–16.61) | 18.20 (11.67–18.36) | +9.9 % warn |
+| 4 000 | 10 017 | 2 | 6.14 (5.97–6.29) | 6.25 (5.99–6.56) | +1.7 % pass |
+| 8 000 | 19 969 | 2 | 6.06 (5.90–6.46) | 6.05 (5.80–6.43) | -0.2 % pass |
+| 12 000 | 29 942 | 1 | 6.86 (6.84–6.87) | 6.70 (6.63–6.73) | -2.3 % pass |
+
+**0 of 21 fail; 3 pass, 18 warn.** The projection is high at every scale for
+`check` and `byid` (+5.1 to +11.8 %) and peaks where §10 said it would, at
+2 000 persons (4 979 credentials). The model is the cause, not the counters:
+applied to the **board's own** counters it is off by the same amount (+4.7 to
++11.8 % on `check`), because the counters are the same:
+
+| persons | board | worst read-op Δ txns | worst read-op Δ bytes | `put` txns, DK / sim | `put` erases/op, DK / sim |
+|--:|:-:|--:|--:|--:|--:|
+| 250 | 1 | 2.5 % | 0.7 % | 368.2 / 365.6 | 0.010 / 0.010 |
+| 1 000 | 1 | 0.0 % | 0.0 % | 669.3 / 669.3 | 0.000 / 0.000 |
+| 1 000 | 2 | 0.0 % | 0.0 % | 669.3 / 669.3 | 0.000 / 0.000 |
+| 2 000 | 2 | 0.1 % | 0.0 % | 1067.7 / 1071.0 | 0.070 / 0.070 |
+| 4 000 | 2 | 0.8 % | 0.3 % | 435.2 / 438.7 | 0.135 / 0.135 |
+| 8 000 | 2 | 0.6 % | 0.2 % | 327.9 / 327.2 | 0.250 / 0.255 |
+| 12 000 | 1 | 0.6 % | 0.2 % | 337.1 / 337.6 | 0.580 / 0.590 |
+
+Every read op on the board does the same flash traffic as on `native_sim`
+within 2.5 %, at every scale; `put` within 1.3 % in bytes and 2 % in erases. The
+control repeats exactly: boards 1 and 2 report byte-identical counters at
+1 000 persons and times within 1.5–4.4 % of each other (board 1 slower).
+
+**The 1 000-person control does not repeat §5g, and should not.** §5g is a fill
+run at `99a2ca6` (2026-10-01), before the flash-buffer alignment fix #55
+(2026-10-14). Board 1's fill run now reads `check` 16.38 ms (§5g 17.13),
+`byid` 7.48 (7.98), `miss` 9.21 (9.44) — 2–6 % faster on the same board. The
+model's constants were set against that older firmware, which is why it now
+reads high. Refit on all 63 board read points with CBOR held at the measured
+0.95 ms: **66.2 µs per transaction and 0.645 µs/B**, which brings `check` and
+`byid` within ±1.8 % at every scale. 66 µs is `flash_area`'s own 65 µs:
+zephyr-ubi's 7–13 µs per access does not show on this firmware. `miss` stays
+under-predicted by 4–12 % after the refit, i.e. it carries a fixed cost the
+model has no term for (it decodes nothing, so the CBOR term is not it). These
+refit constants are in-sample; they are a proposal for §10's model, not a
+validation of it.
+
+### Writes: read cost + bytes programmed + erases, within 8.4 %
+
+**`put` and `cbor`** (no projection; per-op counters from the board's `io` lines, median of the three runs)
+
+| persons | board | `put` ms, median (min–max) | reads | B read | B written | erases | `cbor` ms |
+|--:|:-:|--:|--:|--:|--:|--:|--:|
+| 250 | 1 | 73.01 (59.69–83.27) | 365 | 13 466 | 2 113 | 0.010 | 0.943 |
+| 1 000 | 1 | 89.63 (80.23–112.58) | 666 | 16 587 | 2 414 | 0.000 | 0.972 |
+| 1 000 | 2 | 86.92 (77.70–107.91) | 666 | 16 587 | 2 414 | 0.000 | 0.956 |
+| 2 000 | 2 | 215.97 (185.45–227.45) | 1064 | 26 930 | 4 955 | 0.070 | 0.958 |
+| 4 000 | 2 | 268.41 (253.79–292.17) | 432 | 25 679 | 8 503 | 0.135 | 0.944 |
+| 8 000 | 2 | 470.66 (441.49–471.63) | 324 | 34 334 | 16 147 | 0.250 | 0.950 |
+| 12 000 | 1 | 1085.57 (1083.75–1086.37) | 333 | 58 416 | 37 028 | 0.580 | 0.954 |
+
+The read model explains a median 46 % of `put` (56 % at 250 persons, 10 % at
+12 000). Fits over all 21 runs, with the read side priced by the model
+(75 µs × reads + 0.63 µs/B × bytes read; the bench line's byte count includes
+erased bytes, so the write side is split out):
+
+| model for `put` | constants | R² | median error | max error |
+|---|---|--:|--:|--:|
+| read cost only | — | −0.64 | 57.5 % | 94.3 % |
+| + k · erases | k = 1.75 s | 0.997 | 9.8 % | 46.2 % |
+| + b · bytes written + k · erases, erase pinned at the measured 1.11 s | b = 10.0 µs/B | — | 4.5 % | 11.3 % |
+| **+ b · bytes written + k · erases** | **b = 11.3 µs/B, k = 1.02 s** | **0.999** | **2.9 %** | **8.4 %** |
+
+Erases alone are not enough: at 250–1 000 persons `put` does almost none
+(0–0.02 per op) and still costs 1.5–2× its read cost. The missing term is the
+bytes programmed — 2.1 KB per `put` at 250 persons, 37 KB at 12 000 — at about
+11 µs per byte in this QSPI mode. A per-program (per-write-call) term does not
+help: fitted alongside, it comes out negative. The fitted erase cost, 1.02 s,
+sits next to the 1.11 s per 64 KB block `app_perf_blob_db` measured directly.
+
+**Out of sample.** Fitted on the 15 runs at ≤ 4 000 persons only
+(b = 11.7 µs/B, k = 0.87 s), the model predicts 8 000 persons at −3.8 to −4.1 %
+and 12 000 at −7.6 to −7.9 % — low, and more so as erases grow, so the erase
+term is worth more than the small scales can show. §10's open question —
+platform, old fork or `blob_db` changes — is answered for current firmware:
+the board's `put` counters match `native_sim`'s (0.580 vs 0.590 erases per
+`put` at 12 000), so the 2.2× byte gap §10 saw is not the platform — it was
+the old fork or `blob_db` changes since `ade6a3e` — and the write path can be
+projected from `native_sim` counters with this model.
+
+### Fill, `open` and wear
+
+**Fill and UBI wear** (fill run; `-ENOSPC`: none at any scale)
+
+| persons | board | open s | prepare s (buckets) | fill s | ms / person | live | UBI EC total, first → last attach | EC max, first → last |
+|--:|:-:|--:|--:|--:|--:|--:|--:|--:|
+| 250 | 1 | 107.5 | 122.9 (114) | 17.5 | 70 | 1.3 % | 8 851 → 9 093 | 74 → 75 |
+| 1 000 | 1 | 141.5 | 106.3 (98) | 70.2 | 70 | 5.1 % | 9 098 → 9 345 | 75 → 77 |
+| 12 000 | 1 | 168.5 | 69.2 (64) | 4564.7 | 380 | 62.0 % | 9 348 → 11 966 | 77 → 99 |
+| 1 000 | 2 | 140.7 | 103.7 (98) | 70.0 | 70 | 5.1 % | 1 659 → 1 906 | 14 → 16 |
+| 2 000 | 2 | 143.9 | 86.7 (82) | 173.2 | 87 | 10.3 % | 1 909 → 2 195 | 16 → 19 |
+| 4 000 | 2 | 144.0 | 82.3 (78) | 609.0 | 152 | 20.6 % | 2 218 → 2 713 | 19 → 23 |
+| 8 000 | 2 | 153.8 | 73.9 (70) | 1842.9 | 230 | 41.3 % | 2 752 → 3 878 | 23 → 33 |
+
+No scale hit `-ENOSPC`; every run printed `VERIFY PASS` twice with 0 bucket
+overflows. Fill cost per person is flat at 70 ms to 1 000 persons and
+grows to 380 ms at 12 000 (76 min for the fill), tracking `put`'s erases.
+`open` is 108–169 s against §5g's 37 s: the store it opens is the previous
+scale's, kept, and `FRESH_START`'s `erase_all` has to invalidate it — the cost of
+keeping UBI's wear history rather than raw-erasing the chip. The whole sweep
+added 3 115 erases to board 1 (max per PEB 74 → 99) and 2 219 to board 2
+(14 → 33).
+
+### What is validated, and what is still projected
+
+- **Validated on hardware, 250 to 12 000 persons**: the I/O counters (within
+  2.5 % of `native_sim` on every op, both boards); the read model to within
+  15 % (`check`/`byid` +5 to +12 %, always high; `miss` −6.5 to +9.9 %); the
+  ranking of scales, including the 2 000-person peak; `put` time as read cost +
+  ~11 µs per byte programmed + ~1 s per erase, out of sample to 8 000 persons
+  within 4 %.
+- **Still projected**: anything above 12 000 persons (§10's `-ENOSPC` ceilings
+  at 14 000 and 16 000 are `native_sim` only); the read constants'
+  refit (66.2 µs, 0.645 µs/B) until a second data set confirms it; `put` where
+  erases exceed ~0.6 per op, where the small-scale fit under-predicts; the
+  QSPI high-performance mode (#49), in which an erase costs about half
+  (`app_perf_blob_db/RESULTS.md`) and none of these constants apply; a chip
+  blank at the start rather than carrying wear.
+
+### Reproducing
+
+```
+west build -p always -b nrf5340dk/nrf5340/cpuapp app_cbor_persondb -- \
+    -DCONFIG_APP_CBOR_PERSONDB_N_PERSONS=<n> \
+    -DCONFIG_APP_CBOR_PERSONDB_BENCH_SAMPLES=200 \
+    -DCONFIG_APP_CBOR_PERSONDB_FRESH_START=y          # run 1 only
+python3 tools/perf_sweep.py parse run1.log run2.log run3.log -o point.json
+```
+
+Capture the console before programming and let `nrfutil device program
+--options reset=RESET_SYSTEM` start each run (§8b). Run 3 is `nrfutil device
+reset` after run 2 prints `persondb: done`.

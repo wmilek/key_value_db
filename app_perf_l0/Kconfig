@@ -115,3 +115,39 @@ config APP_PERF_L0_PASSES
 
 	  Reads cost TARGET_MS per extra pass. Writes also consume erased
 	  space, which the region cursor pays for in whole-region erases.
+
+config APP_PERF_L0_REPROGRAM
+	bool "Check programming over programmed cells without an erase"
+	default y
+	help
+	  Runs the reprogram phase: one erase block at the end of the working
+	  region is programmed repeatedly without being erased — every byte
+	  cleared bit by bit over eight programs, a single byte lane modified
+	  while the others are written as erased, data that asks for 0 -> 1,
+	  and one word hammered APP_PERF_L0_REPROGRAM_REPS times — and read
+	  back against a shadow copy after every step.
+
+	  blob_db relies on this property (erase_all programs 0x00 over bucket
+	  magic; slots are appended into a page one partial program at a time),
+	  and the flash_area API does not promise it. A mismatch is reported in
+	  `l0rp` records, not as a failed run.
+
+config APP_PERF_L0_REPROGRAM_REPS
+	int "Programs of the same word in the reprogram hammer test"
+	default 10000
+	range 1 10000000
+	depends on APP_PERF_L0_REPROGRAM
+	help
+	  How many times one word is programmed with the same mixed 0/1
+	  pattern, with its page checked at every decade. The program-disturb
+	  question: does a 1 bit in the word, or an erased byte next to it,
+	  drift to 0 under repeated programming? Each program is one write
+	  call, roughly 0.1-0.5 ms on QSPI NOR.
+
+config APP_PERF_L0_REPROGRAM_ONLY
+	bool "Run only the reprogram phase"
+	depends on APP_PERF_L0_REPROGRAM
+	help
+	  Skip the timing sweeps (about thirteen minutes on the nRF5340-DK)
+	  and run only the reprogram check. The capture then carries no
+	  `l0raw` records and cannot be fitted.

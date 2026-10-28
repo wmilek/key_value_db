@@ -116,7 +116,7 @@ Read out of the tree and the existing hardware captures, not assumed.
 
 | Id | Constraint | Source |
 |---|---|---|
-| **C1** | `kvhash` is the only implemented Map provider and `kvdb` the only L3 interface. No ordered iteration, no `foreach`, at either layer. | `lib/kvdb/kvdb.c`, `doc/layers/l3_interfaces.md` §3 |
+| **C1** | `kvhash` is the only implemented Map provider and `kvdb` the only L3 interface. No ordered iteration, no `foreach`, at either layer. **Since relaxed:** the Map shape now has unordered, stateless enumeration, `map_ops.next`, plus `count` and `destroy`, all implemented by `kvhash` (`FINDINGS.md` K6, closed). There is still no *ordered* iteration, and `kvdb_foreach` is still deferred. | `lib/kvdb/kvdb.c`, `doc/layers/l3_interfaces.md` §3, `include/app/lib/containers/shape_map.h` |
 | **C2** | A `kvhash` map holds at most `(MAX_PAYLOAD−8)/8` buckets of `MAX_PAYLOAD` bytes, and a *single bucket* is the real limit: it overflows at `MAX_PAYLOAD` of packed entries regardless of how empty the store is. ~~`CONFIG_BLOB_DB_MAX_PAYLOAD_LEN` is capped at 4096~~ — **the cap moved**: the range is now 1..65535, bounded at mount by the geometry to `(sector − 16) / 2 − 14` = **32 746 B on 64 KB sectors**, so a map reaches 4 092 buckets. The app still configures 4 096 → **511 buckets × 4 KB ≈ 2.09 MB per map**, and §12.1 is why that is now a choice rather than a ceiling. | `kvhash.c:45-50,291`, `lib/blob_db/Kconfig`, `blob_db.c:490-503` |
 | **C3** | One `kvhash` entry costs `4 + klen + vlen` and must fit a single payload. | `kvhash.c:291` |
 | **C4** | ~~Every `blob_db` operation reads a whole sector.~~ **No longer true** — `main`'s slot-header walk reads only the slots it needs (this app's finding B1). A read is now many small transactions rather than one large one: measured on the DK, a map get ≈ **7 ms**, a map set ≈ **42 ms**, and a transaction costs ~65 µs (`RESULTS.md` §5b, `FINDINGS.md` N1). | `blob_db.c` slot walk; `RESULTS.md` §4, §5b |
@@ -591,10 +591,81 @@ poking a live store on the DK:
 | `card <card>` | `persondb_card_owner` |
 | `grant`/`revoke <id> <perm>` | `persondb_permission_*` |
 | `assign`/`unassign` | `persondb_card_*` |
+| `tui` | full-screen browser, below |
 
 Being able to `fill 500`, pull the power, reboot and `stat` is the most direct
 demonstration of F8 and F5 that this app can offer — and it is only possible
 because §9 exists.
+
+**`persondb tui` — full-screen, inside the shell frontend.** A page of stored
+persons on the left, the selected one's permissions and cards on the right.
+Tab cycles the three panes, and `a` / `d` add and remove in the one in focus:
+persons, permissions (pick a `tui-…` one or type any name), cards. `n`
+renames, `v` sets the days a person's cards are valid, `g` opens a person by
+id and `c` by card. Every removal asks y/N first.
+
+The validity dialogs ask for the first and the last valid day, pre-filled with
+the stored ones; the last day is stored as the following midnight, because the
+record's window is half-open. A date left as it was keeps the stored instant
+exactly, even when that instant is mid-day.
+
+It takes over the shell's own terminal through the shell's bypass mode and
+gives it back on `q`, Ctrl-C or Ctrl-D, so it needs no second UART, and it
+runs on the shell thread like every other command, so persondb still has one
+caller.
+
+It is stricter about layers than the other two frontends: it calls
+`persondb.h` — this application's L3, the access interface built on the L2
+Map — and nothing else. It does not include `scenario.h` or `dataset.h`, and
+`ui_tui.c` refuses to compile if either is pulled in. The few things it needs
+that are not about stored persons arrive in `struct ui_tui_config`, filled by
+the shell frontend, which already owns the scenario: the persondb handle, the
+first id for persons added by hand (above the dataset's range, so `fill`
+cannot overwrite them), "today" (`SCENARIO_BENCH_NOW`; the board has no
+clock), and a clock that advances on `native_sim`. The grant dialog offers the
+TUI's own permissions, all named `tui-…` so a grant made here is recognisable
+as one, plus any name typed in; the generator's vocabulary is the dataset's
+business, not the TUI's. Plain VT100 and DEC line drawing at 80x24 (`ui/term.c`); the dialogs
+are in `ui/tui_widgets.c`, the screens in `ui/ui_tui.c`. It is
+`CONFIG_APP_CBOR_PERSONDB_TUI`, on by default with the shell frontend.
+
+The storage shapes it as much as the other frontends:
+
+- The list is a walk of the people map (`persondb_person_next()`, on
+  `map_ops.next` — FINDINGS.md K6), so it shows every stored person, dataset
+  or added by hand, in the container's order: stable, not sorted. A page is
+  "the 17 persons after this id". The walk cannot seek, so the start of each
+  page visited is remembered (128 of them, 512 B) and PgUp is free; End walks
+  the whole store with progress on the status line (~49 s on the DK at 8 000)
+  and any key stops it. There is no search by name, which would be that same
+  walk; `g` and `c` go straight to one person instead.
+- An insert can shift page boundaries, so after an add or a delete the
+  remembered starts are dropped; the page on screen keeps its own and its
+  position numbers show `~` until the next walk from the start.
+- The total is `persondb_person_count()` once, at entry (~2 s on the DK), and
+  kept up to date from there.
+- Each row costs about one `persondb_person_get` (~6 ms on the DK), so a page
+  is drawn row by row as the walk returns them. Only a summary per row is
+  cached; the full record is kept for the selected person alone.
+- After every write it reads the person back from the store, and the status
+  line shows the return code and the time the write took. It never patches the
+  screen from RAM.
+- A person is added with `persondb_person_add()`, which refuses a taken id and
+  a card someone already holds — `persondb_person_put()` would overwrite or
+  steal — and only at or above `ui_tui_config.new_id_min`. Their cards are
+  added afterwards in the cards pane.
+- Cards are removed with `persondb_card_revoke_from()`, never the card-only
+  revoke: the screen knows the person, so a removal cut short by a power loss
+  is finished by repeating it.
+- A dataset person edited here no longer matches the generator, so `verify`
+  reports it as a bad record (or, deleted, as missing) if it samples that
+  index. That is `verify` working as intended. Persons added by hand are
+  outside the dataset, so `verify` and `stat`'s content figure do not see them.
+- `mutate` skips, with a warning, a dataset person whose generated state a
+  hand edit made unreachable: deleted, brought to five cards so the temporary
+  card has no slot, or holding nothing while the temporary card's id was
+  given to someone else. The dataset produces none of these, and stopping
+  would fail every later round at the same person.
 
 **`sample.yaml`.**
 
@@ -637,9 +708,10 @@ instances** — the domain has two collections, so the store has two containers:
 ```
 rootreg[ ROOTREG_KEY('PADB', 0) ] ──► superblock blob   (CBOR, app-owned)
                                         1 version
-                                        2 [ root_id ]×1   people map
-                                        3 root_id         credential index
-                                        4 n_persons, populated, rev
+                                        2 table directory (§12.3)
+                                            1 → root_id   people map
+                                            2 → root_id   credential index
+                                        3 n_persons  4 populated  5 rev
                                             │
         kvhash_map_ops on each root ────────┘
 ```
@@ -825,6 +897,17 @@ through is not probing.
 discipline, the API, the CBOR encoding, the verification. Only the number of
 person maps, the payload, and the stack.
 
+**The superblock followed, one version later.** §12.2 kept the superblock's
+array of people-map roots and its count, set to 1, so stores written before the
+change stayed readable. That left a sharding knob nothing should turn — and one
+that overran the sixteen-slot array if set past 16 — plus a hash computed on
+every lookup only to be reduced modulo 1. Superblock **version 2** replaces the
+array with the table directory of §12.3; the knob, the hash and the map-count
+check are gone. A version 1 store of one people map is upgraded at open by
+rewriting the superblock alone — the maps are the same maps, so no record
+moves. One of several maps is refused (`-ENOTSUP`): folding shards into one
+map would mean re-inserting every record.
+
 It is finding **V4** from the other side too: the shard fan-out that made
 `kvdb` stop paying for itself is gone, so V4 no longer describes this
 application — but the reason to stay on L2 does not depend on it (§12.1).
@@ -836,6 +919,91 @@ with `blob_db_get(sb_id) == -ENOENT`, allocates two ids, calls
 atomic write that publishes the structure. A crash before it leaves the maps
 unreferenced, and `blob_db` has no reachability GC: finding **B8**, the same
 window `kvdb` itself has (`kvdb.c:118`).
+
+### 12.3 The table directory — what a build does with a table it does not know
+
+The superblock lists the maps as a directory, `table_id → { root, class,
+schema }`, so that a later build can add a table without making the store
+unopenable by this one — and so that rolling firmware back stays possible.
+
+The obvious rule, "a table you do not know can be removed", is right for some
+tables and destroys data for others, and an older build cannot tell which from
+an id it has never seen. So the build that creates a table records the answer
+next to it, in a field every build reads:
+
+| class | A build that does not know the table… | For |
+|---|---|---|
+| **required** (0) | refuses to open the store (`-ENOTSUP`) | authoritative data an older build would get *wrong* without it — e.g. permissions moved out of the person record |
+| **preserve** (1) | keeps it, and keeps its entry on every superblock rewrite | data no older build's write can make inconsistent — an audit log, a configuration table |
+| **derived** (2) | destroys it and drops its entry at open, before its first write | indexes and caches over other tables |
+
+A class value newer than the build is treated as required: refusing is the only
+answer that cannot lose or corrupt anything.
+
+**Derived tables are dropped, not ignored**, because ignoring one is wrong. An
+older build that writes people does not maintain a newer build's index over
+them; rolled forward again, the newer build would trust an index that is
+missing every change made in between. Dropping it hands the newer build an
+absent table, which it knows how to rebuild — from the tables it is derived
+from, walked with `map_ops.next`.
+
+**Refusing is decided before anything is written.** Every entry is classified
+first; only then are derived tables destroyed. A store this build refuses is
+left byte-identical, so the newer build that wrote it still finds it intact.
+
+**Dropping survives a power cut.** `map_ops.destroy` runs before the directory
+is rewritten. Unlinking first would leak the table's blobs for good if power
+failed in between (B8); destroying first leaves at worst an entry naming a
+destroyed map, which the next open destroys again — `-ENOENT`, taken as done.
+
+**This build's own tables** must carry the record format it reads (`schema`);
+another is refused rather than misread. Both are **required**: either one
+missing would let an access decision be made on half the data.
+
+**What is not here yet.** No table is derived today, so nothing rebuilds one:
+that code belongs to the build that introduces the first derived table. What
+ships now is the half that has to exist *before* that build does — the older
+build's side — and `tests/app_cbor_persondb` exercises it by planting the
+tables a newer build would leave.
+
+### 12.4 Destroying a store — this store, not the partition
+
+`blob_db` is shared: `rootreg` exists so that several structures can each own
+a key and a root. `persondb reset` used to call `blob_db_erase_all()`, which
+removed every one of them and reset the id counter — a wipe of the device
+issued by one of its tenants. `persondb_destroy()` removes what the store
+owns and nothing else: every table its directory lists, the superblock, then
+its registry entry. A whole-partition wipe stays available where it belongs —
+`--flash_erase`, the test fixture, and `CONFIG_APP_CBOR_PERSONDB_FRESH_START`
+for a benchmark's clean start. In the shell, `persondb destroy` is this call
+and `scenario reset` is it followed by `persondb open`.
+
+**A newer build's tables go too**, whatever their class: class says what an
+older build may do while *keeping* the store, and a destroy keeps nothing.
+
+**Everything is checked before anything is released.** The superblock does
+not say what kind of container a table is, and every one this build knows is
+a kvhash map; a table that is not one — a newer build's other container — is
+refused with the store untouched, rather than destroyed half-way.
+
+**It survives a power cut.** The order is §12.3's, extended: the tables while
+the superblock still names them, then the superblock, then the registry entry
+(rootreg's teardown-before-unregister). Each step is repeatable, and two
+in-between states need the open path's help:
+
+- *Tables part-released.* This build's own two tables are released first and
+  `persondb_open()` stats both, so a crash anywhere in the release opens as
+  `-EINPROGRESS` rather than as a store that answers every lookup "not found".
+- *Superblock deleted, entry still registered.* This looks exactly like a
+  create that crashed before its commit, but `blob_db_update()` on a deleted
+  id is undefined (D3). So `persondb_open()` no longer binds a missing
+  superblock at the registered id: it drops the entry and builds at a fresh
+  one. An id that was never bound holds nothing, so this leaks nothing.
+
+**What it cannot do.** It must read the superblock to know what it owns, so a
+store whose superblock is a newer format than this build reads is refused
+(`-ENOTSUP`). Fixing that means freezing the part of the superblock that lists
+the roots, so every later build keeps it readable — deliberately not done yet.
 
 ## 13. Acceptance criteria
 

@@ -7,18 +7,20 @@
  * Layout (DESIGN.md §12). One registry key, one app-owned superblock, two
  * kvhash instances; everything is reachable from the integer 1 (P5):
  *
- *   rootreg[ ROOTREG_KEY('PADB', 0) ] -> superblock -> people_root[0]
- *                                                   -> cred_root
+ *   rootreg[ ROOTREG_KEY('PADB', 0) ] -> superblock -> table 1: people
+ *                                                   -> table 2: credentials
  *
  * Two containers, because the domain has two collections. The people map was
  * sixteen shards until DESIGN.md §12.2, to keep any one bucket under a 4 KB
  * payload cap that has since been lifted; that was a workaround for K2, and
  * workarounds hide the limitations this application exists to find (DESIGN.md
- * §1). The loop below still runs over n_people_maps because the superblock
- * format carries the count -- it is 1.
+ * §1).
  *
- * This is the only file in the application that mentions a key, a shard, a
- * blob id or a map operation.
+ * The superblock lists its maps as a table directory (DESIGN.md §12.3), so a
+ * later build can add a table and this one still knows what to do with it.
+ *
+ * This is the only file in the application that mentions a key, a blob id or
+ * a map operation.
  */
 
 #include <errno.h>
@@ -47,9 +49,6 @@ LOG_MODULE_REGISTER(persondb, CONFIG_APP_CBOR_PERSONDB_LOG_LEVEL);
  * numbering the only one 1 would imply a ('PADB', 0) that does not exist.
  */
 #define PADB_ROOTREG_KEY  ROOTREG_KEY(PADB_MAGIC, 0)
-#define SUPERBLOCK_VERSION 1
-
-#define N_PEOPLE_MAPS CONFIG_APP_CBOR_PERSONDB_PEOPLE_MAPS
 
 /* Person keys are "pXXXXXXXX": fixed width, so every key is 9 bytes and the
  * entry-size arithmetic in DESIGN.md §6 has no variance from key length. */
@@ -78,6 +77,8 @@ struct persondb {
 	bool                  open;
 	uint64_t              sb_id;
 	struct superblock     sb;
+	uint64_t              people_root;   /* resolved from sb at open */
+	uint64_t              cred_root;
 	const struct map_ops *ops;
 	struct persondb_stat  st;
 };
@@ -87,27 +88,6 @@ struct persondb {
 static struct persondb g_db;
 
 /* -- plumbing ----------------------------------------------------------- */
-
-static uint32_t fnv1a32(const void *data, size_t len)
-{
-	const uint8_t *p = data;
-	uint32_t h = 0x811c9dc5u;
-
-	for (size_t i = 0; i < len; i++) {
-		h ^= p[i];
-		h *= 0x01000193u;
-	}
-	return h;
-}
-
-/* Shard on a hash of the id rather than the id itself, so persondb stays
- * independent of how the caller numbers people — a caller allocating ids
- * sequentially and one allocating them sparsely get the same distribution,
- * which is what DESIGN.md §6.1's sizing assumes. */
-static uint64_t people_root(struct persondb *db, uint32_t id)
-{
-	return db->sb.people_root[fnv1a32(&id, sizeof(id)) % db->sb.n_people_maps];
-}
 
 static void person_key(char *buf, uint32_t id)
 {
@@ -171,11 +151,11 @@ static int cred_put(struct persondb *db, const char *card, uint32_t person_id)
 	if (rc != 0) {
 		return rc;
 	}
-	return map_set(db, db->sb.cred_root, card, buf, len);
+	return map_set(db, db->cred_root, card, buf, len);
 }
 
-/* Encode a person and write it to its shard. One map set, so one atomic write:
- * a crash either leaves the previous record or this one, never a blend. */
+/* Encode a person and write it to the people map. One map set, so one atomic
+ * write: a crash either leaves the previous record or this one, never a blend. */
 static int person_store(struct persondb *db, const struct persondb_person *p)
 {
 	uint8_t buf[PERSON_CBOR_MAX];
@@ -187,7 +167,7 @@ static int person_store(struct persondb *db, const struct persondb_person *p)
 		return rc;
 	}
 	person_key(key, p->id);
-	return map_set(db, people_root(db, p->id), key, buf, len);
+	return map_set(db, db->people_root, key, buf, len);
 }
 
 static bool person_lists_card(const struct persondb_person *p, const char *card)
@@ -297,7 +277,6 @@ static int create_store(struct persondb *db, uint32_t n_persons)
 
 	memset(sb, 0, sizeof(*sb));
 	sb->version = SUPERBLOCK_VERSION;
-	sb->n_people_maps = N_PEOPLE_MAPS;
 	sb->n_persons = n_persons;
 
 	/*
@@ -335,33 +314,43 @@ static int create_store(struct persondb *db, uint32_t n_persons)
 		.max_entry_bytes = 23,
 	};
 
-	for (uint8_t i = 0; i < sb->n_people_maps; i++) {
-		sb->people_root[i] = blob_db_alloc_id();
-		if (sb->people_root[i] == 0) {
-			return -EIO;
-		}
-		int rc = db->ops->create(sb->people_root[i], &people_cfg);
-
-		if (rc != 0) {
-			return rc;
-		}
-	}
-
-	sb->cred_root = blob_db_alloc_id();
-	if (sb->cred_root == 0) {
+	db->people_root = blob_db_alloc_id();
+	if (db->people_root == 0) {
 		return -EIO;
 	}
 
-	int rc = db->ops->create(sb->cred_root, &cred_cfg);
+	int rc = db->ops->create(db->people_root, &people_cfg);
 
 	if (rc != 0) {
 		return rc;
 	}
 
+	db->cred_root = blob_db_alloc_id();
+	if (db->cred_root == 0) {
+		return -EIO;
+	}
+
+	rc = db->ops->create(db->cred_root, &cred_cfg);
+	if (rc != 0) {
+		return rc;
+	}
+
+	/* Both required: each is authoritative, and a build that ignored
+	 * either would answer access decisions wrongly. */
+	sb->n_tables = 2;
+	sb->table[0] = (struct sb_table){
+		.id = SB_TABLE_PEOPLE, .root = db->people_root,
+		.cls = SB_CLASS_REQUIRED, .schema = SB_SCHEMA_PEOPLE,
+	};
+	sb->table[1] = (struct sb_table){
+		.id = SB_TABLE_CRED, .root = db->cred_root,
+		.cls = SB_CLASS_REQUIRED, .schema = SB_SCHEMA_CRED,
+	};
+
 	struct map_info people_info, cred_info;
 
-	if (db->ops->stat && db->ops->stat(sb->people_root[0], &people_info) == 0 &&
-	    db->ops->stat(sb->cred_root, &cred_info) == 0) {
+	if (db->ops->stat && db->ops->stat(db->people_root, &people_info) == 0 &&
+	    db->ops->stat(db->cred_root, &cred_info) == 0) {
 		LOG_INF("created store for %u persons: people map depth %u, "
 			"%u buckets; credential map depth %u, %u buckets",
 			n_persons, people_info.depth, people_info.buckets,
@@ -371,6 +360,180 @@ static int create_store(struct persondb *db, uint32_t n_persons)
 	}
 
 	return sb_commit(db);   /* the commit point */
+}
+
+/*
+ * Decide, for every table in the directory, what this build does with it —
+ * before writing anything, so a store this build must refuse is left exactly
+ * as it was found (DESIGN.md §12.3).
+ *
+ * Its own tables resolve to their roots, and must carry the record format
+ * this build reads. A table it does not know is handled by the class its
+ * creator recorded: required (or a class newer than this build) refuses,
+ * preserve stays, derived is marked for dropping.
+ */
+static int tables_resolve(struct persondb *db, bool drop[SB_TABLES_MAX])
+{
+	db->people_root = 0;
+	db->cred_root = 0;
+
+	for (uint8_t i = 0; i < db->sb.n_tables; i++) {
+		const struct sb_table *t = &db->sb.table[i];
+		uint64_t *mine = NULL;
+		uint32_t schema = 0;
+
+		drop[i] = false;
+		if (t->id == SB_TABLE_PEOPLE) {
+			mine = &db->people_root;
+			schema = SB_SCHEMA_PEOPLE;
+		} else if (t->id == SB_TABLE_CRED) {
+			mine = &db->cred_root;
+			schema = SB_SCHEMA_CRED;
+		}
+
+		if (mine != NULL) {
+			if (t->schema != schema) {
+				LOG_ERR("table %u has record format %u, this "
+					"build reads %u", t->id, t->schema,
+					schema);
+				return -ENOTSUP;
+			}
+			*mine = t->root;
+			continue;
+		}
+
+		switch (t->cls) {
+		case SB_CLASS_PRESERVE:
+			LOG_INF("keeping table %u from a newer build", t->id);
+			break;
+		case SB_CLASS_DERIVED:
+			drop[i] = true;
+			break;
+		default:
+			LOG_ERR("table %u (class %u) is required by a newer "
+				"build", t->id, t->cls);
+			return -ENOTSUP;
+		}
+	}
+
+	if (db->people_root == 0 || db->cred_root == 0) {
+		LOG_ERR("superblock lists no %s table",
+			db->people_root == 0 ? "people" : "credential");
+		return -EIO;
+	}
+
+	/* No build would mark one of these maps for dropping; a directory that
+	 * does is corrupt, and acting on it would destroy authoritative data. */
+	for (uint8_t i = 0; i < db->sb.n_tables; i++) {
+		uint64_t root = db->sb.table[i].root;
+
+		if (drop[i] && (root == db->people_root ||
+				root == db->cred_root || root == db->sb_id)) {
+			LOG_ERR("table %u would drop a map this build owns",
+				db->sb.table[i].id);
+			return -EIO;
+		}
+	}
+	return 0;
+}
+
+/*
+ * Destroy the tables tables_resolve() marked, then rewrite the directory
+ * without them.
+ *
+ * Destroy first: unlinking first would leak every blob of the table if
+ * power failed before the destroy (B8). A crash between the two leaves an
+ * entry naming a destroyed map, and the next open destroys it again — which
+ * answers -ENOENT, and is taken as done.
+ *
+ * The caller commits the superblock.
+ */
+static int tables_drop(struct persondb *db, const bool drop[SB_TABLES_MAX])
+{
+	uint8_t kept = 0;
+
+	for (uint8_t i = 0; i < db->sb.n_tables; i++) {
+		const struct sb_table *t = &db->sb.table[i];
+
+		if (!drop[i]) {
+			db->sb.table[kept++] = *t;
+			continue;
+		}
+
+		int rc = db->ops->destroy(t->root);
+
+		if (rc != 0 && rc != -ENOENT) {
+			LOG_ERR("dropping table %u: %d", t->id, rc);
+			return rc;
+		}
+		LOG_INF("dropped table %u, derived data of a newer build",
+			t->id);
+	}
+	db->sb.n_tables = kept;
+	return 0;
+}
+
+/* Open an existing store's superblock: decode, resolve, upgrade, drop. */
+static int attach_store(struct persondb *db, const uint8_t *buf, size_t len)
+{
+	bool drop[SB_TABLES_MAX];
+	bool dirty;
+	int rc = superblock_cbor_decode(buf, len, &db->sb);
+
+	if (rc == -ENOTSUP) {
+		if (db->sb.version != 1 && db->sb.version != SUPERBLOCK_VERSION) {
+			LOG_ERR("superblock version %u, this build reads 1 "
+				"and %u", db->sb.version, SUPERBLOCK_VERSION);
+		} else {
+			LOG_ERR("superblock layout this build cannot hold: "
+				"more than %u tables, or several people maps",
+				SB_TABLES_MAX);
+		}
+		return rc;
+	}
+	if (rc != 0) {
+		LOG_ERR("superblock unreadable: %d", rc);
+		return -EIO;
+	}
+
+	rc = tables_resolve(db, drop);
+	if (rc != 0) {
+		return rc;
+	}
+
+	/* A destroy that lost power part-way leaves the directory naming maps
+	 * that are dying or gone — persondb_destroy() releases these two
+	 * first, so a crash anywhere in it shows here. Opened anyway, every
+	 * lookup would answer "not found" and every write fail. */
+	struct map_info info;
+
+	if (db->ops->stat(db->people_root, &info) == -ENOENT ||
+	    db->ops->stat(db->cred_root, &info) == -ENOENT) {
+		LOG_ERR("store was being destroyed; persondb_destroy() "
+			"finishes it");
+		return -EINPROGRESS;
+	}
+
+	/* Version 1 described the same two maps, so upgrading it is a rewrite
+	 * of this one blob: no record moves. */
+	dirty = (db->sb.version != SUPERBLOCK_VERSION);
+	for (uint8_t i = 0; i < db->sb.n_tables; i++) {
+		dirty = dirty || drop[i];
+	}
+	if (!dirty) {
+		return 0;
+	}
+
+	rc = tables_drop(db, drop);
+	if (rc != 0) {
+		return rc;
+	}
+	if (db->sb.version != SUPERBLOCK_VERSION) {
+		LOG_INF("superblock upgraded from version %u to %u",
+			db->sb.version, SUPERBLOCK_VERSION);
+		db->sb.version = SUPERBLOCK_VERSION;
+	}
+	return sb_commit(db);
 }
 
 int persondb_open(struct persondb **out, uint32_t n_persons)
@@ -394,6 +557,8 @@ int persondb_open(struct persondb **out, uint32_t n_persons)
 		return rc;
 	}
 
+	/* The whole partition, not this store: a benchmark's clean start, and
+	 * the one place this module reaches past its own blobs (Kconfig). */
 	if (IS_ENABLED(CONFIG_APP_CBOR_PERSONDB_FRESH_START)) {
 		rc = blob_db_erase_all();
 		if (rc != 0) {
@@ -416,37 +581,43 @@ int persondb_open(struct persondb **out, uint32_t n_persons)
 
 	db->st.partition_bytes = partition_bytes;
 
-	rc = rootreg_get_or_create(PADB_ROOTREG_KEY, &db->sb_id);
-	if (rc != 0) {
-		LOG_ERR("rootreg: %d", rc);
-		return rc;
-	}
-
 	uint8_t buf[SUPERBLOCK_CBOR_MAX];
 	size_t got = 0;
 
-	rc = blob_db_get(db->sb_id, buf, sizeof(buf), &got);
-	if (rc == -ENOENT || (rc == 0 && got == 0)) {
-		/* Virgin, or a crash before a previous create's commit. */
+	rc = rootreg_get(PADB_ROOTREG_KEY, &db->sb_id);
+	if (rc == 0) {
+		rc = blob_db_get(db->sb_id, buf, sizeof(buf), &got);
+		if (rc == -ENOENT) {
+			/*
+			 * The registry names a superblock that is not there:
+			 * a create that crashed before its commit, or a
+			 * destroy that crashed before unregistering. The two
+			 * look alike, and only the first id may be bound —
+			 * update on a deleted id is undefined (blob_db D3) —
+			 * so drop the entry and build at a fresh one. An id
+			 * that was never bound holds nothing, so dropping it
+			 * leaks nothing.
+			 */
+			rc = rootreg_unregister(PADB_ROOTREG_KEY);
+			if (rc == 0) {
+				rc = -ENOENT;
+			}
+		}
+	}
+	if (rc == -ENOENT) {
+		rc = rootreg_get_or_create(PADB_ROOTREG_KEY, &db->sb_id);
+		if (rc != 0) {
+			LOG_ERR("rootreg: %d", rc);
+			return rc;
+		}
+		rc = create_store(db, n_persons);
+	} else if (rc == 0 && got == 0) {
+		/* Bound, but to nothing: no table was ever published. */
 		rc = create_store(db, n_persons);
 	} else if (rc == 0) {
-		rc = superblock_cbor_decode(buf, got, &db->sb);
-		if (rc == 0 && db->sb.version != SUPERBLOCK_VERSION) {
-			LOG_ERR("superblock version %u, expected %u",
-				db->sb.version, SUPERBLOCK_VERSION);
-			rc = -EIO;
-		}
-		if (rc == 0 && db->sb.n_people_maps != N_PEOPLE_MAPS) {
-			/* The shard count is baked into where every key lives,
-			 * so a build that disagrees cannot read the store.
-			 * kvhash cannot rehash (K3) and cannot be iterated
-			 * (K6), so there is no migration path — say so plainly
-			 * rather than returning wrong answers. */
-			LOG_ERR("store has %u people maps, this build has %u — "
-				"reformat required (FINDINGS.md K3/K6)",
-				db->sb.n_people_maps, N_PEOPLE_MAPS);
-			rc = -ENOTSUP;
-		}
+		rc = attach_store(db, buf, got);
+	} else {
+		LOG_ERR("store lookup: %d", rc);
 	}
 	if (rc != 0) {
 		return rc;
@@ -466,26 +637,149 @@ int persondb_close(struct persondb *db)
 	return 0;
 }
 
-int persondb_erase(struct persondb **db, uint32_t n_persons)
+static bool table_is_own(const struct sb_table *t)
 {
-	int rc;
+	return t->id == SB_TABLE_PEOPLE || t->id == SB_TABLE_CRED;
+}
 
-	if (db && *db) {
-		(*db)->open = false;
-		*db = NULL;
+/*
+ * Destroy every table the directory lists, this build's or a newer one's.
+ *
+ * Each root is checked before the first is released, so a store this build
+ * cannot take apart is left as it was found (DESIGN.md §12.3's rule, applied
+ * to destroy). The superblock does not say what kind of container a table is;
+ * every one this build knows is a kvhash map, and stat() is the cheapest way
+ * to ask "can I walk this": -ENOENT is a map already released by an earlier,
+ * interrupted destroy, and anything else is a container this build cannot
+ * free.
+ *
+ * This build's own tables go first, because persondb_open() checks those two
+ * for a part-way destroy: the first release must be one it can see.
+ */
+static int tables_destroy(struct persondb *db)
+{
+	for (uint8_t i = 0; i < db->sb.n_tables; i++) {
+		const struct sb_table *t = &db->sb.table[i];
+		struct map_info info;
+		int rc;
+
+		if (t->root == 0 || t->root == BLOB_DB_ROOT_ID ||
+		    t->root == db->sb_id) {
+			LOG_ERR("table %u names root %llu", t->id,
+				(unsigned long long)t->root);
+			return -EIO;
+		}
+		rc = db->ops->stat(t->root, &info);
+		if (rc != 0 && rc != -ENOENT) {
+			LOG_ERR("table %u is not a map this build can "
+				"destroy: %d", t->id, rc);
+			return rc;
+		}
 	}
 
-	/* Logical wipe: one master write, rather than the tens of seconds a
-	 * full-partition erase costs on an 8 MiB QSPI part. */
-	rc = blob_db_erase_all();
-	if (rc != 0) {
+	for (int pass = 0; pass < 2; pass++) {
+		for (uint8_t i = 0; i < db->sb.n_tables; i++) {
+			const struct sb_table *t = &db->sb.table[i];
+
+			if (table_is_own(t) != (pass == 0)) {
+				continue;
+			}
+
+			int rc = db->ops->destroy(t->root);
+
+			if (rc != 0 && rc != -ENOENT) {
+				LOG_ERR("destroying table %u: %d", t->id, rc);
+				return rc;
+			}
+		}
+	}
+	return 0;
+}
+
+/*
+ * Tear down in the order that keeps every step repeatable: the tables while
+ * the superblock still names them, then the superblock, then the registry
+ * entry — the rootreg contract's "teardown before unregistration" (§8). A
+ * crash before the unregister leaves an entry naming a deleted superblock,
+ * which this function and persondb_open() both recognise.
+ */
+int persondb_destroy(struct persondb **out)
+{
+	struct persondb *db = &g_db;
+	uint8_t buf[SUPERBLOCK_CBOR_MAX];
+	size_t got = 0;
+	int rc;
+
+	if (out && *out) {
+		(*out)->open = false;
+		*out = NULL;
+	}
+	db->open = false;
+	db->ops = &kvhash_map_ops;
+
+	rc = blob_db_mount();
+	if (rc != 0 && rc != -EALREADY) {
+		LOG_ERR("blob_db_mount: %d", rc);
 		return rc;
 	}
 	rc = rootreg_init();
 	if (rc != 0) {
+		LOG_ERR("rootreg_init: %d", rc);
 		return rc;
 	}
-	return persondb_open(db, n_persons);
+
+	rc = rootreg_get(PADB_ROOTREG_KEY, &db->sb_id);
+	if (rc == -ENOENT) {
+		return 0;   /* no store */
+	}
+	if (rc != 0) {
+		LOG_ERR("rootreg: %d", rc);
+		return rc;
+	}
+
+	rc = blob_db_get(db->sb_id, buf, sizeof(buf), &got);
+	if (rc == -ENOMEM) {
+		LOG_ERR("superblock larger than this build reads: cannot tell "
+			"which blobs the store owns");
+		return -ENOTSUP;
+	}
+	if (rc != 0 && rc != -ENOENT) {
+		LOG_ERR("superblock lookup: %d", rc);
+		return rc;
+	}
+
+	/* Absent or empty, it names no table: nothing to release but itself
+	 * and the entry. */
+	if (rc == 0 && got > 0) {
+		rc = superblock_cbor_decode(buf, got, &db->sb);
+		if (rc == -ENOTSUP) {
+			LOG_ERR("superblock (version %u) this build cannot "
+				"read in full: cannot tell which blobs the "
+				"store owns", db->sb.version);
+			return rc;
+		}
+		if (rc != 0) {
+			LOG_ERR("superblock unreadable: %d", rc);
+			return -EIO;
+		}
+		rc = tables_destroy(db);
+		if (rc != 0) {
+			return rc;
+		}
+	}
+
+	rc = blob_db_delete(db->sb_id);
+	if (rc != 0 && rc != -ENOENT) {
+		LOG_ERR("deleting the superblock: %d", rc);
+		return rc;
+	}
+	rc = rootreg_unregister(PADB_ROOTREG_KEY);
+	if (rc != 0 && rc != -ENOENT) {
+		LOG_ERR("rootreg_unregister: %d", rc);
+		return rc;
+	}
+	LOG_INF("store destroyed");
+	return 0;
 }
 
 int persondb_prepare(int *buckets_formatted)
@@ -546,7 +840,7 @@ int persondb_person_put(struct persondb *db, const struct persondb_person *p)
 			if (person_lists_card(p, old.card[i])) {
 				continue;
 			}
-			rc = map_del(db, db->sb.cred_root, old.card[i]);
+			rc = map_del(db, db->cred_root, old.card[i]);
 			if (rc != 0 && rc != -ENOENT) {
 				return rc;
 			}
@@ -578,7 +872,7 @@ int persondb_person_get(struct persondb *db, uint32_t id,
 
 	person_key(key, id);
 
-	int rc = map_get(db, people_root(db, id), key, buf, sizeof(buf), &len);
+	int rc = map_get(db, db->people_root, key, buf, sizeof(buf), &len);
 
 	if (rc != 0) {
 		return rc;
@@ -598,7 +892,7 @@ int persondb_person_delete(struct persondb *db, uint32_t id)
 	/* Credentials first (F5): after each delete the card already resolves
 	 * to nothing, so every crash point in this loop denies. */
 	for (uint8_t i = 0; i < p.n_cards; i++) {
-		rc = map_del(db, db->sb.cred_root, p.card[i]);
+		rc = map_del(db, db->cred_root, p.card[i]);
 		if (rc != 0 && rc != -ENOENT) {
 			return rc;
 		}
@@ -607,7 +901,93 @@ int persondb_person_delete(struct persondb *db, uint32_t id)
 	char key[PERSON_KEY_SZ];
 
 	person_key(key, id);
-	return map_del(db, people_root(db, id), key);
+	return map_del(db, db->people_root, key);
+}
+
+int persondb_person_add(struct persondb *db, const struct persondb_person *p)
+{
+	struct persondb_person existing;
+	uint32_t owner;
+	int rc;
+
+	if (p->name[0] == '\0' || p->valid_until <= p->valid_from) {
+		return -EINVAL;
+	}
+
+	rc = persondb_person_get(db, p->id, &existing);
+	if (rc == 0) {
+		return -EEXIST;
+	}
+	if (rc != -ENOENT) {
+		return rc;
+	}
+
+	for (uint8_t i = 0; i < p->n_cards && i < PERSONDB_CARDS_MAX; i++) {
+		/* Listed twice in the record itself: stored, it would keep one
+		 * listing after the card's index entry is revoked. */
+		for (uint8_t j = 0; j < i; j++) {
+			if (strcmp(p->card[i], p->card[j]) == 0) {
+				return -EINVAL;
+			}
+		}
+		rc = persondb_card_owner(db, p->card[i], &owner);
+		if (rc == 0) {
+			return -EEXIST;
+		}
+		if (rc != -ENOENT) {
+			return rc;
+		}
+	}
+
+	/* Checked, then written: the caller serializes every call (see the
+	 * header), so nothing can take the id or a card in between. */
+	return persondb_person_put(db, p);
+}
+
+/* -- enumeration -------------------------------------------------------- */
+
+int persondb_person_next(struct persondb *db, const uint32_t *after,
+			 struct persondb_person *out)
+{
+	char cursor[PERSON_KEY_SZ];
+	char key[PERSON_KEY_SZ + 1];    /* one spare: detects a longer key */
+	uint8_t buf[PERSON_CBOR_MAX];
+	size_t klen = 0, vlen = 0;
+
+	if (after != NULL) {
+		person_key(cursor, *after);
+	}
+
+	/* Counted as a get: it is one lookup of the cursor plus a forward
+	 * search, which is what the stat block's map traffic means. */
+	db->st.map_gets++;
+
+	int rc = db->ops->next(db->people_root, after ? cursor : NULL,
+			       after ? strlen(cursor) : 0, key, sizeof(key),
+			       &klen, buf, sizeof(buf), &vlen);
+
+	if (rc == -ENODATA) {
+		return rc;
+	}
+	if (rc == -ENOMEM || (rc == 0 && klen != PERSON_KEY_SZ - 1)) {
+		/* The people map holds person keys and nothing else. */
+		return -EIO;
+	}
+	if (rc != 0) {
+		return rc;
+	}
+	return person_cbor_decode(buf, vlen, out) == 0 ? 0 : -EIO;
+}
+
+int persondb_person_count(struct persondb *db, uint32_t *n)
+{
+	size_t count = 0;
+	int rc = db->ops->count(db->people_root, &count);
+
+	if (rc == 0) {
+		*n = (uint32_t)count;
+	}
+	return rc;
 }
 
 /* -- credentials -------------------------------------------------------- */
@@ -689,7 +1069,7 @@ int persondb_card_revoke_from(struct persondb *db, uint32_t person_id,
 
 	/* Index first, person second — the mirror of assignment, fail-safe for
 	 * the same reason: after this write the card resolves to nothing. */
-	rc = map_del(db, db->sb.cred_root, card);
+	rc = map_del(db, db->cred_root, card);
 	if (rc != 0 && rc != -ENOENT) {
 		return rc;
 	}
@@ -751,12 +1131,23 @@ int persondb_card_owner(struct persondb *db, const char *card,
 {
 	uint8_t buf[CRED_CBOR_MAX];
 	size_t len = 0;
-	int rc = map_get(db, db->sb.cred_root, card, buf, sizeof(buf), &len);
+	int rc = map_get(db, db->cred_root, card, buf, sizeof(buf), &len);
 
 	if (rc != 0) {
 		return rc;
 	}
 	return cred_cbor_decode(buf, len, person_id);
+}
+
+int persondb_card_count(struct persondb *db, uint32_t *n)
+{
+	size_t count = 0;
+	int rc = db->ops->count(db->cred_root, &count);
+
+	if (rc == 0) {
+		*n = (uint32_t)count;
+	}
+	return rc;
 }
 
 /* -- permissions -------------------------------------------------------- */
@@ -821,6 +1212,52 @@ int persondb_permission_revoke(struct persondb *db, uint32_t person_id,
 		return -ENOENT;
 	}
 	p.n_perms = n;
+	return person_store(db, &p);
+}
+
+/* -- person details ----------------------------------------------------- */
+
+int persondb_person_rename(struct persondb *db, uint32_t person_id,
+			   const char *name)
+{
+	struct persondb_person p;
+	size_t n = name ? strlen(name) : 0;
+
+	if (n == 0 || n > PERSONDB_NAME_MAX) {
+		return -EINVAL;
+	}
+
+	int rc = persondb_person_get(db, person_id, &p);
+
+	if (rc != 0) {
+		return rc;
+	}
+	if (strcmp(p.name, name) == 0) {
+		return 0;
+	}
+	memcpy(p.name, name, n + 1);
+	return person_store(db, &p);
+}
+
+int persondb_person_set_validity(struct persondb *db, uint32_t person_id,
+				 uint32_t valid_from, uint32_t valid_until)
+{
+	struct persondb_person p;
+
+	if (valid_until <= valid_from) {
+		return -EINVAL;
+	}
+
+	int rc = persondb_person_get(db, person_id, &p);
+
+	if (rc != 0) {
+		return rc;
+	}
+	if (p.valid_from == valid_from && p.valid_until == valid_until) {
+		return 0;
+	}
+	p.valid_from = valid_from;
+	p.valid_until = valid_until;
 	return person_store(db, &p);
 }
 
@@ -1000,18 +1437,17 @@ int persondb_stat(struct persondb *db, struct persondb_stat *out)
 	out->n_persons = db->sb.n_persons;
 	out->populated = db->sb.populated;
 	out->rev = db->sb.rev;
-	out->n_people_maps = db->sb.n_people_maps;
 
 	/* Read the geometry back rather than modelling it. Costs one or two
 	 * blob reads and no writes — the container reports only what it
 	 * already had to persist in order to work. */
 	struct map_info info;
 
-	if (db->ops->stat && db->ops->stat(db->sb.people_root[0], &info) == 0) {
+	if (db->ops->stat && db->ops->stat(db->people_root, &info) == 0) {
 		out->people_depth = info.depth;
 		out->people_buckets = info.buckets;
 	}
-	if (db->ops->stat && db->ops->stat(db->sb.cred_root, &info) == 0) {
+	if (db->ops->stat && db->ops->stat(db->cred_root, &info) == 0) {
 		out->cred_depth = info.depth;
 		out->cred_buckets = info.buckets;
 	}

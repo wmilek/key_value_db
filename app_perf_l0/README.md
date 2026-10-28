@@ -27,6 +27,7 @@ is the one parameter each L0 call has.
 | `erase` | **erase size** — blocks covered by one call | is a 16-block erase cheaper than sixteen 1-block erases? `blob_db_prepare()` does the latter, `blob_db_erase_all()` the former |
 | `erase1` | one block, repeated over every block in the region | the per-block anchor, and the **distribution** — each sample is emitted individually, because a model carries one number for erase and this is the spread that number stands in for |
 | `erase_erased` | one block that is already erased | does erasing blank flash cost anything less? `blob_db_prepare()` re-erases often enough that it is worth measuring rather than assuming |
+| `reprogram` | **programs per cell between erases** — 8 bit-by-bit programs of every byte of a page, one byte lane at a time, a 0→1 request, and one word hammered 10 000× | not a timing question but a correctness one: can a cell be programmed again without an erase, does only the 1→0 part land, and does anything else in the page or block move? `blob_db_erase_all()` and slot appends rely on it |
 
 Every read and write point is measured **three times** (`CONFIG_APP_PERF_L0_PASSES`).
 The reported cost is the mean; the extremes appear beside it as a `spread`
@@ -103,6 +104,35 @@ Two details exist because of writes specifically:
 > **This benchmark destroys `storage_partition`.** It erases and rewrites the
 > first `CONFIG_APP_PERF_L0_REGION_BLOCKS` blocks of it, repeatedly. Do not run
 > it on a device whose store you want to keep.
+
+### `reprogram`: programming without an erase
+
+Every other write phase writes each byte once per erase, because that is what
+the timing model describes. The stack does more than that: `blob_db_erase_all()`
+invalidates bucket headers by programming `0x00` over their magic, and
+`blob_db` appends slots into a 256 B page one partial program at a time. Both
+rely on something the `flash_area` API does not promise and the MX25R6435F
+datasheet does not quantify (it gives no partial-program limit per page, and
+does not say whether re-programming a cell is allowed): a cell can take many
+programs between erases, each one only clears bits, and nothing it did not ask
+to change moves.
+
+The phase checks that in the last block of the working region, against a
+shadow copy of what the block should hold, and reads back after every step:
+
+| test | what it does | fails if |
+|---|---|---|
+| `rp_page` | one page, every word programmed 8 times: `ff fe fc … 00`, one more bit cleared per round | any byte ≠ AND of everything programmed into it |
+| `rp_lane` | same, but each write changes **one byte** and writes `0xff` to the rest of its word | a lane written as `0xff` moves |
+| `rp_and` | `a5 0f 00 3c`, then `5a f0 ff ff`, then all `ff` | the result is not `old & new`, or the driver errors |
+| `rp_hammer` | one word, mixed `55 aa 0f f0`, programmed `CONFIG_APP_PERF_L0_REPROGRAM_REPS` times; its page is checked at every power of ten | a 1 bit in the word, or an erased neighbour, drifts to 0 (program disturb) |
+| `rp_block` | the whole 64 KB block | anything outside those four pages is not erased |
+
+The results go in `l0rp` records, with `l0rp_end mismatches=N verdict=PASS|FAIL`
+as the summary. A mismatch is a finding, not an I/O error, so it does not turn
+`l0end` non-zero and the sweep still produces a model. To run just this check
+(seconds instead of thirteen minutes), build with
+`-DCONFIG_APP_PERF_L0_REPROGRAM_ONLY=y`. `RESULTS.md` §8 has the DK results.
 
 ## Why the numbers look the way they do
 
@@ -344,6 +374,9 @@ separates them. `RESULTS.md` §5 has the scorecard.
 | `CONFIG_APP_PERF_L0_STEPS_PER_OCTAVE` | size samples per doubling (8): the resolution knob, and what places a cost step to within 9 % instead of a factor of 2 |
 | `CONFIG_APP_PERF_L0_PASSES` | timed passes per point (3): turns each row from a number into a number with a spread |
 | `CONFIG_APP_PERF_L0_PROGRAM_PAGE` | the part's program page (256 B on most SPI NOR); chooses the sizes for the page-program sweep. `flash_area` does not report it, so it has to be told; `0` skips that phase |
+| `CONFIG_APP_PERF_L0_REPROGRAM` | run the `reprogram` correctness check (default y) |
+| `CONFIG_APP_PERF_L0_REPROGRAM_REPS` | programs of one word in `rp_hammer` (10 000); each one costs about 0.11 ms on the DK |
+| `CONFIG_APP_PERF_L0_REPROGRAM_ONLY` | skip the timing sweeps and run only `reprogram`. The capture then cannot be fitted |
 
 On `native_sim` the app builds and runs in seconds, and
 `boards/native_sim.conf` turns on the simulator's own timing model so the sweep

@@ -974,6 +974,73 @@ ZTEST(blob_db, test_prepare_survives_remount)
 	zassert_equal(blob_db_prepare(4), 0);
 }
 
+/* maintain — the erases blob_db can do ahead of time, run when the caller
+ * can afford them. */
+ZTEST(blob_db, test_maintain_needs_mount)
+{
+	struct blob_db_maint_result res;
+
+	zassert_ok(blob_db_unmount());
+	zassert_equal(blob_db_maintain(1, &res), -ENODEV);
+}
+
+/* Budget 0 is a question, not a request; the result may be left out. */
+ZTEST(blob_db, test_maintain_budget_zero_only_reports)
+{
+	struct blob_db_maint_result res;
+
+	zassert_ok(blob_db_maintain(0, &res));
+	zassert_equal(res.performed, 0);
+	zassert_ok(blob_db_maintain(0, NULL));
+}
+
+/* Every compaction on UBI with atomic replace leaves the replaced block to
+ * reclaim, and nothing else erases it. maintain() drains that, and no blob
+ * reads differently afterwards, before or after a remount. On flash_area
+ * there is nothing to do. */
+ZTEST(blob_db, test_maintain_drains_and_keeps_data)
+{
+	struct blob_db_maint_result res;
+	uint64_t id = put_blob("v0000", 5);
+	char val[8];
+
+	for (int i = 0; i < 500; i++) {
+		(void)snprintk(val, sizeof(val), "v%04d", i);
+		zassert_ok(blob_db_update(id, val, 5), "update #%d failed", i);
+	}
+
+	zassert_ok(blob_db_maintain(0, &res));
+	if (IS_ENABLED(CONFIG_BLOB_DB_BACKEND_UBI) &&
+	    IS_ENABLED(CONFIG_BLOB_DB_UBI_ATOMIC_REPLACE)) {
+		zassert_true(res.more, "500 rebinds left nothing to reclaim");
+		zassert_ok(blob_db_maintain(1, &res));
+		zassert_equal(res.performed, 1);
+	} else if (IS_ENABLED(CONFIG_BLOB_DB_BACKEND_FLASH_AREA)) {
+		zassert_false(res.more);
+	}
+
+	int steps = 0;
+
+	do {
+		zassert_ok(blob_db_maintain(1, &res));
+		zassert_true(++steps < 4096, "maintain never runs out of work");
+	} while (res.more);
+
+	uint8_t buf[16];
+	size_t got;
+
+	zassert_ok(blob_db_get(id, buf, sizeof(buf), &got));
+	zassert_equal(got, 5);
+	zassert_mem_equal(buf, "v0499", 5);
+
+	zassert_ok(blob_db_unmount());
+	zassert_ok(blob_db_mount());
+	zassert_ok(blob_db_get(id, buf, sizeof(buf), &got));
+	zassert_mem_equal(buf, "v0499", 5);
+	zassert_ok(blob_db_maintain(0, &res));
+	zassert_false(res.more, "work came back on remount");
+}
+
 
 /* --- on-flash format compatibility --------------------------------------
  *

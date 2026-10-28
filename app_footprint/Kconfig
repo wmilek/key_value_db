@@ -1,0 +1,13 @@
+# app_footprint — Kconfig entry point.
+#
+# Copyright (c) 2026
+# SPDX-License-Identifier: Apache-2.0
+#
+# The app has no options of its own. Which layers it links is decided by the
+# libraries' own symbols (CONFIG_FLASH_MAP, CONFIG_UBI, CONFIG_BLOB_DB,
+# CONFIG_BLOB_ROOTREG, CONFIG_BLOB_CONTAINER_*, CONFIG_BLOBDB_KVDB,
+# CONFIG_BLOBDB_BLOBFS), set by the fragments in stages/ and variants/.
+
+menu "Zephyr"
+source "Kconfig.zephyr"
+endmenu

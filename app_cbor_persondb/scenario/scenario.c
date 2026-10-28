@@ -92,14 +92,19 @@ int scenario_close(struct scenario *s)
 	return 0;
 }
 
-int scenario_erase(struct scenario *s)
+int scenario_reset(struct scenario *s)
 {
-	int rc = persondb_erase(&s->db, N_PERSONS);
+	int rc = persondb_destroy(&s->db);
 
-	if (rc == 0) {
-		s->n_persons = N_PERSONS;
+	if (rc != 0) {
+		return rc;
 	}
-	return rc;
+	return scenario_open(s);
+}
+
+int scenario_destroy(struct scenario *s)
+{
+	return persondb_destroy(&s->db);
 }
 
 int scenario_prepare(struct scenario *s, int *buckets_formatted, int64_t *ms)
@@ -303,6 +308,19 @@ int scenario_mutate(struct scenario *s, struct scenario_mutate_report *out)
 		}
 		dataset_card(idx, DATASET_TEMP_CARD_SLOT, card);
 		rc = persondb_card_assign(s->db, dataset_id_of(idx), card);
+		if (rc == -ENOENT || rc == -ENOSPC || rc == -EEXIST) {
+			/* A hand edit (persondb tui) made this person's generated
+			 * state unreachable: deleted (-ENOENT), given a fifth card
+			 * by hand so the temporary one has no slot (-ENOSPC), or
+			 * the temporary card's id assigned to someone else
+			 * (-EEXIST). The dataset never produces any of these.
+			 * Skipped rather than fatal, or every round whose subset
+			 * includes this person would fail forever. */
+			LOG_WRN("mutate: %s for index %u skipped: %d", card, idx,
+				rc);
+			out->skipped++;
+			continue;
+		}
 		if (rc != 0) {
 			LOG_ERR("assign %s: %d", card, rc);
 			goto done;
@@ -483,10 +501,12 @@ int scenario_report_get(struct scenario *s, struct scenario_report *out)
 	persondb_stat(s->db, &out->st);
 	persondb_progress_get(s->db, &populated, &rev);
 
-	/* Re-derive the content and add it up. There is no iteration (K6) and
-	 * no occupancy query (B3), so this is the only route — and it works
-	 * only because the dataset is a pure function of its index. A real
-	 * deployment, whose data comes from outside, could not do this at all. */
+	/* Re-derive the content and add it up. This predates map_ops.next
+	 * (K6, since closed) and there is still no occupancy query (B3); it
+	 * works only because the dataset is a pure function of its index. A
+	 * real deployment, whose data comes from outside, would instead walk
+	 * its maps with map_ops.next. Persons added by hand (persondb tui)
+	 * are not in this figure. */
 	for (uint32_t i = 0; i < populated; i++) {
 		dataset_person(i, rev, s->n_persons, &p);
 		person_bytes += persondb_person_record_bytes(&p) +
@@ -539,6 +559,11 @@ int scenario_person_show(struct scenario *s, uint32_t index,
 uint32_t scenario_index_of(uint32_t person_id)
 {
 	return dataset_index_of(person_id);
+}
+
+uint32_t scenario_id_of(uint32_t index)
+{
+	return dataset_id_of(index);
 }
 
 int scenario_card_of(struct scenario *s, uint32_t index, uint8_t slot,

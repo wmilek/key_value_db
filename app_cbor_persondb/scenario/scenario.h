@@ -52,8 +52,12 @@ int64_t scenario_since_us(int64_t since_us);
 int scenario_open(struct scenario *s);
 int scenario_close(struct scenario *s);
 
-/** Drop everything and start over (CONFIG_..._FRESH_START, or `reset`). */
-int scenario_erase(struct scenario *s);
+/** Destroy this store and build an empty one (`scenario reset`). */
+int scenario_reset(struct scenario *s);
+
+/** Destroy this store and leave none (`persondb destroy`); s->db is NULL
+ *  afterwards, success or not. */
+int scenario_destroy(struct scenario *s);
 
 /* -- population --------------------------------------------------------- */
 
@@ -201,11 +205,13 @@ struct scenario_report {
 /**
  * @brief Account for what the store holds.
  *
- * Computed from the generator, not from the store: there is no iteration
- * (FINDINGS.md K6) and no occupancy query (B3), so the only way an
- * application can say how full its flash is, is to re-derive its own content
- * and add it up. Physical occupancy — live bytes plus uncompacted garbage —
- * stays unobservable.
+ * Computed from the generator, not from the store. This was written when
+ * there was no iteration (FINDINGS.md K6) and no occupancy query (B3), so
+ * re-deriving its own content and adding it up was the only way an
+ * application could say how full its flash is. K6 has since closed —
+ * map_ops.next could walk the maps and add up what is actually stored — but
+ * this function has not been changed to do so. Physical occupancy — live
+ * bytes plus uncompacted garbage — stays unobservable either way (B3).
  */
 int scenario_report_get(struct scenario *s, struct scenario_report *out);
 
@@ -225,6 +231,9 @@ int scenario_card_of(struct scenario *s, uint32_t index, uint8_t slot,
  * straight to the bottom one.
  */
 uint32_t scenario_index_of(uint32_t person_id);
+
+/** The person id of dataset index @p index — the forward direction. */
+uint32_t scenario_id_of(uint32_t index);
 
 #ifdef __cplusplus
 }

@@ -1,0 +1,785 @@
+{
+ "schema": "persondb-perf/1",
+ "generated": "2026-10-28T11:21:42+00:00",
+ "source": {
+  "kind": "capture",
+  "board": "nrf5340dk/nrf5340/cpuapp",
+  "files": [
+   "/home/wmilek/src/key_value_db_hw_validator/kvdb_scale/app_cbor_persondb/results/dk-scale/b2-n2000-0c441f0-20261028T110933Z-run1.log",
+   "/home/wmilek/src/key_value_db_hw_validator/kvdb_scale/app_cbor_persondb/results/dk-scale/b2-n2000-0c441f0-20261028T110933Z-run2.log",
+   "/home/wmilek/src/key_value_db_hw_validator/kvdb_scale/app_cbor_persondb/results/dk-scale/b2-n2000-0c441f0-20261028T110933Z-run3.log"
+  ]
+ },
+ "models": {
+  "ubi-v0.1.0": {
+   "label": "nRF5340-DK, UBI backend on zephyr-ubi v0.1.0 (the default)",
+   "txn_us": 75.0,
+   "byte_us": 0.63,
+   "cbor_us": 950.0,
+   "source": "app_perf_blob_db/RESULTS.md: flash_area 65 us/transaction and 0.63 us/B (run 2), plus UBI v0.1.0's 7-13 us per access (midpoint 10); cbor from app_cbor_persondb/RESULTS.md \u00a75g"
+  },
+  "ubi-fork": {
+   "label": "nRF5340-DK, UBI backend on the old wmilek/ubi fork",
+   "txn_us": 178.0,
+   "byte_us": 0.616,
+   "cbor_us": 950.0,
+   "source": "app_cbor_persondb/RESULTS.md \u00a75c, validated in \u00a75e/\u00a75f"
+  },
+  "flash_area": {
+   "label": "nRF5340-DK, raw flash_area backend",
+   "txn_us": 65.0,
+   "byte_us": 0.63,
+   "cbor_us": 950.0,
+   "source": "app_perf_blob_db/RESULTS.md run 2; FINDINGS.md N1"
+  }
+ },
+ "runs": [
+  {
+   "zephyr": "4a405846193f",
+   "app_version": "1.0.0",
+   "persons": 2000,
+   "credentials": 4979,
+   "kind": "fill",
+   "phases": {
+    "open": {
+     "ms": 143881
+    },
+    "prepare": {
+     "ms": 86684,
+     "buckets": 82
+    },
+    "fill": {
+     "ms": 173225,
+     "written": 2000,
+     "populated": 2000,
+     "target": 2000,
+     "commits": 8
+    },
+    "verify": {
+     "ms": 14626,
+     "persons": 256,
+     "cards": 623
+    },
+    "mutate": {
+     "ms": 10142,
+     "rev_from": 0,
+     "rev_to": 1,
+     "revoked": 0,
+     "assigned": 64
+    },
+    "reverify": {
+     "ms": 14989,
+     "persons": 256,
+     "cards": 631
+    }
+   },
+   "bench": {
+    "check": {
+     "ops": 200,
+     "us": 6873382,
+     "store_ops": 400,
+     "flash_ops": 85653,
+     "flash_bytes": 1817808,
+     "measured": true,
+     "amp": 22,
+     "io": {
+      "reads": 85653,
+      "bytes_read": 1817808,
+      "writes": 0,
+      "bytes_written": 0,
+      "erases": 0,
+      "bytes_erased": 0
+     },
+     "decisions": {
+      "granted": 199,
+      "denied": 0,
+      "unknown": 0,
+      "expired": 1
+     }
+    },
+    "byid": {
+     "ops": 200,
+     "us": 3624298,
+     "store_ops": 200,
+     "flash_ops": 41939,
+     "flash_bytes": 1154374,
+     "measured": true,
+     "amp": 15,
+     "io": {
+      "reads": 41939,
+      "bytes_read": 1154374,
+      "writes": 0,
+      "bytes_written": 0,
+      "erases": 0,
+      "bytes_erased": 0
+     }
+    },
+    "miss": {
+     "ops": 200,
+     "us": 3322448,
+     "store_ops": 200,
+     "flash_ops": 43473,
+     "flash_bytes": 654171,
+     "measured": true,
+     "amp": 142,
+     "io": {
+      "reads": 43473,
+      "bytes_read": 654171,
+      "writes": 0,
+      "bytes_written": 0,
+      "erases": 0,
+      "bytes_erased": 0
+     }
+    },
+    "put": {
+     "ops": 200,
+     "us": 43194763,
+     "store_ops": 906,
+     "flash_ops": 247875,
+     "flash_bytes": 7182443,
+     "measured": true,
+     "amp": 81,
+     "io": {
+      "reads": 247145,
+      "bytes_read": 5406531,
+      "writes": 718,
+      "bytes_written": 991016,
+      "erases": 12,
+      "bytes_erased": 784896
+     }
+    },
+    "cbor": {
+     "ops": 200,
+     "us": 191650,
+     "store_ops": 0,
+     "flash_ops": 0,
+     "flash_bytes": 0,
+     "measured": true,
+     "amp": 0,
+     "io": {
+      "reads": 0,
+      "bytes_read": 0,
+      "writes": 0,
+      "bytes_written": 0,
+      "erases": 0,
+      "bytes_erased": 0
+     }
+    }
+   },
+   "store": {
+    "partition_bytes": 8388608,
+    "people_depth": 2,
+    "people_buckets": 256,
+    "cred_depth": 2,
+    "cred_buckets": 256,
+    "populated": 2000,
+    "n_persons": 2000,
+    "credentials": 4979,
+    "mean_entry": 433,
+    "live_bytes": 866385,
+    "fill_pct": 10.3,
+    "overflows": 0,
+    "rev": 1
+   },
+   "created": {
+    "persons": 2000,
+    "people_depth": 2,
+    "people_buckets": 256,
+    "cred_depth": 2,
+    "cred_buckets": 256
+   },
+   "verify_pass": 2,
+   "status": "ok",
+   "error": null,
+   "label": "b2-n2000-0c441f0",
+   "log": "/home/wmilek/src/key_value_db_hw_validator/kvdb_scale/app_cbor_persondb/results/dk-scale/b2-n2000-0c441f0-20261028T110933Z-run1.log"
+  },
+  {
+   "zephyr": "4a405846193f",
+   "app_version": "1.0.0",
+   "persons": 2000,
+   "credentials": 4979,
+   "kind": "steady",
+   "phases": {
+    "open": {
+     "ms": 539
+    },
+    "prepare": {
+     "ms": 9,
+     "buckets": 0
+    },
+    "fill": {
+     "ms": 0,
+     "written": 0,
+     "populated": 2000,
+     "target": 2000,
+     "commits": 0
+    },
+    "verify": {
+     "ms": 15507,
+     "persons": 256,
+     "cards": 631
+    },
+    "mutate": {
+     "ms": 25059,
+     "rev_from": 1,
+     "rev_to": 2,
+     "revoked": 64,
+     "assigned": 64
+    },
+    "reverify": {
+     "ms": 13685,
+     "persons": 256,
+     "cards": 631
+    }
+   },
+   "bench": {
+    "check": {
+     "ops": 200,
+     "us": 5856049,
+     "store_ops": 400,
+     "flash_ops": 70997,
+     "flash_bytes": 1641517,
+     "measured": true,
+     "amp": 20,
+     "io": {
+      "reads": 70997,
+      "bytes_read": 1641517,
+      "writes": 0,
+      "bytes_written": 0,
+      "erases": 0,
+      "bytes_erased": 0
+     },
+     "decisions": {
+      "granted": 199,
+      "denied": 0,
+      "unknown": 0,
+      "expired": 1
+     }
+    },
+    "byid": {
+     "ops": 200,
+     "us": 2581329,
+     "store_ops": 200,
+     "flash_ops": 27181,
+     "flash_bytes": 977158,
+     "measured": true,
+     "amp": 12,
+     "io": {
+      "reads": 27181,
+      "bytes_read": 977158,
+      "writes": 0,
+      "bytes_written": 0,
+      "erases": 0,
+      "bytes_erased": 0
+     }
+    },
+    "miss": {
+     "ops": 200,
+     "us": 3309845,
+     "store_ops": 200,
+     "flash_ops": 43069,
+     "flash_bytes": 649070,
+     "measured": true,
+     "amp": 141,
+     "io": {
+      "reads": 43069,
+      "bytes_read": 649070,
+      "writes": 0,
+      "bytes_written": 0,
+      "erases": 0,
+      "bytes_erased": 0
+     }
+    },
+    "put": {
+     "ops": 200,
+     "us": 45489990,
+     "store_ops": 906,
+     "flash_ops": 213540,
+     "flash_bytes": 7581484,
+     "measured": true,
+     "amp": 86,
+     "io": {
+      "reads": 212798,
+      "bytes_read": 5386020,
+      "writes": 724,
+      "bytes_written": 1018120,
+      "erases": 18,
+      "bytes_erased": 1177344
+     }
+    },
+    "cbor": {
+     "ops": 200,
+     "us": 191529,
+     "store_ops": 0,
+     "flash_ops": 0,
+     "flash_bytes": 0,
+     "measured": true,
+     "amp": 0,
+     "io": {
+      "reads": 0,
+      "bytes_read": 0,
+      "writes": 0,
+      "bytes_written": 0,
+      "erases": 0,
+      "bytes_erased": 0
+     }
+    }
+   },
+   "store": {
+    "partition_bytes": 8388608,
+    "people_depth": 2,
+    "people_buckets": 256,
+    "cred_depth": 2,
+    "cred_buckets": 256,
+    "populated": 2000,
+    "n_persons": 2000,
+    "credentials": 4979,
+    "mean_entry": 433,
+    "live_bytes": 866385,
+    "fill_pct": 10.3,
+    "overflows": 0,
+    "rev": 2
+   },
+   "created": null,
+   "verify_pass": 2,
+   "status": "ok",
+   "error": null,
+   "label": "b2-n2000-0c441f0",
+   "log": "/home/wmilek/src/key_value_db_hw_validator/kvdb_scale/app_cbor_persondb/results/dk-scale/b2-n2000-0c441f0-20261028T110933Z-run2.log"
+  },
+  {
+   "zephyr": "4a405846193f",
+   "app_version": "1.0.0",
+   "persons": 2000,
+   "credentials": 4979,
+   "kind": "steady",
+   "phases": {
+    "open": {
+     "ms": 817
+    },
+    "prepare": {
+     "ms": 9,
+     "buckets": 0
+    },
+    "fill": {
+     "ms": 0,
+     "written": 0,
+     "populated": 2000,
+     "target": 2000,
+     "commits": 0
+    },
+    "verify": {
+     "ms": 13750,
+     "persons": 256,
+     "cards": 631
+    },
+    "mutate": {
+     "ms": 20798,
+     "rev_from": 2,
+     "rev_to": 3,
+     "revoked": 64,
+     "assigned": 64
+    },
+    "reverify": {
+     "ms": 9856,
+     "persons": 256,
+     "cards": 631
+    }
+   },
+   "bench": {
+    "check": {
+     "ops": 200,
+     "us": 4527314,
+     "store_ops": 400,
+     "flash_ops": 52520,
+     "flash_bytes": 1420440,
+     "measured": true,
+     "amp": 17,
+     "io": {
+      "reads": 52520,
+      "bytes_read": 1420440,
+      "writes": 0,
+      "bytes_written": 0,
+      "erases": 0,
+      "bytes_erased": 0
+     },
+     "decisions": {
+      "granted": 199,
+      "denied": 0,
+      "unknown": 0,
+      "expired": 1
+     }
+    },
+    "byid": {
+     "ops": 200,
+     "us": 2463531,
+     "store_ops": 200,
+     "flash_ops": 25554,
+     "flash_bytes": 957844,
+     "measured": true,
+     "amp": 12,
+     "io": {
+      "reads": 25554,
+      "bytes_read": 957844,
+      "writes": 0,
+      "bytes_written": 0,
+      "erases": 0,
+      "bytes_erased": 0
+     }
+    },
+    "miss": {
+     "ops": 200,
+     "us": 2172882,
+     "store_ops": 200,
+     "flash_ops": 27265,
+     "flash_bytes": 459537,
+     "measured": true,
+     "amp": 99,
+     "io": {
+      "reads": 27265,
+      "bytes_read": 459537,
+      "writes": 0,
+      "bytes_written": 0,
+      "erases": 0,
+      "bytes_erased": 0
+     }
+    },
+    "put": {
+     "ops": 200,
+     "us": 37089630,
+     "store_ops": 906,
+     "flash_ops": 153047,
+     "flash_bytes": 6287051,
+     "measured": true,
+     "amp": 71,
+     "io": {
+      "reads": 152313,
+      "bytes_read": 4399979,
+      "writes": 720,
+      "bytes_written": 971360,
+      "erases": 14,
+      "bytes_erased": 915712
+     }
+    },
+    "cbor": {
+     "ops": 200,
+     "us": 191620,
+     "store_ops": 0,
+     "flash_ops": 0,
+     "flash_bytes": 0,
+     "measured": true,
+     "amp": 0,
+     "io": {
+      "reads": 0,
+      "bytes_read": 0,
+      "writes": 0,
+      "bytes_written": 0,
+      "erases": 0,
+      "bytes_erased": 0
+     }
+    }
+   },
+   "store": {
+    "partition_bytes": 8388608,
+    "people_depth": 2,
+    "people_buckets": 256,
+    "cred_depth": 2,
+    "cred_buckets": 256,
+    "populated": 2000,
+    "n_persons": 2000,
+    "credentials": 4979,
+    "mean_entry": 433,
+    "live_bytes": 866385,
+    "fill_pct": 10.3,
+    "overflows": 0,
+    "rev": 3
+   },
+   "created": null,
+   "verify_pass": 2,
+   "status": "ok",
+   "error": null,
+   "label": "b2-n2000-0c441f0",
+   "log": "/home/wmilek/src/key_value_db_hw_validator/kvdb_scale/app_cbor_persondb/results/dk-scale/b2-n2000-0c441f0-20261028T110933Z-run3.log"
+  }
+ ],
+ "points": [
+  {
+   "persons": 2000,
+   "credentials": 4979,
+   "status": "ok",
+   "runs": 3,
+   "steady_runs": 2,
+   "store": {
+    "partition_bytes": 8388608,
+    "people_depth": 2,
+    "people_buckets": 256,
+    "cred_depth": 2,
+    "cred_buckets": 256,
+    "populated": 2000,
+    "n_persons": 2000,
+    "credentials": 4979,
+    "mean_entry": 433,
+    "live_bytes": 866385,
+    "fill_pct": 10.3,
+    "overflows": 0,
+    "rev": 3
+   },
+   "created": {
+    "persons": 2000,
+    "people_depth": 2,
+    "people_buckets": 256,
+    "cred_depth": 2,
+    "cred_buckets": 256
+   },
+   "fill": {
+    "ms": 173225,
+    "written": 2000,
+    "ms_per_person": 86.6125,
+    "commits": 8
+   },
+   "phases": {
+    "open": {
+     "ms": 143881
+    },
+    "prepare": {
+     "ms": 86684,
+     "buckets": 82
+    },
+    "verify": {
+     "ms": 14626,
+     "persons": 256,
+     "cards": 623
+    },
+    "mutate": {
+     "ms": 10142,
+     "rev_from": 0,
+     "rev_to": 1,
+     "revoked": 0,
+     "assigned": 64
+    },
+    "reverify": {
+     "ms": 14989,
+     "persons": 256,
+     "cards": 631
+    }
+   },
+   "bench": {
+    "check": {
+     "us_per_op": 29280.245,
+     "ops_per_s": 34.15271969206542,
+     "store_ops": 2.0,
+     "flash_ops": 354.985,
+     "flash_bytes": 8207.585,
+     "amp": 20,
+     "reads": 354.985,
+     "bytes_read": 8207.585,
+     "writes": 0.0,
+     "bytes_written": 0.0,
+     "erases": 0.0,
+     "bytes_erased": 0.0,
+     "spread_us_per_op": [
+      22636.57,
+      34366.91
+     ],
+     "spread_flash_ops": [
+      262.6,
+      428.265
+     ],
+     "spread_flash_bytes": [
+      7102.2,
+      9089.04
+     ],
+     "spread_erases": [
+      0.0,
+      0.0
+     ],
+     "samples": 200,
+     "runs": 3
+    },
+    "byid": {
+     "us_per_op": 12906.645,
+     "ops_per_s": 77.47946890923241,
+     "store_ops": 1.0,
+     "flash_ops": 135.905,
+     "flash_bytes": 4885.79,
+     "amp": 12,
+     "reads": 135.905,
+     "bytes_read": 4885.79,
+     "writes": 0.0,
+     "bytes_written": 0.0,
+     "erases": 0.0,
+     "bytes_erased": 0.0,
+     "spread_us_per_op": [
+      12317.655,
+      18121.49
+     ],
+     "spread_flash_ops": [
+      127.77,
+      209.695
+     ],
+     "spread_flash_bytes": [
+      4789.22,
+      5771.87
+     ],
+     "spread_erases": [
+      0.0,
+      0.0
+     ],
+     "samples": 200,
+     "runs": 3
+    },
+    "miss": {
+     "us_per_op": 16549.225,
+     "ops_per_s": 60.42579033157142,
+     "store_ops": 1.0,
+     "flash_ops": 215.345,
+     "flash_bytes": 3245.35,
+     "amp": 141,
+     "reads": 215.345,
+     "bytes_read": 3245.35,
+     "writes": 0.0,
+     "bytes_written": 0.0,
+     "erases": 0.0,
+     "bytes_erased": 0.0,
+     "spread_us_per_op": [
+      10864.41,
+      16612.24
+     ],
+     "spread_flash_ops": [
+      136.325,
+      217.365
+     ],
+     "spread_flash_bytes": [
+      2297.685,
+      3270.855
+     ],
+     "spread_erases": [
+      0.0,
+      0.0
+     ],
+     "samples": 200,
+     "runs": 3
+    },
+    "put": {
+     "us_per_op": 215973.815,
+     "ops_per_s": 4.6301909330999225,
+     "store_ops": 4.53,
+     "flash_ops": 1067.7,
+     "flash_bytes": 35912.215,
+     "amp": 81,
+     "reads": 1063.99,
+     "bytes_read": 26930.1,
+     "writes": 3.6,
+     "bytes_written": 4955.08,
+     "erases": 0.07,
+     "bytes_erased": 4578.56,
+     "spread_us_per_op": [
+      185448.15,
+      227449.95
+     ],
+     "spread_flash_ops": [
+      765.235,
+      1239.375
+     ],
+     "spread_flash_bytes": [
+      31435.255,
+      37907.42
+     ],
+     "spread_erases": [
+      0.06,
+      0.09
+     ],
+     "samples": 200,
+     "runs": 3
+    },
+    "cbor": {
+     "us_per_op": 958.1,
+     "ops_per_s": 1043.7323870159692,
+     "store_ops": 0.0,
+     "flash_ops": 0.0,
+     "flash_bytes": 0.0,
+     "amp": 0,
+     "reads": 0.0,
+     "bytes_read": 0.0,
+     "writes": 0.0,
+     "bytes_written": 0.0,
+     "erases": 0.0,
+     "bytes_erased": 0.0,
+     "spread_us_per_op": [
+      957.645,
+      958.25
+     ],
+     "spread_flash_ops": [
+      0.0,
+      0.0
+     ],
+     "spread_flash_bytes": [
+      0.0,
+      0.0
+     ],
+     "spread_erases": [
+      0.0,
+      0.0
+     ],
+     "samples": 200,
+     "runs": 3
+    }
+   }
+  }
+ ],
+ "dk": {
+  "board": {
+   "label": "b2",
+   "serial_number": "1050091053",
+   "target": "nrf5340dk/nrf5340/cpuapp",
+   "console": "/dev/ttyACM5"
+  },
+  "commit": "0c441f0",
+  "base": "501bd3f",
+  "local_changes": [
+   "0c441f0 DK-local: print UBI erase-counter state at attach (not for upstream)",
+   "b6704ab app_cbor_persondb: perf_sweep.py \u2014 performance across credential counts"
+  ],
+  "persons": 2000,
+  "samples": 200,
+  "steady_runs": 2,
+  "clean_start": "FRESH_START: blob_db_erase_all(); UBI device kept",
+  "started": "20261028T110933Z",
+  "boots": [
+   {
+    "run": 1,
+    "how": "program",
+    "image": "n2000-fresh",
+    "log": "b2-n2000-0c441f0-20261028T110933Z-run1.log",
+    "status": "done",
+    "started": "2026-10-28T11:09:33+00:00",
+    "wall_s": 510.2,
+    "ubi_ec": "image_seq=1829456762 rev=2 pebs=128 healthy=128 free=0 reclaimable=6 bad=0 corrupt=0 ec_min=2 ec_max=16 ec_total=1909",
+    "kind": "fill"
+   },
+   {
+    "run": 2,
+    "how": "program",
+    "image": "n2000-steady",
+    "log": "b2-n2000-0c441f0-20261028T110933Z-run2.log",
+    "status": "done",
+    "started": "2026-10-28T11:18:03+00:00",
+    "wall_s": 121.6,
+    "ubi_ec": "image_seq=1829456762 rev=2 pebs=128 healthy=128 free=0 reclaimable=6 bad=0 corrupt=0 ec_min=2 ec_max=19 ec_total=2165",
+    "kind": "steady"
+   },
+   {
+    "run": 3,
+    "how": "reset",
+    "image": null,
+    "log": "b2-n2000-0c441f0-20261028T110933Z-run3.log",
+    "status": "done",
+    "started": "2026-10-28T11:20:04+00:00",
+    "wall_s": 97.2,
+    "ubi_ec": "image_seq=1829456762 rev=2 pebs=128 healthy=128 free=0 reclaimable=6 bad=0 corrupt=0 ec_min=2 ec_max=19 ec_total=2195",
+    "kind": "steady"
+   }
+  ]
+ }
+}

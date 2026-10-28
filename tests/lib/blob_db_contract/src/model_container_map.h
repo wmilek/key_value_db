@@ -50,13 +50,16 @@ enum mc_crash_point {
 #define MC_STOPPED  1
 
 /* Open the container rooted at `root_id`, creating it if the id is
- * allocated-but-unbound (the registry-§7 "creation in progress" state), and
- * running intent recovery (§6) if a mutation was interrupted. The caller
+ * allocated-but-unbound (the registry-§7 "creation in progress" state) or
+ * bound to an empty payload (BLOB_DB_ROOT_ID on a fresh store), running
+ * intent recovery (§6) if a mutation was interrupted, and giving the list
+ * a fresh intent blob if create or destroy stopped without one. The caller
  * owns the id's persistence (root registry, direct id-1 binding, ...).
  * Idempotent — safe to call on every mount. */
 int mc_open(uint64_t root_id);
 
-/* Look up a key. Returns 0 and fills out/out_len on hit, -ENOENT on miss. */
+/* Look up a key. Returns 0 and fills out/out_len on hit, -ENOENT on miss,
+ * or the error of a key or value read that failed. */
 int mc_get(const char *key, void *out, size_t out_sz, size_t *out_len);
 
 /* Insert or overwrite key -> value. `crash_at` injects a stop point (§5);
@@ -78,10 +81,16 @@ int mc_del(const char *key, enum mc_crash_point crash_at);
  * abort path with no remount. One-shot; MC_STEP_NONE disarms. */
 void mc_fail_after(enum mc_crash_point step, int err);
 
+/* Test hook: make the next key read during a lookup return `err` instead
+ * of reading, as a flash error would. One-shot; 0 disarms. */
+void mc_fail_key_read(int err);
+
 /* Tear the container down entirely: delete every key/value blob, the intent
  * blob, and finally the list root. After this the container does not exist —
  * the root id is dead (never reused) and every mc_* call fails with -ENODEV
- * until a fresh mc_open(). The client completes the cleanup by dropping its
+ * until a fresh mc_open(). A root of BLOB_DB_ROOT_ID cannot be deleted, so
+ * it is reset to an empty payload instead; mc_open() on it then creates a
+ * fresh container. The client completes the cleanup by dropping its
  * record of the root id (rootreg_unregister) AFTER this returns — teardown
  * before unregistration, per l1_root_registry.md §8.
  *

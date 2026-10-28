@@ -83,6 +83,7 @@ static void before(void *f)
 {
 	ARG_UNUSED(f);
 	mc_fail_after(MC_STEP_NONE, 0);
+	mc_fail_key_read(0);
 	blob_db_unmount();
 	zassert_ok(blob_db_mount());
 	fresh_container();
@@ -315,6 +316,150 @@ ZTEST(blob_db_contract, test_destroy_empty_container)
 
 	open_container();           /* fresh container, fresh id */
 	assert_no_leak();
+}
+
+/* --- create / destroy interrupted between root and intent ------------- */
+
+/* The intent id the list root names, read straight from the root payload. */
+static uint64_t root_intent_id(uint64_t root)
+{
+	uint8_t buf[CONFIG_BLOB_DB_MAX_PAYLOAD_LEN];
+	size_t got;
+	uint64_t id;
+
+	zassert_ok(blob_db_get(root, buf, sizeof(buf), &got));
+	memcpy(&id, buf, sizeof(id));
+	return id;
+}
+
+/* Create commits the root first, naming an intent id it has not bound yet.
+ * A crash right there must leave no residue: the next open gives the list
+ * a fresh intent blob and never binds the one the root named. */
+ZTEST(blob_db_contract, test_create_crash_before_intent)
+{
+	uint64_t root;
+
+	zassert_ok(blob_db_format());
+	zassert_ok(rootreg_init());
+	zassert_ok(rootreg_get_or_create(MC_ROOTREG_KEY, &root));
+
+	/* The state create leaves when it stops after its commit: an empty
+	 * list naming an intent id that was allocated and never bound. */
+	uint64_t unbound = blob_db_alloc_id();
+	uint8_t img[12] = { 0 };
+
+	zassert_not_equal(unbound, BLOB_DB_INVALID_ID);
+	memcpy(img, &unbound, sizeof(unbound));
+	zassert_ok(blob_db_update(root, img, sizeof(img)));
+
+	crash_and_recover();
+
+	zassert_false(blob_db_exists(unbound), "named intent id was bound");
+	zassert_not_equal(root_intent_id(root), unbound);
+	assert_no_leak();
+
+	char buf[16];
+
+	zassert_ok(mc_set("foo", "bar", 3, MC_STEP_NONE));
+	zassert_ok(get_str("foo", buf, sizeof(buf)));
+	zassert_str_equal(buf, "bar");
+	assert_no_leak();
+}
+
+/* Destroy deletes the intent before the root. A crash between the two must
+ * not leave the container unopenable: open repairs it and destroy reruns. */
+ZTEST(blob_db_contract, test_destroy_crash_before_root)
+{
+	uint64_t root;
+
+	zassert_ok(mc_set("foo", "bar", 3, MC_STEP_NONE));
+	zassert_ok(rootreg_get(MC_ROOTREG_KEY, &root));
+
+	/* Intent gone, root still bound — as when destroy stops between the
+	 * two. (Destroy would have deleted the entries too; open does not
+	 * care, and the rerun tolerates either.) */
+	zassert_ok(blob_db_delete(root_intent_id(root)));
+
+	crash_and_recover();
+
+	zassert_ok(mc_destroy());
+	zassert_ok(rootreg_unregister(MC_ROOTREG_KEY));
+	zassert_equal(blob_db_count(), 1,
+		      "want registry only, got %zu blobs", blob_db_count());
+}
+
+/* --- an unreadable key is not an absent key ---------------------------- */
+
+/* Lookups skip only a key that answers -ENOENT. Any other read error
+ * reaches the caller before anything is written — above all it never
+ * turns an overwrite into the insert of a second entry for the key. */
+ZTEST(blob_db_contract, test_key_read_error_propagates)
+{
+	char buf[16];
+	size_t n;
+
+	zassert_ok(mc_set("foo", "bar", 3, MC_STEP_NONE));
+
+	mc_fail_key_read(-EIO);
+	zassert_equal(mc_set("foo", "baz", 3, MC_STEP_NONE), -EIO);
+	zassert_ok(mc_entry_count(&n));
+	zassert_equal(n, 1, "an unreadable key was inserted again");
+	zassert_ok(get_str("foo", buf, sizeof(buf)));
+	zassert_str_equal(buf, "bar");
+	assert_no_leak();
+
+	mc_fail_key_read(-EIO);
+	zassert_equal(get_str("foo", buf, sizeof(buf)), -EIO);
+
+	mc_fail_key_read(-EIO);
+	zassert_equal(mc_del("foo", MC_STEP_NONE), -EIO);
+	zassert_ok(get_str("foo", buf, sizeof(buf)));
+	zassert_str_equal(buf, "bar");
+	assert_no_leak();
+}
+
+/* --- direct id-1 binding ------------------------------------------------ */
+
+/* A client without a registry may build the list at BLOB_DB_ROOT_ID itself.
+ * That id is never unbound — a fresh store binds it empty — so an empty
+ * payload must read as "create now", and destroy must reset it to empty
+ * instead of deleting it. */
+ZTEST(blob_db_contract, test_direct_root_binding)
+{
+	char buf[16];
+
+	zassert_ok(blob_db_format());   /* id 1 bound, empty; no registry */
+	zassert_ok(mc_open(BLOB_DB_ROOT_ID));
+	zassert_ok(mc_set("foo", "bar", 3, MC_STEP_NONE));
+
+	zassert_ok(blob_db_unmount());
+	zassert_ok(blob_db_mount());
+	zassert_ok(mc_open(BLOB_DB_ROOT_ID));
+	zassert_ok(get_str("foo", buf, sizeof(buf)));
+	zassert_str_equal(buf, "bar");
+	/* id 1 (list root) + intent + key + value */
+	zassert_equal(blob_db_count(), 4, "got %zu blobs", blob_db_count());
+
+	zassert_ok(mc_destroy());
+	zassert_true(blob_db_exists(BLOB_DB_ROOT_ID));
+	zassert_equal(blob_db_count(), 1, "got %zu blobs", blob_db_count());
+
+	zassert_ok(mc_open(BLOB_DB_ROOT_ID));   /* fresh container */
+	zassert_equal(get_str("foo", buf, sizeof(buf)), -ENOENT);
+	zassert_equal(blob_db_count(), 2, "got %zu blobs", blob_db_count());
+}
+
+/* A root whose payload is not shaped like a list is refused, and leaves
+ * the container closed. */
+ZTEST(blob_db_contract, test_malformed_root_refused)
+{
+	uint64_t id = blob_db_alloc_id();
+	char buf[16];
+
+	zassert_not_equal(id, BLOB_DB_INVALID_ID);
+	zassert_ok(blob_db_update(id, "xyz", 3));
+	zassert_equal(mc_open(id), -EIO);
+	zassert_equal(get_str("foo", buf, sizeof(buf)), -ENODEV);
 }
 
 /* --- recovery touches only the ids the intent names -------------------- */

@@ -72,7 +72,6 @@ struct persondb_stat {
 	uint32_t n_persons;          /* dataset size recorded at create time */
 	uint32_t populated;          /* persons written so far */
 	uint32_t rev;                /* mutation revision */
-	uint8_t  n_people_maps;
 
 	/* The geometry the container chose, read back through map_ops.stat().
 	 * This used to be absent with an apology: the app asked for the largest
@@ -126,12 +125,22 @@ struct persondb;
  * raised B9/B10 and the fix took the question away from callers rather than
  * exporting the constants to them; -ENOTSUP below is that check reporting.
  *
+ * A store written by an older build is upgraded in place; one written by a
+ * newer build is opened if everything it added is marked as safe to keep or
+ * to drop (DESIGN.md §12.3), and refused otherwise.
+ *
  * @param db          (out) handle
  * @param n_persons   dataset size to record when creating; ignored when
  *                    attaching to a store that already exists
  *
  * @retval 0        ready
- * @retval -ENOTSUP the configured payload does not fit this geometry
+ * @retval -ENOTSUP the configured payload does not fit this geometry, or the
+ *                  store needs something this build lacks: a newer superblock
+ *                  format, a table a newer build marked required, a record
+ *                  format it cannot read. persondb_destroy() removes it,
+ *                  except a newer superblock format (see there).
+ * @retval -EINPROGRESS a persondb_destroy() lost power part-way; repeating
+ *                  it finishes the job
  * @retval -EIO     flash error or a corrupt superblock
  */
 int persondb_open(struct persondb **db, uint32_t n_persons);
@@ -139,8 +148,33 @@ int persondb_open(struct persondb **db, uint32_t n_persons);
 /** Detach and unmount. The store's contents are untouched. */
 int persondb_close(struct persondb *db);
 
-/** Drop every record and rebuild an empty store. Reattaches @p db. */
-int persondb_erase(struct persondb **db, uint32_t n_persons);
+/**
+ * @brief Remove this store from flash: every table its superblock lists, the
+ *        superblock, and its registry entry — and nothing else.
+ *
+ * The partition is shared. Other registry entries, their blobs and the id
+ * counter are left as they were; a whole-partition wipe is not this module's
+ * to make (DESIGN.md §12.4). A newer build's tables are this store's too and
+ * go with it, whatever their class.
+ *
+ * Works on a store persondb_open() refuses, as long as its superblock can be
+ * read: that is what tells it which blobs are its own. It does not need an
+ * open handle; @p db, if open, is closed first and set to NULL. blob_db is
+ * left mounted, so persondb_open() can build a fresh store straight after.
+ *
+ * Resumable: on any error the store is untouched or part-way destroyed, and
+ * repeating the call carries on. persondb_open() refuses a part-way destroyed
+ * store with -EINPROGRESS rather than open one that has lost a map.
+ *
+ * @retval 0        removed, or there was no store
+ * @retval -ENOTSUP the superblock is a format this build cannot read, so it
+ *                  cannot tell which blobs belong to the store; nothing is
+ *                  touched
+ * @retval -EIO     a listed table is not a map this build can walk, a corrupt
+ *                  superblock, or a flash error. Refused before anything is
+ *                  released except when a flash error interrupts the release.
+ */
+int persondb_destroy(struct persondb **db);
 
 /**
  * @brief Pre-format flash erase blocks so first-touch erases leave the hot
@@ -176,6 +210,58 @@ int persondb_person_get(struct persondb *db, uint32_t id,
 
 /** Remove a person and every credential pointing at it. */
 int persondb_person_delete(struct persondb *db, uint32_t id);
+
+/**
+ * @brief Enroll a new person — insert only, never replace.
+ *
+ * persondb_person_put() replaces whatever is stored under the id and indexes
+ * every card it lists, whoever holds it now. That is right for a caller
+ * rewriting a record it owns and wrong for one creating a person: it would
+ * overwrite a stranger, or take a card from its current holder while their
+ * record still lists it. This refuses both before the first write.
+ *
+ * @retval 0       stored
+ * @retval -EEXIST the id is taken, or one of @p p's cards is held
+ * @retval -EINVAL empty name, a validity window no instant falls in, a card
+ *                 listed twice, or what persondb_person_put() rejects
+ */
+int persondb_person_add(struct persondb *db, const struct persondb_person *p);
+
+/* -- enumeration -------------------------------------------------------- */
+
+/*
+ * Every stored person, without knowing their ids in advance. Built on the Map
+ * shape's stateless enumeration (map_ops.next): the cursor is the id of the
+ * last person returned, so a walk holds no state, survives a reboot, and may
+ * be resumed from any id — including one deleted since.
+ *
+ * Order is the container's, stable but not sorted: not by id, not by
+ * insertion. Each call costs about one person_get on the DK (~6 ms of flash
+ * reads), so a walk of the full 8 000 is ~49 s — this is for listing a page
+ * at a time, not for searching (measured in FINDINGS.md K6).
+ */
+
+/**
+ * @brief The person after @p after in enumeration order.
+ *
+ * @param after id of the last person returned, or NULL to start the walk.
+ *              Need not exist: a deleted id still has a successor.
+ *
+ * @retval 0        *out holds the next person
+ * @retval -ENODATA the walk is over (an empty store answers this at once)
+ * @retval -EIO     flash error, or an entry that is not a person record
+ */
+int persondb_person_next(struct persondb *db, const uint32_t *after,
+			 struct persondb_person *out);
+
+/**
+ * @brief How many persons are stored — every one, not just the dataset.
+ *
+ * Exact at any time, power cuts included, because it is counted from flash
+ * rather than kept. That is also its cost: every bucket of the people map is
+ * read (~2 s on the DK at 8 000 persons). Call it once and keep the figure.
+ */
+int persondb_person_count(struct persondb *db, uint32_t *n);
 
 /* -- credentials -------------------------------------------------------- */
 
@@ -237,6 +323,15 @@ int persondb_card_revoke(struct persondb *db, const char *card);
 int persondb_card_owner(struct persondb *db, const char *card,
 			uint32_t *person_id);
 
+/**
+ * @brief How many cards are assigned — one credential-index entry each.
+ *
+ * Counted from flash like persondb_person_count(), with the same cost: every
+ * bucket of the credential map is read. Cards added or revoked by hand are in
+ * it; scenario's report figure, recomputed from the dataset, is not.
+ */
+int persondb_card_count(struct persondb *db, uint32_t *n);
+
 /* -- permissions -------------------------------------------------------- */
 
 /**
@@ -252,6 +347,36 @@ int persondb_permission_grant(struct persondb *db, uint32_t person_id,
 /** Remove @p perm from a person. @retval -ENOENT not held. */
 int persondb_permission_revoke(struct persondb *db, uint32_t person_id,
 			       const char *perm);
+
+/* -- person details ----------------------------------------------------- */
+
+/*
+ * Each of these rewrites the one person record and nothing else: the fields
+ * they touch live only in that record, so — as with permissions — there is no
+ * second structure to keep in step. A call that would store what is already
+ * stored writes nothing and returns 0.
+ */
+
+/**
+ * @brief Change a person's name.
+ *
+ * @retval -EINVAL empty, or longer than PERSONDB_NAME_MAX. Refused rather than
+ *                 truncated, so what is stored is what was asked for.
+ * @retval -ENOENT no such person
+ */
+int persondb_person_rename(struct persondb *db, uint32_t person_id,
+			   const char *name);
+
+/**
+ * @brief Set the window a person's cards are valid in: [@p valid_from,
+ *        @p valid_until), epoch seconds, as persondb_check() reads it.
+ *
+ * @retval -EINVAL @p valid_until is not after @p valid_from — a window no
+ *                 instant falls in would expire every card silently
+ * @retval -ENOENT no such person
+ */
+int persondb_person_set_validity(struct persondb *db, uint32_t person_id,
+				 uint32_t valid_from, uint32_t valid_until);
 
 /* -- the decision (R-D) ------------------------------------------------- */
 

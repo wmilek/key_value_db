@@ -8,6 +8,13 @@
  * kvhash bucket writable once and never updatable (FINDINGS.md B10).
  * blob_db_mount() checks the same inequality against the real geometry
  * (FINDINGS.md B9/B10 — findings this app raised).
+ *
+ * The write-block-size override is load-bearing too: it is part of the store
+ * format. blob_db rounds every slot up to it and the scan recomputes the
+ * stride from it, recorded nowhere on flash. The DK's nrf_qspi_nor reports 4;
+ * at the simulator's default of 1 a board image reads as a near-empty store,
+ * and the flash counters drift from the board's by up to ~2 %. At 4 they are
+ * identical to the DK's, run for run (FINDINGS.md B13).
  */
 
 &flashcontroller0 {
@@ -17,6 +24,7 @@
 &flash0 {
 	reg = <0x00000000 DT_SIZE_M(16)>;
 	erase-block-size = <65536>;
+	write-block-size = <4>;
 };
 
 &storage_partition {

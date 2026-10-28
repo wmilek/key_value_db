@@ -90,6 +90,15 @@ extern "C" {
 #define BLOB_DB_ROOT_ID  ((uint64_t)1)
 
 /**
+ * @brief The id that never names a blob.
+ *
+ * `blob_db_alloc_id()` returns it on failure, and no blob is ever bound to
+ * it, so callers may use it as "no id". Callers should reference this macro
+ * rather than the literal 0.
+ */
+#define BLOB_DB_INVALID_ID  ((uint64_t)0)
+
+/**
  * @brief Open the DB and recover state from flash.
  *
  * Discovers the partition geometry, validates the master sector,
@@ -147,8 +156,9 @@ int blob_db_unmount(void);
  * format time (see @ref blob_db_root). The concrete value of the first
  * user-visible allocation is not part of the contract.
  *
- * @return a fresh id (never 0 or `BLOB_DB_ROOT_ID`), or 0 if not mounted
- *         (0 is never a valid id) or the id ceiling could not be persisted.
+ * @return a fresh id (never `BLOB_DB_INVALID_ID` or `BLOB_DB_ROOT_ID`), or
+ *         `BLOB_DB_INVALID_ID` if not mounted or the id ceiling could not be
+ *         persisted.
  */
 uint64_t blob_db_alloc_id(void);
 
@@ -458,6 +468,46 @@ int blob_db_erase_all(void);
  * @retval -EIO    flash I/O error
  */
 int blob_db_prepare(size_t n);
+
+/**
+ * @brief Outcome of one `blob_db_maintain()` call.
+ */
+struct blob_db_maint_result {
+	/** Steps run, at most the budget. */
+	uint32_t performed;
+	/** Work may be left. A call that finds none clears it. */
+	bool more;
+};
+
+/**
+ * @brief Do up to @p budget steps of the erases blob_db can do ahead of time.
+ *
+ * Some erases need not happen inside the call that would otherwise pay for
+ * them. This runs them now, so that an application can keep them out of its
+ * real operations by calling it while the system is idle, until `more` is
+ * false. One step erases at most one block; on large-sector NOR that is up to
+ * a second.
+ *
+ * What a step does depends on the storage backend, not on the caller:
+ * - **UBI:** erases one block waiting for reclaim, and once none is left
+ *   moves one block for wear levelling. Nothing else asks UBI to reclaim:
+ *   without these calls its free pool stays empty and every write that needs
+ *   a fresh block erases one first.
+ * - **flash_area:** nothing yet; `blob_db_prepare()` formats buckets ahead.
+ *
+ * Nothing it does changes what blob_db reads back. Not thread-safe, like the
+ * rest of blob_db: serialize it with every other call.
+ *
+ * @param budget  most steps to run; 0 runs none and only reports `more`
+ * @param result  steps run and whether work is left; may be NULL
+ *
+ * @retval 0       success, including nothing to do
+ * @retval -ENODEV not mounted
+ * @retval -EIO    flash I/O error, or a torn compaction refuses writes
+ * @retval <0      other negative errno from the backend (UBI: -EROFS once
+ *                 the device is read-only)
+ */
+int blob_db_maintain(uint32_t budget, struct blob_db_maint_result *result);
 
 /** @} */ /* end of lib_blob_db */
 

@@ -53,7 +53,7 @@ rely on nothing beyond it.
 
 | Property | Guarantee |
 |---|---|
-| **Id allocation** | `alloc_id` returns a u64 id never returned before in the lifetime of this DB — across all crashes — and strictly greater than every previously returned id. Allocation itself is a RAM operation. |
+| **Id allocation** | `alloc_id` returns a u64 id never returned before in the lifetime of this DB — across all crashes — and strictly greater than every previously returned id. Allocation itself is a RAM operation, but it occasionally persists the id ceiling; when the store is not mounted or that write fails, it returns `BLOB_DB_INVALID_ID` (0), which never names a blob. |
 | **Id lifecycle** | *allocated* (fresh from `alloc_id`, nothing on flash) → *bound* (first `update` writes content) → rebound (further `update`s) → *dead* (`delete`). After `delete` the id **ceases to exist**: `get`/`exists`/`delete` on it are defined (`-ENOENT`/false), but `update` on it is **undefined behavior** — a debug build may assert. Likewise UB: `update` on an id never allocated. |
 | **Id stability** | A bound id refers to the same logical blob until `delete`d. `update` keeps the id; only the payload changes. |
 | **Reorganization transparency** | Internal reorganization (garbage collection, compaction, moves) never changes an id. A blob you can `get` today is reachable by the same id afterwards. |
