@@ -12,3 +12,8 @@ tests:
       - CONFIG_BLOB_DB_SLOT_INDEX_MAX_BUCKETS=2048
       - CONFIG_BLOB_DB_SLOT_INDEX_VERIFY=y
       - CONFIG_ASSERT=y
+  # The same suite over an encrypted and authenticated store
+  # (CONFIG_BLOB_DB_PROTECT_AEAD): the layers above see no difference.
+  lib.containers.protect_aead:
+    extra_configs:
+      - CONFIG_BLOB_DB_PROTECT_AEAD=y

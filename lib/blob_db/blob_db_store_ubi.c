@@ -36,8 +36,10 @@
 #include <psa/crypto.h>
 #include <ubi/ubi.h>
 
+#include <app/lib/blob_db_security.h>
 #include <app/lib/blob_db_ubi.h>
 
+#include "blob_db_protect.h"
 #include "blob_db_store.h"
 
 LOG_MODULE_REGISTER(blob_db_store, CONFIG_BLOB_DB_LOG_LEVEL);
@@ -58,7 +60,6 @@ static const uint8_t g_key_context[] = "blob_db";
 static struct ubi_device *g_ubi;
 static uint32_t g_vol_id = UBI_VOL_ID_INVALID;
 static uint32_t g_leb_size;
-static psa_key_id_t g_key_id;
 
 /* Damage reported since the last open, for blob_db_store_open_found_damage():
  * a bit per LEB below 32 whose copy failed its header or its seal — UBI then
@@ -116,6 +117,21 @@ static void on_event(const struct ubi_event *event, void *user_context)
 		event->pnum,
 		event->vol_id == UBI_VOL_ID_INVALID ? -1 : (int)event->vol_id,
 		event->lnum);
+
+	switch (event->type) {
+	case UBI_EVENT_HDR_CORRUPT:
+	case UBI_EVENT_VOLUME_TABLE_CORRUPT:
+	case UBI_EVENT_DATA_CORRUPT:
+		blob_db_event(BLOB_DB_EVENT_CORRUPT, BLOB_DB_EVENT_UBI,
+			      event->pnum);
+		break;
+	case UBI_EVENT_HDR_TAMPERED:
+		blob_db_event(BLOB_DB_EVENT_TAMPERED, BLOB_DB_EVENT_UBI,
+			      event->pnum);
+		break;
+	default:
+		break;
+	}
 }
 
 static enum ubi_state_verdict on_state(const struct ubi_device_info *info,
@@ -134,46 +150,6 @@ __weak enum ubi_state_verdict blob_db_ubi_state_check(const struct ubi_device_in
 
 	return UBI_STATE_TRUSTED;
 }
-
-#if defined(CONFIG_BLOB_DB_UBI_KEY_BUILTIN)
-/* A fixed, published key: UBI's MAC then catches damage, not tampering, which
- * is all the previous (unauthenticated) UBI backend offered. Imported as a
- * volatile key at every open and destroyed at close. */
-static int key_acquire(psa_key_id_t *key_id)
-{
-	static const uint8_t ikm[32] = "blob_db UBI dev key, not secret";
-	psa_key_attributes_t attr = PSA_KEY_ATTRIBUTES_INIT;
-
-	psa_set_key_type(&attr, PSA_KEY_TYPE_DERIVE);
-	psa_set_key_usage_flags(&attr, PSA_KEY_USAGE_DERIVE);
-	psa_set_key_algorithm(&attr, PSA_ALG_HKDF(PSA_ALG_SHA_256));
-	psa_set_key_lifetime(&attr, PSA_KEY_LIFETIME_VOLATILE);
-
-	const psa_status_t status = psa_import_key(&attr, ikm, sizeof(ikm), key_id);
-
-	if (status != PSA_SUCCESS) {
-		LOG_ERR("psa_import_key: %d", (int)status);
-		return -EIO;
-	}
-	return 0;
-}
-
-static void key_release(psa_key_id_t key_id)
-{
-	(void)psa_destroy_key(key_id);
-}
-#else
-static int key_acquire(psa_key_id_t *key_id)
-{
-	return blob_db_ubi_ikm_key(key_id);
-}
-
-static void key_release(psa_key_id_t key_id)
-{
-	/* The application's key: it outlives the store. */
-	ARG_UNUSED(key_id);
-}
-#endif
 
 /* True when every byte of the partition reads as erased. Read in small
  * pieces: this runs only when UBI found no device of its own, which is the
@@ -331,28 +307,18 @@ int blob_db_store_open(struct blob_db_store_geom *geom, bool discard)
 		return -EALREADY;
 	}
 
-	psa_status_t status = psa_crypto_init();
-
-	if (status != PSA_SUCCESS) {
-		LOG_ERR("psa_crypto_init: %d", (int)status);
-		return -EIO;
-	}
-
+	/* The core has initialised PSA and acquired the keying material
+	 * (blob_db_protect.c): the same handle feeds UBI and, in a protected
+	 * build, blob_db's own keys, under separate HKDF labels. */
 	struct ubi_config config = {
 		.flash_area_id = PARTITION_ID(BLOB_DB_UBI_PARTITION),
 		.key_context = g_key_context,
 		.key_context_size = sizeof(g_key_context) - 1,
+		.ikm_key_id = blob_db_keys_ikm(),
 		.event_cb = on_event,
 		.state_cb = on_state,
 	};
-
-	int rc = key_acquire(&config.ikm_key_id);
-
-	if (rc != 0) {
-		LOG_ERR("no UBI keying material: %d", rc);
-		return rc;
-	}
-	g_key_id = config.ikm_key_id;
+	int rc;
 
 	g_damaged_lebs = 0;
 	g_damaged_unplaced = false;
@@ -360,8 +326,7 @@ int blob_db_store_open(struct blob_db_store_geom *geom, bool discard)
 	g_ubi = k_calloc(1, ubi_device_size());
 	if (g_ubi == NULL) {
 		LOG_ERR("no heap for the UBI handle");
-		rc = -ENOMEM;
-		goto err_key;
+		return -ENOMEM;
 	}
 
 	rc = attach(&config, discard);
@@ -405,8 +370,6 @@ err_free:
 	k_free(g_ubi);
 	g_ubi = NULL;
 	g_vol_id = UBI_VOL_ID_INVALID;
-err_key:
-	key_release(g_key_id);
 	return rc;
 }
 
@@ -420,7 +383,6 @@ void blob_db_store_close(void)
 	k_free(g_ubi);
 	g_ubi = NULL;
 	g_vol_id = UBI_VOL_ID_INVALID;
-	key_release(g_key_id);
 }
 
 int blob_db_store_read(off_t off, void *buf, size_t len)

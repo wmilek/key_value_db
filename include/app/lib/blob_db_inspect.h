@@ -44,6 +44,9 @@ struct blob_db_inspect_info {
 	size_t   slot_overhead;   /**< per-slot bytes besides the payload      */
 	uint8_t  format_major;    /**< on-flash format this build writes       */
 	uint8_t  format_minor;
+	uint8_t  suite;           /**< CONFIG_BLOB_DB_PROTECT: 0 none; low
+	                               nibble 1 AES-CMAC, 2 AES-CCM; high
+	                               nibble the slot tag length / 4         */
 	uint8_t  active_master;   /**< 0 or 1                                  */
 	uint32_t master_gen;      /**< generation of the active master         */
 	uint64_t next_id;         /**< what `blob_db_alloc_id()` returns next  */
@@ -133,6 +136,21 @@ typedef int (*blob_db_inspect_slot_cb_t)(
 int blob_db_inspect_bucket_get(uint16_t bid,
 			       struct blob_db_inspect_bucket *out,
 			       blob_db_inspect_slot_cb_t cb, void *user);
+
+/**
+ * @brief Read bytes of a bucket sector as they are on flash.
+ *
+ * For dumping a slot found by `blob_db_inspect_bucket_get()`: in an encrypted
+ * store (CONFIG_BLOB_DB_PROTECT_AEAD) this shows the ciphertext, nonce and
+ * tag, never the plaintext.
+ *
+ * @retval 0        success
+ * @retval -EINVAL  @p bid out of range, or the range leaves the sector
+ * @retval -ENODEV  not mounted
+ * @retval -EIO     flash I/O error
+ */
+int blob_db_inspect_raw_read(uint16_t bid, uint32_t off, void *buf,
+			     size_t len);
 
 /** @} */ /* end of lib_blob_db_inspect */
 

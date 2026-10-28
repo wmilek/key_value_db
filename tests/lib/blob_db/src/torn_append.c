@@ -216,9 +216,12 @@ ZTEST(blob_db_torn_append, test_compaction_keeps_slots_after_a_rotten_one)
 	const uint32_t gen = bs.gen;
 
 	blob_db_unmount();
-	/* first is the bucket's first slot: header 16 B, slot head 12 B. */
+	/* first is the bucket's first slot: past the bucket header (whose size
+	 * depends on CONFIG_BLOB_DB_PROTECT) and the 12-byte slot head. Any
+	 * byte after the head fails the slot's CRC, a nonce byte included. */
 	const struct flash_area *fa;
-	const off_t payload_off = (off_t)(3 + bid) * in.sector_size + 16 + 12;
+	const off_t data_off = (off_t)(in.sector_size - in.bucket_capacity);
+	const off_t payload_off = (off_t)(3 + bid) * in.sector_size + data_off + 12;
 	uint8_t byte;
 
 	zassert_ok(flash_area_open(TA_PARTITION_ID, &fa));

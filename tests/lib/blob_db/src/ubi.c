@@ -7,9 +7,12 @@
  * application hooks of <app/lib/blob_db_ubi.h>.
  *
  * The hook cases need the hooks defined here, so they run only in the
- * lib.blob_db.ubi.app_key scenario (CONFIG_BLOB_DB_UBI_KEY_APP); the
+ * lib.blob_db.ubi.app_key scenarios (CONFIG_BLOB_DB_KEY_APP); the
  * lib.blob_db.ubi scenario keeps the shipped defaults — the built-in key and
- * the weak trust-everything state check.
+ * the weak trust-everything state check. The key comes through
+ * blob_db_ikm_key() (<app/lib/blob_db_security.h>), or, in the scenario that
+ * keeps the deprecated CONFIG_BLOB_DB_UBI_KEY_APP, through the
+ * blob_db_ubi_ikm_key() an application written before it defines.
  */
 
 #include <errno.h>
@@ -23,19 +26,24 @@
 #include <psa/crypto.h>
 
 #include <app/lib/blob_db.h>
+#include <app/lib/blob_db_security.h>
 #include <app/lib/blob_db_ubi.h>
 
 #define PARTITION_ID_UNDER_TEST PARTITION_ID(storage_partition)
 
-#if defined(CONFIG_BLOB_DB_UBI_KEY_APP)
+#if defined(CONFIG_BLOB_DB_KEY_APP)
 
-/* Which key blob_db_ubi_ikm_key() hands out, and whether the state check
- * trusts the device. Reset after every case. */
+/* Which key the application hands out, and whether the state check trusts
+ * the device. Reset after every case. */
 static unsigned int g_key_variant;
 static bool g_untrusted;
 static psa_key_id_t g_keys[2];
 
+#if defined(CONFIG_BLOB_DB_UBI_KEY_APP)
 int blob_db_ubi_ikm_key(psa_key_id_t *key_id)
+#else
+int blob_db_ikm_key(psa_key_id_t *key_id)
+#endif
 {
 	if (g_keys[g_key_variant] == PSA_KEY_ID_NULL) {
 		uint8_t ikm[32];
@@ -64,7 +72,7 @@ enum ubi_state_verdict blob_db_ubi_state_check(const struct ubi_device_info *inf
 	return g_untrusted ? UBI_STATE_UNTRUSTED : UBI_STATE_TRUSTED;
 }
 
-#endif /* CONFIG_BLOB_DB_UBI_KEY_APP */
+#endif /* CONFIG_BLOB_DB_KEY_APP */
 
 static void ubi_before(void *fixture)
 {
@@ -78,7 +86,7 @@ static void ubi_after(void *fixture)
 {
 	ARG_UNUSED(fixture);
 	blob_db_unmount();
-#if defined(CONFIG_BLOB_DB_UBI_KEY_APP)
+#if defined(CONFIG_BLOB_DB_KEY_APP)
 	g_key_variant = 0;
 	g_untrusted = false;
 #endif
@@ -137,8 +145,8 @@ ZTEST(blob_db_ubi, test_blank_partition_is_formatted_by_mount)
  * mistake that for a blank partition and format over it. */
 ZTEST(blob_db_ubi, test_wrong_key_is_refused_and_store_survives)
 {
-	Z_TEST_SKIP_IFNDEF(CONFIG_BLOB_DB_UBI_KEY_APP);
-#if defined(CONFIG_BLOB_DB_UBI_KEY_APP)
+	Z_TEST_SKIP_IFNDEF(CONFIG_BLOB_DB_KEY_APP);
+#if defined(CONFIG_BLOB_DB_KEY_APP)
 	const uint8_t pl[] = "survives a wrong key";
 	uint8_t buf[sizeof(pl)];
 	size_t got;
@@ -163,8 +171,8 @@ ZTEST(blob_db_ubi, test_wrong_key_is_refused_and_store_survives)
  * attach fails the mount, and the device mounts again once it is trusted. */
 ZTEST(blob_db_ubi, test_untrusted_state_refuses_mount)
 {
-	Z_TEST_SKIP_IFNDEF(CONFIG_BLOB_DB_UBI_KEY_APP);
-#if defined(CONFIG_BLOB_DB_UBI_KEY_APP)
+	Z_TEST_SKIP_IFNDEF(CONFIG_BLOB_DB_KEY_APP);
+#if defined(CONFIG_BLOB_DB_KEY_APP)
 	blob_db_unmount();
 
 	g_untrusted = true;
@@ -180,8 +188,8 @@ ZTEST(blob_db_ubi, test_untrusted_state_refuses_mount)
  * before stays readable after a remount. */
 ZTEST(blob_db_ubi, test_trust_withdrawn_at_run_time_stops_writes)
 {
-	Z_TEST_SKIP_IFNDEF(CONFIG_BLOB_DB_UBI_KEY_APP);
-#if defined(CONFIG_BLOB_DB_UBI_KEY_APP)
+	Z_TEST_SKIP_IFNDEF(CONFIG_BLOB_DB_KEY_APP);
+#if defined(CONFIG_BLOB_DB_KEY_APP)
 	const uint8_t pl[] = "written while trusted";
 	uint8_t buf[sizeof(pl)];
 	size_t got;

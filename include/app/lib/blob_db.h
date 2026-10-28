@@ -366,7 +366,8 @@ typedef int (*blob_db_iter_cb_t)(uint64_t id,
  * @retval 0        full walk completed
  * @retval other    value the callback returned to abort early
  * @retval -ENODEV  not mounted
- * @retval -EIO     flash I/O error
+ * @retval -EIO     flash I/O error, or a bucket that cannot be read was
+ *                  skipped; every other bucket was still visited
  */
 int blob_db_iterate(blob_db_iter_cb_t cb, void *user);
 

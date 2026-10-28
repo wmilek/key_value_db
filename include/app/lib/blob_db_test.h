@@ -68,6 +68,19 @@ extern enum blob_db_test_cut blob_db_test_cut;
 void blob_db_test_wedge(void);
 #endif /* CONFIG_BLOB_DB_TEST_CRASH_HOOKS */
 
+#if defined(CONFIG_BLOB_DB_TEST_PROTECT_HOOKS)
+/**
+ * @brief Called with every AEAD nonce blob_db seals a slot under.
+ *
+ * Defined by the test (`CONFIG_BLOB_DB_TEST_PROTECT_HOOKS`), which records
+ * them to show that no nonce is used twice under one key, across power cuts
+ * and compactions included.
+ *
+ * @param nonce The 12-byte nonce: salt (4) then counter (8, LE).
+ */
+void blob_db_test_nonce_used(const uint8_t *nonce);
+#endif /* CONFIG_BLOB_DB_TEST_PROTECT_HOOKS */
+
 /** @} */ /* end of lib_blob_db_test */
 
 #ifdef __cplusplus

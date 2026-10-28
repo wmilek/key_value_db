@@ -43,6 +43,7 @@ int blob_db_inspect_info_get(struct blob_db_inspect_info *out)
 		.slot_overhead   = BLOB_DB_SLOT_OVERHEAD,
 		.format_major    = BLOB_DB_FORMAT_MAJOR,
 		.format_minor    = BLOB_DB_FORMAT_MINOR,
+		.suite           = BLOB_DB_SUITE,
 		.active_master   = st.active_master,
 		.master_gen      = st.master_gen,
 		.next_id         = st.next_id,
@@ -51,6 +52,24 @@ int blob_db_inspect_info_get(struct blob_db_inspect_info *out)
 		.wedged          = st.wedged,
 	};
 	return 0;
+}
+
+int blob_db_inspect_raw_read(uint16_t bid, uint32_t off, void *buf,
+			     size_t len)
+{
+	struct blob_db_core_state st;
+
+	blob_db_core_state_get(&st);
+	if (!st.mounted) {
+		return -ENODEV;
+	}
+	if (bid >= st.n_buckets || !buf || off > st.peb_size ||
+	    len > st.peb_size - off) {
+		return -EINVAL;
+	}
+	return blob_db_store_read(
+		(off_t)(BLOB_DB_FIRST_BUCKET + bid) * (off_t)st.peb_size + off,
+		buf, len);
 }
 
 int blob_db_inspect_bucket_get(uint16_t bid,
