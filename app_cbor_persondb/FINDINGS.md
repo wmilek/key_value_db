@@ -39,9 +39,9 @@ that would show K2's cliff coming. See K9 and K10.
 | | |
 |---|---|
 | **Closed by `main`** | B1, B5 (partly), B9, B10, B3 (partly), **K6** (`map_ops.next`; a walk costs reads per entry, and it is unsorted), **K9** (declared population, `-EINVAL` instead of a clamp, `map_ops.stat`; an undeclared map is still eight buckets), **K10 (partly)** (`map_ops.count`, by a walk of every record; no per-bucket occupancy) |
-| **Still open** | B2, B4, B6, B7, B8, B11, B12, K1–K5, K7, K8, K11, **K12**, **K13**, V1–V4, X1 |
+| **Still open** | B2, B4, B6, B7, B8, B11, B12, **B13**, K1–K5, K7, K8, K11, **K12**, **K13**, V1–V4, X1 |
 | **Withdrawn** | R1 — `ROOTREG_MAX_ROOTS`'s default was never the problem; the layout that wanted seventeen entries was (`DESIGN.md` §12.1) |
-| **Newly observed** | N1 — transaction count rose sharply as byte count fell (closed on hardware: ~65 µs per transaction) · B12 — compaction lowers the durable id ceiling ([issue #14](https://github.com/wmilek/key_value_db/issues/14)) |
+| **Newly observed** | N1 — transaction count rose sharply as byte count fell (closed on hardware: ~65 µs per transaction) · B12 — compaction lowers the durable id ceiling ([issue #14](https://github.com/wmilek/key_value_db/issues/14)) · **B13** — the write-block size shapes the on-flash layout but is recorded nowhere; a DK store opened on `native_sim` read as empty and was overwritten |
 | **Found by removing a workaround** | **K12** — the largest map the geometry allows cannot be written to · **K13** — the directory blob caps the store at 9 670 persons, half the partition. Both were invisible while the app sharded its person records over sixteen maps; both appeared in the first hour after it stopped (`DESIGN.md` §12.2). |
 
 This is the *probe* output of `app_cbor_persondb` (see `DESIGN.md` §1). Every
@@ -1416,6 +1416,69 @@ indistinguishable.
 
 Recorded, not fixed: `blob_db` is not this application's layer (`DESIGN.md` §2),
 the same rule that parks B2. The direction is in the issue.
+
+### B13 — The write-block size is part of the store format, and nothing records it (moderate, **`hit`**)
+
+Board 1's store (12 000 persons, dumped from the DK's QSPI flash on
+2026-10-28) booted on `native_sim` at the same commit and geometry. UBI
+attached it cleanly. blob_db mounted it and found both masters valid. Then:
+
+```
+<inf> persondb: created store for 12000 persons
+open         :     38 ms
+<err> persondb: put person 0: -2
+fill failed: -2
+```
+
+The root registry (id 1) loaded and named the superblock (id 2), but
+`blob_db_get(2)` answered `-ENOENT`. persondb read that as a create that had
+crashed before its commit (`persondb_open`). It dropped the registry entry and
+built a new store over the old one, writing to 55 of 128 PEBs before the fill
+failed. That run was against a copy of the image; on a device, the store would
+have been lost.
+
+The cause is `write_align`. Every slot is rounded up to the backing device's
+write-block size (`slot_size_for()`: `ROUND_UP(14 + val_len, write_align)`).
+Nothing on flash records that size: the slot header holds `val_len` only, and
+every reader works the stride out again from its *own* `st.write_align`
+(the bucket scan, `find_live_slot`, compaction). The DK's `nrf_qspi_nor`
+reports 4; the flash simulator reports 1. A 37-byte slot written on the
+board occupies 40 bytes. The simulator steps 37 and lands in the `0xFF`
+padding. The scan reads `flags == 0xff` there and takes it as the end of the
+log, so the log ends at the first unaligned slot. Id 1 survived only because it sits first in its bucket, where both
+strides agree. With `write-block-size = <4>` on the simulator's flash, the same
+image opens: `fill: already complete (12000 persons)`, `VERIFY PASS`, and the
+store carries on from the board's revision (rev 3 → 4).
+
+**Why it matters beyond a simulator.** `write_align` comes from the flash
+driver at mount (`flash_area_align()` in the flash backend,
+`ubi_device_info.write_block_size` in the UBI one), so it can change under a
+store that did not change. A driver update, a different QSPI driver or
+an image moved between parts with different program granularity are enough. When that
+happens blob_db does not refuse the store, as it refuses an unknown
+`format_major` — it mounts it and misreads it, and the layer above sees an
+almost empty store. The compat prefix (`blob_db_compat_hdr`) exists so that a
+store the reader cannot parse is refused rather than misread. This is the one
+format parameter it does not cover.
+
+It also explains the gap that was left between the simulator and the board.
+`RESULTS.md` §10a had `native_sim`'s flash counters within 2.5 % of the DK's,
+not equal to them. With `write-block-size = <4>` in `boards/native_sim.overlay`,
+they are equal: every run, every op, every field (reads, bytes read, writes,
+bytes written, erases), at 1 000 persons against both boards and at 12 000
+against board 1. Unpadded slots pack differently, so buckets fill and compact
+at different moments. That is why at 12 000 persons the old simulator ran
+*above* the board (`put` +1.2 % in bytes, +1.7 % in erases; reads +0.4–0.6 %),
+not below it. At 1 000 persons only `put`'s bytes written differed (−0.2 %).
+
+Direction: record `write_align` in the master header (24 reserved bytes,
+`blob_db_master_hdr.reserved1`) as a MINOR addition, and refuse to mount with
+`-ENOTSUP` when it differs from the device's. A store with the field absent
+(written before the change) is the only case that cannot be checked.
+
+Recorded, not fixed, for the same reason as B12: `blob_db` is not this
+application's layer. The app's own exposure is closed by the overlay; a
+device's is not.
 
 ## X1 — An application cannot ask the stack anything, so it restates it (major, `hit`)
 
