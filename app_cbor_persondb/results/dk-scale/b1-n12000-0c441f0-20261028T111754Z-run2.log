@@ -1,0 +1,37 @@
+*** Booting Zephyr OS build 4a405846193f ***
+
+persondb 1.0.0 — CBOR person/credential database
+[00:00:06.559,722] [0m<inf> ubi: attached partition 3: image_seq=0x27534cfe, 1 volumes, revision 2[0m
+ubi-ec: image_seq=659770622 rev=2 pebs=128 healthy=128 free=0 reclaimable=6 bad=0 corrupt=0 ec_min=2 ec_max=97 ec_total=11794
+open         :   6324 ms
+prepare      :      9 ms (0 buckets formatted)
+fill         : already complete (12000 persons)
+verify       :   6655 ms  256 persons, 658 cards
+VERIFY PASS
+mutate       : 101925 ms  rev 1 -> 2  (64 revoked, 64 assigned)
+re-verify    :   6358 ms  256 persons, 658 cards
+VERIFY PASS
+
+bench check :   200 ops in  2942413 us ->    67.97 ops/s    14712 us/op   400 store ops  23214 flash ops   1824034 B  amp 23x
+io check       : rd  23214 ops/  1824034 B  wr      0 ops/        0 B  er     0 ops/        0 B
+             : 200 granted, 0 denied, 0 unknown, 0 expired
+bench byid  :   200 ops in  1653565 us ->   120.95 ops/s     8267 us/op   200 store ops  11479 flash ops   1093088 B  amp 14x
+io byid        : rd  11479 ops/  1093088 B  wr      0 ops/        0 B  er     0 ops/        0 B
+bench miss  :   200 ops in  1371186 us ->   145.86 ops/s     6855 us/op   200 store ops  11694 flash ops    722542 B  amp 157x
+io miss        : rd  11694 ops/   722542 B  wr      0 ops/        0 B  er     0 ops/        0 B
+bench put   :   200 ops in 217274018 us ->     0.92 ops/s  1086370 us/op   871 store ops  67427 flash ops  26701021 B  amp 313x
+io put         : rd  66524 ops/ 11683045 B  wr    787 ops/  7430648 B  er   116 ops/  7587328 B
+bench cbor  :   200 ops in   190674 us ->  1048.91 ops/s      953 us/op     0 store ops      0 flash ops         0 B  amp 0x
+io cbor        : rd      0 ops/        0 B  wr      0 ops/        0 B  er     0 ops/        0 B
+
+store
+  partition   : 8388608 B (8192 KiB)
+  maps        : person (depth 2, 1156 buckets) + credential (depth 2, 256 buckets)
+  persons     : 12000 of 12000   credentials: 29942
+  mean entry  : 433 B
+  live content: 5205696 B = 62.0 % of the partition
+  bucket overflows: 0
+  NOTE: physical occupancy (live + uncompacted garbage) is not
+        observable through the API — see FINDINGS.md B3.
+
+persondb: done — store at rev 2; rerun to prove persistence
