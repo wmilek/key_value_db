@@ -284,16 +284,18 @@ void blob_db_core_state_get(struct blob_db_core_state *out);
  * blob_db calls (single-threaded contract). */
 uint8_t *blob_db_core_sector_buf(void);
 
-/* A committed slot, as the core's own walk sees it. */
+/* A slot, as the core's own walk sees it. */
 struct blob_db_core_slot {
 	uint64_t id;
 	uint8_t  flags;
 	uint16_t val_len;
 	size_t   total_size;
+	bool     intact;      /* CRC verifies; a rotten slot is stepped over */
 };
 
 /* Parse the slot at buf[off] of a resident bucket image. False at end of log
- * (erased, unsealed, unknown flag, implausible length, or CRC mismatch). */
+ * (erased, unsealed, unknown flag, implausible length); a CRC mismatch is a
+ * slot like any other, with `intact` false. */
 bool blob_db_core_slot_at(const uint8_t *buf, off_t off,
 			  struct blob_db_core_slot *out);
 

@@ -66,6 +66,7 @@ enum blob_db_inspect_slot_state {
 	BLOB_DB_INSPECT_LIVE,       /**< newest slot for its id: kept         */
 	BLOB_DB_INSPECT_SUPERSEDED, /**< a later slot shadows it: garbage     */
 	BLOB_DB_INSPECT_TOMBSTONE,  /**< deletion marker: garbage             */
+	BLOB_DB_INSPECT_ROTTEN,     /**< CRC fails, stepped over: garbage     */
 };
 
 /** @brief One slot of a bucket's log, as `blob_db_inspect_bucket_get()` sees
@@ -95,19 +96,20 @@ struct blob_db_inspect_bucket {
 	uint32_t capacity;        /**< slot-stream bytes the sector can hold   */
 	uint32_t live_bytes;      /**< bytes compaction would keep             */
 	uint32_t payload_bytes;   /**< payload part of `live_bytes`            */
-	uint32_t garbage_bytes;   /**< superseded slots and tombstones         */
-	uint32_t tail_bytes;      /**< programmed but unreadable (torn/rotten) */
+	uint32_t garbage_bytes;   /**< superseded, tombstone and rotten slots  */
+	uint32_t tail_bytes;      /**< programmed past the end of the log      */
 	uint32_t free_bytes;      /**< still erased, available to append       */
 	uint16_t objects;         /**< live user-visible ids                   */
 	uint16_t segments;        /**< live segment slots (large objects)      */
 	uint16_t superseded;      /**< superseded slots                        */
 	uint16_t tombstones;      /**< tombstone slots                         */
+	uint16_t rotten;          /**< slots whose CRC fails                   */
 };
 
 /**
- * @brief Called by `blob_db_inspect_bucket_get()` for every readable slot,
- *        in log order. Return non-zero to stop the walk (stats are then
- *        partial).
+ * @brief Called by `blob_db_inspect_bucket_get()` for every slot of the
+ *        log, rotten ones included, in log order. Return non-zero to stop
+ *        the walk (stats are then partial).
  */
 typedef int (*blob_db_inspect_slot_cb_t)(
 	const struct blob_db_inspect_slot *slot, void *user);

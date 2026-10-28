@@ -894,9 +894,7 @@ static bool bucket_hdr_valid(const uint8_t *buf, uint16_t bid)
 	return true;
 }
 
-/* Interpret a slot at buf[off] in a bucket buffer.
- * Returns true iff structurally valid AND CRC verifies — i.e., a real
- * committed slot. Returns false otherwise (end-of-log, torn write, etc.). */
+/* A slot of a resident bucket image, as sized by its header. */
 struct slot_view {
 	uint64_t id;
 	uint8_t  flags;
@@ -904,7 +902,13 @@ struct slot_view {
 	size_t   total_size;
 };
 
-static bool slot_view_at(const uint8_t *buf, off_t off, struct slot_view *out)
+/* Size the slot at buf[off] from its header, as scan_bucket_for() does. False
+ * where the header cannot be trusted to size it: the end of the log (§3.4 of
+ * l1_bucketlog.md). Otherwise *intact says whether its CRC verifies. A slot
+ * that is not intact is stepped over, never served, kept or counted, so one
+ * rotten slot does not hide the slots after it. */
+static bool slot_walk_at(const uint8_t *buf, off_t off, struct slot_view *out,
+			 bool *intact)
 {
 	if (off + BLOB_DB_SLOT_OVERHEAD > (off_t)st.peb_size) {
 		return false;
@@ -941,15 +945,41 @@ static bool slot_view_at(const uint8_t *buf, off_t off, struct slot_view *out)
 	const size_t crc_off = sizeof(*shdr) + sizeof(id) + shdr->val_len;
 
 	memcpy(&stored, buf + off + crc_off, sizeof(stored));
-	if (slot_crc16(shdr, id, payload, shdr->val_len) != stored) {
-		return false;
-	}
+	*intact = slot_crc16(shdr, id, payload, shdr->val_len) == stored;
 
 	out->id         = id;
 	out->flags      = shdr->flags;
 	out->val_len    = shdr->val_len;
 	out->total_size = ssz;
 	return true;
+}
+
+/* An intact slot at buf[off]; false at the end of the log or a rotten slot.
+ * For images blob_db built itself, where every slot is intact. */
+static bool slot_view_at(const uint8_t *buf, off_t off, struct slot_view *out)
+{
+	bool intact;
+
+	return slot_walk_at(buf, off, out, &intact) && intact;
+}
+
+/* Whether an intact slot later in the log carries the same id as @p sv at
+ * @p off. A rotten slot supersedes nothing: readers fall back past it to the
+ * newest intact one, and that is the slot to keep. */
+static bool slot_superseded(const uint8_t *buf, off_t off,
+			    const struct slot_view *sv)
+{
+	off_t scan = off + (off_t)sv->total_size;
+	struct slot_view future;
+	bool intact;
+
+	while (slot_walk_at(buf, scan, &future, &intact)) {
+		if (intact && future.id == sv->id) {
+			return true;
+		}
+		scan += future.total_size;
+	}
+	return false;
 }
 
 static int read_bucket(uint16_t bid, uint8_t *buf)
@@ -1474,8 +1504,8 @@ static int append_slot2(uint16_t bid, off_t write_cursor, uint64_t id,
 
 /* Build a compacted image of bucket `bid` in new_buf using old_buf as the
  * source. Returns the number of bytes written into new_buf (≥ 16 for the
- * bucket header). Skipped entries: tombstones, and any slot whose id has
- * a later occurrence in the same bucket. */
+ * bucket header). Skipped entries: tombstones, rotten slots, and any slot
+ * whose id has a later intact occurrence in the same bucket. */
 static size_t build_compacted_image(const uint8_t *old_buf, uint8_t *new_buf,
 				    uint16_t bid)
 {
@@ -1496,29 +1526,14 @@ static size_t build_compacted_image(const uint8_t *old_buf, uint8_t *new_buf,
 
 	for (;;) {
 		struct slot_view sv;
+		bool intact;
 
-		if (!slot_view_at(old_buf, cursor, &sv)) {
+		if (!slot_walk_at(old_buf, cursor, &sv, &intact)) {
 			break;
 		}
 
-		/* Is there a later slot with the same id? */
-		bool superseded = false;
-		off_t scan = cursor + sv.total_size;
-
-		for (;;) {
-			struct slot_view future;
-
-			if (!slot_view_at(old_buf, scan, &future)) {
-				break;
-			}
-			if (future.id == sv.id) {
-				superseded = true;
-				break;
-			}
-			scan += future.total_size;
-		}
-
-		if (!superseded && !(sv.flags & BLOB_DB_SLOT_F_TOMBSTONE)) {
+		if (intact && !(sv.flags & BLOB_DB_SLOT_F_TOMBSTONE) &&
+		    !slot_superseded(old_buf, cursor, &sv)) {
 			memcpy(new_buf + new_cursor,
 			       old_buf + cursor, sv.total_size);
 			new_cursor += sv.total_size;
@@ -3113,9 +3128,9 @@ bool blob_db_exists(uint64_t id)
 /* Stage 6 — format / count / iterate ------------------------------------ */
 
 /* Walk a bucket buffer, invoking `cb` for each *live* slot — the latest
- * non-tombstoned slot for its id within this bucket. O(n²) over slots in
- * the bucket; the per-bucket count is small in normal use. Returns 0 if
- * walk completed, or the non-zero value the callback returned to abort. */
+ * intact, non-tombstoned slot for its id within this bucket. O(n²) over
+ * slots in the bucket; the per-bucket count is small in normal use. Returns
+ * 0 if walk completed, or the non-zero value the callback returned to abort. */
 typedef int (*live_slot_visit_t)(uint64_t id, const uint8_t *payload,
 				  uint16_t val_len, void *user);
 
@@ -3126,26 +3141,17 @@ static int for_each_live_slot(const uint8_t *buf,
 
 	for (;;) {
 		struct slot_view sv;
+		bool intact;
 
-		if (!slot_view_at(buf, cursor, &sv)) {
+		if (!slot_walk_at(buf, cursor, &sv, &intact)) {
 			break;
 		}
-
-		bool superseded = false;
-		off_t scan = cursor + sv.total_size;
-
-		for (;;) {
-			struct slot_view future;
-
-			if (!slot_view_at(buf, scan, &future)) {
-				break;
-			}
-			if (future.id == sv.id) {
-				superseded = true;
-				break;
-			}
-			scan += future.total_size;
+		if (!intact) {
+			cursor += sv.total_size;
+			continue;
 		}
+
+		const bool superseded = slot_superseded(buf, cursor, &sv);
 
 		/* A SEGMENT slot is a chunk of another object, not an object.
 		 * Reporting it would make count() and iterate() describe storage
@@ -3270,8 +3276,9 @@ bool blob_db_core_slot_at(const uint8_t *buf, off_t off,
 			  struct blob_db_core_slot *out)
 {
 	struct slot_view sv;
+	bool intact;
 
-	if (!slot_view_at(buf, off, &sv)) {
+	if (!slot_walk_at(buf, off, &sv, &intact)) {
 		return false;
 	}
 	*out = (struct blob_db_core_slot){
@@ -3279,6 +3286,7 @@ bool blob_db_core_slot_at(const uint8_t *buf, off_t off,
 		.flags      = sv.flags,
 		.val_len    = sv.val_len,
 		.total_size = sv.total_size,
+		.intact     = intact,
 	};
 	return true;
 }
