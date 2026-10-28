@@ -1139,6 +1139,17 @@ int persondb_card_owner(struct persondb *db, const char *card,
 	return cred_cbor_decode(buf, len, person_id);
 }
 
+int persondb_card_count(struct persondb *db, uint32_t *n)
+{
+	size_t count = 0;
+	int rc = db->ops->count(db->cred_root, &count);
+
+	if (rc == 0) {
+		*n = (uint32_t)count;
+	}
+	return rc;
+}
+
 /* -- permissions -------------------------------------------------------- */
 
 int persondb_permission_grant(struct persondb *db, uint32_t person_id,

@@ -347,6 +347,7 @@ persondb person count
 persondb person rename <id> <name>
 persondb person validity <id> <from> <until>     epoch seconds, [from, until)
 persondb card owner <card>
+persondb card count
 persondb card assign <id> <card>
 persondb card revoke <card>       holder found through the index
 persondb card revoke-from <id> <card>            the repairable form

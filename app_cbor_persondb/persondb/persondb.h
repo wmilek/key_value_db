@@ -323,6 +323,15 @@ int persondb_card_revoke(struct persondb *db, const char *card);
 int persondb_card_owner(struct persondb *db, const char *card,
 			uint32_t *person_id);
 
+/**
+ * @brief How many cards are assigned — one credential-index entry each.
+ *
+ * Counted from flash like persondb_person_count(), with the same cost: every
+ * bucket of the credential map is read. Cards added or revoked by hand are in
+ * it; scenario's report figure, recomputed from the dataset, is not.
+ */
+int persondb_card_count(struct persondb *db, uint32_t *n);
+
 /* -- permissions -------------------------------------------------------- */
 
 /**
