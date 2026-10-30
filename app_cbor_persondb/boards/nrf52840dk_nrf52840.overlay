@@ -1,0 +1,20 @@
+/*
+ * Same store as the nRF5340-DK: the nRF52840-DK carries the same MX25R6435F
+ * (8 MiB, 64 KB sectors) on QSPI, so the store lives there and every geometry
+ * in RESULTS.md applies unchanged.
+ */
+
+/delete-node/ &storage_partition;
+
+&mx25r64 {
+	partitions {
+		compatible = "fixed-partitions";
+		#address-cells = <1>;
+		#size-cells = <1>;
+
+		storage_partition: partition@0 {
+			label = "storage";
+			reg = <0x00000000 0x00800000>;
+		};
+	};
+};
