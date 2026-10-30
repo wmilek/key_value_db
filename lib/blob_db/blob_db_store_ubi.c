@@ -58,6 +58,7 @@ static const uint8_t g_key_context[] = "blob_db";
 static struct ubi_device *g_ubi;
 static uint32_t g_vol_id = UBI_VOL_ID_INVALID;
 static uint32_t g_leb_size;
+static uint32_t g_leb_count;
 static psa_key_id_t g_key_id;
 
 /* Damage reported since the last open, for blob_db_store_open_found_damage():
@@ -397,6 +398,7 @@ int blob_db_store_open(struct blob_db_store_geom *geom, bool discard)
 	geom->peb_size = g_leb_size;
 	geom->write_align = info.write_block_size ? info.write_block_size : 1;
 	geom->n_pebs = (uint16_t)leb_count;
+	g_leb_count = leb_count;
 	return 0;
 
 err_deinit:
@@ -441,6 +443,38 @@ int blob_db_store_write(off_t off, const void *buf, size_t len)
 
 	BLOB_DB_IO_NOTE(BLOB_DB_IO_WRITE, len);
 	return ubi_leb_write_at(g_ubi, g_vol_id, lnum, within, buf, len);
+}
+
+/* Removing the volume and creating it again empties it without erasing
+ * anything now: UBI queues the old blocks for reclaim and erases each one when
+ * a write needs it, and the device keeps its erase counters. Erasing LEB by
+ * LEB would cost an erase per mapped block up front. The new volume has the
+ * size of the old, because blob_db's geometry was read at open. A power cut
+ * between the two calls leaves no volume, which the next open creates: an
+ * empty store, as asked for. */
+int blob_db_store_discard(void)
+{
+	int rc = ubi_volume_remove(g_ubi, g_vol_id);
+
+	if (rc != 0) {
+		LOG_ERR("ubi_volume_remove: %d", rc);
+		return rc;
+	}
+	g_vol_id = UBI_VOL_ID_INVALID;
+
+	const struct ubi_volume_config cfg = {
+		.name = BLOB_DB_UBI_VOL_NAME,
+		.leb_count = g_leb_count,
+	};
+
+	rc = ubi_volume_create(g_ubi, &cfg, &g_vol_id);
+	if (rc != 0) {
+		LOG_ERR("ubi_volume_create: %d", rc);
+		return rc;
+	}
+	LOG_INF("recreated UBI volume '%s' id=%u leb_count=%u",
+		BLOB_DB_UBI_VOL_NAME, g_vol_id, cfg.leb_count);
+	return 0;
 }
 
 /* Static data never moves on its own: UBI levels wear only when asked.

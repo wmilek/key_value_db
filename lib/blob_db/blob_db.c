@@ -3541,10 +3541,10 @@ static int format_whole_store(void)
 	blob_db_sidx_reset(st.n_buckets);
 	st.wedged = false;   /* the whole store, scratch included, goes away */
 
-	int rc = blob_db_store_erase(0, st.fa_size);
+	int rc = blob_db_store_discard();
 
 	if (rc < 0) {
-		LOG_ERR("format: erase: %d", rc);
+		LOG_ERR("format: discard: %d", rc);
 		return rc;
 	}
 

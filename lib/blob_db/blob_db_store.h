@@ -66,6 +66,16 @@ int blob_db_store_write(off_t off, const void *buf, size_t len);
 int blob_db_store_erase(off_t off, size_t len);
 
 /*
+ * Discard the whole store: afterwards every PEB reads back as the erased
+ * value, and the geometry blob_db_store_open() reported still holds. Called
+ * by blob_db_format() only. A backend may do this more cheaply than erasing
+ * every PEB, as long as nothing of the old contents can be read back through
+ * this interface. A power loss part-way leaves part of the old contents or
+ * none of them, never a store that will not open.
+ */
+int blob_db_store_discard(void);
+
+/*
  * Replace the PEB at off with len bytes from buf: the PEB reads as buf
  * followed by the erased value, and later writes may append after it. Equal to
  * blob_db_store_erase(off, peb_size) then blob_db_store_write(off, buf, len),

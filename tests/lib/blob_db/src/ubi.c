@@ -18,6 +18,7 @@
 #include <string.h>
 
 #include <zephyr/storage/flash_map.h>
+#include <zephyr/sys/byteorder.h>
 #include <zephyr/ztest.h>
 
 #include <psa/crypto.h>
@@ -305,4 +306,80 @@ ZTEST(blob_db_ubi, test_rolled_back_master_still_raises_ceiling)
 
 	zassert_true(next > id, "re-issued a bound id: next=%llu id=%llu",
 		     (unsigned long long)next, (unsigned long long)id);
+}
+
+/* UBI headers on the raw partition: the erase-counter header at the start of
+ * every PEB, its count big-endian at 0x08 and the device's image sequence at
+ * 0x18 (zephyr-ubi's ubi_header.c). */
+#define EC_HDR_MAGIC_0  0x55   /* 'U' */
+#define EC_OFF_COUNT    0x08
+#define EC_OFF_IMAGE    0x18
+
+static void raw_ubi_state(const struct flash_area *fa, uint32_t *image_seq,
+			  uint64_t *ec_total)
+{
+	uint8_t hdr[0x1c];
+
+	*image_seq = 0;
+	*ec_total = 0;
+	for (off_t off = 0; off < (off_t)fa->fa_size; off += RAW_PEB_SZ) {
+		zassert_ok(flash_area_read(fa, off, hdr, sizeof(hdr)));
+		if (hdr[0] != EC_HDR_MAGIC_0) {
+			continue;
+		}
+		*ec_total += sys_get_be64(&hdr[EC_OFF_COUNT]);
+		if (*image_seq == 0) {
+			*image_seq = sys_get_be32(&hdr[EC_OFF_IMAGE]);
+		}
+	}
+}
+
+/* Format on an attached device starts the store over without formatting
+ * UBI: the device and its erase counters stay, nothing is erased up front,
+ * and nothing of the old store reads back. */
+ZTEST(blob_db_ubi, test_format_keeps_the_ubi_device)
+{
+	static const uint8_t pl[64] = { 0x5a };
+	const struct flash_area *fa;
+	uint64_t ids[48];
+	uint8_t buf[sizeof(pl)];
+	uint32_t seq_before, seq_after;
+	uint64_t ec_before, ec_after;
+	size_t got;
+
+	/* Enough blobs to map many LEBs, so erasing them one by one would
+	 * show in the counters. */
+	for (size_t i = 0; i < ARRAY_SIZE(ids); i++) {
+		ids[i] = blob_db_alloc_id();
+		zassert_ok(blob_db_update(ids[i], pl, sizeof(pl)));
+	}
+
+	zassert_ok(flash_area_open(PARTITION_ID_UNDER_TEST, &fa));
+	raw_ubi_state(fa, &seq_before, &ec_before);
+	zassert_not_equal(seq_before, 0, "no UBI header found");
+
+	zassert_ok(blob_db_format());
+	zassert_equal(blob_db_count(), 1, "want a fresh store holding only root");
+	for (size_t i = 0; i < ARRAY_SIZE(ids); i++) {
+		zassert_equal(blob_db_get(ids[i], buf, sizeof(buf), &got),
+			      -ENOENT, "blob %llu survived the format",
+			      (unsigned long long)ids[i]);
+	}
+
+	raw_ubi_state(fa, &seq_after, &ec_after);
+	zassert_equal(seq_after, seq_before, "format must not reformat UBI");
+	/* Erasing LEB by LEB cost 51 here, one per mapped block; recreating
+	 * the volume costs the volume-table updates and the new store's first
+	 * blocks, 12. */
+	zassert_true(ec_after - ec_before < ARRAY_SIZE(ids) / 2,
+		     "format erased %llu blocks up front",
+		     (unsigned long long)(ec_after - ec_before));
+
+	/* The new volume survives a remount, still empty. */
+	blob_db_unmount();
+	zassert_ok(blob_db_mount());
+	zassert_equal(blob_db_count(), 1);
+	zassert_equal(blob_db_get(ids[0], buf, sizeof(buf), &got), -ENOENT);
+
+	flash_area_close(fa);
 }

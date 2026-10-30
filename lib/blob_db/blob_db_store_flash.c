@@ -111,6 +111,11 @@ int blob_db_store_erase(off_t off, size_t len)
 	return flash_area_erase(g_fa, off, len);
 }
 
+int blob_db_store_discard(void)
+{
+	return blob_db_store_erase(0, g_fa->fa_size);
+}
+
 int blob_db_store_replace(off_t off, const void *buf, size_t len)
 {
 	int rc = blob_db_store_erase(off, g_peb_size);
