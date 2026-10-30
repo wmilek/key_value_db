@@ -1,0 +1,16 @@
+/*
+ * With persondb_minimal.conf: the store is on the QSPI NOR, so drop the
+ * internal-flash partitions, and the code-partition pointer at one of them.
+ * flash_map then no longer references the SoC flash controller, and
+ * CONFIG_SOC_FLASH_NRF=n links.
+ */
+
+/ {
+	chosen {
+		/delete-property/ zephyr,code-partition;
+	};
+};
+
+&flash0 {
+	/delete-node/ partitions;
+};

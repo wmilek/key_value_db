@@ -36,6 +36,9 @@ The builds are lists of Kconfig fragments:
   logring, kvdb, blobfs.
 - [`variants/`](variants) — one toggle each, applied to the full stack
   (stages 1–8) or to `app_cbor_persondb`.
+- `variants/persondb_minimal.*` and `persondb_single_thread.conf` are the
+  exception: bundles that build the smallest `app_cbor_persondb` that still
+  runs (`RESULTS.md` §4). `footprint.py` does not build them.
 
 `app_cbor_persondb` is built as shipped and with a few of the same fragments, as
 the finished application.

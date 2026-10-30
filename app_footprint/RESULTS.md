@@ -110,3 +110,94 @@ What the toggles say:
 - **F3. `CONFIG_APP_CBOR_PERSONDB_TUI=n` did not compile**: the
   `SHELL_COND_CMD_ARG` entry still names `cmd_tui`, which the flag compiles
   out. Fixed in `ui/ui_shell.c` (`#define cmd_tui NULL` when off).
+
+## 4. The smallest persondb that still runs
+
+How far `app_cbor_persondb` goes down with Kconfig and devicetree alone, without
+changing its code. Measured 2026-10-30 with Zephyr SDK 1.0.1 at key_value_db
+`43024978632f`, Zephyr `ec98918869ca`, zephyr-ubi `d66b599af9ef`. That Zephyr
+is newer than the one in §1–2, so `p0` here is 109 056 B, not 108 992; every
+row below comes from this one tree.
+
+Fragments: [`variants/persondb_minimal.conf`](variants/persondb_minimal.conf)
+with [`variants/persondb_minimal.overlay`](variants/persondb_minimal.overlay),
+and [`variants/persondb_single_thread.conf`](variants/persondb_single_thread.conf)
+on top of them. They bundle several toggles, so `footprint.py` does not build
+them. Build them by hand:
+
+```
+west build -b nrf5340dk/nrf5340/cpuapp key_value_db/app_cbor_persondb -- \
+  -DEXTRA_CONF_FILE="$PWD/key_value_db/app_footprint/variants/persondb_minimal.conf" \
+  -DEXTRA_DTC_OVERLAY_FILE="$PWD/key_value_db/app_footprint/variants/persondb_minimal.overlay"
+```
+
+Each row adds one toggle to the row above it. RAM is listed for reference only,
+as in §1.
+
+| Step | Kconfig added | FLASH | Δ | RAM |
+|---|---|--:|--:|--:|
+| p0 as shipped | — | 109 056 | | 215 188 |
+| flash_area backend | `CONFIG_BLOB_DB_BACKEND_FLASH_AREA=y` | 67 528 | -41 528 | 198 864 |
+| logging off | `CONFIG_LOG=n` | 51 904 | -15 624 | 196 704 |
+| LTO | `CONFIG_LTO=y CONFIG_ISR_TABLES_LOCAL_DECLARATION=y` | 47 304 | -4 600 | 196 680 |
+| no GPIO driver | `CONFIG_GPIO=n` | 44 188 | -3 116 | 196 496 |
+| no fault dump | `CONFIG_EXCEPTION_DEBUG=n CONFIG_FAULT_DUMP=0` | 42 948 | -1 240 | 196 496 |
+| no MPU stack guard | `CONFIG_ARM_MPU=n CONFIG_HW_STACK_PROTECTION=n` | 42 212 | -736 | 196 432 |
+| nano cbprintf | `CONFIG_CBPRINTF_NANO=y` | 41 532 | -680 | 196 432 |
+| no time slicing | `CONFIG_TIMESLICING=n` | 41 084 | -448 | 196 400 |
+| no I/O stats | `CONFIG_BLOB_DB_IOSTATS=n` | 40 876 | -208 | 196 336 |
+| no boot banner | `CONFIG_BOOT_BANNER=n` | 40 828 | -48 | 196 336 |
+| no libc malloc | `CONFIG_COMMON_LIBC_MALLOC=n` | 40 284 | -544 | 196 320 |
+| no internal-flash driver | `CONFIG_SOC_FLASH_NRF=n` + overlay | **39 720** | -564 | 196 296 |
+| single-threaded | `CONFIG_MULTITHREADING=n` | **36 948** | -2 772 | 195 560 |
+
+**39 720 B (38.8 KB) is the minimum, 36 % of the shipped 106.5 KB.** With
+`CONFIG_MULTITHREADING=n` as well it is 36 948 B (36.1 KB), 34 %.
+
+What is left, attributed without LTO (44 136 B; LTO merges every object, so the
+attribution cannot see inside it):
+
+| app | platform | kvhash | blob_db | kernel | flash drv | libc | zcbor | Zephyr libs | linker | rootreg | CRC | blob_db backend |
+|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|
+| 10 995 | 10 133 | 4 514 | 4 351 | 3 715 | 2 975 | 1 978 | 1 785 | 1 622 | 860 | 628 | 312 | 268 |
+
+The application and the platform (QSPI and UART HAL, RTC timer, clocks,
+pinctrl) are half of it. The storage stack is 9.5 KB.
+
+If UBI stays, the same toggles apart from the backend and malloc (Mbed TLS
+allocates) give **65 004 B**. Single-threaded does not link with UBI, because
+zephyr-ubi takes a `k_mutex`.
+
+What it was checked with:
+
+- **nRF5340-DK: built only, not run.** All builds above link. No DK was
+  attached when these numbers were taken.
+- **native_sim: run.** The part of `persondb_minimal.conf` that native_sim
+  has (flash_area, no logging, no I/O stats, nano cbprintf, no GPIO, no
+  malloc, no time slicing, no banner) ran the full 8 000 persons: fill,
+  `VERIFY PASS` twice, `bucket overflows: 0`, 41.3 % live (the shipped
+  figure), then a second boot on the same flash file (`rev 1 -> 2`,
+  `VERIFY PASS`). Nano cbprintf prints the report the same as the full
+  formatter, apart from the timings. LTO, the MPU, the fault dump, the
+  internal-flash driver and `MULTITHREADING=n` are Cortex-M settings that
+  native_sim cannot exercise. They need a DK run.
+
+What each cut costs:
+
+- **flash_area instead of UBI** changes the on-flash format (raw partition,
+  not a UBI volume): expect to wipe a store the shipped image wrote. It also
+  drops UBI's wear leveling and header MACs.
+- **No I/O stats**: the report's "flash ops" and "B" columns read 0. A
+  benchmark run loses its measurement, which is what the app is for.
+- **No MPU guard**: a main-stack overflow corrupts memory silently. The
+  28 KB stack is sized at 1.4× a measured worst case (`prj.conf`).
+- **Not to be cut**: the console (the report is the output),
+  `CONFIG_ZCBOR_CANONICAL` (verification compares encodings), and
+  `CBPRINTF_FULL_INTEGRAL` (the report prints 64-bit values).
+  `CONFIG_SIZE_OPTIMIZATIONS_AGGRESSIVE` (`-Oz`) gave the same image byte for
+  byte, and `CONFIG_MINIMAL_LIBC` was 992 B larger than picolibc.
+- **RAM does not shrink with any of this.** 188 KB of the 196 KB is two
+  64 KB blob_db sector buffers, two 16 KB kvhash buffers and the 28 KB main
+  stack. All of them follow from the 64 KB erase block and
+  `CONFIG_BLOB_DB_MAX_PAYLOAD_LEN=16384`, which the 8 000-person dataset
+  needs.
