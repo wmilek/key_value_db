@@ -2188,3 +2188,102 @@ python3 tools/perf_sweep.py parse run1.log run2.log run3.log -o point.json
 Capture the console before programming and let `nrfutil device program
 --options reset=RESET_SYSTEM` start each run (§8b). Run 3 is `nrfutil device
 reset` after run 2 prints `persondb: done`.
+
+## 10b. nRF52840-DK — 8 000 persons, against the nRF5340-DK on the same build
+
+The nRF52840-DK (PCA10056) carries the same MX25R6435F on QSPI as the
+nRF5340-DK, so the store, its geometry and every flash counter in this file
+carry over unchanged. What differs is the CPU: a Cortex-M4F at 64 MHz instead
+of the nRF5340's Cortex-M33 at 64 MHz, and half the RAM (256 KB). This section
+runs the 8 000-person benchmark on both boards from one commit, so the only
+difference is the SoC.
+
+### Setup
+
+- **Boards**: nRF52840-DK PCA10056, J-Link SN 1050295749 ("board 3", new);
+  nRF5340-DK PCA10095, SN 1050091053 (board 2 of §10a) as the control.
+  Store on the on-board MX25R6435F, whole chip, UBI on zephyr-ubi `v0.1.0`,
+  two-level `kvhash`, default `app_cbor_persondb` configuration
+  (8 000 persons, 200 bench samples).
+- **Firmware**: `f2a2b94` (main) plus the DK-local `ubi-ec:` `printk` of §10a.
+  The board files are `boards/nrf52840dk_nrf52840.{overlay,conf}`, the
+  nRF5340 ones applied to the nRF52840. Zephyr `4a405846193f` plus the
+  `nrf_qspi_nor` power-mode patch from #49, SDK 1.0.1.
+- **QSPI in high-performance mode on both boards** (#49), because the
+  low-power mode corrupts reads on this flash part (#44). These times are
+  therefore not comparable with §10a, which ran in low-power mode; an erase
+  costs about half here.
+- **Starting state differs, on purpose**: board 3's chip was blank (its first
+  UBI attach formatted it); board 2 kept its UBI device and wear from §10a
+  (`image_seq` `0x6d0b4b7a`, max erase count 87) and started from
+  `FRESH_START`. That only changes `open` on run 1, which is left out of the
+  comparison.
+- **Runs**: run 1 creates and fills the store, then mutates and benches;
+  run 2 is the same image without `FRESH_START`, after a reboot.
+- **Footprint on the nRF52840**: 106 120 B flash (10.1 %), 215 108 B RAM
+  (**82.1 %**). The 64 KB sector buffer is most of it; RAM, not flash, is
+  this board's limit.
+
+Files: `results/dk-nrf52840/` — `<soc>-b<board>-n8000-f2a2b94-run{1,2}.log`,
+raw UART as captured.
+
+### Results
+
+Every flash counter (operations and bytes, every bench line) is
+**byte-identical on the two boards**, in both runs. The differences below are
+time only.
+
+| run 1 | nRF5340 | nRF52840 | Δ |
+|---|--:|--:|--:|
+| `prepare` (70 bucket formats) | 36.4 s | 39.4 s | +8.4 % |
+| `fill`, 8 000 persons | 1 210.5 s | 1 218.8 s | +0.7 % |
+| `mutate` (64 assigned) | 15.52 s | 15.71 s | +1.2 % |
+| `check` ms/op | 14.60 | 14.76 | +1.1 % |
+| `byid` ms/op | 8.80 | 9.01 | +2.5 % |
+| `miss` ms/op | 6.23 | 6.34 | +1.7 % |
+| `put` ms/op | 272.4 | 276.2 | +1.4 % |
+| `cbor` ms/op (no flash) | 0.948 | 1.148 | **+21.1 %** |
+
+| run 2 (after reboot) | nRF5340 | nRF52840 | Δ |
+|---|--:|--:|--:|
+| `open` | 4.27 s | 4.62 s | +8.4 % |
+| `mutate` (64 revoked, 64 assigned) | 28.48 s | 28.75 s | +1.0 % |
+| `check` ms/op | 14.36 | 14.75 | +2.7 % |
+| `byid` ms/op | 8.24 | 8.57 | +3.9 % |
+| `miss` ms/op | 6.51 | 6.73 | +3.3 % |
+| `put` ms/op | 253.5 | 256.4 | +1.2 % |
+| `cbor` ms/op (no flash) | 0.947 | 1.148 | **+21.2 %** |
+
+Both runs pass on both boards: 8 000 of 8 000 persons in 32 commits, no
+`<err>`/`<wrn>`, and run 2 finds the store complete and moves it from rev 1 to
+rev 2. Board 3's UBI device after run 2: `image_seq` `0xae640eb4`, 128 PEBs
+healthy, erase count max 10, total 1 067.
+
+### What to take from this
+
+- **Pure CPU work is 21 % slower on the nRF52840** at the same clock: `cbor`
+  is the only line with no flash in it.
+- **Everything that touches the store moves 1–4 %**, because flash time
+  dominates and the flash is the same part. Reads move most (`byid`, `miss`
+  +2–4 %), `fill` and `put` least (+0.7–1.4 %), in proportion to their CPU
+  share.
+- **The flash side of the models carries over unchanged**: same counters,
+  same per-byte and per-erase costs. Only the CPU share of the per-transaction
+  term differs; refitting it on this board has not been done.
+- **Projection, not measured here**: work that is mostly CPU — software crypto
+  in particular — should cost about 1.2× on the nRF52840, so a protection mode
+  that adds ×1.7–×2.5 to reads on the nRF5340 would add proportionally more
+  here.
+
+### Reproducing
+
+```
+west build -p always -b nrf52840dk/nrf52840 app_cbor_persondb \
+    -- -DCONFIG_APP_CBOR_PERSONDB_FRESH_START=y      # run 1 only
+```
+
+High-performance mode needs #49's driver patch and
+`mxicy,mx25r-power-mode = "high-performance";` on `&mx25r64`, as for the
+nRF5340-DK. An nRF52840-DK that arrives with readback protection on must be
+unlocked first (`nrfutil device recover`, which erases its internal flash but
+not the MX25R).

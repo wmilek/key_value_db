@@ -149,6 +149,13 @@ jobs:
           west build -p always -b nrf5340dk/nrf5340/cpuapp -d build/nrf_persondb \
             key_value_db/app_cbor_persondb
 
+      # The nRF52840-DK has half the RAM (256 KB); the 64 KB sector buffer
+      # leaves it at about 82 %, so keep the link checked.
+      - name: Build app_cbor_persondb — benchmark frontend (nRF52840)
+        run: |
+          west build -p always -b nrf52840dk/nrf52840 -d build/nrf52_persondb \
+            key_value_db/app_cbor_persondb
+
       - name: Build app_cbor_persondb — shell frontend (ARM)
         run: |
           west build -p always -b nrf5340dk/nrf5340/cpuapp -d build/nrf_persondb_shell \

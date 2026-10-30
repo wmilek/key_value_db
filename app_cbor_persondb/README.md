@@ -20,6 +20,7 @@ measured numbers are in **[`RESULTS.md`](RESULTS.md)**.
 ```
 west build -b native_sim app_cbor_persondb && ./build/zephyr/zephyr.exe --flash=db.bin
 west build -b nrf5340dk/nrf5340/cpuapp app_cbor_persondb && west flash
+west build -b nrf52840dk/nrf52840 app_cbor_persondb && west flash   # RESULTS.md §10b
 ```
 
 ---
