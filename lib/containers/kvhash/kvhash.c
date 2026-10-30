@@ -225,12 +225,30 @@ static inline uint32_t key_hash(const void *key, size_t klen)
 /*
  * A key's fingerprint, kept in a spilled key's entry so a lookup reads the
  * key blob only on a likely match. It is format: fixed for v3, never
- * configurable. CRC-32C rather than the bucket hash, because every key in a
- * bucket shares the bucket hash bits that chose it.
+ * configurable.
+ *
+ * It is the bucket hash itself, so the stack carries one CRC-32 (the one UBI
+ * and blob_db's headers already use) rather than a second polynomial for this
+ * alone. That costs fingerprint strength, and only that: keys in one bucket
+ * share the residues that chose it, which leaves about 32 - log2(buckets)
+ * bits to tell them apart: at least 24 in a flat map (at most 255 buckets),
+ * and a two-level map aims at one entry per bucket, so it has few keys to
+ * tell apart. Any other function of the same CRC would leave no more, since
+ * for keys of one length a different seed only XORs in a constant. A
+ * collision is never a wrong answer: a fingerprint match is always confirmed
+ * against the key bytes, so it costs one blob read.
+ *
+ * A caller that has the bucket hash takes the fingerprint from it, so a
+ * lookup runs the CRC over its key once.
  */
+static inline uint32_t hash_fp(uint32_t h)
+{
+	return h & FP_MASK;
+}
+
 static inline uint32_t key_fp(const void *key, size_t klen)
 {
-	return crc32_c(0, key, klen, true, true) & FP_MASK;
+	return hash_fp(key_hash(key, klen));
 }
 
 static inline uint16_t idx_top(uint32_t h, uint16_t n)
@@ -334,18 +352,17 @@ static int dir_load(uint64_t root, uint16_t *n_out, uint8_t *depth_out)
 }
 
 /*
- * Walk from @root to the leaf directory holding @key, leaving that directory
- * in dir_buf. Reports the leaf's own root id (what a fresh bucket must be
- * published into) and the bucket index within it.
+ * Walk from @root to the leaf directory holding the key whose bucket hash is
+ * @h, leaving that directory in dir_buf. Reports the leaf's own root id (what
+ * a fresh bucket must be published into) and the bucket index within it.
  *
  * At depth 2 this reads the top directory, takes the 8 bytes it needs, and
  * reuses dir_buf for the leaf — the top level is never needed again, which is
  * why a second level costs a read rather than a buffer.
  */
-static int resolve_leaf(uint64_t root, const void *key, size_t klen,
-			uint64_t *leaf_root, uint16_t *leaf_n, uint16_t *idx)
+static int resolve_leaf(uint64_t root, uint32_t h, uint64_t *leaf_root,
+			uint16_t *leaf_n, uint16_t *idx)
 {
-	uint32_t h = key_hash(key, klen);
 	uint16_t n;
 	uint8_t depth;
 	int rc = dir_load(root, &n, &depth);
@@ -884,9 +901,10 @@ static int kvhash_get(uint64_t root, const void *key, size_t klen,
 		return -ENOENT; /* longer than any key that can be stored */
 	}
 
+	uint32_t h = key_hash(key, klen);
 	uint64_t leaf;
 	uint16_t leaf_n, idx;
-	int rc = resolve_leaf(root, key, klen, &leaf, &leaf_n, &idx);
+	int rc = resolve_leaf(root, h, &leaf, &leaf_n, &idx);
 
 	if (rc != 0) {
 		return rc;
@@ -909,7 +927,7 @@ static int kvhash_get(uint64_t root, const void *key, size_t klen,
 	size_t off;
 	struct ent e;
 
-	rc = bkt_find(bkt_buf, used, key, klen, key_fp(key, klen), dir_buf,
+	rc = bkt_find(bkt_buf, used, key, klen, hash_fp(h), dir_buf,
 		      &off, &e);
 	if (rc != 0) {
 		return rc;
@@ -946,9 +964,10 @@ static int kvhash_set(uint64_t root, const void *key, size_t klen,
 		return -ENOSPC; /* the length field has 15 bits */
 	}
 
+	uint32_t h = key_hash(key, klen);
 	uint64_t leaf;
 	uint16_t leaf_n, idx;
-	int rc = resolve_leaf(root, key, klen, &leaf, &leaf_n, &idx);
+	int rc = resolve_leaf(root, h, &leaf, &leaf_n, &idx);
 
 	if (rc != 0) {
 		return rc;
@@ -964,7 +983,7 @@ static int kvhash_set(uint64_t root, const void *key, size_t klen,
 		return -ENOSPC; /* a spilled key is one slot, so a lookup can hold it */
 	}
 
-	uint32_t fp = key_fp(key, klen);
+	uint32_t fp = hash_fp(h);
 	uint64_t bid = dir_child(dir_buf, idx);
 	size_t used = 0;
 	bool have_old = false;
@@ -1116,9 +1135,10 @@ static int kvhash_del(uint64_t root, const void *key, size_t klen)
 		return -ENOENT; /* longer than any key that can be stored */
 	}
 
+	uint32_t h = key_hash(key, klen);
 	uint64_t leaf;
 	uint16_t leaf_n, idx;
-	int rc = resolve_leaf(root, key, klen, &leaf, &leaf_n, &idx);
+	int rc = resolve_leaf(root, h, &leaf, &leaf_n, &idx);
 
 	if (rc != 0) {
 		return rc;
@@ -1140,7 +1160,7 @@ static int kvhash_del(uint64_t root, const void *key, size_t klen)
 	size_t off;
 	struct ent e;
 
-	rc = bkt_find(bkt_buf, used, key, klen, key_fp(key, klen), dir_buf,
+	rc = bkt_find(bkt_buf, used, key, klen, hash_fp(h), dir_buf,
 		      &off, &e);
 	if (rc != 0) {
 		return rc;
@@ -1324,9 +1344,9 @@ static int kvhash_next(uint64_t root, const void *key, size_t klen,
 	uint32_t ch = 0;
 
 	if (klen != 0) {
-		cur.fp = key_fp(key, klen);
-		cursor = &cur;
 		ch = key_hash(key, klen);
+		cur.fp = hash_fp(ch);
+		cursor = &cur;
 	}
 
 	uint16_t n;
