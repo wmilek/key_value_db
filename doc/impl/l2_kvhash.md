@@ -27,7 +27,7 @@ bucket blob (packed pair list):
 **Spilling (v3).** A key longer than `CONFIG_BLOB_CONTAINER_KVHASH_KEY_INLINE_MAX`
 or a value longer than `..._VAL_INLINE_MAX` is written to a blob of its own; its
 entry keeps the true length (low 15 bits), a flag (bit 15) and the blob id, plus
-a CRC-32C fingerprint for a key. The thresholds are a write policy only: every
+a fingerprint for a key (the CRC-32 bucket hash). The thresholds are a write policy only: every
 read goes by the flags, the thresholds are consulted solely when `set` builds a
 new entry, and an entry moves to the current placement only when its key is next
 set. They can change between builds, or at run time with

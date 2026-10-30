@@ -53,7 +53,8 @@ the TRUE key/value length, wherever the bytes live.
   CRC-32C (`crc32_c`, already in Zephyr).** It must not be derived from the
   CRC-32 that picks the bucket, because every key in a bucket shares 8 of those
   bits (4 for the sub-map, 4 for the bucket at fanout 16). It is part of the
-  format: fixed forever in v3, never configurable.
+  format: fixed forever in v3, never configurable. *Superseded before any
+  deployment: `key_fp` is now the bucket hash itself (§9).*
 - **A spilled key or value is one ordinary blob** holding the bytes and nothing
   else. With `CONFIG_BLOB_DB_LARGE_PAYLOADS` it may be larger than one slot,
   which lifts `ENTRY_LIMIT` for spilled parts entirely.
@@ -92,7 +93,7 @@ Consequences, each of which is a test (§6):
 
 **Lookup** (`bkt_find`). For each entry: skip unless the true `klen` matches.
 Then, if inline, compare bytes; if spilled, compare `key_fp` with the
-requested key's CRC-32C and, only on a match, read `key_id` and compare bytes.
+requested key's fingerprint and, only on a match, read `key_id` and compare bytes.
 A hit on a spilled key costs one extra blob read; a miss costs one only on a
 32-bit fingerprint collision between keys of equal length in one bucket. The
 search must not stop at the first entry in the "expected" placement: a key
@@ -239,6 +240,18 @@ decisions made along the way:
   the bucket buffer now holds each bucket while its spilled blobs are released.
 - **A build-time guard** asserts `CONFIG_BLOB_DB_MAX_PAYLOAD_LEN <= 0x7fff`, the
   condition that keeps bit 15 free; blob_db cannot mount a larger cap anyway.
+- **`key_fp` is the CRC-32 bucket hash, not CRC-32C** (changed 2026-10-30,
+  before any store was deployed, so v3 is redefined rather than bumped). The
+  stack then carries two CRCs, the CRC-32 that UBI and blob_db's headers use
+  and blob_db's slot CRC-16, instead of three, which matters once they are
+  table-driven: each polynomial needs its own table. The cost is the one §1
+  names, and it is only a cost in reads: keys in one bucket share the residues
+  that chose it, leaving about 32 − log2(buckets) bits to tell them apart, at
+  least 24 in a flat map, while a two-level map aims at one entry per bucket.
+  No other function of the same CRC does better, since for keys of one length
+  a different seed only XORs in a constant. A collision costs one blob read,
+  because a fingerprint match is always confirmed against the key bytes. The
+  walk order within a bucket changes with it; it is never stored.
 
 Tests (`tests/lib/containers/src/spill.c`, suite `kvhash_spill`) cover §6
 items 1–5: policies lowered, raised, zeroed and disabled with no data moved and
