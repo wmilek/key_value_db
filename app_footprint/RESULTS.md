@@ -110,6 +110,12 @@ What the toggles say:
 - **F3. `CONFIG_APP_CBOR_PERSONDB_TUI=n` did not compile**: the
   `SHELL_COND_CMD_ARG` entry still names `cmd_tui`, which the flag compiles
   out. Fixed in `ui/ui_shell.c` (`#define cmd_tui NULL` when off).
+- **F4. `CONFIG_UBI_MAX_NR_OF_VOLUMES=1` does not compile.** zephyr-ubi
+  builds with `-Werror`, and GCC 14 reports `array subscript 1 is above array
+  bounds of 'struct ubi_volume[1]'` at `library/ubi_volume.c:139` and `:166`.
+  Both loops start at `index + 1 < count`, so they never run with one volume;
+  the warning is a false positive, but it stops the build. blob_db uses one
+  volume. `2` builds and saves nothing, so the default of 4 costs no RAM here.
 
 ## 4. The smallest persondb that still runs
 
@@ -201,3 +207,86 @@ What each cut costs:
   stack. All of them follow from the 64 KB erase block and
   `CONFIG_BLOB_DB_MAX_PAYLOAD_LEN=16384`, which the 8 000-person dataset
   needs.
+
+## 5. persondb on UBI, storage stack trimmed
+
+§4 trims the whole image. This section keeps UBI and leaves Zephyr as
+shipped, and changes only the storage stack: logging off, diagnostics off,
+and PSA Crypto cut down to what zephyr-ubi calls. Same tree as §4.
+
+Fragments: [`variants/persondb_ubi_minimal.conf`](variants/persondb_ubi_minimal.conf)
+and the TF-PSA-Crypto settings in
+[`variants/persondb_ubi_psa.h`](variants/persondb_ubi_psa.h). A `.conf` file
+cannot name the header by a relative path, so it goes on the command line:
+
+```
+west build -b nrf5340dk/nrf5340/cpuapp key_value_db/app_cbor_persondb -- \
+  -DEXTRA_CONF_FILE="$PWD/key_value_db/app_footprint/variants/persondb_ubi_minimal.conf" \
+  -DCONFIG_TF_PSA_CRYPTO_USER_CONFIG_FILE=\"$PWD/key_value_db/app_footprint/variants/persondb_ubi_psa.h\"
+```
+
+Each row adds one setting to the row above it:
+
+| Step | Setting | FLASH | Δ | RAM | ΔRAM |
+|---|---|--:|--:|--:|--:|
+| p0 as shipped | — | 109 056 | | 215 188 | |
+| logging off | `CONFIG_LOG=n` | 80 864 | -28 192 | 213 028 | -2 160 |
+| no I/O stats | `CONFIG_BLOB_DB_IOSTATS=n` | 80 560 | -304 | 212 964 | -64 |
+| PSA RNG from Zephyr | `CONFIG_MBEDTLS_PSA_CRYPTO_EXTERNAL_RNG=y` (+ test RNG, see below) | 78 128 | -2 432 | 212 796 | -168 |
+| AES: encrypt only, 128-bit | `MBEDTLS_BLOCK_CIPHER_NO_DECRYPT`, `MBEDTLS_AES_ONLY_128_BIT_KEY_LENGTH` | **76 436** | -1 692 | **208 444** | -4 352 |
+
+**76 436 B (74.6 KB), 70 % of the shipped image, with UBI kept.** The storage
+stack goes from 51.6 to 31.5 KB:
+
+| Build | PSA Crypto | UBI | blob_db | blob_db backend | rootreg | kvhash | Stack total | Logging core |
+|---|--:|--:|--:|--:|--:|--:|--:|--:|
+| p0 | 14 456 | 22 561 | 7 453 | 2 516 | 780 | 5 039 | 52 805 | 3 983 |
+| trimmed | 10 335 | 11 362 | 4 351 | 1 098 | 628 | 4 514 | 32 288 | 0 |
+
+Of the 31.9 KB saved, 20.0 KB comes out of the stack. The rest is the logging
+core (3.9 KB), the kernel code logging pulled in (Zephyr base 32.1 → 27.4 KB)
+and persondb's own log calls (app 13.0 → 10.7 KB).
+
+Why each step is safe:
+
+- **External RNG.** zephyr-ubi draws one random word from PSA: the image
+  sequence number, when it formats a device. Mbed TLS's entropy pool and
+  HMAC_DRBG only fed that. The nRF5340 application core has no CSPRNG driver,
+  so the fragment keeps the test generator the shipped build already falls
+  back to (F2), via `..._EXTERNAL_RNG_ALLOW_NON_CSPRNG` and
+  `CONFIG_TEST_RANDOM_GENERATOR`. With a real entropy driver, drop those two
+  lines; the external RNG is then the smaller and the secure choice.
+- **AES encrypt-only, 128-bit.** zephyr-ubi uses AES only inside AES-CMAC,
+  which only encrypts, with 128-bit keys (`UBI_KEY_BITS`). No ECB/CBC
+  algorithm is enabled, which `NO_DECRYPT` requires. It also drops the
+  decryption tables from RAM, which is most of the RAM saved.
+- **No on-flash change.** The keys, MACs and layout are unchanged. On native_sim,
+  a store written by the shipped image opens in the trimmed one and the other
+  way round: shipped fill at 8 000, then trimmed `rev 1 -> 2`, then shipped
+  `rev 2 -> 3`, all `VERIFY PASS`.
+
+Checked: the nRF5340 build links (not run on a DK). On native_sim the same two
+files ran the full 8 000 persons: `VERIFY PASS` twice, `bucket overflows: 0`,
+41.3 % live, and a second boot from the same flash file (`rev 1 -> 2`), plus
+the store exchange above.
+
+Measured and left out (each on top of the trimmed build):
+
+| Setting | ΔFLASH | Why not |
+|---|--:|---|
+| `CONFIG_BLOB_DB_UBI_ATOMIC_REPLACE=n` | -240 | Not a diagnostic: compaction goes back to five erases through the scratch sector, and an existing store must be formatted first (Kconfig help) |
+| `CONFIG_UBI_ERASE_INVALIDATES_HEADERS=n` | -144 | An erase cut short can leave a block that attach takes back as valid |
+| `CONFIG_ROOTREG_MAX_ROOTS=1` | -64 | persondb needs one root, but the next root anyone adds fails |
+| `CONFIG_MBEDTLS_INIT=n`, `CONFIG_MBEDTLS_HAVE_ASM=n` | -16 each | Too small to matter |
+| `CONFIG_MBEDTLS_MEMORY_BUFFER_ALLOC_C=n` | 0 | Not linked anyway |
+| `CONFIG_MBEDTLS_PSA_KEY_SLOT_COUNT=4` | 0 | RAM only: -816 B. zephyr-ubi creates two keys (the HKDF secret and the derived CMAC key); take it if RAM matters |
+| `CONFIG_UBI_MAX_NR_OF_VOLUMES=1` | — | Does not compile (F4); `2` saves nothing |
+
+Already off in the shipped build, so nothing to gain: `UBI_VERIFY_ON_READ`,
+`UBI_SELF_CHECKS`, `BLOB_DB_INSPECT`, `BLOB_DB_SHELL`, `BLOB_DB_SLOT_INDEX`,
+`BLOB_DB_LARGE_PAYLOADS`, `BLOB_DB_AUTOFORMAT_ON_CORRUPT`,
+`BLOB_CONTAINER_KVHASH_TEST_HOOKS`.
+
+What is left in PSA Crypto (10.3 KB) is mostly its core, `psa_crypto.c` at 4.5 KB,
+then AES 1.4, the MAC layer 1.0, SHA-256 0.9 and CMAC 0.8. No Kconfig setting
+reaches the core.
