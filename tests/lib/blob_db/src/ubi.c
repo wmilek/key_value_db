@@ -3,8 +3,9 @@
  * SPDX-License-Identifier: Apache-2.0
  *
  * What the UBI backend adds on top of the store seam: refusing a substrate it
- * cannot read, discarding it only through blob_db_format(), and the two
- * application hooks of <app/lib/blob_db_ubi.h>.
+ * cannot read, discarding it only through blob_db_format(), finishing a first
+ * format a power cut interrupted, and the two application hooks of
+ * <app/lib/blob_db_ubi.h>.
  *
  * The hook cases need the hooks defined here, so they run only in the
  * lib.blob_db.ubi.app_key scenario (CONFIG_BLOB_DB_UBI_KEY_APP); the
@@ -17,6 +18,8 @@
 #include <stdint.h>
 #include <string.h>
 
+#include <zephyr/drivers/flash.h>
+#include <zephyr/drivers/flash/flash_simulator.h>
 #include <zephyr/storage/flash_map.h>
 #include <zephyr/ztest.h>
 
@@ -131,6 +134,150 @@ ZTEST(blob_db_ubi, test_blank_partition_is_formatted_by_mount)
 
 	zassert_ok(blob_db_mount());
 	zassert_equal(blob_db_count(), 1, "want a fresh store holding only root");
+}
+
+/* Power cuts for the interrupted-format cases: every program and erase fails
+ * once the budget of programmed bytes is spent. */
+static struct {
+	bool cut, armed;
+	uint32_t budget, bytes;
+} pc;
+
+static int pc_write_byte(const struct device *dev, off_t off, uint8_t data)
+{
+	ARG_UNUSED(dev);
+	ARG_UNUSED(off);
+	if (pc.cut) {
+		return -EIO;
+	}
+	if (pc.armed) {
+		if (pc.budget == 0) {
+			pc.cut = true;
+			return -EIO;
+		}
+		pc.budget--;
+	}
+	pc.bytes++;
+	return data;
+}
+
+static int pc_erase_unit(const struct device *dev, off_t unit_off)
+{
+	size_t size;
+	uint8_t *mem = flash_simulator_get_memory(dev, &size);
+	struct flash_pages_info page;
+
+	if (pc.cut) {
+		return -EIO;
+	}
+	(void)flash_get_page_info_by_offs(dev, unit_off, &page);
+	memset(&mem[unit_off], flash_get_parameters(dev)->erase_value, page.size);
+	return 0;
+}
+
+static const struct flash_simulator_cb pc_cb = {
+	.write_byte = pc_write_byte,
+	.erase_unit = pc_erase_unit,
+};
+
+static size_t block_size(const struct flash_area *fa)
+{
+	struct flash_pages_info page;
+
+	zassert_ok(flash_get_page_info_by_offs(fa->fa_dev, fa->fa_off, &page));
+	return page.size;
+}
+
+/* Whether anything past the first two blocks is programmed, i.e. the format
+ * finished and blob_db went on to create its volume. */
+static bool past_the_format(const struct flash_area *fa)
+{
+	uint8_t chunk[256];
+
+	for (off_t off = 2 * block_size(fa); off < (off_t)fa->fa_size;
+	     off += sizeof(chunk)) {
+		zassert_ok(flash_area_read(fa, off, chunk, sizeof(chunk)));
+		for (size_t i = 0; i < sizeof(chunk); i++) {
+			if (chunk[i] != 0xff) {
+				return true;
+			}
+		}
+	}
+	return false;
+}
+
+/* A power cut inside the first mount's format, at every byte of it, leaves a
+ * partition the next mount formats again. Before, a cut in the erase counter
+ * header left -ENOTSUP and one in the first volume table copy -EBADMSG, at
+ * every boot, until the application called blob_db_format(). */
+ZTEST(blob_db_ubi, test_interrupted_first_format_is_finished_by_mount)
+{
+	const struct flash_area *fa;
+	uint32_t tested = 0;
+
+	blob_db_unmount();
+	zassert_ok(flash_area_open(PARTITION_ID_UNDER_TEST, &fa));
+	flash_simulator_set_callbacks(fa->fa_dev, &pc_cb);
+
+	for (uint32_t cut = 1;; cut++) {
+		memset(&pc, 0, sizeof(pc));
+		zassert_ok(flash_area_erase(fa, 0, fa->fa_size));
+		pc.budget = cut;
+		pc.armed = true;
+		(void)blob_db_mount();
+		zassert_true(pc.cut, "cut %u: the first mount finished first", cut);
+		pc.armed = false;
+		pc.cut = false;
+		blob_db_unmount();
+		if (past_the_format(fa)) {
+			break;
+		}
+
+		zassert_ok(blob_db_mount(), "cut %u: the format is left stuck", cut);
+		zassert_equal(blob_db_count(), 1, "cut %u: not a fresh store", cut);
+		blob_db_unmount();
+		tested++;
+	}
+
+	flash_simulator_set_callbacks(fa->fa_dev, NULL);
+	/* The last cut may have torn blob_db's own first master. */
+	zassert_ok(flash_area_erase(fa, 0, fa->fa_size));
+	flash_area_close(fa);
+	zassert_true(tested > 2 * 64, "covered only %u cuts of the format", tested);
+}
+
+/* What a torn format leaves is formatted again only while nothing else is on
+ * the partition: the same erase counter magic beside other bytes, or in a block
+ * a first format never writes, is refused and left as it is. */
+ZTEST(blob_db_ubi, test_format_leftovers_beside_other_data_are_refused)
+{
+	static const uint8_t ec_magic[] = { 0x55, 0x42, 0x49, 0x23 };
+	static const uint8_t other[] = { 1, 2, 3, 4 };
+	const struct flash_area *fa;
+	uint8_t back[4];
+
+	blob_db_unmount();
+	zassert_ok(flash_area_open(PARTITION_ID_UNDER_TEST, &fa));
+
+	const off_t block = (off_t)block_size(fa);
+
+	zassert_ok(flash_area_erase(fa, 0, fa->fa_size));
+	zassert_ok(flash_area_write(fa, 0, ec_magic, sizeof(ec_magic)));
+	zassert_ok(flash_area_write(fa, 5 * block, other, sizeof(other)));
+	zassert_equal(blob_db_mount(), -ENOTSUP,
+		      "format leftovers beside other data must be refused");
+	zassert_ok(flash_area_read(fa, 5 * block, back, sizeof(back)));
+	zassert_mem_equal(back, other, sizeof(other));
+
+	zassert_ok(flash_area_erase(fa, 0, fa->fa_size));
+	zassert_ok(flash_area_write(fa, 3 * block, ec_magic, sizeof(ec_magic)));
+	zassert_equal(blob_db_mount(), -ENOTSUP,
+		      "a block a first format never writes must be refused");
+	zassert_ok(flash_area_read(fa, 3 * block, back, sizeof(back)));
+	zassert_mem_equal(back, ec_magic, sizeof(ec_magic));
+
+	zassert_ok(flash_area_erase(fa, 0, fa->fa_size));
+	flash_area_close(fa);
 }
 
 /* Other keying material makes the store unreadable — and mount must not
