@@ -142,6 +142,11 @@ jobs:
           west build -p always -b nrf5340dk/nrf5340/cpuapp -d build/nrf_perf_l0 \
             key_value_db/app_perf_l0
 
+      - name: Build app_perf_l0 (nRF52840)
+        run: |
+          west build -p always -b nrf52840dk/nrf52840 -d build/nrf52_perf_l0 \
+            key_value_db/app_perf_l0
+
       # Same reasoning for app_cbor_persondb: both frontends, because the shell
       # one pulls in a subsystem the benchmark build never links.
       - name: Build app_cbor_persondb — benchmark frontend (ARM)
