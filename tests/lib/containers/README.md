@@ -1,6 +1,7 @@
 # L2 containers — test suite
 
-Two ztest suites in `src/main.c`, plus the `logring/` subdir suite.
+Two Map suites in `src/main.c`, two Set suites in `src/set.c`, the spill
+suites, plus the `logring/` subdir suite.
 
 ## `map_contract`
 
@@ -78,3 +79,15 @@ monikers, zero-length/binary records, reset and destroy.
 ```sh
 west twister -T key_value_db/tests/lib/containers -p native_sim --inline-logs
 ```
+
+## `set_contract` and `set_over_map`
+
+The Set shape (`include/app/lib/containers/shape_set.h`), written the same way
+as `map_contract`: every `set_contract` test loops over `set_providers[]`, so
+the native kvhash set (`doc/proposals/2026-10-31-set-shape.md` step 3) is
+covered by adding one row. Beyond round-trips it pins what a set promises over
+a map with empty values: a repeated add is `-EEXIST` and issues no write
+(checked with `blob_db_iostats`), and the return codes are exact enough to keep
+a member count by. `set_over_map` holds what is specific to the adapter: a
+root holding a map with a non-empty value is not a set (`-EIO`), and an adapter
+set reads back as a map of empty values.

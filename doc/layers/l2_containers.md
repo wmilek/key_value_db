@@ -141,6 +141,16 @@ the planned interfaces:
 > undefined". A replacement map therefore goes at a fresh `alloc_id`, never
 > back on the old root.
 
+**Set** — key-only membership (`set_ops`, `include/app/lib/containers/shape_set.h`):
+`create · stat · has · add · del · next · count · destroy`
+
+> Added after the two above. It mirrors `map_ops` op for op; what it adds is
+> that an `add` of a present member answers `-EEXIST` and writes nothing.
+> Provided today by `set_over_map`, an adapter over any `map_ops`
+> (`CONFIG_BLOB_CONTAINER_SET_OVER_MAP`); a native kvhash set with key-only
+> bucket records is proposed in `doc/proposals/2026-10-31-set-shape.md`.
+> First consumer: `app_cbor_persondb`'s rights vocabulary.
+
 Keys and values are opaque byte strings (`ptr + len`); key semantics (strings,
 paths, hashes) belong to L3. Concrete containers export a `const struct
 map_ops`/`seq_ops` instance; the L3 backend `choice` (P4) decides which instance

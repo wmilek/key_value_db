@@ -7,4 +7,5 @@ project(containers_test)
 
 # The container providers are built from lib/containers by the module CMake
 # when their Kconfigs are enabled; we only add the test itself.
-target_sources(app PRIVATE src/main.c src/spill.c src/spill_crash.c)
+target_sources(app PRIVATE src/main.c src/spill.c src/spill_crash.c
+			   src/set.c)

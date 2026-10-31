@@ -125,4 +125,14 @@ config BLOB_CONTAINER_KVTREE
 	  Map shape (map_ops) backed by a balanced tree; ordered / range queries.
 	  NOT YET IMPLEMENTED — skeleton only.
 
+config BLOB_CONTAINER_SET_OVER_MAP
+	bool "set_over_map — Set shape over any map provider"
+	help
+	  Set shape (set_ops, shape_set.h) built on any map_ops: a member is a
+	  map key with an empty value. An add of a present member writes
+	  nothing and answers -EEXIST; a new member costs a get probe plus the
+	  map's set. A few hundred bytes of code; with kvhash enabled it also
+	  provides set_over_kvhash_ops. Any other map is bound with
+	  SET_OVER_MAP_DEFINE(). See doc/proposals/2026-10-31-set-shape.md.
+
 endmenu
