@@ -111,8 +111,8 @@ Costs achieved by this design (satisfying contract §3):
 |---|---|---|---|
 | `mount` | 2 (master A + B) + root bucket walk; + 2045 (bucket scan) with a master in doubt¹ | 0 (or format if first ever) | O(1) |
 | `alloc_id()` | 0 | 0 (occasional id-hint persist) | O(1) |
-| `get(id)` | 1 bucket header + 12 B per slot + 1 payload | 0 | O(1) |
-| `update(id, …)` | 1 bucket header + 12 B per slot² | 1 (slot; on rebind the old slot becomes garbage) + occasional compact | O(1) |
+| `get(id)` | 1 bucket header + 1 per window of slots walked³ + 1 payload and CRC | 0 | O(1) |
+| `update(id, …)` | 1 bucket header + 1 per window of slots walked²³ | 1 (slot; on rebind the old slot becomes garbage) + occasional compact | O(1) |
 | `delete(id)` | as `get` (verify presence) | 1 (tombstone) | O(1) |
 | `exists(id)` | as `get` | 0 | O(1) |
 | `count` / `iterate` | 2045 (full scan) | 0 | O(1) |
@@ -125,6 +125,10 @@ is read because its `val_len` is needed to skip to the next slot).
 ² Release builds perform no existence check — `update` on a dead id is UB
 (contract §2). A debug build may spend one bucket read to verify and assert
 (§13.5).
+³ The walk reads `CONFIG_BLOB_DB_READ_WINDOW` bytes at a time (256 by
+default) and parses the slot heads in them from RAM (§5.4); after a slot larger
+than the window it reads the next head alone. The payload and its CRC are one
+read when they fit in a window, two otherwise.
 
 ## 2. Storage layout
 
@@ -366,8 +370,18 @@ bound or freshly allocated (§13.5).
 Walk the bucket by slot header (12 B per slot: header + id), tracking the
 latest match, apply latest-wins (§4); then read and CRC-verify just that slot's
 payload. No whole-sector read — the point of the header-driven walk is that
-answering one lookup costs O(slots) small reads instead of one erase-block read,
-which on 64 KB sectors is the difference between ~12 B per slot and 64 KB.
+answering one lookup reads the slot heads, not one erase block, which on 64 KB
+sectors is the difference between ~12 B per slot and 64 KB.
+
+The heads are read `CONFIG_BLOB_DB_READ_WINDOW` bytes at a time (256 by
+default) into a buffer on the walker's stack and parsed from there, not one
+12 B read each. A read costs mostly its fixed overhead (§5.4a: about 69 µs on
+the DK's QSPI NOR against 0.25 µs per byte; on UBI also a lock and a lookup),
+so a window pays for itself as soon as it holds two heads. After a slot larger
+than the window (a segment) the next refill reads just the 12 B head, since
+the window would hold nothing else. The buffer lives for one walk: it holds
+bucket bytes, and keeping them between calls would be a data cache (P3).
+The payload and its 2 B CRC are read together when they fit in a window.
 
 `count` / `iterate` and compaction keep working on a resident sector image:
 their liveness test is "does a later slot share this id?", which is O(n²) in
@@ -377,8 +391,10 @@ path (contract D5).
 
 ### 5.4a Optional slot index (`CONFIG_BLOB_DB_SLOT_INDEX`)
 
-**The walk is the cost.** A `get` is one 16 B bucket-header read, one 12 B read
-per slot in the bucket, then the payload and a 2 B CRC. The walk cannot stop at
+**The walk is the cost.** A `get` was one 16 B bucket-header read, one 12 B read
+per slot in the bucket, then the payload and a 2 B CRC; the figures in this
+paragraph were measured that way, before the walk read a window at a time
+(§5.4). The walk cannot stop at
 the first match, because the newest slot wins and the log has no back-pointers.
 On the nRF5340-DK's QSPI NOR a read costs about 69 µs of command overhead plus
 0.25 µs per byte, so a 12 B header read is 72 µs, almost all of it overhead. In
@@ -398,8 +414,8 @@ its append cursor from the index instead of walking.
 
 | Operation | Without | With the index |
 |---|---|---|
-| `get` (hit) | 1 + slots + 2 reads | 3 reads |
-| `update` (cursor known) | 1 + slots reads, then the append | the append |
+| `get` (hit) | 1 + windows walked + 1 reads (was 1 + slots + 2) | 2 reads: slot head, then payload and CRC (was 3) |
+| `update` (cursor known) | 1 + windows walked reads, then the append | the append |
 | `mount` | no scan with both masters valid (§5.1) | the same; a scanning mount also fills the index, otherwise each bucket's first walk does |
 | RAM | none | 12 B per table cell + 6 B per bucket, fixed by Kconfig |
 

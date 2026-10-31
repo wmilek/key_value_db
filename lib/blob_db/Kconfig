@@ -322,6 +322,22 @@ config BLOB_DB_SECTOR_BUF_SIZE
 	  target flash's largest sector — e.g. 65536 for the mx25r64 QSPI
 	  NOR on the nRF5340-DK.
 
+config BLOB_DB_READ_WINDOW
+	int "Bytes a bucket walk reads at a time"
+	default 256
+	range 16 4096
+	help
+	  A bucket walk reads this many bytes at a time and parses the slot
+	  headers in them from RAM, instead of one read of 12 bytes per
+	  slot. Each store read has a fixed cost on top of its bytes: on UBI
+	  a lock, a lookup and a flash transaction, and with
+	  CONFIG_UBI_VERIFY_ON_READ two header reads and two CMACs.
+
+	  The buffer is on the walker's stack and lives for one walk only:
+	  nothing is kept between calls. Larger values make fewer reads on
+	  buckets with many slots, and read more bytes past the end of a
+	  short log.
+
 config BLOB_DB_SLOT_INDEX
 	bool "RAM index from blob id to its newest slot (opt-in; departs from P3)"
 	help

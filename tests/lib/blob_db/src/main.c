@@ -711,6 +711,39 @@ ZTEST(blob_db, test_compaction_does_not_lower_id_ceiling)
  *      compaction three (bucket, and scratch twice) — or one, when the
  *      backend replaces a block atomically and skips the scratch protocol
  *      and its masters altogether. */
+/* A lookup reads its bucket a window at a time, not one 12-byte slot head per
+ * read: a bucket of nine short slots costs the header, one window and one read
+ * of the target's payload and CRC. It used to cost the header, nine heads, the
+ * payload and the CRC. A slot index hit costs less (the head, then payload and
+ * CRC); CONFIG_BLOB_DB_SLOT_INDEX_VERIFY adds the walk it checks the hit
+ * against, one window. */
+ZTEST(blob_db, test_lookup_reads_a_window_not_each_slot_head)
+{
+	struct blob_db_iostats io;
+	char val[8];
+	uint8_t buf[16];
+	size_t got;
+
+	uint64_t id = put_blob("v0000", 5);
+
+	for (int i = 1; i < 9; i++) {
+		(void)snprintk(val, sizeof(val), "v%04d", i);
+		zassert_ok(blob_db_update(id, val, 5), "update #%d failed", i);
+	}
+
+	blob_db_iostats_reset();
+	zassert_ok(blob_db_get(id, buf, sizeof(buf), &got));
+	blob_db_iostats_get(&io);
+
+	zassert_equal(got, 5);
+	zassert_mem_equal(buf, "v0008", 5);
+	const uint32_t most =
+		IS_ENABLED(CONFIG_BLOB_DB_SLOT_INDEX_VERIFY) ? 4 : 3;
+
+	zassert_true(io.reads <= most, "a lookup over 9 slots took %u reads",
+		     io.reads);
+}
+
 ZTEST(blob_db, test_iostats_causes_account_for_erases)
 {
 	struct blob_db_iostats io;

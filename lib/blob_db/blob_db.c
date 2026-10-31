@@ -51,6 +51,19 @@ struct __packed slot_head {
 };
 BUILD_ASSERT(sizeof(struct slot_head) == 12, "slot_head layout drift");
 
+/* A bucket walk's view of its sector, CONFIG_BLOB_DB_READ_WINDOW bytes at a
+ * time. A slot head is 12 bytes, and reading heads one by one costs a store
+ * read each: on UBI a lock, a lookup and a flash transaction, plus two header
+ * reads and two CMACs under CONFIG_UBI_VERIFY_ON_READ. The window lives on the
+ * walker's stack and dies with it, so nothing is cached across calls (P3);
+ * a walk that writes must not use one. */
+struct read_window {
+	off_t   base;   /* sector offset of buf[0]                */
+	size_t  len;    /* bytes of buf that hold the sector; 0 = none */
+	size_t  fill;   /* bytes the next refill reads; 0 = all of buf */
+	uint8_t __aligned(4) buf[CONFIG_BLOB_DB_READ_WINDOW];
+};
+
 /* Result of one streaming pass over a bucket. */
 struct bucket_scan {
 	off_t            write_cursor;  /* end of log — where an append goes   */
@@ -358,12 +371,41 @@ static int persist_next_id_hint(uint64_t new_hint)
 
 /* Bucket scan ----------------------------------------------------------- */
 
+/* Copy @p n bytes at offset @p off of the sector at @p sector into @p dst,
+ * through @p w: a read the window already covers costs no store read, and one
+ * it does not refills the window from @p off on, with w->fill bytes (all of
+ * the buffer when 0) but never fewer than @p n nor past the sector's end. The
+ * caller keeps @p off + @p n within the sector. */
+static int window_read(struct read_window *w, off_t sector, off_t off,
+		       void *dst, size_t n)
+{
+	if (n > sizeof(w->buf)) {
+		return blob_db_store_read(sector + off, dst, n);
+	}
+	if (w->len == 0 || off < w->base ||
+	    off + (off_t)n > w->base + (off_t)w->len) {
+		const size_t want = w->fill ? MAX(w->fill, n) : sizeof(w->buf);
+		const size_t len = MIN(want, st.peb_size - (size_t)off);
+		const int rc = blob_db_store_read(sector + off, w->buf, len);
+
+		if (rc < 0) {
+			w->len = 0;
+			return rc;
+		}
+		w->base = off;
+		w->len = len;
+	}
+	memcpy(dst, w->buf + (off - w->base), n);
+	return 0;
+}
+
 static int scan_bucket(uint16_t bid, uint64_t *max_id_inout)
 {
 	const off_t base = peb_offset(BLOB_DB_FIRST_BUCKET + bid);
+	struct read_window win = { 0 };
 
 	struct blob_db_bucket_hdr bhdr;
-	int rc = blob_db_store_read(base, &bhdr, sizeof(bhdr));
+	int rc = window_read(&win, base, 0, &bhdr, sizeof(bhdr));
 	if (rc < 0) {
 		return rc;
 	}
@@ -388,7 +430,7 @@ static int scan_bucket(uint16_t bid, uint64_t *max_id_inout)
 
 	while (cursor + min_slot <= st.peb_size) {
 		struct blob_db_slot_hdr shdr;
-		rc = blob_db_store_read(base + cursor, &shdr, sizeof(shdr));
+		rc = window_read(&win, base, cursor, &shdr, sizeof(shdr));
 		if (rc < 0) {
 			return rc;
 		}
@@ -421,8 +463,8 @@ static int scan_bucket(uint16_t bid, uint64_t *max_id_inout)
 		}
 
 		uint64_t id;
-		rc = blob_db_store_read(base + cursor + sizeof(shdr),
-				     &id, sizeof(id));
+		rc = window_read(&win, base, cursor + (off_t)sizeof(shdr),
+				 &id, sizeof(id));
 		if (rc < 0) {
 			return rc;
 		}
@@ -436,6 +478,9 @@ static int scan_bucket(uint16_t bid, uint64_t *max_id_inout)
 		blob_db_sidx_note(bid, id, (uint32_t)cursor, (uint32_t)slot_sz,
 				  (shdr.flags & BLOB_DB_SLOT_F_TOMBSTONE) != 0);
 		cursor += slot_sz;
+		/* As in scan_bucket_for(): no window for heads that far apart. */
+		win.fill = slot_sz > sizeof(win.buf) ?
+			   sizeof(shdr) + sizeof(id) : 0;
 	}
 
 	return 0;
@@ -1018,6 +1063,7 @@ static int scan_bucket_for(uint16_t bid, uint64_t target_id, off_t limit,
 {
 	const off_t base = bucket_offset(bid);
 	off_t cursor = BLOB_DB_BUCKET_DATA_OFF;
+	struct read_window win = { 0 };
 
 	out->target_off = -1;
 	out->from_index = false;
@@ -1029,7 +1075,7 @@ static int scan_bucket_for(uint16_t bid, uint64_t target_id, off_t limit,
 		}
 
 		struct slot_head sh;
-		int rc = blob_db_store_read(base + cursor, &sh, sizeof(sh));
+		int rc = window_read(&win, base, cursor, &sh, sizeof(sh));
 
 		if (rc < 0) {
 			return rc;
@@ -1055,6 +1101,9 @@ static int scan_bucket_for(uint16_t bid, uint64_t target_id, off_t limit,
 			out->target     = sh;
 		}
 		cursor += ssz;
+		/* Slots too large to share a window with the next head (segments)
+		 * make every head a fresh read: read just the head, then. */
+		win.fill = ssz > sizeof(win.buf) ? sizeof(sh) : 0;
 	}
 
 	out->write_cursor = cursor;
@@ -1078,15 +1127,26 @@ static int slot_verify(uint16_t bid, const struct bucket_scan *sc, void *dst)
 	uint16_t stored;
 	int rc;
 
-	if (val_len > 0) {
+	if ((size_t)val_len + sizeof(stored) <= CONFIG_BLOB_DB_READ_WINDOW) {
+		/* Payload and CRC are contiguous: one store read for both. */
+		uint8_t __aligned(4) buf[CONFIG_BLOB_DB_READ_WINDOW];
+
+		rc = blob_db_store_read(poff, buf, val_len + sizeof(stored));
+		if (rc < 0) {
+			return rc;
+		}
+		memcpy(dst, buf, val_len);
+		memcpy(&stored, buf + val_len, sizeof(stored));
+	} else {
 		rc = blob_db_store_read(poff, dst, val_len);
 		if (rc < 0) {
 			return rc;
 		}
-	}
-	rc = blob_db_store_read(poff + val_len, &stored, sizeof(stored));
-	if (rc < 0) {
-		return rc;
+		rc = blob_db_store_read(poff + val_len, &stored,
+					sizeof(stored));
+		if (rc < 0) {
+			return rc;
+		}
 	}
 	if (slot_crc16(&sc->target.hdr, sc->target.id, dst, val_len) != stored) {
 		return -EBADMSG;
