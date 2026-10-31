@@ -1,0 +1,655 @@
+*** Booting Zephyr OS build 7483394e4533 ***
+l0 perf 1.0.0 — raw flash_area timing
+l0geom part_bytes=8388608 block_bytes=65536 blocks=128 write_align=4 erased_val=0xff region_blocks=32 max_xfer=65536 program_page=256 cycles_per_s=32768 source=hardware timing=real board=nrf52840dk/nrf52840
+partition 8388608 B, 128 blocks of 65536 B, write align 4, erased 0xff
+working region: first 32 block(s) = 2097152 B  (THIS ERASES THEM)
+
+-- erase: cost vs erase size --
+l0raw op=erase blocks=1 ops=5 total_ns=5768737791 ns_per_op=1153747558 ns_per_block=1153747558 min_ns=1141601562 max_ns=1161804199
+  erase                 1 blk x5           1153.747 ms/call      1153.747 ms/block
+l0raw op=erase blocks=2 ops=5 total_ns=10880249022 ns_per_op=2176049804 ns_per_block=1088024902 min_ns=2060943603 max_ns=2222503662
+  erase                 2 blk x5           2176.049 ms/call      1088.024 ms/block
+l0raw op=erase blocks=4 ops=5 total_ns=21941772458 ns_per_op=4388354491 ns_per_block=1097088622 min_ns=4242950439 max_ns=4444915771
+  erase                 4 blk x5           4388.354 ms/call      1097.088 ms/block
+l0raw op=erase blocks=8 ops=5 total_ns=42074829098 ns_per_op=8414965819 ns_per_block=1051870727 min_ns=7667541503 max_ns=8616973876
+  erase                 8 blk x5           8414.965 ms/call      1051.870 ms/block
+l0raw op=erase blocks=16 ops=5 total_ns=83613891599 ns_per_op=16722778319 ns_per_block=1045173644 min_ns=15405639648 max_ns=17062164306
+  erase                16 blk x5          16722.778 ms/call      1045.173 ms/block
+l0raw op=erase blocks=32 ops=5 total_ns=166439483640 ns_per_op=33287896728 ns_per_block=1040246772 min_ns=30225250244 max_ns=34073760986
+  erase                32 blk x5          33287.896 ms/call      1040.246 ms/block
+l0raw op=erase1_sample block=0 ns=1101257324
+l0raw op=erase1_sample block=1 ns=1050781250
+l0raw op=erase1_sample block=2 ns=1121490478
+l0raw op=erase1_sample block=3 ns=1070983886
+l0raw op=erase1_sample block=4 ns=1070983886
+l0raw op=erase1_sample block=5 ns=1050781250
+l0raw op=erase1_sample block=6 ns=1050781250
+l0raw op=erase1_sample block=7 ns=1060882568
+l0raw op=erase1_sample block=8 ns=1081085205
+l0raw op=erase1_sample block=9 ns=1050781250
+l0raw op=erase1_sample block=10 ns=1070983886
+l0raw op=erase1_sample block=11 ns=1050781250
+l0raw op=erase1_sample block=12 ns=1060882568
+l0raw op=erase1_sample block=13 ns=1050781250
+l0raw op=erase1_sample block=14 ns=1040679931
+l0raw op=erase1_sample block=15 ns=1060882568
+l0raw op=erase1_sample block=16 ns=1091186523
+l0raw op=erase1_sample block=17 ns=1050781250
+l0raw op=erase1_sample block=18 ns=1060882568
+l0raw op=erase1_sample block=19 ns=1060882568
+l0raw op=erase1_sample block=20 ns=1050781250
+l0raw op=erase1_sample block=21 ns=1060882568
+l0raw op=erase1_sample block=22 ns=1070983886
+l0raw op=erase1_sample block=23 ns=1050781250
+l0raw op=erase1_sample block=24 ns=1060882568
+l0raw op=erase1_sample block=25 ns=1050781250
+l0raw op=erase1_sample block=26 ns=1060882568
+l0raw op=erase1_sample block=27 ns=1060882568
+l0raw op=erase1_sample block=28 ns=1060882568
+l0raw op=erase1_sample block=29 ns=1060882568
+l0raw op=erase1_sample block=30 ns=1060882568
+l0raw op=erase1_sample block=31 ns=1050781250
+l0raw op=erase1_dist n=32 min_ns=1040679931 med_ns=1060882568 max_ns=1121490478
+  erase1 dist           1 blk x32      median 1060.882 ms  spread 1040.679..1121.490 ms (1.07x)
+l0raw op=erase1 blocks=1 ops=32 total_ns=34008819571 ns_per_op=1062775611 ns_per_block=1062775611 min_ns=1040679931 max_ns=1121490478
+l0raw op=erase_erased blocks=1 ops=1 total_ns=1091186523 ns_per_op=1091186523
+  erase (erased)        1 blk x1           1091.186 ms  (102% of a median first erase)
+  erase1                1 blk x32          1062.775 ms/call  (spread 1040.679..1121.490 ms)
+     11872.00?[1;31m--- 12 messages dropped ---
+[0m  0.0%
+l0raw op=read size=4 ops=6552 total_ns=546203613 ns_per_op=83364 min_ns=83364 max_ns=83364
+        4     6552        83.364           45   20841.00      -703.00?     -
+l0raw op=read size=5 ops=3930 total_ns=497070311 ns_per_op=126480 min_ns=126473 max_ns=126496
+        5     3930       126.480           38   25296.00     43116.00   0.0%
+l0raw op=read size=6 ops=3930 total_ns=497528075 ns_per_op=126597 min_ns=126566 max_ns=126613
+        6     3930       126.597           45   21099.50       117.00   0.0%
+l0raw op=read size=7 ops=4914 total_ns=622528075 ns_per_op=126684 min_ns=126672 max_ns=126690
+        7     4914       126.684           53   18097.71        87.00   0.0%
+l0raw op=read size=8 ops=6552 total_ns=551177977 ns_per_op=84123 min_ns=84118 max_ns=84132
+        8     6552        84.123           92   10515.37    -42561.00?  0.0%
+l0raw op=read size=9 ops=4914 total_ns=625274657 ns_per_op=127243 min_ns=127231 max_ns=127249
+        9     4914       127.243           68   14138.11     43120.00   0.0%
+l0raw op=read size=10 ops=4914 total_ns=625732420 ns_per_op=127336 min_ns=127324 max_ns=127361
+       10     4914       127.336           76   12733.60        93.00   0.0%
+l0raw op=read size=11 ops=4914 total_ns=626403807 ns_per_op=127473 min_ns=127454 max_ns=127491
+       11     4914       127.473           83   11588.45       137.00   0.0%
+l0raw op=read size=12 ops=6552 total_ns=492675780 ns_per_op=75194 min_ns=65590 max_ns=85767
+       12     6552        75.194          155    6266.16    -52279.00?  26.8%
+l0raw op=read size=13 ops=4914 total_ns=433197020 ns_per_op=88155 min_ns=88124 max_ns=88180
+       13     4914        88.155          143    6781.15     12961.00?  0.0%
+l0raw op=read size=14 ops=6552 total_ns=575531004 ns_per_op=87840 min_ns=87151 max_ns=88199
+       14     6552        87.840          155    6274.28      -315.00?  1.1%
+l0raw op=read size=15 ops=3930 total_ns=448516845 ns_per_op=114126 min_ns=87778 max_ns=129152
+       15     3930       114.126          127    7608.40     26286.00?  36.2%
+l0raw op=read size=16 ops=9828 total_ns=762145995 ns_per_op=77548 min_ns=77504 max_ns=77579
+       16     9828        77.548          201    4846.75    -36578.00?  0.0%
+l0raw op=read size=18 ops=6552 total_ns=682220458 ns_per_op=104124 min_ns=99028 max_ns=113826
+       18     6552       104.124          167    5784.66     13288.00   14.2%
+l0raw op=read size=20 ops=6552 total_ns=520324706 ns_per_op=79414 min_ns=79409 max_ns=79423
+       20     6552        79.414          245    3970.70    -12355.00?  0.0%
+l0raw op=read size=22 ops=4914 total_ns=499145506 ns_per_op=101576 min_ns=101520 max_ns=101669
+       22     4914       101.576          210    4617.09     11081.00   0.1%
+l0raw op=read size=24 ops=6552 total_ns=531555174 ns_per_op=81128 min_ns=79899 max_ns=83560
+       24     6552        81.128          288    3380.33    -10224.00?  4.5%
+l0raw op=read size=26 ops=4914 total_ns=504028319 ns_per_op=102569 min_ns=102545 max_ns=102600
+       26     4914       102.569          247    3944.96     10720.50   0.0%
+l0raw op=read size=28 ops=6552 total_ns=531372069 ns_per_op=81100 min_ns=80430 max_ns=81436
+       28     6552        81.100          336    2896.42    -10734.50?  1.2%
+l0raw op=read size=30 ops=4914 total_ns=519165038 ns_per_op=105650 min_ns=103029 max_ns=110873
+       30     4914       105.650          276    3521.66     12275.00   7.4%
+l0raw op=read size=32 ops=6552 total_ns=540069578 ns_per_op=82428 min_ns=82414 max_ns=82456
+       32     6552        82.428          378    2575.87    -11611.00?  0.0%
+l0raw op=read size=36 ops=6552 total_ns=544311521 ns_per_op=83075 min_ns=82386 max_ns=83434
+       36     6552        83.075          422    2307.63       161.75?  1.2%
+l0raw op=read size=40 ops=6552 total_ns=553100585 ns_per_op=84417 min_ns=84412 max_ns=84426
+       40     6552        84.417          461    2110.42       335.50   0.0%
+l0raw op=read size=44 ops=6552 total_ns=557159422 ns_per_op=85036 min_ns=84202 max_ns=85460
+       44     6552        85.036          504    1932.63       154.75?  1.4%
+l0raw op=read size=48 ops=6552 total_ns=566497801 ns_per_op=86461 min_ns=86452 max_ns=86480
+       48     6552        86.461          541    1801.27       356.25   0.0%
+l0raw op=read size=52 ops=6552 total_ns=570190428 ns_per_op=87025 min_ns=86159 max_ns=87458
+       52     6552        87.025          583    1673.55       141.00?  1.4%
+l0raw op=read size=56 ops=9828 total_ns=869506834 ns_per_op=88472 min_ns=88459 max_ns=88487
+       56     9828        88.472          617    1579.85       361.75   0.0%
+l0raw op=read size=60 ops=6552 total_ns=581573485 ns_per_op=88762 min_ns=88422 max_ns=88939
+       60     6552        88.762          659    1479.36        72.50?  0.5%
+l0raw op=read size=64 ops=9828 total_ns=889312743 ns_per_op=90487 min_ns=90462 max_ns=90518
+       64     9828        90.487          690    1413.85       431.25   0.0%
+l0raw op=read size=72 ops=6552 total_ns=601104734 ns_per_op=91743 min_ns=91454 max_ns=91916
+       72     6552        91.743          765    1274.20       157.00   0.5%
+l0raw op=read size=80 ops=6552 total_ns=619018553 ns_per_op=94477 min_ns=94445 max_ns=94501
+       80     6552        94.477          826    1180.96       341.75   0.0%
+l0raw op=read size=88 ops=4914 total_ns=472229003 ns_per_op=96098 min_ns=95297 max_ns=96508
+       88     4914        96.098          893    1092.02       202.62   1.2%
+l0raw op=read size=96 ops=4914 total_ns=483856199 ns_per_op=98464 min_ns=98446 max_ns=98483
+       96     4914        98.464          951    1025.66       295.75   0.0%
+l0raw op=read size=104 ops=6552 total_ns=656188964 ns_per_op=100150 min_ns=99489 max_ns=100481
+      104     6552       100.150         1013     962.98       210.75   0.9%
+l0raw op=read size=112 ops=6552 total_ns=671569822 ns_per_op=102498 min_ns=102479 max_ns=102521
+      112     6552       102.498         1066     915.16       293.50   0.0%
+l0raw op=read size=120 ops=6552 total_ns=681793212 ns_per_op=104058 min_ns=103723 max_ns=104519
+      120     6552       104.058         1125     867.15       195.00   0.7%
+l0raw op=read size=128 ops=4914 total_ns=523406980 ns_per_op=106513 min_ns=106476 max_ns=106532
+      128     4914       106.513         1172     832.13       306.87   0.0%
+l0raw op=read size=144 ops=6552 total_ns=722381590 ns_per_op=110253 min_ns=108907 max_ns=111310
+      144     6552       110.253         1275     765.64       233.75   2.1%
+l0raw op=read size=160 ops=4914 total_ns=562835692 ns_per_op=114537 min_ns=114506 max_ns=114562
+      160     4914       114.537         1363     715.85       267.75   0.0%
+l0raw op=read size=176 ops=4914 total_ns=581604002 ns_per_op=118356 min_ns=117915 max_ns=118586
+      176     4914       118.356         1452     672.47       238.68   0.5%
+l0raw op=read size=192 ops=4914 total_ns=602111815 ns_per_op=122529 min_ns=122498 max_ns=122554
+      192     4914       122.529         1529     638.17       260.81   0.0%
+l0raw op=read size=208 ops=4914 total_ns=620910643 ns_per_op=126355 min_ns=125181 max_ns=127305
+      208     4914       126.355         1607     607.47       239.12   1.6%
+l0raw op=read size=224 ops=3930 total_ns=512969969 ns_per_op=130526 min_ns=130503 max_ns=130573
+      224     3930       130.526         1675     582.70       260.68   0.0%
+l0raw op=read size=240 ops=3930 total_ns=528320311 ns_per_op=134432 min_ns=134090 max_ns=134603
+      240     3930       134.432         1743     560.13       244.12   0.3%
+l0raw op=read size=256 ops=3930 total_ns=544616697 ns_per_op=138579 min_ns=138051 max_ns=139612
+      256     3930       138.579         1803     541.32       259.18   1.1%
+l0raw op=read size=288 ops=3930 total_ns=576385497 ns_per_op=146662 min_ns=146647 max_ns=146694
+      288     3930       146.662         1916     509.24       252.59   0.0%
+l0raw op=read size=320 ops=3930 total_ns=607818602 ns_per_op=154661 min_ns=154428 max_ns=154824
+      320     3930       154.661         2020     483.31       249.96   0.2%
+l0raw op=read size=352 ops=3930 total_ns=639221190 ns_per_op=162651 min_ns=162628 max_ns=162674
+      352     3930       162.651         2113     462.07       249.68   0.0%
+l0raw op=read size=384 ops=3276 total_ns=557922362 ns_per_op=170305 min_ns=169020 max_ns=171256
+      384     3276       170.305         2201     443.50       239.18   1.3%
+l0raw op=read size=416 ops=3276 total_ns=585327146 ns_per_op=178671 min_ns=178661 max_ns=178689
+      416     3276       178.671         2273     429.49       261.43   0.0%
+l0raw op=read size=448 ops=3276 total_ns=610504150 ns_per_op=186356 min_ns=185480 max_ns=186850
+      448     3276       186.356         2347     415.97       240.15   0.7%
+l0raw op=read size=480 ops=3276 total_ns=637817381 ns_per_op=194693 min_ns=194647 max_ns=194759
+      480     3276       194.693         2407     405.61       260.53   0.0%
+l0raw op=read size=512 ops=2808 total_ns=568237303 ns_per_op=202363 min_ns=201298 max_ns=203026
+      512     2808       202.363         2470     395.24       239.68   0.8%
+l0raw op=read size=576 ops=2457 total_ns=537200926 ns_per_op=218640 min_ns=218616 max_ns=218653
+      576     2457       218.640         2572     379.58       254.32   0.0%
+l0raw op=read size=640 ops=2457 total_ns=576232908 ns_per_op=234527 min_ns=234266 max_ns=234713
+      640     2457       234.527         2664     366.44       248.23   0.1%
+l0raw op=read size=704 ops=2457 total_ns=616363523 ns_per_op=250860 min_ns=250847 max_ns=250885
+      704     2457       250.860         2740     356.33       255.20   0.0%
+l0raw op=read size=768 ops=2184 total_ns=581970213 ns_per_op=266469 min_ns=265058 max_ns=267531
+      768     2184       266.469         2814     346.96       243.89   0.9%
+l0raw op=read size=832 ops=1965 total_ns=555847167 ns_per_op=282873 min_ns=282811 max_ns=282904
+      832     1965       282.873         2872     339.99       256.31   0.0%
+l0raw op=read size=896 ops=2184 total_ns=652343749 ns_per_op=298692 min_ns=298091 max_ns=299097
+      896     2184       298.692         2928     333.36       247.17   0.3%
+l0raw op=read size=960 ops=1785 total_ns=562042234 ns_per_op=314869 min_ns=314767 max_ns=314920
+      960     1785       314.869         2976     327.98       252.76   0.0%
+l0raw op=read size=1024 ops=1965 total_ns=649963378 ns_per_op=330770 min_ns=329589 max_ns=331733
+     1024     1965       330.770         3022     323.01       248.45   0.6%
+l0raw op=read size=1152 ops=1638 total_ns=594787596 ns_per_op=363118 min_ns=363025 max_ns=363192
+     1152     1638       363.118         3097     315.20       252.71   0.0%
+l0raw op=read size=1280 ops=1638 total_ns=646789550 ns_per_op=394865 min_ns=394492 max_ns=395163
+     1280     1638       394.865         3165     308.48       248.02   0.1%
+l0raw op=read size=1408 ops=1404 total_ns=599731444 ns_per_op=427159 min_ns=427115 max_ns=427180
+     1408     1404       427.159         3218     303.37       252.29   0.0%
+l0raw op=read size=1536 ops=1308 total_ns=600280761 ns_per_op=458930 min_ns=457413 max_ns=460213
+     1536     1308       458.930         3267     298.78       248.21   0.6%
+l0raw op=read size=1664 ops=1227 total_ns=602813719 ns_per_op=491290 min_ns=491191 max_ns=491489
+     1664     1227       491.290         3307     295.24       252.81   0.0%
+l0raw op=read size=1792 ops=1155 total_ns=604095457 ns_per_op=523026 min_ns=521810 max_ns=523713
+     1792     1155       523.026         3345     291.86       247.93   0.3%
+l0raw op=read size=1920 ops=1092 total_ns=606414793 ns_per_op=555324 min_ns=555269 max_ns=555436
+     1920     1092       555.324         3375     289.23       252.32   0.0%
+l0raw op=read size=2048 ops=981 total_ns=575927733 ns_per_op=587082 min_ns=586180 max_ns=587673
+     2048      981       587.082         3406     286.66       248.10   0.2%
+l0raw op=read size=2304 ops=891 total_ns=580261229 ns_per_op=651247 min_ns=651144 max_ns=651349
+     2304      891       651.247         3454     282.65       250.64   0.0%
+l0raw op=read size=2560 ops=852 total_ns=609405516 ns_per_op=715264 min_ns=714691 max_ns=715766
+     2560      852       715.264         3495     279.40       250.06   0.1%
+l0raw op=read size=2816 ops=786 total_ns=612854002 ns_per_op=779712 min_ns=779595 max_ns=779828
+     2816      786       779.712         3526     276.88       251.75   0.0%
+l0raw op=read size=3072 ops=726 total_ns=612548827 ns_per_op=843731 min_ns=843394 max_ns=844025
+     3072      726       843.731         3554     274.65       250.07   0.0%
+l0raw op=read size=3328 ops=675 total_ns=613159178 ns_per_op=908383 min_ns=908203 max_ns=908610
+     3328      675       908.383         3577     272.95       252.54   0.0%
+l0raw op=read size=3584 ops=612 total_ns=594970701 ns_per_op=972174 min_ns=971177 max_ns=972673
+     3584      612       972.174         3599     271.25       249.18   0.1%
+l0raw op=read size=3840 ops=576 total_ns=597167967 ns_per_op=1036749 min_ns=1036643 max_ns=1036961
+     3840      576      1036.749         3616     269.98       252.24   0.0%
+l0raw op=read size=4096 ops=546 total_ns=600921629 ns_per_op=1100589 min_ns=1099303 max_ns=1101483
+     4096      546      1100.589         3633     268.69       249.37   0.1%
+l0raw op=read size=4608 ops=477 total_ns=586273192 ns_per_op=1229084 min_ns=1228764 max_ns=1229340
+     4608      477      1229.084         3661     266.72       250.96   0.0%
+l0raw op=read size=5120 ops=435 total_ns=590270995 ns_per_op=1356944 min_ns=1356874 max_ns=1357085
+     5120      435      1356.944         3684     265.02       249.72   0.0%
+l0raw op=read size=5632 ops=408 total_ns=606048583 ns_per_op=1485413 min_ns=1485263 max_ns=1485487
+     5632      408      1485.413         3702     263.74       250.91   0.0%
+l0raw op=read size=6144 ops=369 total_ns=595336913 ns_per_op=1613379 min_ns=1611973 max_ns=1614454
+     6144      369      1613.379         3718     262.59       249.93   0.1%
+l0raw op=read size=6656 ops=336 total_ns=585235593 ns_per_op=1741772 min_ns=1741409 max_ns=1741954
+     6656      336      1741.772         3731     261.68       250.76   0.0%
+l0raw op=read size=7168 ops=321 total_ns=600219725 ns_per_op=1869843 min_ns=1868987 max_ns=1870413
+     7168      321      1869.843         3743     260.85       250.13   0.0%
+l0raw op=read size=7680 ops=300 total_ns=599487303 ns_per_op=1998291 min_ns=1997985 max_ns=1998596
+     7680      300      1998.291         3752     260.19       250.87   0.0%
+l0raw op=read size=8192 ops=279 total_ns=593170165 ns_per_op=2126057 min_ns=2124745 max_ns=2127042
+     8192      279      2126.057         3762     259.52       249.54   0.1%
+l0raw op=read size=9216 ops=252 total_ns=600402831 ns_per_op=2382550 min_ns=2382550 max_ns=2382550
+     9216      252      2382.550         3777     258.52       250.48      -
+l0raw op=read size=10240 ops=225 total_ns=593749999 ns_per_op=2638888 min_ns=2637532 max_ns=2639567
+    10240      225      2638.888         3789     257.70       250.33   0.0%
+l0raw op=read size=11264 ops=204 total_ns=590759277 ns_per_op=2895878 min_ns=2895579 max_ns=2896477
+    11264      204      2895.878         3797     257.09       250.96   0.0%
+l0raw op=read size=12288 ops=189 total_ns=595977782 ns_per_op=3153321 min_ns=3152514 max_ns=3154451
+    12288      189      3153.321         3804     256.61       251.40   0.0%
+l0raw op=read size=13312 ops=174 total_ns=593383788 ns_per_op=3410251 min_ns=3409550 max_ns=3410602
+    13312      174      3410.251         3811     256.17       250.90   0.0%
+l0raw op=read size=14336 ops=162 total_ns=593902586 ns_per_op=3666065 min_ns=3664369 max_ns=3667195
+    14336      162      3666.065         3818     255.72       249.81   0.0%
+l0raw op=read size=15360 ops=150 total_ns=588623045 ns_per_op=3924153 min_ns=3922729 max_ns=3925170
+    15360      150      3924.153         3822     255.47       252.03   0.0%
+l0raw op=read size=16384 ops=141 total_ns=589263914 ns_per_op=4179176 min_ns=4178310 max_ns=4180258
+    16384      141      4179.176         3828     255.07       249.04   0.0%
+l0raw op=read size=18432 ops=126 total_ns=591400145 ns_per_op=4693651 min_ns=4692440 max_ns=4694620
+    18432      126      4693.651         3834     254.64       251.20   0.0%
+l0raw op=read size=20480 ops=114 total_ns=593444823 ns_per_op=5205656 min_ns=5204050 max_ns=5208065
+    20480      114      5205.656         3841     254.18       250.00   0.0%
+l0raw op=read size=22528 ops=102 total_ns=583465574 ns_per_op=5720250 min_ns=5719353 max_ns=5721148
+    22528      102      5720.250         3845     253.91       251.26   0.0%
+l0raw op=read size=24576 ops=96 total_ns=598541258 ns_per_op=6234804 min_ns=6233215 max_ns=6237030
+    24576       96      6234.804         3848     253.69       251.24   0.0%
+l0raw op=read size=26624 ops=87 total_ns=587097166 ns_per_op=6748243 min_ns=6746489 max_ns=6750698
+    26624       87      6748.243         3852     253.46       250.70   0.0%
+l0raw op=read size=28672 ops=81 total_ns=587982176 ns_per_op=7259039 min_ns=7257532 max_ns=7260923
+    28672       81      7259.039         3856     253.17       249.41   0.0%
+l0raw op=read size=30720 ops=75 total_ns=583007811 ns_per_op=7773437 min_ns=7772216 max_ns=7774658
+    30720       75      7773.437         3858     253.04       251.17   0.0%
+l0raw op=read size=32768 ops=72 total_ns=596588134 ns_per_op=8285946 min_ns=8284250 max_ns=8288065
+    32768       72      8285.946         3861     252.86       250.24   0.0%
+l0raw op=read size=36864 ops=63 total_ns=586730955 ns_per_op=9313189 min_ns=9312220 max_ns=9315127
+    36864       63      9313.189         3865     252.63       250.79   0.0%
+l0raw op=read size=40960 ops=57 total_ns=589050292 ns_per_op=10334215 min_ns=10332609 max_ns=10335821
+    40960       57     10334.215         3870     252.30       249.27   0.0%
+l0raw op=read size=45056 ops=51 total_ns=579406736 ns_per_op=11360916 min_ns=11359719 max_ns=11361514
+    45056       51     11360.916         3872     252.15       250.65   0.0%
+l0raw op=read size=49152 ops=48 total_ns=594726561 ns_per_op=12390136 min_ns=12388229 max_ns=12392044
+    49152       48     12390.136         3874     252.07       251.27   0.0%
+l0raw op=read size=53248 ops=42 total_ns=563629148 ns_per_op=13419741 min_ns=13419015 max_ns=13421194
+    53248       42     13419.741         3874     252.02       251.36   0.0%
+l0raw op=read size=57344 ops=39 total_ns=563446043 ns_per_op=14447334 min_ns=14444204 max_ns=14451246
+    57344       39     14447.334         3875     251.94       250.87   0.0%
+l0raw op=read size=61440 ops=36 total_ns=557159422 ns_per_op=15476650 min_ns=15474955 max_ns=15477498
+    61440       36     15476.650         3875     251.89       251.29   0.0%
+l0raw op=read size=65536 ops=36 total_ns=593749999 ns_per_op=16493055 min_ns=16492207 max_ns=16494750
+    65536       36     16493.055         3879     251.66       248.14   0.0%
+l0lin op=read overall_cmarg=25067 cmarg_min=8700 cmarg_max=4312000 used=94 skipped=17
+  cost per byte across the whole sweep: 250.67 ns/B
+  step-to-step marginal 87.00 .. 43120.00 ns/B  (495.63x spread over 94 of 111 steps; 17 too noisy to count)
+  -> NOT affine: the per-byte cost varies 495.63x across the steps that
+     cleared the gate, so a single slope misprices some sizes. The fit's residuals
+     say by how much.
+
+-- read: cost either side of a word boundary (does the driver split?) --
+     size      ops         us/op        KiB/s       ns/B   marginal ns/B   spread
+l0raw op=read_odd size=14 ops=1310 total_ns=168640136 ns_per_op=128732 min_ns=128732 max_ns=128732
+       14     1310       128.732          105    9195.14          -     -
+l0raw op=read_odd size=15 ops=1310 total_ns=168884277 ns_per_op=128919 min_ns=128919 max_ns=128919
+       15     1310       128.919          113    8594.60       187.00      -
+l0raw op=read_odd size=16 ops=2184 total_ns=185180664 ns_per_op=84789 min_ns=84789 max_ns=84789
+       16     2184        84.789          183    5299.31    -44130.00?     -
+l0raw op=read_odd size=17 ops=2184 total_ns=216400146 ns_per_op=99084 min_ns=99084 max_ns=99084
+       17     2184        99.084          166    5828.47     14295.00      -
+l0raw op=read_odd size=18 ops=2184 total_ns=216613769 ns_per_op=99182 min_ns=99182 max_ns=99182
+       18     2184        99.182          176    5510.11        98.00      -
+l0raw op=read_odd size=19 ops=1638 total_ns=212463378 ns_per_op=129709 min_ns=129709 max_ns=129709
+       19     1638       129.709          142    6826.78     30527.00      -
+l0raw op=read_odd size=20 ops=3276 total_ns=262481689 ns_per_op=80122 min_ns=80122 max_ns=80122
+       20     3276        80.122          243    4006.10    -49587.00?     -
+l0raw op=read_odd size=62 ops=1638 total_ns=182342529 ns_per_op=111320 min_ns=111320 max_ns=111320
+       62     1638       111.320          542    1795.48          -     -
+l0raw op=read_odd size=63 ops=1638 total_ns=182464599 ns_per_op=111394 min_ns=111394 max_ns=111394
+       63     1638       111.394          551    1768.15        74.00      -
+l0raw op=read_odd size=64 ops=2184 total_ns=200469970 ns_per_op=91790 min_ns=91790 max_ns=91790
+       64     2184        91.790          680    1434.21    -19604.00?     -
+l0raw op=read_odd size=65 ops=1638 total_ns=183807373 ns_per_op=112214 min_ns=112214 max_ns=112214
+       65     1638       112.214          565    1726.36     20424.00      -
+l0raw op=read_odd size=66 ops=1638 total_ns=183959960 ns_per_op=112307 min_ns=112307 max_ns=112307
+       66     1638       112.307          573    1701.62        93.00      -
+l0raw op=read_odd size=67 ops=1310 total_ns=162353515 ns_per_op=123933 min_ns=123933 max_ns=123933
+       67     1310       123.933          527    1849.74     11626.00      -
+l0raw op=read_odd size=68 ops=2184 total_ns=199279785 ns_per_op=91245 min_ns=91245 max_ns=91245
+       68     2184        91.245          727    1341.83    -32688.00?     -
+l0raw op=read_odd size=254 ops=1310 total_ns=208770751 ns_per_op=159366 min_ns=159366 max_ns=159366
+      254     1310       159.366         1555     627.42          -     -
+l0raw op=read_odd size=255 ops=1092 total_ns=189331054 ns_per_op=173380 min_ns=173380 max_ns=173380
+      255     1092       173.380         1435     679.92     14014.00      -
+l0raw op=read_odd size=256 ops=1310 total_ns=181243896 ns_per_op=138354 min_ns=138354 max_ns=138354
+      256     1310       138.354         1806     540.44    -35026.00?     -
+l0raw op=read_odd size=257 ops=1092 total_ns=175079345 ns_per_op=160329 min_ns=160329 max_ns=160329
+      257     1092       160.329         1564     623.84     21975.00      -
+l0raw op=read_odd size=258 ops=1092 total_ns=190643310 ns_per_op=174581 min_ns=174581 max_ns=174581
+      258     1092       174.581         1442     676.67     14252.00      -
+l0raw op=read_odd size=259 ops=1310 total_ns=210296630 ns_per_op=160531 min_ns=160531 max_ns=160531
+      259     1310       160.531         1575     619.81    -14050.00?     -
+l0raw op=read_odd size=260 ops=1310 total_ns=182586669 ns_per_op=139379 min_ns=139379 max_ns=139379
+      260     1310       139.379         1821     536.07    -21152.00?     -
+l0raw op=read_odd size=510 ops=728 total_ns=170379638 ns_per_op=234037 min_ns=234037 max_ns=234037
+      510      728       234.037         2127     458.89          -     -
+l0raw op=read_odd size=511 ops=936 total_ns=209289550 ns_per_op=223599 min_ns=223599 max_ns=223599
+      511      936       223.599         2231     437.57    -10438.00?     -
+l0raw op=read_odd size=512 ops=936 total_ns=189575195 ns_per_op=202537 min_ns=202537 max_ns=202537
+      512      936       202.537         2467     395.58    -21062.00?     -
+l0raw op=read_odd size=513 ops=728 total_ns=171081542 ns_per_op=235002 min_ns=235002 max_ns=235002
+      513      728       235.002         2130     458.09     32465.00      -
+l0raw op=read_odd size=514 ops=819 total_ns=184082031 ns_per_op=224764 min_ns=224764 max_ns=224764
+      514      819       224.764         2232     437.28    -10238.00?     -
+l0raw op=read_odd size=515 ops=936 total_ns=210388183 ns_per_op=224773 min_ns=224773 max_ns=224773
+      515      936       224.773         2237     436.45         9.00      -
+l0raw op=read_odd size=516 ops=936 total_ns=192321777 ns_per_op=205471 min_ns=205471 max_ns=205471
+      516      936       205.471         2452     398.19    -19302.00?     -
+l0raw op=read_odd size=1022 ops=546 total_ns=192077636 ns_per_op=351790 min_ns=351790 max_ns=351790
+     1022      546       351.790         2836     344.21          -     -
+l0raw op=read_odd size=1023 ops=546 total_ns=192138671 ns_per_op=351902 min_ns=351902 max_ns=351902
+     1023      546       351.902         2838     343.99       112.00      -
+l0raw op=read_odd size=1024 ops=595 total_ns=198059082 ns_per_op=332872 min_ns=332872 max_ns=332872
+     1024      595       332.872         3003     325.07    -19030.00?     -
+l0raw op=read_odd size=1025 ops=595 total_ns=209838867 ns_per_op=352670 min_ns=352670 max_ns=352670
+     1025      595       352.670         2837     344.06     19798.00      -
+l0raw op=read_odd size=1026 ops=595 total_ns=209930419 ns_per_op=352824 min_ns=352824 max_ns=352824
+     1026      595       352.824         2838     343.88       154.00      -
+l0raw op=read_odd size=1027 ops=546 total_ns=197753906 ns_per_op=362186 min_ns=362186 max_ns=362186
+     1027      546       362.186         2768     352.66      9362.00      -
+l0raw op=read_odd size=1028 ops=655 total_ns=217407226 ns_per_op=331919 min_ns=331919 max_ns=331919
+     1028      655       331.919         3024     322.87    -30267.00?     -
+l0raw op=read_odd size=4094 ops=177 total_ns=198608398 ns_per_op=1122081 min_ns=1122081 max_ns=1122081
+     4094      177      1122.081         3562     274.07          -     -
+l0raw op=read_odd size=4095 ops=172 total_ns=194183349 ns_per_op=1128972 min_ns=1128972 max_ns=1128972
+     4095      172      1128.972         3541     275.69      6891.00      -
+l0raw op=read_odd size=4096 ops=182 total_ns=200286865 ns_per_op=1100477 min_ns=1100477 max_ns=1100477
+     4096      182      1100.477         3634     268.67    -28495.00?     -
+l0raw op=read_odd size=4097 ops=177 total_ns=198760986 ns_per_op=1122943 min_ns=1122943 max_ns=1122943
+     4097      177      1122.943         3562     274.08     22466.00      -
+l0raw op=read_odd size=4098 ops=177 total_ns=199981689 ns_per_op=1129840 min_ns=1129840 max_ns=1129840
+     4098      177      1129.840         3541     275.70      6897.00      -
+l0raw op=read_odd size=4099 ops=177 total_ns=198638916 ns_per_op=1122253 min_ns=1122253 max_ns=1122253
+     4099      177      1122.253         3566     273.78     -7587.00?     -
+l0raw op=read_odd size=4100 ops=182 total_ns=200408935 ns_per_op=1101147 min_ns=1101147 max_ns=1101147
+     4100      182      1101.147         3635     268.57    -21106.00?     -
+l0raw op=read_odd size=16382 ops=47 total_ns=197692871 ns_per_op=4206231 min_ns=4206231 max_ns=4206231
+    16382       47      4206.231         3802     256.75          -     -
+l0raw op=read_odd size=16383 ops=47 total_ns=197387695 ns_per_op=4199738 min_ns=4199738 max_ns=4199738
+    16383       47      4199.738         3808     256.34     -6493.00?     -
+l0raw op=read_odd size=16384 ops=48 total_ns=200592041 ns_per_op=4179000 min_ns=4179000 max_ns=4179000
+    16384       48      4179.000         3828     255.06    -20738.00?     -
+l0raw op=read_odd size=16385 ops=47 total_ns=197784423 ns_per_op=4208179 min_ns=4208179 max_ns=4208179
+    16385       47      4208.179         3801     256.83     29179.00      -
+l0raw op=read_odd size=16386 ops=47 total_ns=197418212 ns_per_op=4200387 min_ns=4200387 max_ns=4200387
+    16386       47      4200.387         3809     256.33     -7792.00?     -
+l0raw op=read_odd size=16387 ops=47 total_ns=197479248 ns_per_op=4201686 min_ns=4201686 max_ns=4201686
+    16387       47      4201.686         3808     256.40      1299.00      -
+l0raw op=read_odd size=16388 ops=47 total_ns=196563720 ns_per_op=4182206 min_ns=4182206 max_ns=4182206
+    16388       47      4182.206         3826     255.19    -19480.00?     -
+
+-- read: cost vs offset alignment (same size, shifted start) --
+   offset      ops         us/op
+l0raw op=read_offset size=256 offset=0 ops=1310 total_ns=177612304 ns_per_op=135581
+        0     1310       135.581 us
+l0raw op=read_offset size=256 offset=1 ops=936 total_ns=193084716 ns_per_op=206287
+        1      936       206.287 us
+l0raw op=read_offset size=256 offset=2 ops=819 total_ns=195465087 ns_per_op=238663
+        2      819       238.663 us
+l0raw op=read_offset size=256 offset=3 ops=936 total_ns=193084716 ns_per_op=206287
+        3      936       206.287 us
+
+-- write: cost vs transfer size --
+     size      ops         us/op        KiB/s       ns/B   marginal ns/B   spread
+l0raw op=write size=4 ops=2808 total_ns=582244871 ns_per_op=207352 min_ns=207297 max_ns=207395
+        4     2808       207.352           18   51838.00          -  0.0%
+l0raw op=write size=8 ops=2184 total_ns=560058592 ns_per_op=256437 min_ns=256381 max_ns=256506
+        8     2184       256.437           30   32054.62     12271.25   0.0%
+l0raw op=write size=12 ops=1965 total_ns=610351560 ns_per_op=310611 min_ns=309462 max_ns=311232
+       12     1965       310.611           37   25884.25     13543.50   0.5%
+l0raw op=write size=16 ops=1638 total_ns=577148436 ns_per_op=352349 min_ns=352293 max_ns=352405
+       16     1638       352.349           43   22021.81     10434.50   0.0%
+l0raw op=write size=20 ops=1512 total_ns=614715575 ns_per_op=406557 min_ns=405992 max_ns=406961
+       20     1512       406.557           47   20327.85     13552.00   0.2%
+l0raw op=write size=24 ops=1227 total_ns=545074462 ns_per_op=444233 min_ns=444183 max_ns=444258
+       24     1227       444.233           52   18509.70      9419.00   0.0%
+l0raw op=write size=28 ops=1227 total_ns=601013183 ns_per_op=489823 min_ns=488803 max_ns=490445
+       28     1227       489.823           55   17493.67     11397.50   0.3%
+l0raw op=write size=32 ops=1092 total_ns=572540282 ns_per_op=524304 min_ns=524164 max_ns=524499
+       32     1092       524.304           59   16384.50      8620.25   0.0%
+l0raw op=write size=36 ops=1032 total_ns=604583739 ns_per_op=585836 min_ns=584979 max_ns=586398
+       36     1032       585.836           59   16273.22     15383.00   0.2%
+l0raw op=write size=40 ops=936 total_ns=596343992 ns_per_op=637119 min_ns=637054 max_ns=637152
+       40      936       637.119           60   15927.97     12820.75   0.0%
+l0raw op=write size=44 ops=852 total_ns=587432860 ns_per_op=689475 min_ns=689224 max_ns=689761
+       44      852       689.475           61   15669.88     13089.00   0.0%
+l0raw op=write size=48 ops=819 total_ns=598358154 ns_per_op=730596 min_ns=730521 max_ns=730745
+       48      819       730.596           63   15220.75     10280.25   0.0%
+l0raw op=write size=52 ops=756 total_ns=593688964 ns_per_op=785302 min_ns=784979 max_ns=785948
+       52      756       785.302           64   15101.96     13676.50   0.1%
+l0raw op=write size=56 ops=702 total_ns=580261229 ns_per_op=826582 min_ns=826452 max_ns=826713
+       56      702       826.582           65   14760.39     10320.00   0.0%
+l0raw op=write size=60 ops=675 total_ns=586486815 ns_per_op=868869 min_ns=867919 max_ns=869411
+       60      675       868.869           67   14481.15     10571.75   0.1%
+l0raw op=write size=64 ops=675 total_ns=613281249 ns_per_op=908564 min_ns=908338 max_ns=908881
+       64      675       908.564           68   14196.31      9923.75   0.0%
+l0raw op=write size=72 ops=594 total_ns=606292723 ns_per_op=1020694 min_ns=1020181 max_ns=1021105
+       72      594      1020.694           68   14176.30     14016.25   0.0%
+l0raw op=write size=80 ops=531 total_ns=593170165 ns_per_op=1117081 min_ns=1116908 max_ns=1117426
+       80      531      1117.081           69   13963.51     12048.37   0.0%
+l0raw op=write size=88 ops=504 total_ns=610137938 ns_per_op=1210591 min_ns=1210348 max_ns=1210893
+       88      504      1210.591           70   13756.71     11688.75   0.0%
+l0raw op=write size=96 ops=468 total_ns=603973386 ns_per_op=1290541 min_ns=1290541 max_ns=1290541
+       96      468      1290.541           72   13443.13      9993.75      -
+l0raw op=write size=104 ops=426 total_ns=597503661 ns_per_op=1402590 min_ns=1402089 max_ns=1402948
+      104      426      1402.590           72   13486.44     14006.12   0.0%
+l0raw op=write size=112 ops=393 total_ns=589233396 ns_per_op=1499321 min_ns=1499321 max_ns=1499321
+      112      393      1499.321           72   13386.79     12091.37      -
+l0raw op=write size=120 ops=369 total_ns=587493894 ns_per_op=1592124 min_ns=1591628 max_ns=1592620
+      120      369      1592.124           73   13267.70     11600.37   0.0%
+l0raw op=write size=128 ops=363 total_ns=608642576 ns_per_op=1676701 min_ns=1676449 max_ns=1676953
+      128      363      1676.701           74   13099.22     10572.12   0.0%
+l0raw op=write size=144 ops=321 total_ns=605102538 ns_per_op=1885054 min_ns=1884103 max_ns=1886100
+      144      321      1885.054           74   13090.65     13022.06   0.1%
+l0raw op=write size=160 ops=288 total_ns=592590331 ns_per_op=2057605 min_ns=2057393 max_ns=2057711
+      160      288      2057.605           75   12860.03     10784.43   0.0%
+l0raw op=write size=176 ops=264 total_ns=598449705 ns_per_op=2266854 min_ns=2266623 max_ns=2267317
+      176      264      2266.854           75   12879.85     13078.06   0.0%
+l0raw op=write size=192 ops=243 total_ns=593414305 ns_per_op=2442034 min_ns=2441406 max_ns=2442536
+      192      243      2442.034           76   12718.92     10948.75   0.0%
+l0raw op=write size=208 ops=225 total_ns=596405028 ns_per_op=2650689 min_ns=2650146 max_ns=2651367
+      208      225      2650.689           76   12743.69     13040.93   0.0%
+l0raw op=write size=224 ops=210 total_ns=592956541 ns_per_op=2823602 min_ns=2823311 max_ns=2824183
+      224      210      2823.602           77   12605.36     10807.06   0.0%
+l0raw op=write size=240 ops=195 total_ns=591125487 ns_per_op=3031412 min_ns=3030630 max_ns=3032508
+      240      195      3031.412           77   12630.88     12988.12   0.0%
+l0raw op=write size=256 ops=186 total_ns=597961425 ns_per_op=3214846 min_ns=3214190 max_ns=3215174
+      256      186      3214.846           77   12557.99     11464.62   0.0%
+l0raw op=write size=288 ops=165 total_ns=593414305 ns_per_op=3596450 min_ns=3595525 max_ns=3597745
+      288      165      3596.450           78   12487.67     11925.12   0.0%
+l0raw op=write size=320 ops=150 total_ns=596954343 ns_per_op=3979695 min_ns=3978881 max_ns=3980102
+      320      150      3979.695           78   12436.54     11976.40   0.0%
+l0raw op=write size=352 ops=135 total_ns=588653563 ns_per_op=4360396 min_ns=4359266 max_ns=4361300
+      352      135      4360.396           78   12387.48     11896.90   0.0%
+l0raw op=write size=384 ops=126 total_ns=598297119 ns_per_op=4748389 min_ns=4748389 max_ns=4748389
+      384      126      4748.389           78   12365.59     12124.78      -
+l0raw op=write size=416 ops=117 total_ns=600158691 ns_per_op=5129561 min_ns=5128518 max_ns=5130083
+      416      117      5129.561           79   12330.67     11911.62   0.0%
+l0raw op=write size=448 ops=108 total_ns=595581053 ns_per_op=5514639 min_ns=5514356 max_ns=5515204
+      448      108      5514.639           79   12309.46     12033.68   0.0%
+l0raw op=write size=480 ops=99 total_ns=583496092 ns_per_op=5893899 min_ns=5893591 max_ns=5894516
+      480       99      5893.899           79   12278.95     11851.87   0.0%
+l0raw op=write size=512 ops=93 total_ns=584564207 ns_per_op=6285636 min_ns=6284652 max_ns=6286621
+      512       93      6285.636           79   12276.63     12241.78   0.0%
+l0raw op=write size=576 ops=84 total_ns=592346190 ns_per_op=7051740 min_ns=7050650 max_ns=7052830
+      576       84      7051.740           79   12242.60     11970.37   0.0%
+l0raw op=write size=640 ops=75 total_ns=586547851 ns_per_op=7820638 min_ns=7819824 max_ns=7821044
+      640       75      7820.638           79   12219.74     12014.03   0.0%
+l0raw op=write size=704 ops=69 total_ns=592407225 ns_per_op=8585611 min_ns=8584727 max_ns=8587381
+      704       69      8585.611           79   12195.47     11952.70   0.0%
+l0raw op=write size=768 ops=63 total_ns=589508055 ns_per_op=9357270 min_ns=9355817 max_ns=9358723
+      768       63      9357.270           80   12183.94     12057.17   0.0%
+l0raw op=write size=832 ops=57 total_ns=577056883 ns_per_op=10123804 min_ns=10122198 max_ns=10125411
+      832       57     10123.804           80   12168.03     11977.09   0.0%
+l0raw op=write size=896 ops=54 total_ns=588195799 ns_per_op=10892514 min_ns=10891384 max_ns=10893079
+      896       54     10892.514           80   12156.82     12011.09   0.0%
+l0raw op=write size=960 ops=51 total_ns=594573973 ns_per_op=11658313 min_ns=11657714 max_ns=11659509
+      960       51     11658.313           80   12144.07     11965.60   0.0%
+l0raw op=write size=1024 ops=48 total_ns=596679686 ns_per_op=12430826 min_ns=12430191 max_ns=12432098
+     1024       48     12430.826           80   12139.47     12070.51   0.0%
+l0raw op=write size=1152 ops=42 total_ns=586578368 ns_per_op=13966151 min_ns=13963971 max_ns=13968331
+     1152       42     13966.151           80   12123.39     11994.72   0.0%
+l0raw op=write size=1280 ops=36 total_ns=556915281 ns_per_op=15469868 min_ns=15469868 max_ns=15469868
+     1280       36     15469.868           80   12085.83     11747.78      -
+l0raw op=write size=1408 ops=33 total_ns=561584472 ns_per_op=17017711 min_ns=17017711 max_ns=17017711
+     1408       33     17017.711           80   12086.44     12092.52      -
+l0raw op=write size=1536 ops=30 total_ns=556396483 ns_per_op=18546549 min_ns=18545532 max_ns=18548583
+     1536       30     18546.549           80   12074.57     11944.04   0.0%
+l0raw op=write size=1664 ops=27 total_ns=542510984 ns_per_op=20092999 min_ns=20090738 max_ns=20094129
+     1664       27     20092.999           80   12075.11     12081.64   0.0%
+l0raw op=write size=1792 ops=27 total_ns=583709716 ns_per_op=21618878 min_ns=21616617 max_ns=21620008
+     1792       27     21618.878           80   12064.10     11920.92   0.0%
+l0raw op=write size=1920 ops=24 total_ns=555847166 ns_per_op=23160298 min_ns=23159027 max_ns=23162841
+     1920       24     23160.298           80   12062.65     12042.34   0.0%
+l0raw op=write size=2048 ops=24 total_ns=593231200 ns_per_op=24717966 min_ns=24715423 max_ns=24719238
+     2048       24     24717.966           80   12069.31     12169.28   0.0%
+l0raw op=write size=2304 ops=21 total_ns=583557127 ns_per_op=27788434 min_ns=27784075 max_ns=27792794
+     2304       21     27788.434           80   12060.95     11994.01   0.0%
+l0raw op=write size=2560 ops=18 total_ns=555603026 ns_per_op=30866834 min_ns=30863444 max_ns=30868530
+     2560       18     30866.834           80   12057.35     12025.00   0.0%
+l0raw op=write size=2816 ops=15 total_ns=509094236 ns_per_op=33939615 min_ns=33935546 max_ns=33941650
+     2816       15     33939.615           80   12052.42     12003.05   0.0%
+l0raw op=write size=3072 ops=15 total_ns=554962157 ns_per_op=36997477 min_ns=36993408 max_ns=36999511
+     3072       15     36997.477           81   12043.44     11944.77   0.0%
+l0raw op=write size=3328 ops=12 total_ns=480926512 ns_per_op=40077209 min_ns=40069580 max_ns=40084838
+     3328       12     40077.209           81   12042.43     12030.20   0.0%
+l0raw op=write size=3584 ops=12 total_ns=517761229 ns_per_op=43146769 min_ns=43144226 max_ns=43151855
+     3584       12     43146.769           81   12038.71     11990.46   0.0%
+l0raw op=write size=3840 ops=12 total_ns=554687498 ns_per_op=46223958 min_ns=46218872 max_ns=46226501
+     3840       12     46223.958           81   12037.48     12020.26   0.0%
+l0raw op=write size=4096 ops=12 total_ns=591491698 ns_per_op=49290974 min_ns=49285888 max_ns=49293518
+     4096       12     49290.974           81   12033.92     11980.53   0.0%
+l0raw op=write size=4608 ops=9 total_ns=498901366 ns_per_op=55433485 min_ns=55430094 max_ns=55440266
+     4608        9     55433.485           81   12029.83     11997.09   0.0%
+l0raw op=write size=5120 ops=9 total_ns=554199217 ns_per_op=61577690 min_ns=61574300 max_ns=61584472
+     5120        9     61577.690           81   12026.89     12000.40   0.0%
+l0raw op=write size=5632 ops=6 total_ns=406433104 ns_per_op=67738850 min_ns=67733764 max_ns=67749023
+     5632        6     67738.850           81   12027.49     12033.51   0.0%
+l0raw op=write size=6144 ops=6 total_ns=443267821 ns_per_op=73877970 min_ns=73867797 max_ns=73883056
+     6144        6     73877.970           81   12024.40     11990.46   0.0%
+l0raw op=write size=6656 ops=6 total_ns=480163573 ns_per_op=80027262 min_ns=80017089 max_ns=80032348
+     6656        6     80027.262           81   12023.32     12010.33   0.0%
+l0raw op=write size=7168 ops=6 total_ns=517059325 ns_per_op=86176554 min_ns=86166381 max_ns=86181640
+     7168        6     86176.554           81   12022.39     12010.33   0.0%
+l0raw op=write size=7680 ops=6 total_ns=553985594 ns_per_op=92330932 min_ns=92315673 max_ns=92346191
+     7680        6     92330.932           81   12022.25     12020.26   0.0%
+l0raw op=write size=8192 ops=6 total_ns=590820312 ns_per_op=98470052 min_ns=98449707 max_ns=98480224
+     8192        6     98470.052           81   12020.27     11990.46   0.0%
+l0raw op=write size=9216 ops=3 total_ns=332153319 ns_per_op=110717773 min_ns=110717773 max_ns=110717773
+     9216        3    110717.773           81   12013.64     11960.66      -
+l0raw op=write size=10240 ops=3 total_ns=369110107 ns_per_op=123036702 min_ns=123016357 max_ns=123046875
+    10240        3    123036.702           81   12015.30     12030.20   0.0%
+l0raw op=write size=11264 ops=3 total_ns=406036374 ns_per_op=135345458 min_ns=135345458 max_ns=135345458
+    11264        3    135345.458           81   12015.75     12020.26      -
+l0raw op=write size=12288 ops=3 total_ns=442840574 ns_per_op=147613524 min_ns=147583007 max_ns=147644042
+    12288        3    147613.524           81   12012.81     11980.53   0.0%
+l0raw op=write size=13312 ops=3 total_ns=479705809 ns_per_op=159901936 min_ns=159881591 max_ns=159912109
+    13312        3    159901.936           81   12011.86     12000.40   0.0%
+l0raw op=write size=14336 ops=3 total_ns=516479491 ns_per_op=172159830 min_ns=172119140 max_ns=172210693
+    14336        3    172159.830           81   12008.91     11970.59   0.0%
+l0raw op=write size=15360 ops=3 total_ns=553466795 ns_per_op=184488931 min_ns=184478759 max_ns=184509277
+    15360        3    184488.931           81   12010.99     12040.13   0.0%
+l0raw op=write size=16384 ops=3 total_ns=590270994 ns_per_op=196756998 min_ns=196716308 max_ns=196777343
+    16384        3    196756.998           81   12009.09     11980.53   0.0%
+l0raw op=write size=18432 ops=3 total_ns=664123533 ns_per_op=221374511 min_ns=221374511 max_ns=221374511
+    18432        3    221374.511           81   12010.33     12020.27      -
+l0raw op=write size=20480 ops=3 total_ns=737792968 ns_per_op=245930989 min_ns=245910644 max_ns=245941162
+    20480        3    245930.989           81   12008.34     11990.46   0.0%
+l0raw op=write size=22528 ops=3 total_ns=811401365 ns_per_op=270467121 min_ns=270416259 max_ns=270507812
+    22528        3    270467.121           81   12005.82     11980.53   0.0%
+l0raw op=write size=24576 ops=3 total_ns=885131835 ns_per_op=295043945 min_ns=295043945 max_ns=295043945
+    24576        3    295043.945           81   12005.36     12000.40      -
+l0raw op=write size=26624 ops=3 total_ns=958892821 ns_per_op=319630940 min_ns=319610595 max_ns=319641113
+    26624        3    319630.940           81   12005.36     12005.36   0.0%
+l0raw op=write size=28672 ops=3 total_ns=1032562255 ns_per_op=344187418 min_ns=344146728 max_ns=344238281
+    28672        3    344187.418           81   12004.30     11990.46   0.0%
+l0raw op=write size=30720 ops=3 total_ns=1106445312 ns_per_op=368815104 min_ns=368774414 max_ns=368835449
+    30720        3    368815.104           81   12005.70     12025.23   0.0%
+l0raw op=write size=32768 ops=3 total_ns=1180053709 ns_per_op=393351236 min_ns=393310546 max_ns=393402099
+    32768        3    393351.236           81   12004.12     11980.53   0.0%
+l0raw op=write size=36864 ops=3 total_ns=1327697752 ns_per_op=442565917 min_ns=442504882 max_ns=442596435
+    36864        3    442565.917           81   12005.36     12015.30   0.0%
+l0raw op=write size=40960 ops=3 total_ns=1474822998 ns_per_op=491607666 min_ns=491607666 max_ns=491607666
+    40960        3    491607.666           81   12002.14     11973.08      -
+l0raw op=write size=45056 ops=3 total_ns=1622039794 ns_per_op=540679931 min_ns=540649414 max_ns=540740966
+    45056        3    540679.931           81   12000.17     11980.53   0.0%
+l0raw op=write size=49152 ops=3 total_ns=1769714354 ns_per_op=589904784 min_ns=589874267 max_ns=589935302
+    49152        3    589904.784           81   12001.64     12017.78   0.0%
+l0raw op=write size=53248 ops=3 total_ns=1917358397 ns_per_op=639119465 min_ns=639068603 max_ns=639190673
+    53248        3    639119.465           81   12002.69     12015.30   0.0%
+l0raw op=write size=57344 ops=3 total_ns=2064636230 ns_per_op=688212076 min_ns=688140869 max_ns=688293457
+    57344        3    688212.076           81   12001.46     11985.50   0.0%
+l0raw op=write size=61440 ops=3 total_ns=2212310790 ns_per_op=737436930 min_ns=737396240 max_ns=737457275
+    61440        3    737436.930           81   12002.55     12017.78   0.0%
+l0raw op=write size=65536 ops=3 total_ns=2359527587 ns_per_op=786509195 min_ns=786437988 max_ns=786560058
+    65536        3    786509.195           81   12001.17     11980.53   0.0%
+l0lin op=write overall_cmarg=1199874 cmarg_min=862025 cmarg_max=1538300 used=95 skipped=0
+  cost per byte across the whole sweep: 11998.74 ns/B
+  step-to-step marginal 8620.25 .. 15383.00 ns/B  (1.78x spread over 95 of 95 steps; 0 too noisy to count)
+  -> NOT affine: the per-byte cost varies 1.78x across the steps that
+     cleared the gate, so a single slope misprices some sizes. The fit's residuals
+     say by how much.
+
+-- write: page-program staircase (each transfer page-aligned) --
+     size      ops         us/op        KiB/s       ns/B   marginal ns/B   spread
+l0raw op=write_pg size=64 ops=32 total_ns=28961181 ns_per_op=905036 min_ns=905036 max_ns=905036
+       64       32       905.036           68   14141.18          -     -
+l0raw op=write_pg size=128 ops=32 total_ns=53344726 ns_per_op=1667022 min_ns=1667022 max_ns=1667022
+      128       32      1667.022           74   13023.60     11906.03      -
+l0raw op=write_pg size=252 ops=32 total_ns=100311279 ns_per_op=3134727 min_ns=3134727 max_ns=3134727
+      252       32      3134.727           78   12439.39     11836.33      -
+l0raw op=write_pg size=256 ops=32 total_ns=101898193 ns_per_op=3184318 min_ns=3184318 max_ns=3184318
+      256       32      3184.318           78   12438.74     12397.75      -
+l0raw op=write_pg size=260 ops=32 total_ns=104980468 ns_per_op=3280639 min_ns=3280639 max_ns=3280639
+      260       32      3280.639           77   12617.84     24080.25      -
+l0raw op=write_pg size=384 ops=32 total_ns=151611328 ns_per_op=4737854 min_ns=4737854 max_ns=4737854
+      384       32      4737.854           79   12338.16     11751.73      -
+l0raw op=write_pg size=512 ops=32 total_ns=200225830 ns_per_op=6257057 min_ns=6257057 max_ns=6257057
+      512       32      6257.057           79   12220.81     11868.77      -
+l0raw op=write_pg size=516 ops=32 total_ns=203033447 ns_per_op=6344795 min_ns=6344795 max_ns=6344795
+      516       32      6344.795           79   12296.11     21934.50      -
+l0raw op=write_pg size=768 ops=32 total_ns=298522949 ns_per_op=9328842 min_ns=9328842 max_ns=9328842
+      768       32      9328.842           80   12146.92     11841.45      -
+l0raw op=write_pg size=1024 ops=32 total_ns=396820068 ns_per_op=12400627 min_ns=12400627 max_ns=12400627
+     1024       32     12400.627           80   12109.98     11999.16      -
+
+-- write: page-straddle penalty (same size, offset by one align unit) --
+     size      ops         us/op        KiB/s       ns/B   marginal ns/B   spread
+l0raw op=write_unaligned size=256 ops=64 total_ns=205627441 ns_per_op=3212928 min_ns=3212928 max_ns=3212928
+      256       64      3212.928           77   12550.50          -     -
+l0raw op=write_unaligned size=512 ops=64 total_ns=402282714 ns_per_op=6285667 min_ns=6285667 max_ns=6285667
+      512       64      6285.667           79   12276.69     12002.88      -
+l0raw op=write_unaligned size=4096 ops=64 total_ns=3155578613 ns_per_op=49305915 min_ns=49305915 max_ns=49305915
+     4096       64     49305.915           81   12037.57     12003.41      -
+
+-- reprogram: programming over programmed cells, no erase --
+block 31, 4 B per program, 256 B pages
+l0rp test=rp_page_fresh programs=64 max_per_cell=1 ns_per_op=164508 bad_bytes=0 verdict=PASS
+  rp_page_fresh       64 programs     1 per cell       164.508 us/op  ok
+l0rp test=rp_page_re programs=448 max_per_cell=8 ns_per_op=164440 bad_bytes=0 verdict=PASS
+  rp_page_re         448 programs     8 per cell       164.440 us/op  ok
+l0rp test=rp_lane_fresh programs=64 max_per_cell=1 ns_per_op=154018 bad_bytes=0 verdict=PASS
+  rp_lane_fresh       64 programs     1 per cell       154.018 us/op  ok
+l0rp test=rp_lane_re programs=448 max_per_cell=8 ns_per_op=153882 bad_bytes=0 verdict=PASS
+  rp_lane_re         448 programs     8 per cell       153.882 us/op  ok
+l0rp test=rp_and programs=2 max_per_cell=3 ns_per_op=152587 bad_bytes=0 verdict=PASS
+  rp_and               2 programs     3 per cell       152.587 us/op  ok
+l0rp_hammer programs=1 bad_bytes=0 ns_per_op=183105
+l0rp_hammer programs=10 bad_bytes=0 ns_per_op=128173
+l0rp_hammer programs=100 bad_bytes=0 ns_per_op=122375
+l0rp_hammer programs=1000 bad_bytes=0 ns_per_op=121734
+l0rp_hammer programs=10000 bad_bytes=0 ns_per_op=121713
+l0rp test=rp_hammer programs=10000 max_per_cell=10000 ns_per_op=121713 bad_bytes=0 verdict=PASS
+  rp_hammer        10000 programs  10000 per cell       121.713 us/op  ok
+l0rp test=rp_block programs=0 max_per_cell=0 ns_per_op=0 bad_bytes=0 verdict=PASS
+  rp_block             0 programs     0 per cell         0.000 us/op  ok
+l0rp_end mismatches=0 verdict=PASS
+  reprogram: every re-program cleared only the bits it asked to, and nothing else moved
+l0end status=0
+
+done. Feed this capture to tools/l0_timing.py fit.

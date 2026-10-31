@@ -1135,6 +1135,83 @@ The flash simulator ANDs on a double write only when
 sets). Without it the simulator *rejects* a re-program with `-EIO`, so it is
 stricter than the part.
 
+## 9. nRF52840-DK — the same part behind a different SoC
+
+The nRF52840-DK (PCA10056) carries the same MX25R6435F on QSPI as the
+nRF5340-DK. This run asks which of the costs above belong to the flash part and
+which to the SoC and its driver path: a Cortex-M4F at 64 MHz instead of a
+Cortex-M33, a different QSPI peripheral instance and a different `nrfx`
+build of the same driver.
+
+**Setup.** Board 3, nRF52840-DK, J-Link SN 1050295749. App from `4302497`
+with `boards/nrf52840dk_nrf52840.{overlay,conf}`, the nRF5340 files applied
+unchanged. QSPI in **low-power mode**, set explicitly
+(`mxicy,mx25r-power-mode = "low-power"` with #49's driver patch), so the run
+compares with the nRF5340 captures of §5e and §5f, which ran in the power-on
+default (also low-power). Zephyr `4a405846193f` plus that patch. Default
+configuration: 32-block region, every phase, 3 passes.
+
+Files: [`models/observations_nrf52840dk_l0_full.txt`](models/observations_nrf52840dk_l0_full.txt)
+(raw console), [`models/mx25r64_nrf52840dk_full.json`](models/mx25r64_nrf52840dk_full.json)
+(`l0_timing.py fit`). The nRF5340 reference is
+`observations_nrf5340dk_l0_full_run2.txt` (§5f).
+
+**The board held a UBI device.** L0 erases its region raw, which removes the
+UBI headers of blocks 0–31, including the volume table. The run was bracketed
+by a dump of the whole chip (`nrfutil device read`), and blocks 0–31 were
+written back afterwards; a third dump matched the first byte for byte, and UBI
+attached with the same `image_seq`. Two consequences: the UBI erase counters of
+those 32 blocks do not include L0's erases (at least 7 to 32 per block), and
+running L0 on a board that keeps wear history needs this bracket, or an L0
+region outside the UBI partition.
+
+### Fitted coefficients
+
+| | nRF5340 (§5f) | nRF52840 | Δ |
+|---|--:|--:|--:|
+| read, fixed per call | 69.1 µs | 81.5 µs | **+12.4 µs** |
+| read, per byte | 253.8 ns | 245.9 ns | −3.1 % |
+| write, fixed per call | 159.2 µs | 159.2 µs | 0 |
+| write, per byte | 12 219 ns | 11 971 ns | −2.0 % |
+| erase, per 64 KB block | 1 085 ms | 1 050 ms | −3.2 % |
+
+Gated marginal read cost 250.1–250.8 ns/B (nRF5340 252.7–253.4); write
+10 747–12 079 ns/B (10 674–12 413). Both still fit the affine model; the
+erase-span points scatter ±6 % around their line on both boards, the same as
+in §5.
+
+### Point by point, against the same sizes on the nRF5340
+
+| class | points | median Δ | range |
+|---|--:|--:|--:|
+| `read` | 109 | +0.9 % | −1.1 … +67 % |
+| `read_odd` | 49 | +3.2 % | −0.9 … +65 % |
+| `read_offset` | 4 | +9.7 % | +2.6 … +10.1 % |
+| `write` | 96 | −2.0 % | −2.2 … −0.4 % |
+| `write_pg` | 10 | −2.0 % | −2.0 … −1.9 % |
+| `write_unaligned` | 3 | −2.0 % | |
+| `erase` (spans 1–32) | 6 | −0.8 % | −5.9 … +6.1 % |
+
+### What to take from this
+
+- **Program and erase belong to the part.** Writes are 2 % faster at every
+  size and erases agree within their own scatter. The write and erase
+  coefficients of the nRF5340 model transfer to this board unchanged within a
+  few percent.
+- **The read fixed cost belongs to the SoC.** Each read costs 12.4 µs more per
+  call, which is +34 % on a 4 B read and +8 % at 64 B, and nothing from 4 KB
+  up. The per-byte rate is the part's and agrees within 3 %. So the CPU and
+  driver path accounts for at least 12 µs of the read intercept, which is
+  consistent with `app_cbor_persondb`'s 21 % slower CPU-only step on this
+  board (`app_cbor_persondb/RESULTS.md` §10b).
+- **The offset-2 anomaly of §5f reproduces here.** At 256 B, offsets 1 and 3
+  cost 206.3 µs and offset 2 costs 238.7 µs: +32.4 µs, against +31.1 µs on the
+  nRF5340. Unaligned reads cost +10 % more than on the nRF5340 overall, in
+  line with the larger fixed cost, since the unaligned path issues extra
+  transactions.
+- **Re-programming passes** as in §8: every case `PASS`, 10 000 programs of
+  one cell with `bad_bytes=0`, `l0rp_end mismatches=0`.
+
 ## Raw capture — `native_sim`, simulator defaults
 
 Machine-readable records only; the human tables are in §1.
