@@ -377,6 +377,12 @@ int blob_db_iterate(blob_db_iter_cb_t cb, void *user);
  * re-initialized, and `BLOB_DB_ROOT_ID` is bound to an empty payload
  * (see @ref blob_db_root). The id space is reset.
  *
+ * On the UBI backend an attached device is kept: the volume is removed and
+ * created again at the same size, so the device's erase counters survive
+ * and the old blocks are erased by UBI's reclaim when a write needs them,
+ * not here. Nothing of the old store reads back through blob_db, but it
+ * stays on the raw flash until then.
+ *
  * **Does not require a mount.** This is the deliberate-discard path
  * `blob_db_mount()`'s `-ENOTSUP` refers to, so it must work on precisely the
  * store that cannot be mounted — an unrecognized format, or one with no usable
