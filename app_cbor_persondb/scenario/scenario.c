@@ -139,6 +139,24 @@ int scenario_fill(struct scenario *s, uint32_t budget,
 		budget = s->n_persons;
 	}
 
+	/* The vocabulary is part of the population: the names the dataset
+	 * draws from, defined before the first person who holds them. Only
+	 * on a fill from nothing, so names a user has since undefined do not
+	 * come back on a resumed fill. A define that finds the name already
+	 * there answers -EEXIST and writes nothing, so a fill restarted after
+	 * a power cut here repeats reads only. */
+	if (populated == 0) {
+		for (uint8_t i = 0; i < DATASET_PERM_VOCAB; i++) {
+			rc = persondb_right_define(s->db, dataset_permission(i));
+			if (rc == 0) {
+				out->rights_defined++;
+			} else if (rc != -EEXIST && rc != -ENOTSUP) {
+				LOG_ERR("define right %u: %d", i, rc);
+				goto done;
+			}
+		}
+	}
+
 	while (populated < s->n_persons && out->written < budget) {
 		uint32_t batch = MIN(MIN((uint32_t)FILL_BATCH,
 					 s->n_persons - populated),

@@ -69,6 +69,7 @@ struct scenario_fill_report {
 	uint32_t enospc;      /* bucket overflows — expected to be zero (A8) */
 	int64_t  ms;
 	uint32_t batches;     /* progress commits, i.e. resume points */
+	uint32_t rights_defined; /* vocabulary names this call defined */
 };
 
 /**

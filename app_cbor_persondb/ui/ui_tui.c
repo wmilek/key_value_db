@@ -154,27 +154,33 @@ enum purpose {
 static const char OTHER[] = "<other...>";
 
 /*
- * What the grant dialog offers, besides typing a name (<other...>). The TUI's
- * own set, prefixed so a grant made here is recognisable as one: the
- * generated population draws from a different vocabulary, which belongs to
- * the dataset and is none of the TUI's business. Each fits
- * PERSONDB_PERM_MAX.
+ * What the grant dialog offers, besides typing a name (<other...>): the
+ * store's rights vocabulary (persondb_right_*, DESIGN.md §12.5), read once at
+ * entry and kept here, alphabetical, for the life of the TUI.
+ *
+ * Read once because the set's walk is one persondb_right_next per name, each
+ * re-reading the set's directory and bucket: ~2 blob reads a name, ~84 for 42
+ * names. Paid per dialog that would be ~150 ms on the DK; paid at entry it is
+ * part of the wait the person count already costs. Nothing else writes the
+ * store while the TUI holds the terminal, so the copy cannot go stale except
+ * through the TUI's own defines, which update it.
+ *
+ * Bounded by the pick list: VOCAB_MAX names (one slot is <other...>), the
+ * alphabetically first ones, about 1 KB. A larger vocabulary is still fully
+ * usable — <other...> grants any name, and a name past the cache is asked of
+ * the store when it matters (vocab_defined) — but the dialog offers only the
+ * first VOCAB_MAX and its title says so.
  */
-static const char *const tui_perms[] = {
-	"tui-door-main",
-	"tui-door-lab",
-	"tui-door-server-room",
-	"tui-door-storage",
-	"tui-parking",
-	"tui-lift",
-	"tui-after-hours",
-	"tui-weekend",
-	"tui-visitor-escort",
-	"tui-admin",
-};
+#define VOCAB_MAX (TUI_PICK_MAX - 1)
 
-BUILD_ASSERT(ARRAY_SIZE(tui_perms) < TUI_PICK_MAX,
-	     "the pick list needs one slot for <other...>");
+static struct {
+	char     name[VOCAB_MAX][PERSONDB_PERM_MAX + 1];
+	uint8_t  n;       /* cached, sorted */
+	uint32_t total;   /* defined in the store */
+	int      rc;      /* 0, or why there is no vocabulary (-ENOTSUP) */
+} vocab;
+
+BUILD_ASSERT(PERSONDB_PERMS_MAX <= 32, "sel_undef is a 32-bit mask");
 
 static struct {
 	bool                 active;
@@ -209,6 +215,8 @@ static struct {
 	enum focus           focus;
 	uint8_t              perm_cur;
 	uint8_t              perm_top;
+	uint32_t             sel_undef;  /* bit i: g.sel.perm[i] is held but
+					  * not in the vocabulary */
 	uint8_t              card_cur;
 
 	struct row           rows[LIST_ROWS];
@@ -554,8 +562,12 @@ static void draw_perm_row(int i)
 	if (idx == g.perm_cur && g.focus == FOCUS_PERMS) {
 		term_attr(TERM_REVERSE);
 	}
-	term_fieldf(row, DET_COL + 1, DET_IN, " %c %s",
-		    idx == g.perm_cur ? '>' : ' ', g.sel.perm[idx]);
+	/* '?': held, but not in the vocabulary — undefined since it was
+	 * granted, or granted by a build or a path that did not define it.
+	 * Still revocable like any other. */
+	term_fieldf(row, DET_COL + 1, DET_IN, " %c %s%s",
+		    idx == g.perm_cur ? '>' : ' ', g.sel.perm[idx],
+		    (g.sel_undef & BIT(idx)) ? "  ?" : "");
 	term_attr(TERM_NORMAL);
 }
 
@@ -647,7 +659,7 @@ static void draw_help(void)
 		[FOCUS_LIST]  = " arrows/PgUp/PgDn/Home move  End walks to the"
 				" last  Tab next pane  r reload",
 		[FOCUS_PERMS] = " arrows/PgUp/PgDn move  Tab next pane  d/Del"
-				" revokes the selected permission",
+				" revokes  ? not in the vocabulary",
 		[FOCUS_CARDS] = " Up/Dn move  Tab next pane  d/Del removes the"
 				" selected card",
 	};
@@ -720,6 +732,75 @@ static void cursor_clamp(void)
 }
 
 /** Re-read the selected person into g.sel, and refresh its list row. */
+/* Keep the VOCAB_MAX alphabetically first names: insert in order, and let
+ * the last one fall off when the cache is full. */
+static void vocab_insert(const char *name)
+{
+	uint8_t at = 0;
+
+	while (at < vocab.n && strcmp(vocab.name[at], name) < 0) {
+		at++;
+	}
+	if (at < vocab.n && strcmp(vocab.name[at], name) == 0) {
+		return;
+	}
+	if (at >= VOCAB_MAX) {
+		return;
+	}
+
+	uint8_t keep = MIN(vocab.n, (uint8_t)(VOCAB_MAX - 1));
+
+	memmove(vocab.name[at + 1], vocab.name[at],
+		(size_t)(keep - at) * sizeof(vocab.name[0]));
+	strcpy(vocab.name[at], name);
+	vocab.n = keep + 1;
+}
+
+static int vocab_load(struct persondb *db)
+{
+	char cur[PERSONDB_PERM_MAX + 1] = "";
+	char name[PERSONDB_PERM_MAX + 1];
+	int rc;
+
+	memset(&vocab, 0, sizeof(vocab));
+	while ((rc = persondb_right_next(db, cur, name, sizeof(name))) == 0) {
+		vocab_insert(name);
+		vocab.total++;
+		strcpy(cur, name);
+	}
+	vocab.rc = (rc == -ENODATA) ? 0 : rc;
+	return vocab.rc;
+}
+
+/* Is @p name defined? From the cache when it can answer: always when the
+ * whole vocabulary fits, and for any name it holds. A store without a
+ * vocabulary marks nothing. */
+static bool vocab_defined(const char *name)
+{
+	if (vocab.rc != 0) {
+		return true;
+	}
+	for (uint8_t i = 0; i < vocab.n; i++) {
+		if (strcmp(vocab.name[i], name) == 0) {
+			return true;
+		}
+	}
+	if (vocab.total <= vocab.n) {
+		return false;
+	}
+	return persondb_right_defined(g.db, name) == 0;
+}
+
+static void mark_undefined(void)
+{
+	g.sel_undef = 0;
+	for (uint8_t i = 0; g.sel_rc == 0 && i < g.sel.n_perms; i++) {
+		if (!vocab_defined(g.sel.perm[i])) {
+			g.sel_undef |= BIT(i);
+		}
+	}
+}
+
 static void load_sel(void)
 {
 	uint32_t id;
@@ -738,6 +819,7 @@ static void load_sel(void)
 	if (!g.detached && g.sel_rc == 0) {
 		summarize(&g.rows[g.cur - g.top], &g.sel);
 	}
+	mark_undefined();
 	cursor_clamp();
 }
 
@@ -1058,6 +1140,30 @@ static void do_grant(const char *perm)
 	}
 }
 
+/*
+ * A name typed at <other...>: define it, then grant it. In that order, so a
+ * power cut between the two leaves a name defined and held by nobody —
+ * harmless — rather than one held and undefined. A store without a
+ * vocabulary (-ENOTSUP) still grants.
+ */
+static void do_grant_other(const char *perm)
+{
+	int rc = persondb_right_define(g.db, perm);
+
+	if (rc == 0) {
+		vocab_insert(perm);
+		vocab.total++;
+	} else if (rc == -EINVAL) {
+		set_status(true, "a permission name is 1..%d characters | rc %d",
+			   PERSONDB_PERM_MAX, rc);
+		return;
+	} else if (rc != -EEXIST && rc != -ENOTSUP) {
+		set_status(true, "defining '%s' failed | rc %d", perm, rc);
+		return;
+	}
+	do_grant(perm);
+}
+
 static void do_revoke(const char *perm)
 {
 	uint32_t id = g.sel.id;
@@ -1343,7 +1449,7 @@ static void open_input(enum purpose why, const char *title, const char *prompt,
 
 static void open_grant(void)
 {
-	static char title[32];
+	static char title[48];
 
 	if (g.sel_rc != 0) {
 		set_status(true, "no person selected");
@@ -1352,13 +1458,18 @@ static void open_grant(void)
 	}
 
 	memset(&g.pick, 0, sizeof(g.pick));
-	snprintf(title, sizeof(title), "Grant to %u", g.sel.id);
+	if (vocab.total > vocab.n) {
+		snprintf(title, sizeof(title), "Grant to %u (first %u of %u)",
+			 g.sel.id, vocab.n, (unsigned int)vocab.total);
+	} else {
+		snprintf(title, sizeof(title), "Grant to %u", g.sel.id);
+	}
 	g.pick.title = title;
 
-	/* The TUI's set, less what is already held: offering a permission
+	/* The vocabulary, less what is already held: offering a permission
 	 * the person has would make Enter a no-op that looks like a success. */
-	for (uint8_t i = 0; i < ARRAY_SIZE(tui_perms); i++) {
-		const char *name = tui_perms[i];
+	for (uint8_t i = 0; i < vocab.n; i++) {
+		const char *name = vocab.name[i];
 
 		if (!sel_holds(name)) {
 			g.pick.item[g.pick.n++] = name;
@@ -1717,7 +1828,7 @@ static void dialog_key(int key)
 		break;
 	}
 	case FOR_GRANT_OTHER:
-		do_grant(g.input.buf);
+		do_grant_other(g.input.buf);
 		break;
 	case FOR_REVOKE_CONFIRM:
 		do_revoke(g.perm);
@@ -2068,6 +2179,14 @@ int ui_tui_enter(const struct shell *sh, const struct ui_tui_config *cfg)
 	rc = persondb_person_count(cfg->db, &n);
 	if (rc != 0) {
 		shell_error(sh, "persondb tui: counting persons failed: %d", rc);
+		return rc;
+	}
+
+	shell_print(sh, "persondb tui: reading the rights vocabulary ...");
+	rc = vocab_load(cfg->db);
+	if (rc != 0 && rc != -ENOTSUP) {
+		shell_error(sh, "persondb tui: reading the vocabulary failed: %d",
+			    rc);
 		return rc;
 	}
 

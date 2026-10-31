@@ -489,6 +489,60 @@ static int cmd_perm_revoke(const struct shell *sh, size_t argc, char **argv)
 	return rc;
 }
 
+/* -- the rights vocabulary ---------------------------------------------- */
+
+static int cmd_right_list(const struct shell *sh, size_t argc, char **argv)
+{
+	char cur[PERSONDB_PERM_MAX + 1] = "";
+	char name[PERSONDB_PERM_MAX + 1];
+	uint32_t n = 0;
+	int rc = need_open(sh);
+
+	ARG_UNUSED(argc);
+	ARG_UNUSED(argv);
+	if (rc) {
+		return rc;
+	}
+	while ((rc = persondb_right_next(g_s.db, cur, name, sizeof(name))) == 0) {
+		shell_print(sh, "  %s", name);
+		strcpy(cur, name);
+		n++;
+	}
+	if (rc != -ENODATA) {
+		shell_error(sh, "list: %d", rc);
+		return rc;
+	}
+	shell_print(sh, "%u defined (set order, not sorted)", n);
+	return 0;
+}
+
+static int cmd_right_define(const struct shell *sh, size_t argc, char **argv)
+{
+	int rc = need_open(sh);
+
+	ARG_UNUSED(argc);
+	if (rc) {
+		return rc;
+	}
+	rc = persondb_right_define(g_s.db, argv[1]);
+	shell_print(sh, "define: %d%s", rc,
+		    rc == -EEXIST ? " (already defined, nothing written)" : "");
+	return rc == -EEXIST ? 0 : rc;
+}
+
+static int cmd_right_undefine(const struct shell *sh, size_t argc, char **argv)
+{
+	int rc = need_open(sh);
+
+	ARG_UNUSED(argc);
+	if (rc) {
+		return rc;
+	}
+	rc = persondb_right_undefine(g_s.db, argv[1]);
+	shell_print(sh, "undefine: %d", rc);
+	return rc;
+}
+
 /* -- the decision ------------------------------------------------------- */
 
 static int cmd_check(const struct shell *sh, size_t argc, char **argv)
@@ -603,6 +657,15 @@ SHELL_STATIC_SUBCMD_SET_CREATE(
 	SHELL_SUBCMD_SET_END);
 
 SHELL_STATIC_SUBCMD_SET_CREATE(
+	right_cmds,
+	SHELL_CMD_ARG(list, NULL, "list — every defined name", cmd_right_list, 1, 0),
+	SHELL_CMD_ARG(define, NULL, "define <name> — offer it for granting",
+		      cmd_right_define, 2, 0),
+	SHELL_CMD_ARG(undefine, NULL, "undefine <name> — holders keep it",
+		      cmd_right_undefine, 2, 0),
+	SHELL_SUBCMD_SET_END);
+
+SHELL_STATIC_SUBCMD_SET_CREATE(
 	persondb_cmds,
 	SHELL_CMD_ARG(open, NULL, "Open the store, building one if there is none",
 		      cmd_open, 1, 0),
@@ -615,6 +678,7 @@ SHELL_STATIC_SUBCMD_SET_CREATE(
 	SHELL_CMD(person, &person_cmds, "Persons", NULL),
 	SHELL_CMD(card, &card_cmds, "Credentials", NULL),
 	SHELL_CMD(perm, &perm_cmds, "Permissions", NULL),
+	SHELL_CMD(right, &right_cmds, "The rights vocabulary", NULL),
 	SHELL_CMD_ARG(check, NULL, "check <card> <perm> [now] — the decision",
 		      cmd_check, 3, 1),
 	SHELL_COND_CMD_ARG(CONFIG_APP_CBOR_PERSONDB_TUI, tui, NULL,
@@ -667,6 +731,9 @@ static int cmd_fill(const struct shell *sh, size_t argc, char **argv)
 	shell_print(sh, "%u written in %lld ms, %u/%u total, %u commits%s",
 		    f.written, (long long)f.ms, f.populated, f.target,
 		    f.batches, f.complete ? ", complete" : "");
+	if (f.rights_defined) {
+		shell_print(sh, "%u rights defined", f.rights_defined);
+	}
 	if (f.enospc) {
 		shell_warn(sh, "%u bucket overflows (FINDINGS.md K2)", f.enospc);
 	}

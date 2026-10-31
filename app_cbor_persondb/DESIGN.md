@@ -600,7 +600,7 @@ because §9 exists.
 **`persondb tui` — full-screen, inside the shell frontend.** A page of stored
 persons on the left, the selected one's permissions and cards on the right.
 Tab cycles the three panes, and `a` / `d` add and remove in the one in focus:
-persons, permissions (pick a `tui-…` one or type any name), cards. `n`
+persons, permissions (pick a defined one or type any name), cards. `n`
 renames, `v` sets the days a person's cards are valid, `g` opens a person by
 id and `c` by card. Every removal asks y/N first.
 
@@ -623,9 +623,10 @@ the shell frontend, which already owns the scenario: the persondb handle, the
 first id for persons added by hand (above the dataset's range, so `fill`
 cannot overwrite them), "today" (`SCENARIO_BENCH_NOW`; the board has no
 clock), and a clock that advances on `native_sim`. The grant dialog offers the
-TUI's own permissions, all named `tui-…` so a grant made here is recognisable
-as one, plus any name typed in; the generator's vocabulary is the dataset's
-business, not the TUI's. Plain VT100 and DEC line drawing at 80x24 (`ui/term.c`); the dialogs
+store's rights vocabulary (§12.5), read once at entry and sorted in RAM, minus
+what the person already holds, plus any name typed in — which is defined
+first, then granted. A held name that is not in the vocabulary is marked `?`
+in the permissions pane. Plain VT100 and DEC line drawing at 80x24 (`ui/term.c`); the dialogs
 are in `ui/tui_widgets.c`, the screens in `ui/ui_tui.c`. It is
 `CONFIG_APP_CBOR_PERSONDB_TUI`, on by default with the shell frontend.
 
@@ -703,7 +704,8 @@ nothing.
 ## 12. Storage layout — and why L2 rather than L3
 
 **The layout.** One registry key, one app-owned superblock, **two `kvhash`
-instances** — the domain has two collections, so the store has two containers:
+instances** — the domain has two collections, so the store has two containers
+— and, since §12.5, a set of the permission names a frontend offers:
 
 ```
 rootreg[ ROOTREG_KEY('PADB', 0) ] ──► superblock blob   (CBOR, app-owned)
@@ -711,6 +713,7 @@ rootreg[ ROOTREG_KEY('PADB', 0) ] ──► superblock blob   (CBOR, app-owned)
                                         2 table directory (§12.3)
                                             1 → root_id   people map
                                             2 → root_id   credential index
+                                            3 → root_id   rights vocabulary (§12.5)
                                         3 n_persons  4 populated  5 rev
                                             │
         kvhash_map_ops on each root ────────┘
@@ -982,8 +985,9 @@ and `scenario reset` is it followed by `persondb open`.
 older build may do while *keeping* the store, and a destroy keeps nothing.
 
 **Everything is checked before anything is released.** The superblock does
-not say what kind of container a table is, and every one this build knows is
-a kvhash map; a table that is not one — a newer build's other container — is
+not say what kind of container a table is. Every one this build knows is a
+kvhash map, or the rights set, which is reached through its own shape and is
+a kvhash map on flash under `SB_SCHEMA_RIGHTS` 1; a table that is not one — a newer build's other container — is
 refused with the store untouched, rather than destroyed half-way.
 
 **It survives a power cut.** The order is §12.3's, extended: the tables while
@@ -1004,6 +1008,38 @@ in-between states need the open path's help:
 store whose superblock is a newer format than this build reads is refused
 (`-ENOTSUP`). Fixing that means freezing the part of the superblock that lists
 the roots, so every later build keeps it readable — deliberately not done yet.
+
+### 12.5 The rights vocabulary — a set
+
+A right existed only inside the records of the people who held it, so a right
+nobody held yet could not exist, and the TUI offered a compiled-in list of its
+own. The store now keeps the names a frontend may offer: table 3, a **set**
+(`shape_set.h`), through `set_over_map` over `kvhash_map_ops` — on flash a
+kvhash map whose values are all empty. The design, and the native kvhash set
+it can later move to, are `doc/proposals/2026-10-31-set-shape.md`.
+
+| | |
+|---|---|
+| API | `persondb_right_define` / `_undefine` / `_defined` / `_next` / `_count`; shell `persondb right list\|define\|undefine` |
+| Class | **preserve** — no access decision reads it, so an older build that keeps it and grants without it can leave a held name undefined, nothing worse; and it is not derivable, since a name can be defined before anyone holds it |
+| Seeded | by `scenario_fill` from the dataset's 32 names, on a fill from nothing only |
+| Upgrade | a store without it gains one at open, in the superblock rewrite (same B8 window as a create); a full directory opens without one, and the calls answer `-ENOTSUP` |
+| Geometry | 64 members of ~16 B declared: one level, a few buckets |
+
+**It governs what is offered, not what may be held.** `persondb_permission_grant`
+does not consult it and `persondb_check` never reads it, so the hot paths are
+unchanged. Undefining a name touches no person: a walk of every record would be
+the price of the alternative, and a held name that is no longer defined stays
+revocable and is marked in the TUI. A name typed at the TUI's `<other...>` is
+defined *then* granted, so a power cut between the two leaves a name nobody
+holds rather than one held and undefined.
+
+**What the set is for here.** A define of a name already there answers
+`-EEXIST` and writes nothing, so the seeding repeated by a fill restarted after
+a power cut costs reads only; and the return codes say insert from no-op, so a
+count can be kept without a probe. Rights carry no attributes today; if one
+gains a description or the doors it opens, the table becomes a map and only
+persondb changes.
 
 ## 13. Acceptance criteria
 

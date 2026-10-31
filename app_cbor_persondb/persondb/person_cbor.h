@@ -62,11 +62,16 @@ extern "C" {
  * have an old build apply one table's rule to another's data. */
 #define SB_TABLE_PEOPLE 1
 #define SB_TABLE_CRED   2
+#define SB_TABLE_RIGHTS 3   /* the rights vocabulary: a set of names */
 
 /* The record formats this codec reads, per table. A table whose schema is
  * not the one listed here is refused rather than misread. */
 #define SB_SCHEMA_PEOPLE 1
 #define SB_SCHEMA_CRED   1
+/* 1: set_over_map over kvhash -- on flash a kvhash map whose values are all
+ * empty. The native kvhash set (doc/proposals/2026-10-31-set-shape.md step 3)
+ * is a different record format and takes the next value. */
+#define SB_SCHEMA_RIGHTS 1
 
 /**
  * What a build that does not know a table must do with it. Recorded by the

@@ -45,7 +45,8 @@ above it. Acceptance criterion **A7** checks this rather than trusting it.
 `kvdb` (L3) is the ergonomic interface, and its unit — one named instance —
 is not this application's unit of structure. This application is two
 collections: people and credentials. So it is **two L2 containers behind one
-root**: one registry key, one app-owned superblock, two `kvhash` instances.
+root**: one registry key, one app-owned superblock, two `kvhash` instances —
+plus a set of the right names a frontend offers (`DESIGN.md` §12.5).
 L3 would wrap each container in an instance to give it a name the app never
 uses and a backend record it never varies.
 

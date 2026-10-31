@@ -20,6 +20,7 @@
 
 #include <app/lib/blob_db.h>
 #include <app/lib/containers/kvhash.h>
+#include <app/lib/containers/set_over_map.h>
 #include <app/lib/rootreg.h>
 
 #include "person_cbor.h"
@@ -198,19 +199,23 @@ ZTEST_SUITE(persondb_superblock, NULL, NULL, before, after, NULL);
 
 /* -- a store this build writes ------------------------------------------ */
 
-ZTEST(persondb_superblock, test_fresh_store_lists_two_required_tables)
+ZTEST(persondb_superblock, test_fresh_store_lists_its_three_tables)
 {
 	struct superblock sb;
 
 	sb_read(&sb);
 	zassert_equal(sb.version, SUPERBLOCK_VERSION);
-	zassert_equal(sb.n_tables, 2);
+	zassert_equal(sb.n_tables, 3);
 	zassert_equal(sb.table[0].id, SB_TABLE_PEOPLE);
 	zassert_equal(sb.table[0].cls, SB_CLASS_REQUIRED);
 	zassert_equal(sb.table[0].schema, SB_SCHEMA_PEOPLE);
 	zassert_equal(sb.table[1].id, SB_TABLE_CRED);
 	zassert_equal(sb.table[1].cls, SB_CLASS_REQUIRED);
 	zassert_equal(sb.table[1].schema, SB_SCHEMA_CRED);
+	zassert_equal(sb.table[2].id, SB_TABLE_RIGHTS);
+	zassert_equal(sb.table[2].cls, SB_CLASS_PRESERVE,
+		      "no access decision reads the vocabulary");
+	zassert_equal(sb.table[2].schema, SB_SCHEMA_RIGHTS);
 	zassert_equal(sb.n_persons, N_PERSONS);
 
 	zassert_ok(reopen());
@@ -233,8 +238,9 @@ ZTEST(persondb_superblock, test_v1_store_is_upgraded_in_place)
 
 	sb_read(&sb);
 	zassert_equal(sb.version, SUPERBLOCK_VERSION, "not rewritten as v2");
-	zassert_equal(sb.n_tables, 2);
+	zassert_equal(sb.n_tables, 3, "no rights vocabulary added");
 	zassert_equal(sb.table[0].root, people);
+	zassert_equal(sb.table[2].id, SB_TABLE_RIGHTS);
 	zassert_equal(sb.populated, 1);
 
 	/* No record moved: the same maps answer as before. */
@@ -286,11 +292,11 @@ ZTEST(persondb_superblock, test_unknown_preserve_table_is_kept)
 	put_person(100001);
 	zassert_ok(persondb_progress_set(db, 1, 0));
 	sb_read(&sb);
-	zassert_equal(sb.n_tables, 3);
-	zassert_equal(sb.table[2].id, 9);
-	zassert_equal(sb.table[2].root, root);
-	zassert_equal(sb.table[2].cls, SB_CLASS_PRESERVE);
-	zassert_equal(sb.table[2].schema, 4);
+	zassert_equal(sb.n_tables, 4);
+	zassert_equal(sb.table[3].id, 9);
+	zassert_equal(sb.table[3].root, root);
+	zassert_equal(sb.table[3].cls, SB_CLASS_PRESERVE);
+	zassert_equal(sb.table[3].schema, 4);
 	zassert_true(map_alive(root));
 }
 
@@ -305,7 +311,7 @@ ZTEST(persondb_superblock, test_unknown_derived_table_is_dropped)
 	zassert_ok(reopen());
 
 	sb_read(&sb);
-	zassert_equal(sb.n_tables, 2, "derived table still listed");
+	zassert_equal(sb.n_tables, 3, "derived table still listed");
 	zassert_equal(kvhash_map_ops.get(root, "k", 1, NULL, 0, NULL), -ENOENT,
 		      "derived table not destroyed");
 	zassert_ok(persondb_person_get(db, 100001, &got));
@@ -322,7 +328,7 @@ ZTEST(persondb_superblock, test_drop_resumes_after_a_crash)
 	zassert_ok(reopen());
 
 	sb_read(&sb);
-	zassert_equal(sb.n_tables, 2);
+	zassert_equal(sb.n_tables, 3);
 }
 
 /* A refusal is decided before anything is dropped. */
@@ -351,7 +357,7 @@ ZTEST(persondb_superblock, test_derived_entry_cannot_drop_an_owned_map)
 	struct superblock sb;
 
 	sb_read(&sb);
-	sb.n_tables = 2;
+	sb.n_tables--;   /* the foreign entry, appended last */
 	sb_write(&sb);
 	zassert_ok(reopen());
 	zassert_ok(persondb_person_get(db, 100001, &got));
@@ -484,7 +490,7 @@ ZTEST(persondb_superblock, test_destroy_refuses_before_releasing_anything)
 
 	/* The store is whole: drop the foreign entry and it opens as before. */
 	sb_read(&sb);
-	sb.n_tables = 2;
+	sb.n_tables--;   /* the foreign entry, appended last */
 	sb_write(&sb);
 	zassert_ok(persondb_open(&db, N_PERSONS));
 	zassert_ok(persondb_person_get(db, 100001, &got));
@@ -509,6 +515,7 @@ ZTEST(persondb_superblock, test_open_after_a_destroy_lost_its_last_step)
 
 	zassert_ok(kvhash_map_ops.destroy(table_root(SB_TABLE_PEOPLE)));
 	zassert_ok(kvhash_map_ops.destroy(table_root(SB_TABLE_CRED)));
+	zassert_ok(set_over_kvhash_ops.destroy(table_root(SB_TABLE_RIGHTS)));
 	zassert_ok(blob_db_delete(old));
 
 	/* Building at the deleted id would be D3's undefined update. */
@@ -525,6 +532,179 @@ ZTEST(persondb_superblock, test_destroy_without_a_store)
 	zassert_ok(persondb_destroy(&db));
 	zassert_ok(persondb_destroy(&db));
 	zassert_equal(blob_db_count(), BLOBS_WITHOUT_A_STORE);
+}
+
+/* -- the rights vocabulary ---------------------------------------------- */
+
+ZTEST(persondb_superblock, test_rights_define_undefine_roundtrip)
+{
+	uint32_t n = 99;
+
+	zassert_ok(persondb_right_count(db, &n));
+	zassert_equal(n, 0, "persondb itself seeds nothing");
+
+	zassert_ok(persondb_right_define(db, "door.lab"));
+	zassert_equal(persondb_right_define(db, "door.lab"), -EEXIST);
+	zassert_ok(persondb_right_defined(db, "door.lab"));
+	zassert_equal(persondb_right_defined(db, "door.la"), -ENOENT);
+	zassert_ok(persondb_right_count(db, &n));
+	zassert_equal(n, 1);
+
+	zassert_ok(persondb_right_undefine(db, "door.lab"));
+	zassert_equal(persondb_right_undefine(db, "door.lab"), -ENOENT);
+	zassert_equal(persondb_right_defined(db, "door.lab"), -ENOENT);
+}
+
+ZTEST(persondb_superblock, test_rights_names_follow_the_permission_rules)
+{
+	char longest[PERSONDB_PERM_MAX + 2];
+
+	memset(longest, 'r', sizeof(longest));
+	longest[PERSONDB_PERM_MAX + 1] = '\0';
+
+	zassert_equal(persondb_right_define(db, ""), -EINVAL);
+	zassert_equal(persondb_right_define(db, NULL), -EINVAL);
+	zassert_equal(persondb_right_define(db, longest), -EINVAL);
+	longest[PERSONDB_PERM_MAX] = '\0';
+	zassert_ok(persondb_right_define(db, longest));
+}
+
+ZTEST(persondb_superblock, test_rights_next_walks_every_name_once)
+{
+	static const char *const names[] = { "a", "door.hq", "lift", "park.b2",
+					     "shift.night" };
+	char cur[PERSONDB_PERM_MAX + 1] = "";
+	char got[PERSONDB_PERM_MAX + 1];
+	char tiny[1];
+	unsigned int seen = 0;
+	int rc;
+
+	for (size_t i = 0; i < ARRAY_SIZE(names); i++) {
+		zassert_ok(persondb_right_define(db, names[i]));
+	}
+	while ((rc = persondb_right_next(db, cur, got, sizeof(got))) == 0) {
+		size_t i;
+
+		for (i = 0; i < ARRAY_SIZE(names); i++) {
+			if (strcmp(got, names[i]) == 0) {
+				break;
+			}
+		}
+		zassert_true(i < ARRAY_SIZE(names), "unknown name '%s'", got);
+		zassert_false(seen & BIT(i), "'%s' twice", got);
+		seen |= BIT(i);
+		strcpy(cur, got);
+	}
+	zassert_equal(rc, -ENODATA);
+	zassert_equal(seen, BIT_MASK(ARRAY_SIZE(names)));
+
+	/* Room for the terminator is the caller's to give: one byte holds
+	 * only the terminator, so every name is too long for it. */
+	zassert_equal(persondb_right_next(db, NULL, tiny, 1), -ENOMEM);
+	zassert_equal(persondb_right_next(db, NULL, got, 0), -EINVAL);
+}
+
+ZTEST(persondb_superblock, test_rights_survive_reopen)
+{
+	zassert_ok(persondb_right_define(db, "room.server"));
+	zassert_ok(reopen());
+	zassert_ok(persondb_right_defined(db, "room.server"));
+	zassert_equal(persondb_right_define(db, "room.server"), -EEXIST);
+}
+
+/* The vocabulary governs what is offered, not what may be held. */
+ZTEST(persondb_superblock, test_rights_do_not_gate_grants_or_holders)
+{
+	struct persondb_person got;
+
+	put_person(100001);   /* holds "door.test", never defined */
+	zassert_ok(persondb_permission_grant(db, 100001, "undefined.too"));
+	zassert_ok(persondb_right_define(db, "door.test"));
+	zassert_ok(persondb_right_undefine(db, "door.test"));
+
+	zassert_ok(persondb_person_get(db, 100001, &got));
+	zassert_equal(got.n_perms, 2, "undefining touched a holder");
+	zassert_ok(persondb_permission_revoke(db, 100001, "door.test"));
+}
+
+/* A store written before the vocabulary existed gains one at open, in the
+ * superblock rewrite, with no person record touched. */
+ZTEST(persondb_superblock, test_store_without_rights_gains_them)
+{
+	struct persondb_person got;
+	struct superblock sb;
+	uint64_t old_rights = table_root(SB_TABLE_RIGHTS);
+
+	put_person(100001);
+	zassert_ok(set_over_kvhash_ops.destroy(old_rights));
+	sb_read(&sb);
+	sb.n_tables = 2;   /* people and credentials, as the older build wrote */
+	sb_write(&sb);
+
+	zassert_ok(reopen());
+	sb_read(&sb);
+	zassert_equal(sb.n_tables, 3);
+	zassert_equal(sb.table[2].id, SB_TABLE_RIGHTS);
+	zassert_equal(sb.table[2].cls, SB_CLASS_PRESERVE);
+	zassert_not_equal(sb.table[2].root, old_rights,
+			  "built on a destroyed id (D3)");
+	zassert_ok(persondb_right_define(db, "door.new"));
+	zassert_ok(persondb_person_get(db, 100001, &got));
+
+	/* And destroy still takes every blob, the new set included. */
+	zassert_ok(persondb_destroy(&db));
+	zassert_equal(blob_db_count(), 1u);
+}
+
+/* The vocabulary is inserted in id order, before a newer build's tables. */
+ZTEST(persondb_superblock, test_rights_table_keeps_the_directory_ascending)
+{
+	struct superblock sb;
+	uint64_t newer = make_map();
+
+	zassert_ok(set_over_kvhash_ops.destroy(table_root(SB_TABLE_RIGHTS)));
+	sb_read(&sb);
+	sb.table[2] = (struct sb_table){
+		.id = 9, .root = newer, .cls = SB_CLASS_PRESERVE, .schema = 1,
+	};
+	sb_write(&sb);
+
+	zassert_ok(reopen());
+	sb_read(&sb);
+	zassert_equal(sb.n_tables, 4);
+	zassert_equal(sb.table[2].id, SB_TABLE_RIGHTS);
+	zassert_equal(sb.table[3].id, 9);
+	zassert_true(map_alive(newer));
+}
+
+/* A full directory does not refuse the store over a table no decision needs:
+ * it opens without a vocabulary, and the calls say so. */
+ZTEST(persondb_superblock, test_full_directory_opens_without_rights)
+{
+	struct persondb_person got;
+	struct superblock sb;
+	char name[PERSONDB_PERM_MAX + 1];
+	uint32_t n;
+
+	put_person(100001);
+	zassert_ok(set_over_kvhash_ops.destroy(table_root(SB_TABLE_RIGHTS)));
+	sb_read(&sb);
+	sb.n_tables = 2;
+	for (uint32_t id = 10; sb.n_tables < SB_TABLES_MAX; id++) {
+		sb.table[sb.n_tables++] = (struct sb_table){
+			.id = id, .root = make_map(), .cls = SB_CLASS_PRESERVE,
+			.schema = 1,
+		};
+	}
+	sb_write(&sb);
+
+	zassert_ok(reopen());
+	zassert_ok(persondb_person_get(db, 100001, &got));
+	zassert_equal(persondb_right_define(db, "x"), -ENOTSUP);
+	zassert_equal(persondb_right_defined(db, "x"), -ENOTSUP);
+	zassert_equal(persondb_right_next(db, NULL, name, sizeof(name)),
+		      -ENOTSUP);
+	zassert_equal(persondb_right_count(db, &n), -ENOTSUP);
 }
 
 /* -- the codec ---------------------------------------------------------- */

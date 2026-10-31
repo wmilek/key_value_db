@@ -9,8 +9,10 @@
  *
  *   rootreg[ ROOTREG_KEY('PADB', 0) ] -> superblock -> table 1: people
  *                                                   -> table 2: credentials
+ *                                                   -> table 3: rights vocabulary
  *
- * Two containers, because the domain has two collections. The people map was
+ * Two maps, because the domain has two collections, and a set of the
+ * permission names a frontend may offer (DESIGN.md §12.5). The people map was
  * sixteen shards until DESIGN.md §12.2, to keep any one bucket under a 4 KB
  * payload cap that has since been lifted; that was a workaround for K2, and
  * workarounds hide the limitations this application exists to find (DESIGN.md
@@ -34,6 +36,7 @@
 #include <app/lib/blob_db.h>
 #include <app/lib/blob_db_iostats.h>
 #include <app/lib/containers/kvhash.h>
+#include <app/lib/containers/set_over_map.h>
 #include <app/lib/rootreg.h>
 
 #include "person_cbor.h"
@@ -79,7 +82,9 @@ struct persondb {
 	struct superblock     sb;
 	uint64_t              people_root;   /* resolved from sb at open */
 	uint64_t              cred_root;
+	uint64_t              rights_root;   /* 0: this store has none */
 	const struct map_ops *ops;
+	const struct set_ops *rights_ops;
 	struct persondb_stat  st;
 };
 
@@ -262,6 +267,81 @@ static int geometry(size_t *partition_bytes)
 /* -- lifecycle ---------------------------------------------------------- */
 
 /*
+ * The rights vocabulary (DESIGN.md §12.5): a set of the permission names a
+ * frontend offers. A few dozen names of ~16 B, so one level and a handful of
+ * buckets; the declaration says so and kvhash derives the rest.
+ */
+static int rights_create(struct persondb *db)
+{
+	const struct set_config cfg = {
+		.expected_members = 64,
+		.typical_key_bytes = 16,
+		.max_key_bytes = PERSONDB_PERM_MAX,
+	};
+
+	db->rights_root = blob_db_alloc_id();
+	if (db->rights_root == 0) {
+		return -EIO;
+	}
+	return db->rights_ops->create(db->rights_root, &cfg);
+}
+
+/*
+ * Class *preserve*: no access decision reads the vocabulary, so a build that
+ * does not know it — and grants without consulting it — cannot make anything
+ * wrong, only leave a held name undefined, which a frontend shows. It is not
+ * derived either: a name defined before anyone holds it cannot be rebuilt
+ * from the people map.
+ */
+static struct sb_table rights_entry(const struct persondb *db)
+{
+	return (struct sb_table){
+		.id = SB_TABLE_RIGHTS, .root = db->rights_root,
+		.cls = SB_CLASS_PRESERVE, .schema = SB_SCHEMA_RIGHTS,
+	};
+}
+
+/*
+ * Give a store written before the vocabulary existed one, in the directory
+ * in memory; the caller commits. Same window as create_store(): a crash
+ * before the commit leaves the new set unreferenced (B8), and the next open
+ * builds another.
+ *
+ * A full directory is not a reason to refuse a store over a table no
+ * decision needs: the store opens without a vocabulary, and the
+ * persondb_right_* calls say so.
+ */
+static int rights_add_table(struct persondb *db)
+{
+	struct superblock *sb = &db->sb;
+
+	if (sb->n_tables >= SB_TABLES_MAX) {
+		LOG_WRN("table directory full: store opened without a rights "
+			"vocabulary");
+		return 0;
+	}
+
+	int rc = rights_create(db);
+
+	if (rc != 0) {
+		db->rights_root = 0;
+		return rc;
+	}
+
+	uint8_t at = 0;
+
+	while (at < sb->n_tables && sb->table[at].id < SB_TABLE_RIGHTS) {
+		at++;
+	}
+	memmove(&sb->table[at + 1], &sb->table[at],
+		(sb->n_tables - at) * sizeof(sb->table[0]));
+	sb->table[at] = rights_entry(db);
+	sb->n_tables++;
+	LOG_INF("added a rights vocabulary to the store");
+	return 0;
+}
+
+/*
  * Build a virgin store: allocate the map roots, create each map, and bind the
  * superblock LAST. That single write publishes the whole structure atomically.
  *
@@ -335,9 +415,15 @@ static int create_store(struct persondb *db, uint32_t n_persons)
 		return rc;
 	}
 
-	/* Both required: each is authoritative, and a build that ignored
-	 * either would answer access decisions wrongly. */
-	sb->n_tables = 2;
+	rc = rights_create(db);
+	if (rc != 0) {
+		return rc;
+	}
+
+	/* People and credentials are required: each is authoritative, and a
+	 * build that ignored either would answer access decisions wrongly.
+	 * The vocabulary is not (rights_create). */
+	sb->n_tables = 3;
 	sb->table[0] = (struct sb_table){
 		.id = SB_TABLE_PEOPLE, .root = db->people_root,
 		.cls = SB_CLASS_REQUIRED, .schema = SB_SCHEMA_PEOPLE,
@@ -346,6 +432,7 @@ static int create_store(struct persondb *db, uint32_t n_persons)
 		.id = SB_TABLE_CRED, .root = db->cred_root,
 		.cls = SB_CLASS_REQUIRED, .schema = SB_SCHEMA_CRED,
 	};
+	sb->table[2] = rights_entry(db);
 
 	struct map_info people_info, cred_info;
 
@@ -376,6 +463,7 @@ static int tables_resolve(struct persondb *db, bool drop[SB_TABLES_MAX])
 {
 	db->people_root = 0;
 	db->cred_root = 0;
+	db->rights_root = 0;
 
 	for (uint8_t i = 0; i < db->sb.n_tables; i++) {
 		const struct sb_table *t = &db->sb.table[i];
@@ -389,6 +477,9 @@ static int tables_resolve(struct persondb *db, bool drop[SB_TABLES_MAX])
 		} else if (t->id == SB_TABLE_CRED) {
 			mine = &db->cred_root;
 			schema = SB_SCHEMA_CRED;
+		} else if (t->id == SB_TABLE_RIGHTS) {
+			mine = &db->rights_root;
+			schema = SB_SCHEMA_RIGHTS;
 		}
 
 		if (mine != NULL) {
@@ -428,7 +519,8 @@ static int tables_resolve(struct persondb *db, bool drop[SB_TABLES_MAX])
 		uint64_t root = db->sb.table[i].root;
 
 		if (drop[i] && (root == db->people_root ||
-				root == db->cred_root || root == db->sb_id)) {
+				root == db->cred_root ||
+				root == db->rights_root || root == db->sb_id)) {
 			LOG_ERR("table %u would drop a map this build owns",
 				db->sb.table[i].id);
 			return -EIO;
@@ -515,8 +607,11 @@ static int attach_store(struct persondb *db, const uint8_t *buf, size_t len)
 	}
 
 	/* Version 1 described the same two maps, so upgrading it is a rewrite
-	 * of this one blob: no record moves. */
-	dirty = (db->sb.version != SUPERBLOCK_VERSION);
+	 * of this one blob: no record moves. A store from before the rights
+	 * vocabulary gains one, in the same rewrite — when there is room for
+	 * it; a full directory must not cost a superblock write per open. */
+	dirty = (db->sb.version != SUPERBLOCK_VERSION) ||
+		(db->rights_root == 0 && db->sb.n_tables < SB_TABLES_MAX);
 	for (uint8_t i = 0; i < db->sb.n_tables; i++) {
 		dirty = dirty || drop[i];
 	}
@@ -527,6 +622,12 @@ static int attach_store(struct persondb *db, const uint8_t *buf, size_t len)
 	rc = tables_drop(db, drop);
 	if (rc != 0) {
 		return rc;
+	}
+	if (db->rights_root == 0) {
+		rc = rights_add_table(db);
+		if (rc != 0) {
+			return rc;
+		}
 	}
 	if (db->sb.version != SUPERBLOCK_VERSION) {
 		LOG_INF("superblock upgraded from version %u to %u",
@@ -548,6 +649,7 @@ int persondb_open(struct persondb **out, uint32_t n_persons)
 
 	memset(&db->st, 0, sizeof(db->st));
 	db->ops = &kvhash_map_ops;
+	db->rights_ops = &set_over_kvhash_ops;
 
 	/* This module owns the storage stack end to end, so nothing above it
 	 * ever names blob_db or rootreg (DESIGN.md F12, checked by A7). */
@@ -642,6 +744,28 @@ static bool table_is_own(const struct sb_table *t)
 	return t->id == SB_TABLE_PEOPLE || t->id == SB_TABLE_CRED;
 }
 
+/* The vocabulary goes through its own shape; every other table this build
+ * can take apart is a kvhash map. Under SB_SCHEMA_RIGHTS 1 the set is a
+ * kvhash map on flash too, which is why an older build can still free it. */
+static int table_stat(struct persondb *db, const struct sb_table *t)
+{
+	if (t->id == SB_TABLE_RIGHTS) {
+		struct set_info info;
+
+		return db->rights_ops->stat(t->root, &info);
+	}
+
+	struct map_info info;
+
+	return db->ops->stat(t->root, &info);
+}
+
+static int table_destroy(struct persondb *db, const struct sb_table *t)
+{
+	return t->id == SB_TABLE_RIGHTS ? db->rights_ops->destroy(t->root)
+					: db->ops->destroy(t->root);
+}
+
 /*
  * Destroy every table the directory lists, this build's or a newer one's.
  *
@@ -660,7 +784,6 @@ static int tables_destroy(struct persondb *db)
 {
 	for (uint8_t i = 0; i < db->sb.n_tables; i++) {
 		const struct sb_table *t = &db->sb.table[i];
-		struct map_info info;
 		int rc;
 
 		if (t->root == 0 || t->root == BLOB_DB_ROOT_ID ||
@@ -669,7 +792,7 @@ static int tables_destroy(struct persondb *db)
 				(unsigned long long)t->root);
 			return -EIO;
 		}
-		rc = db->ops->stat(t->root, &info);
+		rc = table_stat(db, t);
 		if (rc != 0 && rc != -ENOENT) {
 			LOG_ERR("table %u is not a map this build can "
 				"destroy: %d", t->id, rc);
@@ -685,7 +808,7 @@ static int tables_destroy(struct persondb *db)
 				continue;
 			}
 
-			int rc = db->ops->destroy(t->root);
+			int rc = table_destroy(db, t);
 
 			if (rc != 0 && rc != -ENOENT) {
 				LOG_ERR("destroying table %u: %d", t->id, rc);
@@ -716,6 +839,7 @@ int persondb_destroy(struct persondb **out)
 	}
 	db->open = false;
 	db->ops = &kvhash_map_ops;
+	db->rights_ops = &set_over_kvhash_ops;
 
 	rc = blob_db_mount();
 	if (rc != 0 && rc != -EALREADY) {
@@ -1213,6 +1337,87 @@ int persondb_permission_revoke(struct persondb *db, uint32_t person_id,
 	}
 	p.n_perms = n;
 	return person_store(db, &p);
+}
+
+/* -- the rights vocabulary ---------------------------------------------- */
+
+static int right_arg(struct persondb *db, const char *name)
+{
+	if (db->rights_root == 0) {
+		return -ENOTSUP;
+	}
+	return perm_valid(name);
+}
+
+int persondb_right_define(struct persondb *db, const char *name)
+{
+	int rc = right_arg(db, name);
+
+	if (rc != 0) {
+		return rc;
+	}
+	/* -EEXIST is the set's answer for a name already there, and it wrote
+	 * nothing: re-seeding a populated vocabulary costs reads only. */
+	return db->rights_ops->add(db->rights_root, name, strlen(name));
+}
+
+int persondb_right_undefine(struct persondb *db, const char *name)
+{
+	int rc = right_arg(db, name);
+
+	if (rc != 0) {
+		return rc;
+	}
+	return db->rights_ops->del(db->rights_root, name, strlen(name));
+}
+
+int persondb_right_defined(struct persondb *db, const char *name)
+{
+	int rc = right_arg(db, name);
+
+	if (rc != 0) {
+		return rc;
+	}
+	return db->rights_ops->has(db->rights_root, name, strlen(name));
+}
+
+int persondb_right_next(struct persondb *db, const char *after, char *out,
+			size_t out_sz)
+{
+	size_t alen = after ? strlen(after) : 0;
+	size_t len = 0;
+	int rc;
+
+	if (db->rights_root == 0) {
+		return -ENOTSUP;
+	}
+	if (out == NULL || out_sz == 0) {
+		return -EINVAL;
+	}
+
+	/* One byte is kept back for the terminator. */
+	rc = db->rights_ops->next(db->rights_root, after, alen, out, out_sz - 1,
+				  &len);
+	if (rc != 0) {
+		return rc;
+	}
+	out[len] = '\0';
+	return 0;
+}
+
+int persondb_right_count(struct persondb *db, uint32_t *n)
+{
+	size_t c = 0;
+	int rc;
+
+	if (db->rights_root == 0) {
+		return -ENOTSUP;
+	}
+	rc = db->rights_ops->count(db->rights_root, &c);
+	if (rc == 0) {
+		*n = (uint32_t)c;
+	}
+	return rc;
 }
 
 /* -- person details ----------------------------------------------------- */

@@ -348,6 +348,53 @@ int persondb_permission_grant(struct persondb *db, uint32_t person_id,
 int persondb_permission_revoke(struct persondb *db, uint32_t person_id,
 			       const char *perm);
 
+/* -- the rights vocabulary ---------------------------------------------- */
+
+/*
+ * The names a frontend offers when it grants a permission, kept in the store
+ * as a set (DESIGN.md §12.5). The vocabulary governs what is *offered*, not
+ * what may be *held*: persondb_permission_grant() does not consult it, and
+ * persondb_check() never reads it, so no access decision depends on it.
+ * Undefining a name touches no person; a held name that is not defined stays
+ * held and revocable.
+ *
+ * Names follow the permission rules: non-empty, at most PERSONDB_PERM_MAX.
+ * Every call answers -ENOTSUP on a store that has no vocabulary table (one
+ * whose table directory was full when this build first opened it).
+ */
+
+/**
+ * @brief Add @p name to the vocabulary.
+ *
+ * @retval 0        defined
+ * @retval -EEXIST  already defined; nothing was written
+ * @retval -EINVAL  empty, or longer than PERSONDB_PERM_MAX
+ */
+int persondb_right_define(struct persondb *db, const char *name);
+
+/** Remove @p name. @retval -ENOENT not defined. No person is touched. */
+int persondb_right_undefine(struct persondb *db, const char *name);
+
+/** @retval 0 defined  @retval -ENOENT not defined */
+int persondb_right_defined(struct persondb *db, const char *name);
+
+/**
+ * @brief The defined name after @p after (NULL or "" for the first), in the
+ *        set's enumeration order, which is stable but not alphabetical.
+ *
+ * @p out receives the name NUL-terminated; @p out_sz of PERSONDB_PERM_MAX + 1
+ * always suffices for a name this build defined.
+ *
+ * @retval 0        *out filled
+ * @retval -ENODATA no name follows @p after
+ * @retval -ENOMEM  @p out_sz too small for the next name
+ */
+int persondb_right_next(struct persondb *db, const char *after, char *out,
+			size_t out_sz);
+
+/** How many names are defined. Walks the set: not for a hot path. */
+int persondb_right_count(struct persondb *db, uint32_t *n);
+
 /* -- person details ----------------------------------------------------- */
 
 /*
