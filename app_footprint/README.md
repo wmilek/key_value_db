@@ -22,6 +22,7 @@ layer, so the linker keeps what a real caller would link:
 | `CONFIG_BLOB_DB` | the whole `blob_db.h` API; `blob_db_iostats_*` / `blob_db_inspect_*` when those are on |
 | `CONFIG_BLOB_ROOTREG` | the whole `rootreg.h` API |
 | `CONFIG_BLOB_CONTAINER_KVHASH` | every `map_ops` entry of `kvhash_map_ops` |
+| `CONFIG_BLOB_CONTAINER_SET_OVER_MAP` (with kvhash) | every `set_ops` entry of `set_over_kvhash_ops` |
 | `CONFIG_BLOB_CONTAINER_LOGRING` | the whole `logring.h` API |
 | `CONFIG_BLOBDB_KVDB` | the whole `kvdb.h` API |
 | `CONFIG_BLOBDB_BLOBFS` | the path API of `blobfs.h` |

@@ -290,3 +290,58 @@ Already off in the shipped build, so nothing to gain: `UBI_VERIFY_ON_READ`,
 What is left in PSA Crypto (10.3 KB) is mostly its core, `psa_crypto.c` at 4.5 KB,
 then AES 1.4, the MAC layer 1.0, SHA-256 0.9 and CMAC 0.8. No Kconfig setting
 reaches the core.
+
+## 6. The Set shape and persondb's rights vocabulary
+
+What `doc/proposals/2026-10-31-set-shape.md` steps 1 and 1a added, measured
+2026-10-31 as **before and after on one tree**: key_value_db `6e8ce3b` (before)
+and `94deebd` (after), both on Zephyr `0534e997eacb`, zephyr-ubi
+`d66b599af9ef`, SDK 1.0.1. Zephyr has moved since §1–5 were taken
+(`c4aa9324508f`): `p0` is 109 364 B here, against 108 992 B there. So compare
+the rows below with each other, not with the tables above. Raw data:
+[`results/set_shape.json`](results/set_shape.json).
+
+**The adapter on its own** (`v16`, new: `variants/set_over_map.conf` on the
+full stack `s08`, with `main()` calling every `set_ops` entry):
+
+| Build | FLASH | Δ | set_over_map | app (`main.c` calls) | linker |
+|---|--:|--:|--:|--:|--:|
+| s08 | 99 900 | | | | |
+| v16 + set_over_map | 100 700 | +800 | +594 | +192 | +14 |
+
+594 B covers the whole adapter: the eight forwarding ops, the struct translations,
+and the probe-then-set `add`. kvhash grows by nothing, because the adapter
+calls only `map_ops` entries that were already linked.
+
+**persondb, as shipped and in each variant** (the adapter, table 3 in the
+superblock, `persondb_right_*`, seeding in `scenario_fill`, and in the shell
+builds `persondb right` and the TUI's vocabulary):
+
+| # | Build | before | after | Δ | set_over_map | persondb.c | scenario.c + dataset.c | ui_shell.c | ui_tui.c |
+|---|---|--:|--:|--:|--:|--:|--:|--:|--:|
+| p0 | as shipped | 109 364 | 110 576 | +1 212 | +594 | +526 | +99 | | |
+| p1 | on flash_area | 67 836 | 69 060 | +1 224 | +594 | | | | |
+| p2 | without I/O stats | 109 044 | 110 272 | +1 228 | +594 | | | | |
+| p3 | logging off | 81 124 | 82 212 | +1 088 | +594 | +416 | +80 | | |
+| p4 | shell frontend + TUI | 170 700 | 173 416 | +2 716 | +594 | +826 | +112 | +660 | +505 |
+| p5 | shell, no TUI | 156 468 | 158 604 | +2 136 | +594 | +758 | +110 | +660 | |
+
+Linker padding moves by up to ±14 B per image and makes up the rest of each Δ.
+The p1 and p2 app split is the same as p0's, within 2 B per file.
+
+- **The benchmark image (p0) pays 1.2 KB**, about half of it the adapter.
+  The rest of `persondb.c` is table 3 handling (create, upgrade at open,
+  destroy through the set's own ops) and `persondb_right_define`, the only
+  vocabulary call the benchmark makes. The other `persondb_right_*` calls are
+  dropped by the linker. The `scenario.c` and `dataset.c` lines are the seeding loop.
+- **The shell builds pay 2.1–2.7 KB.** They link every `persondb_right_*` call
+  and the three `persondb right` commands. The TUI adds only 505 B: the vocabulary
+  cache, the `?` marker and define-then-grant, less the compiled-in `tui-*`
+  list it replaced.
+- **RAM:** +8 B in every image (persondb's `rights_root` and `rights_ops`),
+  and +980 B in p4 for the TUI's sorted copy of the vocabulary (39 × 24 B
+  names plus counters, DESIGN.md §10).
+- **What step 3 would change:** the native kvhash set replaces the 594 B
+  adapter with its own `has`/`add`/`del` over the shared kvhash core. The
+  proposal estimates that at about half of `kvhash_map.c`; it is not measured
+  here.

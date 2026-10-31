@@ -49,6 +49,9 @@
 #if defined(CONFIG_BLOB_CONTAINER_LOGRING)
 #include <app/lib/containers/logring.h>
 #endif
+#if defined(CONFIG_BLOB_CONTAINER_SET_OVER_MAP)
+#include <app/lib/containers/set_over_map.h>
+#endif
 #if defined(CONFIG_BLOBDB_KVDB)
 #include <app/lib/kvdb.h>
 #endif
@@ -261,6 +264,29 @@ static void run_kvhash(void)
 }
 #endif
 
+#if defined(CONFIG_BLOB_CONTAINER_SET_OVER_MAP) && defined(CONFIG_BLOB_CONTAINER_KVHASH)
+/* The Set shape over kvhash: every set_ops entry, so the adapter's whole
+ * forwarding layer is linked. kvhash itself is charged to run_kvhash. */
+static void run_set(void)
+{
+	const struct set_ops *o = &set_over_kvhash_ops;
+	const struct set_config cfg = { .expected_members = 32 };
+	struct set_info info;
+	size_t klen, n;
+	uint8_t k[16];
+	uint64_t root = blob_db_alloc_id();
+
+	use(o->create(root, &cfg));
+	use(o->stat(root, &info));
+	use(o->add(root, "k", 1));
+	use(o->has(root, "k", 1));
+	use(o->next(root, NULL, 0, k, sizeof(k), &klen));
+	use(o->count(root, &n));
+	use(o->del(root, "k", 1));
+	use(o->destroy(root));
+}
+#endif
+
 #if defined(CONFIG_BLOB_CONTAINER_LOGRING)
 static void run_logring(void)
 {
@@ -336,6 +362,9 @@ int main(void)
 #endif
 #if defined(CONFIG_BLOB_CONTAINER_KVHASH)
 	run_kvhash();
+#endif
+#if defined(CONFIG_BLOB_CONTAINER_SET_OVER_MAP) && defined(CONFIG_BLOB_CONTAINER_KVHASH)
+	run_set();
 #endif
 #if defined(CONFIG_BLOB_CONTAINER_LOGRING)
 	run_logring();

@@ -109,6 +109,8 @@ def builds():
     var("v14", "+ blob_db shell", ["shell.conf", "blob_db_shell.conf"],
         ref="v13")
     var("v15", "-O2 instead of -Os", ["speed_opt.conf"])
+    var("v16", "+ set_over_map", ["set_over_map.conf"],
+        what="The Set shape over kvhash_map_ops: every set_ops entry")
 
     def pdb(pid, title, frags, what=""):
         frags = [VA / f for f in frags]
@@ -162,6 +164,7 @@ COMPONENTS = [
     ("blob_db_be", "blob_db store backend", "stack"),
     ("rootreg", "rootreg", "stack"),
     ("kvhash", "kvhash", "stack"),
+    ("set_over_map", "set_over_map (Set shape over a map)", "stack"),
     ("logring", "logring", "stack"),
     ("kvdb", "kvdb", "stack"),
     ("blobfs", "blobfs", "stack"),
@@ -184,6 +187,7 @@ def classify(obj, member_dirs):
         (r"isr_tables|zephyr_final|offsets\.dir|empty_file", "linker"),
         (r"libblob_db\.a|/lib/blob_db/", "blob_db"),
         (r"librootreg\.a|/lib/rootreg/", "rootreg"),
+        (r"set_over_map", "set_over_map"),
         (r"kvhash", "kvhash"),
         (r"logring", "logring"),
         (r"libkvdb\.a|/lib/kvdb/", "kvdb"),
