@@ -29,8 +29,10 @@ and erases nothing, and a sector is erased once per 60 to 1 300 updates. The
 header records the geometry and three feature sets (`incompat`, `ro_compat`,
 `compat`) in place of the major-number combinations. Protection is a `suite`
 the build requires, not a feature the store chooses. Compaction no longer
-touches the master: on UBI it never did, and in AEAD mode its nonces stop
-coming from the master counter. Each record also carries 32 **fuses**:
+touches the master on any path. On UBI with atomic replace it never did. On
+the scratch path, recovery is keyed on the scratch sector's seal instead of a
+`COMPACTING` record. In AEAD mode, its nonces stop coming from the master
+counter. Each record also carries 32 **fuses**:
 bits that record damage and recovery as post-mortem evidence. The field and
 its rules are format from phase 1. Every record carries the word forward, OR-only,
 and nothing but a format clears it. Tripping fuses is behaviour, and it can
@@ -43,7 +45,7 @@ come later (§4.5a).
 | # | Requirement | Consequence |
 |---|---|---|
 | M1 | A master update erases nothing in the common case | an append-only log of records inside the master sector (§3) |
-| M2 | Compaction never writes the master on a backend with atomic replace | AEAD compaction nonces drawn at random, not reserved from the master counter (§6) |
+| M2 | Compaction never writes the master, on any path | recovery keyed on the scratch seal, with no compaction state in the master (D17); AEAD compaction nonces drawn at random, not reserved from the master counter (§6) |
 | M3 | A large-payload write costs no erase beyond its slots | the sweep window is two log records (§5) |
 | M4 | Crash safety as today | the same two commit primitives: a slot append and a master update; a torn record reads as no update (§7) |
 | M5 | Every write programs erased bytes only | works on NOR, on flash with ECC and on UBI; no rewrite of programmed bits (§8) |
@@ -73,6 +75,7 @@ come later (§4.5a).
 | D14 | Every record raises the id and nonce ceilings to the current value plus a step: `hint = max(hint, next + 1 + STEP)`. A ceiling-only record is written only when allocation reaches the ceiling and no other record has carried it forward | copying the persisted ceiling unchanged (allocation then needs a ceiling-only record every step, even right after another record was written) |
 | D15 | `format_minor` is 0 for all of major 5; every extension is a feature bit (§3.6) | raising the minor (a rotation by an older build would write its own lower minor and erase the record of the newer one) |
 | D16 | A record's CRC covers `LE32(rot_gen)` too, in every suite, so a record verifies only under its own header | binding it in the protected MAC only (a stale unprotected record would verify) |
+| D17 | Compaction keeps no state in the master. Every mount checks the scratch seal and restores the bucket that a sealed image names (§6.1) | `COMPACTING` and `CLEAN` records around each scratch-path compaction (a rotten `COMPACTING` record hides an interrupted compaction and loses the bucket's data; two records per compaction) |
 
 ## 3. Master sector layout (major 5)
 
@@ -97,7 +100,7 @@ reader of any age reads the frozen prefix from the same place.
   `0xff`. No checksum covers them, and a reader ignores their value.
 - **Reserved** fields are written as 0, and a reader ignores their value.
   §3.6 says what a later field in them may rely on.
-- **Limits.** `n_buckets` and `compacting_bid` are 16 bits, so a store has at
+- **Limits.** `n_buckets` is 16 bits, so a store has at
   most 65 535 buckets. A mount on a larger partition refuses it with
   `-ENOTSUP`, and writes nothing. `peb_size` is 32 bits, and `rot_gen` and
   `rec_no` are 32 bits. Even at one rotation per update, `rot_gen` does not
@@ -162,9 +165,7 @@ another partition.
 | Bytes | Field | Notes |
 |---|---|---|
 | 0..3 | `rec_no` | equals the record's position in this sector, from 0 |
-| 4 | `state` | `CLEAN` or `COMPACTING` |
-| 5 | reserved, 0 | |
-| 6..7 | `compacting_bid` | meaningful only when `COMPACTING` |
+| 4..7 | reserved, 0 | compaction keeps no state here (D17) |
 | 8..15 | `next_id_hint` | the id ceiling (`l1_bucketlog.md` §13.1), raised by every record (§3.3) |
 | 16..23 | `seq_hint` | the AEAD nonce ceiling (PR #63 §3.2), raised by every record (§3.3); 0 otherwise |
 | 24..31 | `seg_owner` | the segmented write in flight; 0 = none |
@@ -188,11 +189,6 @@ order, as everywhere in PR #63: erased, then CRC (damage), then MAC
 (tampering). A protected record whose CRC verifies but whose MAC does not
 counts as not verifying, for the same reason a header's does (§3.1).
 
-`state` is `CLEAN` (0) or `COMPACTING` (1). A record that verifies but holds
-any other value was written by a build that knows a state this one does not.
-Mount refuses the store with `-ENOTSUP` and writes nothing. A new state comes
-with an `incompat` bit (§3.6), so §4.4 normally refuses first, and this is the
-backstop.
 
 Records per sector: (sector − 128) / R.
 
@@ -240,7 +236,7 @@ The write programs only erased bytes, moving forward through the sector:
 already are.
 
 **Every record raises the ceilings (D14).** Whatever a record is written for
-(an id-ceiling step, `seg_owner`, compaction state, a fuse, mount, or a
+(an id-ceiling step, `seg_owner`, a fuse, mount, or a
 rotation's record[0]), it carries
 
 ```
@@ -296,17 +292,17 @@ if hi is usable:     active = hi; fell_back = no
 elif lo is usable:   active = lo; fell_back = yes      # a torn rotation, or every record of hi rotten
 else:                no usable master                  # -EIO, write nothing; or erase all with
                                                        # AUTOFORMAT_ON_CORRUPT, as today
-any record read that verifies with an unknown state    -> -ENOTSUP, write nothing (§3.2)
 
 cursor = end(active); state = newest(active); fuses = state.fuses   # §4.5
 doubt  = the record just below cursor does not verify
       or fell_back
       or the other sector is neither erased nor ok
       or the store reports damage on a master sector   # as today, for UBI
+if the scratch sector carries a valid seal:            # every mount, any backend (D17, §6.1)
+    restore the bucket its image names; erase scratch
 if doubt:
     trip MASTER_DOUBT                                    # RAM only; once fuses trip (§4.5a)
     scan the buckets and raise the id ceiling            # RAM only, as today (§5.1)
-if state == COMPACTING: recover (§6.1), then append a CLEAN record
 if one ok sector has a feature bit the other ok sector lacks:
     rotate                                               # finish an upgrade (§4.2)
 if doubt still holds:                                    # end it, after the scan
@@ -351,7 +347,7 @@ decide this, never the fuse word. Once fuses trip (§4.5a), a mount that finds
      **rotate**: one erase, which rewrites the other sector.
    - If only the last record failed to verify, **append a record**: no erase.
    - A write that mount makes anyway after the scan counts as this write when
-     it ends the doubt (a recovery's CLEAN record, an upgrade's rotation).
+     it ends the doubt (an upgrade's rotation).
 
 The scan comes before the write because the write is what tells the next
 mount the ceiling is safe. Written first, a cut before the scan finished would
@@ -395,7 +391,7 @@ Major 5 can grow without a new major, under these rules:
     older build refuses to write the store (§4.1).
   - If an older reader would misread the store without the field, the bit is
     `incompat`.
-- **A new meaning for existing bytes,** a new `state` value or a new slot flag
+- **A new meaning for existing bytes,** or a new slot flag,
   is `incompat`.
 - **The record layout and R are fixed per suite** for all of major 5. A
   record that needs more than its reserved bytes is a new major.
@@ -538,7 +534,7 @@ every rule below, so the bits a later build sets survive it.
   `previous | trips`, where `previous` is the word of the newest record that
   verified at mount, or of the record this session wrote last. A build that
   trips nothing writes `previous` unchanged. This covers every record:
-  updates, rotation's record[0], compaction and recovery records, and the
+  updates, rotation's record[0], and the
   write that ends a doubt. No build clears a bit, and no build rebuilds the
   word from the bits it knows: no mask of known bits exists anywhere. So a fuse
   defined after a build was released passes through that build unchanged.
@@ -629,7 +625,7 @@ Provisional bits:
 | 10 | `WEDGED` | the store wedges inside compaction's atomic window |
 | 11 | `MASTER_DOUBT` | mount scans the buckets for the id ceiling (§3.5) |
 | 12 | `ROTATION_FALLBACK` | the active sector holds no record that verifies; mount uses the other |
-| 13 | `COMPACT_RECOVERED` | mount finds `COMPACTING` and recovers |
+| 13 | `COMPACT_RECOVERED` | mount finds a sealed scratch and restores a bucket |
 | 14 | `SEG_SWEEP` | mount finds `seg_owner` set and sweeps (an interrupted large write) |
 | 15 | `AUTOFORMATTED` | set in record[0] by an autoformat |
 | 16 | `FOREIGN_SLOT` | a walk stops at a sealed, CRC-intact slot carrying a flag the build does not know (§4.2) |
@@ -670,9 +666,44 @@ That saves the two record programs. It also brings three problems:
 | Path | Today | Proposed |
 |---|---|---|
 | UBI with atomic replace (the default) | no master write | no master write |
-| scratch path (`flash_area`; UBI with `ATOMIC_REPLACE=n`) | 2 sector replaces (COMPACTING, CLEAN) | 2 record appends |
-| recovery at mount | 1 sector replace | 1 record append |
+| scratch path (`flash_area`; UBI with `ATOMIC_REPLACE=n`) | 2 sector replaces (COMPACTING, CLEAN) | no master write |
+| recovery at mount | 1 sector replace | no master write; a 16 B seal read at every mount |
 | AEAD, either path (PR #63) | a master write when the `peb_size` reservation passes the ceiling: nearly every compaction on 64 KB blocks | none: random prefix (below) |
+
+### 6.1 Recovery keyed on the seal (D17)
+
+The scratch path keeps `l1_bucketlog.md` §5.6's steps except the two master
+writes: erase scratch, write the image, seal it, erase the bucket, write the
+image back, erase scratch. The seal is written after the image and erased with
+the scratch sector, so **a valid seal exists only inside the window where the
+bucket may be erased or half written, and the sealed image is the bucket's
+complete new content**:
+
+- Between the seal and the bucket's erase, the bucket is intact, and restoring
+  writes the same image it was about to get.
+- After the bucket's erase, restoring is the only way back.
+- After the bucket is rewritten and before scratch is erased, restoring
+  writes the same bytes again. Compaction runs inside one call, so nothing
+  was appended in between, and a wedged store refuses writes until remount.
+- A tear anywhere in the image or the seal fails the seal's CRCs, and an
+  unsealed scratch means the bucket was never touched.
+
+So every mount reads the seal (16 B), whatever the master says and whatever
+the backend. A valid seal restores the bucket named by the image's own bucket
+header, which its CRC covers, and erases scratch, as `recover_compaction()`
+does today. Nothing else is needed: the master has no compaction state to
+lose. The check runs on UBI with atomic replace too, because atomic replace is
+a build option the format does not record. A store compacted by a build with
+`ATOMIC_REPLACE=n` can carry a sealed scratch into an atomic build. An unsealed
+scratch with content is left as it is, and the next compaction erases it
+first. Recovery runs before the doubt scan, so the scan sees the restored
+bucket.
+
+This closes a hole that exists today. A rotten newest master that hid
+`COMPACTING` made mount skip recovery, and the bucket lost every slot past
+the cut.
+
+### 6.2 AEAD compacted slots
 
 **AEAD compacted slots** (PR #63 §3.2, §3.4). Each compaction draws 12 random
 bytes into the bucket header's 12-byte `cbase` field (bytes 12..23, which
@@ -732,7 +763,8 @@ compacted slot   N = BE96(2⁹⁵ | ((c + offset) mod 2⁹⁵))      N[0] bit 7 
 | an upgrade's second rotation | as a rotation | the same; both headers carry the bit once it lands |
 | a record that carries a new fuse (once fuses trip, §4.5a) | the bit absent | only that piece of evidence is lost: no code depends on a fuse. A mount-time trip trips again at the next mount, since what it found is still on flash |
 | `seg_owner` set / clear record | the old value | as `BLOB_DB_CUT_AFTER_OWNER_SET` / `_AFTER_RELEASE` today: an unset owner means no segment was written yet, a still-set owner means the sweep runs again (it is idempotent) |
-| COMPACTING / CLEAN record (scratch path) | as the corresponding master write today | `l1_bucketlog.md` §6.1 unchanged |
+| a scratch-path compaction, at any step | a sealed scratch, or none | sealed: the bucket is restored from the image (§6.1). Unsealed: the bucket was never touched. The master is not involved |
+| a `seg_owner` record that rots after a cut inside the window | the previous record, `seg_owner` of that or 0, doubt | **accepted residual**, as today: no sweep runs, so the cut write's orphan segments stay as live slots (open item 9) |
 
 A record write that fails without a power cut may leave its slot programmed,
 partly programmed, or still erased. The cursor moves past it, and the next
@@ -770,7 +802,7 @@ QSPI, about 0.53 s per 64 KB erase):
 | Workload | Today | Proposed |
 |---|---|---|
 | `lg pwrite` (32 ops) | 64 master writes = 64 erases, 1.02–1.10 s/op | 64 record programs, 0 erases (one rotation per ~680 ops); the erases were nearly all of the per-op time |
-| churn on `flash_area`, 1 000 updates | 40 erases = 16 master + 8 compactions × 3 | 24 erases + 16 record programs |
+| churn on `flash_area`, 1 000 updates | 40 erases = 16 master + 8 compactions × 3 | 24 erases, no master write |
 | churn on UBI, atomic replace | 8 erases, 0 master | unchanged |
 | AEAD compaction on 64 KB blocks (PR #63) | about +1 erase per compaction (not measured) | 0 |
 | id ceiling | 1 erase per 256 new ids | at most 1 record program per 256 new ids, and none when another record carried the ceiling forward within the step (D14) |
@@ -786,7 +818,7 @@ QSPI, about 0.53 s per 64 KB erase):
 | Where | Change |
 |---|---|
 | `lib/blob_db/blob_db_internal.h` | major-5 header and record structs; the feature and slot-flag registry; the fuse registry |
-| `lib/blob_db/blob_db.c` | `write_master()` becomes `master_update()` and `rotate()`; mount's master classification, log search, feature check and doubt rule; features written at format, the upgrade's two rotations and finishing a half-done upgrade at mount; a sealed, intact slot with an unknown flag refuses its bucket instead of ending its log as torn, and compaction refuses to drop programmed bytes beyond its walk (D13); `persist_seg_owner()`, `persist_next_id_hint()`, compaction and recovery append records, and every record raises both ceilings (D14); every record carries the fuse word forward and a format writes 0 (phase 1); later, `fuse_trip()` at each trip point, the mount and wedge appends, and pending fuses as `blob_db_maintain()` work (§4.5a) |
+| `lib/blob_db/blob_db.c` | `write_master()` becomes `master_update()` and `rotate()`; mount's master classification, log search, feature check and doubt rule; features written at format, the upgrade's two rotations and finishing a half-done upgrade at mount; a sealed, intact slot with an unknown flag refuses its bucket instead of ending its log as torn, and compaction refuses to drop programmed bytes beyond its walk (D13); `persist_seg_owner()` and `persist_next_id_hint()` append records, and every record raises both ceilings (D14); compaction writes no master, and `recover_compaction()` runs on a valid scratch seal at every mount, taking the bucket from the image (D17); every record carries the fuse word forward and a format writes 0 (phase 1); later, `fuse_trip()` at each trip point, the mount and wedge appends, and pending fuses as `blob_db_maintain()` work (§4.5a) |
 | PR #63 | master MAC and tail move into the header and record layouts above; `cbase` becomes a 12-byte random base, and the compacted nonce becomes base + offset (§6); `seq_reserve()` is no longer called by compaction |
 | PR #62 | `DELTA` moves to slot flag bit 5 and is set at format |
 | `lib/blob_db/blob_db_inspect.c`, shell | show features, suite, geometry, log fill and rotation generation, and the raw fuse word; once fuses trip, whether new fuses are pending and the bit names (§4.5a); `struct blob_db_core_state` gains them |
@@ -795,7 +827,15 @@ QSPI, about 0.53 s per 64 KB erase):
 ## 11. Test plan (P8; `native_sim`, both backends)
 
 1. **Log round trips**: every suite passes on major 5; iostats show 0 master
-   erases for `lg pwrite` and for compaction on the atomic path.
+   erases for `lg pwrite`, and no master write at all for compaction on
+   either path.
+1a. **Seal recovery** (D17): a cut at every step of a scratch-path compaction
+    leaves either the old bucket or the new one, with the master untouched.
+    A sealed scratch restores the bucket named in the image, whatever the
+    newest record says, including when that record is rotten. An atomic-
+    replace build mounting a store left with a sealed scratch by an
+    `ATOMIC_REPLACE=n` build restores it too. An unsealed scratch leaves the
+    bucket as it was.
 2. **Power cut** at every byte of a record append and of a rotation (header
    and record[0]): mount sees the old state or the new one, never another, and
    an id or nonce value is never issued twice.
@@ -855,8 +895,7 @@ QSPI, about 0.53 s per 64 KB erase):
       no build can drift from the format.
     - **Refusals.** A `rec_size` other than the build's is refused, and so is
       an ok other sector whose suite, geometry or `hdr_len` differs. A
-      `write_align` above 128 is refused. A verifying record with an unknown
-      `state` is refused. Two ok sectors with equal `rot_gen` return `-EIO`.
+      `write_align` above 128 is refused. Two ok sectors with equal `rot_gen` return `-EIO`.
       None of these writes anything.
     - **Binding and reserved bytes.** A record copied from an earlier
       rotation into a new sector fails its CRC. Non-zero reserved bytes and
@@ -879,7 +918,7 @@ QSPI, about 0.53 s per 64 KB erase):
    needed it, return the error, with the bucket's bytes unchanged.
 9. **Registry**: a `BUILD_ASSERT` that no two features own a slot flag.
 10. **Fuse word** (phase 1, format): plant every one of the 32 bits. They
-    pass through updates, rotations, compaction and recovery records, the
+    pass through updates, rotations, the
     write that ends a doubt, a fallback to an earlier record and a fallback to
     the other sector, and only a format clears them. A phase-1 build changes no
     bit. Every suite run on a store whose fuses are all set gives the same
@@ -896,7 +935,7 @@ QSPI, about 0.53 s per 64 KB erase):
 
 | Phase | Content |
 |---|---|
-| **1** | Major 5: header, records, rotation, mount search and doubt rule; ceilings, `seg_owner` and compaction state as records; geometry; features with `LARGE_PAYLOADS`; the fuse field and its carry-forward rules (§4.5), with no trip points |
+| **1** | Major 5: header, records, rotation, mount search and doubt rule; ceilings and `seg_owner` as records; compaction recovery keyed on the seal (D17); geometry; features with `LARGE_PAYLOADS`; the fuse field and its carry-forward rules (§4.5), with no trip points |
 | **2** | PR #63 rebased onto it: `suite` and `PROTECTED`, header and record MACs, the random compaction base |
 | **3** | PR #62's `DELTA` rebased onto it: slot flag bit 5, set at format |
 | **later** | Fuse trips (§4.5a), after open item 8: no format change |
@@ -929,3 +968,8 @@ QSPI, about 0.53 s per 64 KB erase):
    told apart from damage, by making the provisional slot and master bits
    exact or by naming them for what was observed. Behaviour only: the field's
    rules (§4.5) do not depend on the answer.
+9. **Orphans after a rotten `seg_owner` record**: a cut inside a segmented
+   write followed by rot of its `seg_owner` record leaves orphan segments that
+   no sweep reclaims, as today (§7). A mount that doubts could check every
+   SEGMENT slot its scan meets against its owner's index: about one bucket
+   walk per segment, only on a doubtful mount. That is behaviour, not format.
