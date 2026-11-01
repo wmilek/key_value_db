@@ -71,6 +71,8 @@ come later (§4.5a).
 | D12 | A format clears the fuses | carrying them over (a format is the intervention that ends the store's history, P9; carrying them needs a readable old master, which an autoformat by definition lacks) |
 | D13 | The slot walk accepts the flags the **build** knows. A sealed slot whose CRC verifies but which carries a flag outside them makes its bucket refuse writes; it is never compacted | taking the accepted flags from the store's features (a lost bit would turn live slots into a "torn tail" that the next compaction drops); treating such a slot as torn (the same loss, from a single slot) |
 | D14 | Every record raises the id and nonce ceilings to the current value plus a step: `hint = max(hint, next + 1 + STEP)`. A ceiling-only record is written only when allocation reaches the ceiling and no other record has carried it forward | copying the persisted ceiling unchanged (allocation then needs a ceiling-only record every step, even right after another record was written) |
+| D15 | `format_minor` is 0 for all of major 5; every extension is a feature bit (§3.6) | raising the minor (a rotation by an older build would write its own lower minor and erase the record of the newer one) |
+| D16 | A record's CRC covers `LE32(rot_gen)` too, in every suite, so a record verifies only under its own header | binding it in the protected MAC only (a stale unprotected record would verify) |
 
 ## 3. Master sector layout (major 5)
 
@@ -84,17 +86,35 @@ offset 128+R  record[1] ...     appended, one per update
 128 is `BLOB_DB_MASTER_HDR_MAX`, the window every reader already stages, so a
 reader of any age reads the frozen prefix from the same place.
 
+### 3.0 Encoding
+
+- **Integers** are little-endian, as today. The one exception is the AEAD
+  compaction nonce, which reads `cbase` as a big-endian number (§6).
+- **Checksums.** `crc32` is CRC32-IEEE (`crc32_ieee()`), and `prefix_crc16`
+  is CRC16-CCITT seeded with `0xffff` (`crc16_ccitt()`), both as today.
+- **Filler.** The header window's bytes from `hdr_len` to 128, and a record's
+  padding from its layout size (48, or 64 protected) to R, are written as
+  `0xff`. No checksum covers them, and a reader ignores their value.
+- **Reserved** fields are written as 0, and a reader ignores their value.
+  §3.6 says what a later field in them may rely on.
+- **Limits.** `n_buckets` and `compacting_bid` are 16 bits, so a store has at
+  most 65 535 buckets. A mount on a larger partition refuses it with
+  `-ENOTSUP`, and writes nothing. `peb_size` is 32 bits, and `rot_gen` and
+  `rec_no` are 32 bits. Even at one rotation per update, `rot_gen` does not
+  wrap within any device's erase budget, and a writer that would wrap it
+  refuses with `-ENOSPC`. Ids and ceilings are 64 bits.
+
 ### 3.1 Header
 
 Nothing in it changes until the sector is erased again.
 
 | Bytes | Field | Notes |
 |---|---|---|
-| 0..11 | frozen prefix | `magic` `BDMS`, `format_major = 5`, `format_minor`, `hdr_len` (64, or 84 protected), `reserved`, `prefix_crc16`; layout unchanged since major 1 |
+| 0..11 | frozen prefix | `magic` `BDMS`, `format_major = 5`, `format_minor = 0` (D15), `hdr_len` (64, or 84 protected), `reserved`, `prefix_crc16`; layout unchanged since major 1 |
 | 12..15 | `rot_gen` | +1 per rotation; the sector with the higher valid value is active |
 | 16..19 | `peb_size` | must equal the device's |
 | 20..21 | `n_buckets` | must equal the device's |
-| 22..23 | `rec_size` | R: 48, or 64 protected, rounded up to `write_align` |
+| 22..23 | `rec_size` | R: 48, or 64 protected, rounded up to `write_align`; must equal what the build computes (§3.1 below) |
 | 24..27 | `incompat` | a reader must understand every bit (§4) |
 | 28..31 | `ro_compat` | a writer must understand every bit |
 | 32..35 | `compat` | anyone may ignore an unknown bit |
@@ -105,6 +125,31 @@ Nothing in it changes until the sector is erased again.
 | 60..63 | `hdr_crc32` | over [0, 60) |
 | 64..79 | `mac` | protected only: AES-CMAC-128(K_meta, [0, 64)) |
 | 80..83 | `tail_crc32` | protected only: over [0, 80) |
+
+A protected header whose CRCs verify but whose MAC does not classifies as
+**corrupt**, as rot does: mount falls back to the other sector, with doubt.
+Refusing the whole store instead would protect nothing, because anyone who
+can write the flash can force the same fallback by breaking the CRC. Keeping
+an attacker from rolling the store back is the job of PR #63's rollback
+anchor, not of the classification. Once fuses trip, `MAC_FAIL` records it
+(§4.5a).
+
+**Every ok header must agree with the build and the device**, not only the
+active one. Each sector that classifies as ok must carry the device's
+`peb_size` and `n_buckets`, the build's `suite`, the `hdr_len` of that suite,
+and the `rec_size` the build computes for that suite and the device's
+`write_align`. Otherwise mount refuses the store with `-ENOTSUP` and writes
+nothing. The CRC and MAC sit at fixed offsets in the record (§3.2), whatever R
+is. R only adds filler, so a store whose `rec_size` differs from the build's
+was written by another build or for another device. `write_align` must be a
+power of two no larger than 128, because records start at offset 128. A
+larger one is refused with `-ENOTSUP`, as today's `write_master()` refuses it.
+
+**Equal `rot_gen`.** No writer gives two ok sectors the same `rot_gen`,
+because a rotation always writes the active value plus one. Two ok sectors
+with equal values cannot be ordered, and either could hold the newer state.
+Mount treats that as a store with no usable master: `-EIO`, nothing written,
+and `blob_db_format()`, or an autoformat that opts out of P9, discards it.
 
 A device whose geometry differs from the header's is refused with `-ENOTSUP`
 and nothing is written. In a protected store this closes the gap PR #63 left
@@ -126,18 +171,28 @@ another partition.
 | 32..35 | reserved, 0 | features live in the header only (§4.2) |
 | 36..39 | `fuses` | the previous record's fuses, plus any tripped since; opaque, OR-only (§4.5) |
 | 40..43 | reserved, 0 | |
-| 44..47 | `crc32` | unprotected: over [0, 44); R = 48 |
+| 44..47 | `crc32` | unprotected: over `LE32(rot_gen) ‖ [0, 44)` (D16); R = 48 |
 
 A protected record puts a MAC where the unprotected CRC was:
 
 | Bytes | Field |
 |---|---|
 | 44..59 | `mac`: AES-CMAC-128(K_meta, LE32(rot_gen) ‖ [0, 44)) |
-| 60..63 | `crc32` over [0, 60); R = 64 |
+| 60..63 | `crc32` over `LE32(rot_gen) ‖ [0, 60)` (D16); R = 64 |
 
-`rot_gen` in the MAC and `rec_no` equal to the position mean a record cannot
-be moved within its sector or copied from an earlier rotation. Check order,
-as everywhere in PR #63: erased, then CRC (damage), then MAC (tampering).
+`rot_gen` is the header's. With it in the CRC, and with `rec_no` equal to
+the record's position, a record verifies only in its own slot under its own
+header. A record left from an earlier rotation fails as damage, in either
+suite, and the protected MAC adds the same binding against tampering. Check
+order, as everywhere in PR #63: erased, then CRC (damage), then MAC
+(tampering). A protected record whose CRC verifies but whose MAC does not
+counts as not verifying, for the same reason a header's does (§3.1).
+
+`state` is `CLEAN` (0) or `COMPACTING` (1). A record that verifies but holds
+any other value was written by a build that knows a state this one does not.
+Mount refuses the store with `-ENOTSUP` and writes nothing. A new state comes
+with an `incompat` bit (§3.6), so §4.4 normally refuses first, and this is the
+backstop.
 
 Records per sector: (sector − 128) / R.
 
@@ -225,8 +280,10 @@ today's A/B master write, made once per sector's worth of updates.
 ```
 read [0, 128) of both sectors; classify each as erased, corrupt, foreign or ok (§3.1 of l1_bucketlog.md)
 foreign on either sector                               -> -ENOTSUP, write nothing
-features, suite or geometry not acceptable (§4.4)      -> -ENOTSUP, write nothing
+features, suite, rec_size or geometry of any ok sector not acceptable (§3.1, §4.4) -> -ENOTSUP, write nothing
+both ok with equal rot_gen                             -> -EIO, write nothing (§3.1)
 active = the ok sector with the higher rot_gen
+any record that verifies with an unknown state         -> -ENOTSUP, write nothing (§3.2)
 cursor = one past the last record slot that is not fully erased   # every slot is read (D3); §3.2a also allows a binary search
 state  = the newest record before cursor that verifies
 doubt  = the record just before cursor does not verify
@@ -290,6 +347,34 @@ Cost: two header reads as today, plus a read of every record slot in the
 active sector, up to 82 on 4 KB and 1 362 on 64 KB, once per mount. Every
 record that is not erased is checked, so a rotten record anywhere in the log
 trips `MASTER_REC_ROT`.
+
+### 3.6 Extending the format
+
+Major 5 can grow without a new major, under these rules:
+
+- **No version number inside the major (D15).** `format_minor` stays 0. A
+  writer writes 0, and a reader ignores it. A build learns what a store needs
+  from its feature sets (§4.1), which every writer copies verbatim at
+  rotation. A minor number is not copied that way: a rotation by an older
+  build would write its own lower minor, and the record of the newer one
+  would be gone.
+- **A new field takes reserved bytes,** in the header or in the record, and
+  comes with a feature bit. Older builds write reserved bytes as 0 in every
+  record and in every header they write at rotation. So the bit depends on
+  what that zeroing does:
+  - If 0 means "absent", and an older writer zeroing the field loses only a
+    hint, the bit is `compat`. Its field must read 0 as absent, because the
+    bit survives an older writer and the field does not.
+  - If the field must survive every writer, the bit is `ro_compat`, so an
+    older build refuses to write the store (§4.1).
+  - If an older reader would misread the store without the field, the bit is
+    `incompat`.
+- **A new meaning for existing bytes,** a new `state` value or a new slot flag
+  is `incompat`.
+- **The record layout and R are fixed per suite** for all of major 5. A
+  record that needs more than its reserved bytes is a new major.
+- **The fuse word** follows its own rules (§4.5). Every writer carries it, so
+  it needs no feature bit.
 
 ## 4. Features and fuses
 
@@ -397,12 +482,14 @@ suite" (D8 there), enforced through the major number. Here:
 store.incompat  ⊆ build.known            # else -ENOTSUP
 store.ro_compat ⊆ build.known            # else -ENOTSUP (no read-only mount yet)
 build.required  ⊆ store.incompat         # else -ENOTSUP: a protected build meets an unprotected store
-store.suite    == build.suite            # else -ENOTSUP
-store geometry == device geometry        # else -ENOTSUP
+store.suite    == build.suite            # else -ENOTSUP; in every ok header
+store geometry == device geometry        # else -ENOTSUP; in every ok header
+store.rec_size == build's R              # else -ENOTSUP; in every ok header
 ```
 
-Each `store.*` set is the union over every master sector that classifies as
-ok. Records carry no features, so the check runs on the headers alone, before
+The feature sets are the union over every master sector that classifies as
+ok. Suite, geometry, `hdr_len` and `rec_size` must hold in each of them
+(§3.1). Records carry no features, so the check runs on the headers alone, before
 any record is read. Every refusal writes nothing.
 
 ### 4.5 Fuses: the format (phase 1)
@@ -727,6 +814,21 @@ QSPI, about 0.53 s per 64 KB erase):
     `-ENOTSUP`, reads `-EIO`, and nothing is compacted or erased. Once fuses
     trip, `FOREIGN_SLOT` is set. A torn slot at a bucket's tail still compacts as
     today. A compaction whose walk stops before programmed bytes refuses.
+5b. **Format rules** (§3.0, §3.1, §3.2, §3.6):
+    - **Golden images.** The suite keeps byte images of a major-5 header and
+      record, one per suite, written out by hand from §3. The build must
+      parse them, and must write exactly those bytes for the same state, so
+      no build can drift from the format.
+    - **Refusals.** A `rec_size` other than the build's is refused, and so is
+      an ok other sector whose suite, geometry or `hdr_len` differs. A
+      `write_align` above 128 is refused. A verifying record with an unknown
+      `state` is refused. Two ok sectors with equal `rot_gen` return `-EIO`.
+      None of these writes anything.
+    - **Binding and reserved bytes.** A record copied from an earlier
+      rotation into a new sector fails its CRC. Non-zero reserved bytes and
+      filler in a planted record still mount, the next record writes them as
+      0 and `0xff`, and `format_minor` is written as 0. A protected header with
+      a broken MAC falls back with doubt.
 6. **Protection**: a protected build refuses an unprotected store, another
    suite, a cleared `PROTECTED` bit, and a forged record (MAC). A record
    copied from an earlier rotation or moved within the sector is rejected.
