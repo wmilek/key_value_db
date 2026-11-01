@@ -26,6 +26,13 @@ extern "C" {
  * read of the registry blob plus a linear scan; capacity is
  * CONFIG_ROOTREG_MAX_ROOTS entries. Single-threaded like blob_db v1.
  *
+ * The registry is shared by every structure on the partition and has very
+ * little room. Anything may be registered, but the recommended approach for an
+ * application with its own data model is one key, pointing at a superblock
+ * that describes the whole usage or subsystem, rather than a key per table.
+ * Independent applications in one image each get their own. See
+ * doc/application_model.md.
+ *
  * Full contract: doc/layers/l1_root_registry.md.
  */
 

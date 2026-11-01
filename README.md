@@ -49,6 +49,32 @@ The repository is packaged as a **Zephyr module plus a set of workspace
 applications** ([West T2 topology][west_t2]), so it can either bootstrap its own
 workspace or be added to an existing one.
 
+## Building an application
+
+`kvdb` above suits a few settings or one flat map. An application with its own
+data model — several collections, a format that changes across firmware
+versions, other applications on the same partition — should not be a set of
+`kvdb` instances. key_value_db does not enforce a model, but recommends:
+
+1. **An access interface** that operates on the data model, the application's
+   own L3; the application logic calls it and nothing below. i-nodes, hash keys
+   and the like stay below it.
+2. **One root registry item** per application: the superblock, which
+   references every persistent object in use. Registry space is very limited,
+   so one structure describes a whole usage or subsystem; independent ones in
+   the same image, such as persondb and a certificate store, each get their
+   own.
+3. **CBOR**, if the rest of the system already uses it.
+4. **A superblock ready for upgrade and downgrade**: at minimum a version field
+   checked against the firmware; in more advanced cases, a way to add
+   containers for an old → new upgrade.
+5. **No start after a downgrade**: an old firmware does not start a data model
+   newer than it.
+
+[`doc/application_model.md`](doc/application_model.md) has the details and
+further recommendations (a table directory with required / preserve / derived
+tables). [`app_cbor_persondb/`](app_cbor_persondb) is the worked example.
+
 [zephyr]: https://github.com/zephyrproject-rtos/zephyr
 [west_t2]: https://docs.zephyrproject.org/latest/develop/west/workspaces.html#west-t2
 
@@ -352,6 +378,7 @@ contracts and must never be depended on from above.
 | [`doc/layers/l1_root_registry.md`](doc/layers/l1_root_registry.md) | L1½ — root registry: key → structure root |
 | [`doc/layers/l2_containers.md`](doc/layers/l2_containers.md) | L2 — containers: seq, kvlist, kvhash, kvtree |
 | [`doc/layers/l3_interfaces.md`](doc/layers/l3_interfaces.md) | L3 — access interfaces: kvdb, blobfs, settings |
+| [`doc/application_model.md`](doc/application_model.md) | building an application on the stack: recommendations for its own data model |
 | [`doc/impl/l1_bucketlog.md`](doc/impl/l1_bucketlog.md) | implementation design of the v1 bucket-log allocator |
 | [`doc/impl/l0_backends.md`](doc/impl/l0_backends.md) | implementation design of the two L0 providers (`flash_area`, UBI) |
 | [`doc/proposals/`](doc/proposals) | change proposals: analysis + design for a change spanning a contract and its implementation |
