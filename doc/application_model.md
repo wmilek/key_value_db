@@ -33,9 +33,16 @@ firmware versions. `app_cbor_persondb` follows both, and each point names where.
    format is not specified, but it is supposed to have references to all
    persistent objects which are in use.
 
-   The registry is shared by every application on the partition and holds
-   `CONFIG_ROOTREG_MAX_ROOTS` entries, so one key per application, not one per
+   Technically an application may register anything. But the registry is
+   shared by every application on the partition and holds only
+   `CONFIG_ROOTREG_MAX_ROOTS` entries, so the recommended approach is one
+   structure describing a whole usage or subsystem, rather than a key per
    table.
+
+   *Application* here means a program designed to perform a specific task for
+   the user, not the firmware image. If one image contains persondb and a
+   certificate database, they can be seen as two applications; as they are
+   independent, each should have its own superblock.
 
    *In persondb:* `rootreg[ROOTREG_KEY('PADB', 0)] → superblock → people,
    credentials` (`persondb/persondb.c`, `DESIGN.md` §12).

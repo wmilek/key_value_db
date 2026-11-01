@@ -60,7 +60,10 @@ versions, other applications on the same partition — should not be a set of
    own L3; the application logic calls it and nothing below. i-nodes, hash keys
    and the like stay below it.
 2. **One root registry item** per application: the superblock, which
-   references every persistent object in use.
+   references every persistent object in use. Registry space is very limited,
+   so one structure describes a whole usage or subsystem; independent ones in
+   the same image, such as persondb and a certificate store, each get their
+   own.
 3. **CBOR**, if the rest of the system already uses it.
 4. **A superblock ready for upgrade and downgrade**: at minimum a version field
    checked against the firmware; in more advanced cases, a way to add
