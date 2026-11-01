@@ -821,8 +821,12 @@ QSPI, about 0.53 s per 64 KB erase):
 | `lib/blob_db/blob_db.c` | `write_master()` becomes `master_update()` and `rotate()`; mount's master classification, log search, feature check and doubt rule; features written at format, the upgrade's two rotations and finishing a half-done upgrade at mount; a sealed, intact slot with an unknown flag refuses its bucket instead of ending its log as torn, and compaction refuses to drop programmed bytes beyond its walk (D13); `persist_seg_owner()` and `persist_next_id_hint()` append records, and every record raises both ceilings (D14); compaction writes no master, and `recover_compaction()` runs on a valid scratch seal at every mount, taking the bucket from the image (D17); every record carries the fuse word forward and a format writes 0 (phase 1); later, `fuse_trip()` at each trip point, the mount and wedge appends, and pending fuses as `blob_db_maintain()` work (§4.5a) |
 | PR #63 | master MAC and tail move into the header and record layouts above; `cbase` becomes a 12-byte random base, and the compacted nonce becomes base + offset (§6); `seq_reserve()` is no longer called by compaction |
 | PR #62 | `DELTA` moves to slot flag bit 5 and is set at format |
-| `lib/blob_db/blob_db_inspect.c`, shell | show features, suite, geometry, log fill and rotation generation, and the raw fuse word; once fuses trip, whether new fuses are pending and the bit names (§4.5a); `struct blob_db_core_state` gains them |
-| `doc/impl/l1_bucketlog.md` | §3.1, §5.1, §5.6, §5.6a, §6 and §13.1 rewritten for the log |
+| `include/app/lib/blob_db_inspect.h` (public) | `struct blob_db_inspect_info`: `master_gen` becomes `rot_gen`; `format_minor` stays, always 0 (D15); it gains the three feature sets, `suite`, `rec_size`, the log's fill (records used and per sector) and the raw fuse word |
+| `lib/blob_db/blob_db_inspect.c`, `blob_db_shell.c` | fill the fields above; `blob_db info` prints them and no longer prints a master state (D17); once fuses trip, whether new fuses are pending and the bit names (§4.5a); `struct blob_db_core_state` gains the same fields |
+| `include/app/lib/blob_db.h` (public) | phase 1: no change. `blob_db_maintain()` keeps its contract (erases done ahead, at most one per step, nothing read back changes). The fuse phase changes it: a step may append a master record for pending fuses, and that append may rotate (§4.5a), so the docstring must say so then |
+| `tests/lib/blob_db/src/main.c` | the tests that forge master images by hand (`write_master`, `COMPACTING`, `format_major`, `master_gen`) become major-5 header and record images (test 5b), and the forged-`COMPACTING` crash tests become forged sealed-scratch tests (test 1a) |
+| `doc/impl/l1_bucketlog.md` | §3.1, §5.1, §5.6, §5.6a, §6 and §13.1 rewritten for the log; §1.5's cost table loses compaction's master writes; §11 item 13 becomes a sealed-scratch recovery test |
+| `kvdb_book` (other repo) | `tools/blob-db-bucket-log-explorer/REQUIREMENTS.md`: the master view (`gen`, `CLEAN` / `COMPACTING(b)`) becomes header and log (`rot_gen`, features, suite, records), and the compaction sequence loses its two master steps. `tools/migration-paths/REQUIREMENTS.md`: no minor inside a major (D15), and protection is a `suite` chosen at format, not a major of its own |
 
 ## 11. Test plan (P8; `native_sim`, both backends)
 
@@ -939,6 +943,14 @@ QSPI, about 0.53 s per 64 KB erase):
 | **2** | PR #63 rebased onto it: `suite` and `PROTECTED`, header and record MACs, the random compaction base |
 | **3** | PR #62's `DELTA` rebased onto it: slot flag bit 5, set at format |
 | **later** | Fuse trips (§4.5a), after open item 8: no format change |
+
+**Landing phase 1 on existing boards.** Major 5 refuses stores of majors 1–4
+with `-ENOTSUP` (D10), and `CONFIG_BLOB_DB_AUTOFORMAT_ON_CORRUPT` does not
+cover them, because a foreign store is not corrupt. Every development board,
+and every saved `native_sim` flash file, that holds a store needs one explicit
+`blob_db_format()` or a raw erase before the first major-5 mount. Twister runs
+start from fresh flash and are not affected. Nothing runs this stack in
+production, so no migration is written (D10).
 
 ## 13. Open items
 
