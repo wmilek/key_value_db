@@ -234,10 +234,18 @@ doubt  = the record just before cursor does not verify
       or the other sector is neither erased nor ok
       or the store reports damage on a master sector   # as today, for UBI
 fuses  = the fuses of the newest record that verifies   # §4.5
-if doubt: scan the buckets and raise the id ceiling    # as today (§5.1)
+if doubt:
+    trip MASTER_DOUBT                                    # RAM only
+    scan the buckets and raise the id ceiling            # RAM only, as today (§5.1)
 if state == COMPACTING: recover (§6.1), then append a CLEAN record
 if one ok sector has a feature bit the other ok sector lacks:
     rotate                                               # finish an upgrade (§4.2)
+if doubt still holds:                                    # end it, after the scan
+    if the other sector is not erased and not ok,
+       or mount fell back, or the store reported damage:
+        rotate                                           # rewrites the other sector
+    else:
+        append a record                                  # the last record now verifies
 if mount tripped a new fuse and appended no record: append one   # §4.5
 ```
 
@@ -246,6 +254,36 @@ acknowledged and then lost makes mount scan. A torn last record was never
 acknowledged, but bit rot in the last committed record looks the same, so
 both trigger the scan. A rotten record further back is harmless, because a
 later full-state record replaces it.
+
+**Ending the doubt.** A mount that doubts also ends the doubt before it
+returns, so the next mount does not scan again. Only the doubt conditions
+decide this, never the fuse word: a mount that finds `MASTER_DOUBT` already set
+ends the doubt all the same. The order is fixed:
+
+1. Detect the doubt from the master state, and trip `MASTER_DOUBT` in RAM.
+2. Scan the buckets and raise `next_id` in RAM. Nothing is written yet.
+3. Write once, carrying the raised ceiling (D14) and the pending fuses.
+   - If the other sector is neither erased nor ok, if mount fell back after a
+     torn rotation, or if the store reported damage on a master sector,
+     **rotate**: one erase, which rewrites the other sector.
+   - If only the last record failed to verify, **append a record**: no erase.
+   - A write that mount makes anyway after the scan counts as this write when
+     it ends the doubt (a recovery's CLEAN record, an upgrade's rotation).
+
+The scan comes before the write because the write is what tells the next
+mount the ceiling is safe. Written first, a cut before the scan finished would
+leave a clean-looking master whose ceiling was never checked. A cut during
+step 3 leaves a torn record or a torn rotation, and both are doubt again: the
+next mount scans and writes again. The scan writes nothing, so repeating it
+is harmless.
+
+Without this, the doubt would last until the next rotation, because records
+are appended to the active sector and nothing else rewrites the other one.
+That can be never: on UBI with atomic replace, a workload that only rewrites
+existing ids appends no records at all. Rotating over a corrupt other sector
+discards it, as today's next master write does, and `MASTER_HDR_ROT` keeps the
+evidence. If UBI reports damage on the active sector again at the next attach,
+that mount doubts again. That costs a scan, never a wrong ceiling.
 
 Cost: two header reads as today, plus a read of every record slot in the
 active sector, up to 82 on 4 KB and 1 362 on 64 KB, once per mount. Every
@@ -557,6 +595,7 @@ compacted slot   nonce = cbase(8)      ‖ LE32(offset)     top bit of cbase set
 | a record append | the last record torn (CRC fails) or still erased | the previous record stands. The update was not acknowledged, so no ceiling or feature it carried was used. Doubt, so the bucket scan raises the id ceiling as today |
 | a rotation, before the header lands | the other sector erased or corrupt; the full sector ok | the full sector's newest record stands; doubt, scan. The next update rotates again |
 | a rotation, after the header, during record[0] | the new sector's header ok, no record verifies | that sector is unusable; fall back to the other; doubt, scan |
+| the write that ends a doubt (§3.5) | a torn record, or a torn rotation | doubt again: the next mount scans and writes again. The ceiling stays safe, because the write that would have ended the doubt never landed |
 | an upgrade's first rotation | as a rotation (rows above); if it landed, one ok sector has the new bit and the other lacks it | the store does not use the feature yet. A build that knows the bit finishes the upgrade with the second rotation. One that does not know it refuses, because §4.4 takes the union of the ok headers |
 | an upgrade's second rotation | as a rotation | the same; both headers carry the bit once it lands |
 | a record that carries a new fuse | the bit absent | only that piece of evidence is lost: no code depends on a fuse. A mount-time trip trips again at the next mount, since what it found is still on flash |
@@ -606,6 +645,7 @@ QSPI, about 0.53 s per 64 KB erase):
 | mount | 2 header reads | 2 header reads + every record slot of the active sector (up to 82 on 4 KB, 1 362 on 64 KB) |
 | RAM | — | a cursor (2 B), the active sector's `rot_gen`, the fuse word (4 B) and a pending flag |
 | a failed record write | — | the next update rotates: 1 erase, on a path that should not happen |
+| a doubtful mount | a scan at every mount until the next master write | one scan, then 1 record, or 1 rotation (1 erase) when the other sector is bad; the next mount does not scan |
 | a fuse | — | 1 record program the first time it trips, at mount or with the next record or `blob_db_maintain()`; 0 erases, except a rotation when the sector is full |
 | flash wear on the master sectors | 1 erase per update | 1 erase per 62–1 362 updates |
 
@@ -641,6 +681,15 @@ QSPI, about 0.53 s per 64 KB erase):
    suite as a reference reader, agrees with mount's full read on every store
    the suite produces. A rotten last
    record, and a corrupt other sector, make mount scan.
+3a. **Ending the doubt**: for each doubt condition (a corrupt other sector, a
+    rotten last record, a fallback after a torn rotation, UBI damage on a
+    master sector), mount scans once and writes once: a rotation or a
+    record, as §3.5 says. The next ten mounts do not scan (iostats). The same
+    holds with `MASTER_DOUBT` already set before the first of them. On UBI
+    with atomic replace, a workload that only rewrites existing ids still
+    stops scanning after one mount. A cut at every point of the scan and of
+    that write leaves the next mount scanning again, with a ceiling above
+    every id on flash.
 4. **Rotation**: fill a sector, rotate, remount; the new header carries the
    old header's feature sets verbatim, bits the build does not know included.
 5. **Features**: an unknown `incompat` or `ro_compat` bit refuses with
