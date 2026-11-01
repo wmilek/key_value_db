@@ -32,8 +32,9 @@ the build requires, not a feature the store chooses. Compaction no longer
 touches the master: on UBI it never did, and in AEAD mode its nonces stop
 coming from the master counter. Each record also carries 32 **fuses**:
 bits that record damage and recovery as post-mortem evidence. blob_db only
-carries them forward, adding new ones, and never interprets them. Nothing
-clears them except a format.
+carries them forward, adding new ones, and never interprets them: the stored
+word only tells it that a bit already set needs no write. Nothing clears them
+except a format.
 
 ---
 
@@ -66,7 +67,7 @@ clears them except a format.
 | D8 | Protection is a `suite` byte plus an `incompat` bit, and the build requires it | an ordinary feature the store declares (a forged unprotected master would be obeyed: a downgrade) |
 | D9 | No writes over programmed bits | clearing bits in place (§8: STM32F3, nRF word-write limits, ECC flash; and an attacker can clear bits too) |
 | D10 | Major 5 for the new layout; majors 1–4 are refused, never migrated | migration code for stores that exist only on development boards |
-| D11 | Fuses: a 32-bit OR-only word in every record that blob_db carries forward and never interprets | bits cleared in place (§8); counters (more bytes than a post-mortem needs); fuses in the header (written once per erase, so a trip would need a rotation) |
+| D11 | Fuses: a 32-bit OR-only word in every record that blob_db carries forward and never interprets, except to skip persisting a bit already set | bits cleared in place (§8); counters (more bytes than a post-mortem needs); fuses in the header (written once per erase, so a trip would need a rotation) |
 | D12 | A format clears the fuses | carrying them over (a format is the intervention that ends the store's history, P9; carrying them needs a readable old master, which an autoformat by definition lacks) |
 | D13 | The slot walk accepts the flags the **build** knows. A sealed slot whose CRC verifies but which carries a flag outside them makes its bucket refuse writes; it is never compacted | taking the accepted flags from the store's features (a lost bit would turn live slots into a "torn tail" that the next compaction drops); treating such a slot as torn (the same loss, from a single slot) |
 
@@ -215,7 +216,7 @@ if doubt: scan the buckets and raise the id ceiling    # as today (§5.1)
 if state == COMPACTING: recover (§6.1), then append a CLEAN record
 if one ok sector has a feature bit the other ok sector lacks:
     rotate                                               # finish an upgrade (§4.2)
-if mount tripped a fuse and appended no record: append one   # §4.5
+if mount tripped a new fuse and appended no record: append one   # §4.5
 ```
 
 "Doubt" carries today's rule over: a ceiling that might have been
@@ -350,12 +351,17 @@ only records that something happened to it: a CRC failure, a master update
 that failed, a recovery at mount. They are post-mortem evidence for a store
 returned from the field. The rules:
 
-- **Not interpreted.** blob_db never acts on the stored word. No check,
-  branch, refusal, recovery or write policy depends on its value; a store
-  with every bit set behaves exactly like one with none. A bit that changed
-  behaviour would be a format feature and would belong in `incompat`.
-- **Passed over, fusing only new fuses.** The core does exactly three things
+- **Not interpreted.** The stored word is consulted for exactly one thing:
+  whether a trip is new, meaning its bit is not in the word yet, so that it
+  needs persisting. Nothing else reads it. No check, refusal, recovery, read
+  result or write path depends on its value. The only effect of a set bit is
+  that tripping it again writes nothing, so a store with every bit set does
+  exactly what a store with none does, minus the master records the
+  deduplication saves (§4.5 Persisting). A bit that changed behaviour beyond
+  that would be a format feature and would belong in `incompat`.
+- **Passed over, fusing only new fuses.** The core does exactly four things
   with the word. It reads it at mount from the newest record that verifies.
+  It tests each trip against it, to tell whether the trip is new.
   It writes `fuses = previous | new` into every record, rotation's record[0]
   included. And it hands the word over, raw, to the diagnostic API. The only
   internal call is `fuse_trip(bit)`, and nothing clears a bit.
@@ -390,9 +396,10 @@ returned from the field. The rules:
   A CRC failure followed by intact data is damage. Together the two bits
   cover every CRC failure, and a post-mortem can still tell them apart.
 
-**Persisting.** What the library acts on is its own new trips, never the
-stored word. A trip ORs the bit into RAM. A bit already in the word is not
-new, so it leaves nothing pending, and a fault that every mount finds again
+**Persisting.** A trip whose bit is already in the word is not new. It leaves
+nothing pending, and this is the one use of the stored word (Not interpreted,
+above). A new trip ORs the bit into RAM and leaves it pending until a record
+carries it. So a bit already set leaves nothing pending, and a fault that every mount finds again
 is written once, not once per mount. Reads stay write-free: a CRC
 failure found by a read is written with the next record the store appends
 anyway (an id-ceiling step, `seg_owner`, compaction state, a rotation).
@@ -401,7 +408,7 @@ the background helper) appends one record for them, with no erase. Three
 cases write at once, because the evidence would otherwise be lost to a
 reboot:
 
-- **Mount** appends one record before returning when it tripped a fuse, so a
+- **Mount** appends one record before returning when it tripped a new fuse, so a
   device in a boot loop still records why. A refusal (`-ENOTSUP`, no usable
   master) writes nothing, as everywhere else.
 - **Wedge.** Before refusing further writes, a wedged store makes one
@@ -645,9 +652,15 @@ QSPI, about 0.53 s per 64 KB erase):
     then appends one record. A mount that trips one appends one record before
     returning, and a refused mount writes nothing. A wedge makes its one
     best-effort append. `blob_db_format()` clears every bit, and an autoformat
-    leaves only `AUTOFORMATTED`. **Not interpreted**: every suite run on a
-    store whose fuses are all 32 set gives the same results and the same
-    iostats as on a store with none.
+    leaves only `AUTOFORMATTED`. **Not interpreted**: every suite runs on a
+    store whose fuses are all 32 set and on a store with none. Every call
+    returns the same result and every read the same data. iostats agree
+    except for master record writes, and the rotations they lead to: the
+    all-set run makes no more of either, and makes fewer by exactly the
+    records the deduplication saved. A run that trips no fuse gives identical
+    iostats. **Deduplication**: a fault found again at every mount (a
+    corrupt other sector, say) writes one record at the first mount and none
+    at the next ten.
 
 ## 12. Phases
 
