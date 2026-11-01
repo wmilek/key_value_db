@@ -58,7 +58,7 @@ clears them except a format.
 |---|---|---|
 | D1 | A header plus fixed-size records, each a **full copy** of the mutable state | delta records replayed in order (mount logic, and one rotten record would break the chain) |
 | D2 | Keep two master sectors; a full sector rotates into the other | one sector (a torn erase would leave no master) |
-| D3 | Find the end of the log by binary search on "erased" | a linear walk (up to 1 300 reads on 64 KB) |
+| D3 | Mount reads every record slot of the active sector; the log ends one past the last slot that is not fully erased | a binary search on "erased" (it assumes no erased slot lies below a written one, but a failed write that programs nothing leaves exactly that, and the search can then stop below newer committed records; mount runs once, so the saving is not worth the assumption) |
 | D4 | Large payloads keep the mount-time sweep, as two log records | reclaiming orphans in compaction (§5.2, kept as open item 1) |
 | D5 | AEAD compacted slots take a random 63-bit nonce prefix per compaction | reserving `peb_size` values from the master counter (PR #63 §3.4) |
 | D6 | Features in three sets, ext4-style; a slot flag belongs to exactly one feature | a major number per combination (doubles with every feature) |
@@ -150,7 +150,7 @@ Records per sector: (sector − 128) / R.
 master_update(state):
     if cursor + R > peb_size: rotate(state); return
     write record(rec_no = (cursor - 128) / R, state) at cursor
-    cursor += R          # also on failure: that slot is no longer erased
+    cursor += R          # also on failure: the slot may be programmed, partly or not at all; mount reads past it
 ```
 
 The write programs only erased bytes, moving forward through the sector:
@@ -179,7 +179,7 @@ read [0, 128) of both sectors; classify each as erased, corrupt, foreign or ok (
 foreign on either sector                               -> -ENOTSUP, write nothing
 features, suite or geometry not acceptable (§4.4)      -> -ENOTSUP, write nothing
 active = the ok sector with the higher rot_gen
-cursor = first record slot that is fully erased        # binary search: slots are written in order
+cursor = one past the last record slot that is not fully erased   # every slot is read (D3)
 state  = the newest record before cursor that verifies
 doubt  = the record just before cursor does not verify
       or no record in the active sector verifies       # a torn rotation: fall back to the other sector
@@ -199,8 +199,10 @@ acknowledged, but bit rot in the last committed record looks the same, so
 both trigger the scan. A rotten record further back is harmless, because a
 later full-state record replaces it.
 
-Cost: two header reads as today, plus about log₂(records) reads of R bytes:
-7 on 4 KB, 11 on 64 KB.
+Cost: two header reads as today, plus a read of every record slot in the
+active sector, up to 82 on 4 KB and 1 362 on 64 KB, once per mount. Every
+record that is not erased is checked, so a rotten record anywhere in the log
+trips `MASTER_REC_ROT`.
 
 ## 4. Features and fuses
 
@@ -504,8 +506,11 @@ compacted slot   nonce = cbase(8)      ‖ LE32(offset)     top bit of cbase set
 | `seg_owner` set / clear record | the old value | as `BLOB_DB_CUT_AFTER_OWNER_SET` / `_AFTER_RELEASE` today: an unset owner means no segment was written yet, a still-set owner means the sweep runs again (it is idempotent) |
 | COMPACTING / CLEAN record (scratch path) | as the corresponding master write today | `l1_bucketlog.md` §6.1 unchanged |
 
-A record write that fails without a power cut leaves its slot non-erased. The
-cursor moves past it, and the next update writes the next slot.
+A record write that fails without a power cut may leave its slot programmed,
+partly programmed, or still erased. The cursor moves past it either way, and
+the next update writes the next slot. Mount finds the end of the log past any
+such slot, because it reads every slot (D3), and nothing is written into it
+later.
 
 ## 8. Writing over programmed bits
 
@@ -540,7 +545,7 @@ QSPI, about 0.53 s per 64 KB erase):
 | churn on UBI, atomic replace | 8 erases, 0 master | unchanged |
 | AEAD compaction on 64 KB blocks (PR #63) | about +1 erase per compaction (not measured) | 0 |
 | id ceiling | 1 erase per 256 new ids | 1 record program per 256 new ids |
-| mount | 2 header reads | 2 header reads + ~7–11 record reads |
+| mount | 2 header reads | 2 header reads + every record slot of the active sector (up to 82 on 4 KB, 1 362 on 64 KB) |
 | RAM | — | a cursor (2 B), the active sector's `rot_gen`, the fuse word (4 B) and a pending flag |
 | a fuse | — | 1 record program the first time it trips, at mount or with the next record or `blob_db_maintain()`; 0 erases, except a rotation when the sector is full |
 | flash wear on the master sectors | 1 erase per update | 1 erase per 62–1 362 updates |
@@ -563,8 +568,9 @@ QSPI, about 0.53 s per 64 KB erase):
 2. **Power cut** at every byte of a record append and of a rotation (header
    and record[0]): mount sees the old state or the new one, never another, and
    an id or nonce value is never issued twice.
-3. **The log end**: a torn last record, an erased-but-interrupted slot, and a
-   rotten record in the middle give the newest committed state. A rotten last
+3. **The log end**: a torn last record, an erased-but-interrupted slot, a
+   rotten record in the middle, and a failed write that programmed nothing
+   followed by committed records all give the newest committed state. A rotten last
    record, and a corrupt other sector, make mount scan.
 4. **Rotation**: fill a sector, rotate, remount; the new header carries the
    old header's feature sets verbatim, bits the build does not know included.
