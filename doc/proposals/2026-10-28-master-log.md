@@ -61,7 +61,7 @@ except a format.
 | D2 | Keep two master sectors; a full sector rotates into the other | one sector (a torn erase would leave no master) |
 | D3 | The format guarantees that a sector's record slots are a written prefix followed by erased slots (§3.2a): a failed record write is followed by a rotation, never by a record in the next slot. Mount reads every record slot, and the invariant leaves a later build free to binary-search instead, with no format change | a binary search now (mount runs once, so the saving is not needed yet); leaving gaps to the reader (a store written without the invariant could never be binary-searched, by any later build) |
 | D4 | Large payloads keep the mount-time sweep, as two log records | reclaiming orphans in compaction (§5.2, kept as open item 1) |
-| D5 | AEAD compacted slots take a random 63-bit nonce prefix per compaction | reserving `peb_size` values from the master counter (PR #63 §3.4) |
+| D5 | AEAD compacted slots take a random 95-bit nonce base per compaction, and their nonce is the base plus the slot's offset; one named nonce bit separates them from appended slots (§6) | reserving `peb_size` values from the master counter (PR #63 §3.4); a 63-bit random prefix with the offset beside it (about 2⁻¹⁷ over 10⁷ compactions, beyond the 2⁻³² budget) |
 | D6 | Features in three sets, ext4-style; a slot flag belongs to exactly one feature | a major number per combination (doubles with every feature) |
 | D7 | A feature that adds a slot flag is set **at format**, as ext4 sets `incompat` features at `mkfs`; an existing store gains one only by an explicit upgrade that puts it in every master header before any slot uses it (§4.2) | marking on first use (until the next rotation the bit lives only in the active sector's records, so a fallback to the other sector loses it while slots already use it) |
 | D8 | Protection is a `suite` byte plus an `incompat` bit, and the build requires it | an ordinary feature the store declares (a forged unprotected master would be obeyed: a downgrade) |
@@ -569,24 +569,50 @@ That saves the two record programs. It also brings three problems:
 | recovery at mount | 1 sector replace | 1 record append |
 | AEAD, either path (PR #63) | a master write when the `peb_size` reservation passes the ceiling: nearly every compaction on 64 KB blocks | none: random prefix (below) |
 
-**AEAD compacted slots** (PR #63 §3.2, §3.4). Compaction draws 8 random bytes
-per compaction and stores them in the bucket header's existing 12-byte
-`cbase` field, with the last 4 bytes reserved:
+**AEAD compacted slots** (PR #63 §3.2, §3.4). Each compaction draws 12 random
+bytes into the bucket header's 12-byte `cbase` field (bytes 12..23, which
+PR #63 split into `cbase_seq` and `cbase_salt`), and sets bit 7 of its byte 0.
+Both nonce forms are 12 bytes, `N[0..11]`, and bit 7 of `N[0]` tells them
+apart:
 
 ```
-appended slot    nonce = mount_salt(4) ‖ LE64(seq)        top bit of mount_salt cleared
-compacted slot   nonce = cbase(8)      ‖ LE32(offset)     top bit of cbase set
+appended slot    N = mount_salt(4) ‖ LE64(seq)               N[0] bit 7 = 0
+compacted slot   N = BE96(2⁹⁵ | ((c + offset) mod 2⁹⁵))      N[0] bit 7 = 1
+                 where c = BE96⁻¹(cbase), offset = the slot's byte offset in the bucket
 ```
 
-- The top bit keeps the two nonce forms apart under one key. The mount salt
-  keeps 31 random bits and the compaction prefix 63.
-- Two compactions collide only if they draw the same prefix: 2⁻⁶³ per pair,
-  about 2⁻²⁴ over a million compactions. The appended form already accepts
-  2⁻³² after a master rollback.
+- **One bit, named in the nonce.** `mount_salt` is drawn with bit 7 of its
+  byte 0 cleared, which leaves it 31 random bits. `cbase` is read as a
+  big-endian 96-bit integer, so its top bit is that same `N[0]` bit 7, and the
+  addition runs in the low 95 bits and never carries into it. No appended
+  nonce can equal a compacted one, whatever `seq` reaches. A bit named as the
+  "top bit" of two fields read as little-endian integers would sit in nonce
+  byte 3 for one form and byte 7 for the other, and byte 7 of an appended
+  nonce is bit 31 of `seq`.
+- **Collisions.** A compaction uses the nonce range `[c, c + peb_size)`. Two
+  compactions repeat a nonce only if their ranges overlap, that is
+  `|c₁ − c₂| < peb_size` mod 2⁹⁵: about `2 · peb_size / 2⁹⁵` per pair, 2⁻⁷⁸ on
+  64 KB and 2⁻⁸² on 4 KB. Over n compactions under one key that is about
+  `n² · peb_size / 2⁹⁵`. At 10⁷ compactions, more than a device is expected
+  to make, that is 2⁻³²·⁵ on 64 KB and 2⁻³⁶·⁵ on 4 KB, within the usual total
+  budget of 2⁻³² for random nonces. Under CCM, a repeated nonce would leak
+  the XOR of two plaintexts and weaken their tags, so the budget is not
+  optional.
+- **A never-compacted bucket** carries `cbase = 0`. Its bit 7 is clear, so it
+  is never a valid base, and a `COMPACTED` slot under such a header fails to
+  open: tampering, not a misread.
+- **Entropy failure.** Compaction draws `cbase` from `psa_generate_random()`
+  before it writes anything. If that fails, compaction returns the error,
+  writes nothing and leaves the bucket as it was, and the write that needed
+  the compaction returns the error too. There is no fallback to a fixed,
+  derived or earlier prefix. Recovery at mount restores a sealed scratch image
+  that already carries its `cbase`, so it needs no entropy.
 - Entropy is needed once per compaction, not per write. PR #63 rejected
   random nonces because they would have needed entropy per write.
-- `seq_hint` then covers appended slots only: one record per
-  `BLOB_DB_SEQ_STEP` appends.
+- `seq_hint` then covers appended slots only. Every record raises it (D14),
+  and an append needs a record only when `seq` reaches the ceiling.
+- The bucket header's 4 bytes that PR #63's layout left after `cbase` become
+  part of `cbase`. The key epoch keeps `slot_hdr.reserved` (§4.2).
 
 ## 7. Crash analysis (P7)
 
@@ -655,7 +681,7 @@ QSPI, about 0.53 s per 64 KB erase):
 |---|---|
 | `lib/blob_db/blob_db_internal.h` | major-5 header and record structs; the feature and slot-flag registry; the fuse registry |
 | `lib/blob_db/blob_db.c` | `write_master()` becomes `master_update()` and `rotate()`; mount's master classification, log search, feature check and doubt rule; features written at format, the upgrade's two rotations and finishing a half-done upgrade at mount; a sealed, intact slot with an unknown flag refuses its bucket instead of ending its log as torn, and compaction refuses to drop programmed bytes beyond its walk (D13); `persist_seg_owner()`, `persist_next_id_hint()`, compaction and recovery append records, and every record raises both ceilings (D14); `fuse_trip()` at each trip point in §4.5, the mount and wedge appends, pending fuses as `blob_db_maintain()` work, `fuses = 0` at format |
-| PR #63 | master MAC and tail move into the header and record layouts above; `cbase` becomes a random prefix; `seq_reserve()` is no longer called by compaction |
+| PR #63 | master MAC and tail move into the header and record layouts above; `cbase` becomes a 12-byte random base, and the compacted nonce becomes base + offset (§6); `seq_reserve()` is no longer called by compaction |
 | PR #62 | `DELTA` moves to slot flag bit 5 and is set at format |
 | `lib/blob_db/blob_db_inspect.c`, shell | show features, suite, geometry, log fill and rotation generation; return the raw fuse word and whether new fuses are pending, which the shell prints by bit name; `struct blob_db_core_state` gains both |
 | `doc/impl/l1_bucketlog.md` | §3.1, §5.1, §5.6, §5.6a, §6 and §13.1 rewritten for the log |
