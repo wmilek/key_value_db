@@ -191,7 +191,7 @@ The first version of this plan raised A1–A8 against the proposal before
 
 | PR | Scope | Size (lib + tests) | Risk | Format |
 |---|---|---|---|---|
-| **1** | Refactor: one `master_commit()`, I/O wrappers | ~150 + 0 | low | unchanged |
+| **1** | Refactor: one `master_commit()`, one `master_format()` (#101) | ~120 + ~40 | low | unchanged |
 | **2** | Recovery keyed on the seal, on today's format (D17, first half) | ~80 + ~150 | low | unchanged |
 | **3** | Foreign slots and the compaction guard (D13 + B2) | ~150 + ~200 | medium | unchanged |
 | **4** | Major 5 (all of §5) | ~700 + ~700 | **high** | **break**: 5; 1–4 refused |
@@ -220,19 +220,28 @@ Eight sites each call `write_master(inactive, gen + 1, …)` and then flip
 `compact_commit` (×2), `recover_compaction`, `persist_seg_owner`,
 `erase_all_impl`, `format_masters_fresh` and `format_whole_store`.
 
-`lib/blob_db/blob_db.c`
-- `static int master_commit(void)` writes the state held in `st`
-  (`next_id_hint`, `seg_owner`, and for now the compaction state). On
-  success it advances the A/B pointer. Each caller sets the fields it
-  changes, calls it, and restores the old values on failure, as
-  `persist_seg_owner()` already does.
-- `static int master_format(void)` covers both format paths, so B1's
-  second write lands in one place in PR 4.
-- `io_read/io_write/io_erase/io_replace` replace the direct `blob_db_store_*`
-  calls outside the master code. They do nothing yet; the fuse-trip phase
-  hooks `IO_ERR` here.
+**Status: #101.**
 
-Tests: unchanged and green on every scenario.
+`lib/blob_db/blob_db.c`
+- `static int master_commit(uint8_t state, uint16_t cbid)` writes the state
+  held in `st` (`next_id_hint`, `seg_owner`) with the given compaction state.
+  On success it advances the A/B pointer. Each caller sets the fields it
+  changes, calls it, and restores the old values on failure, as
+  `persist_seg_owner()` already does. The compaction state stays a
+  parameter rather than an `st` field: today a compaction that fails before
+  its window closes leaves a `COMPACTING` master, and the next ceiling or
+  `seg_owner` write must still write `CLEAN`, as it does now. PR 4 drops the
+  parameter with D17.
+- `static int master_format(void)` covers both format paths, so B1's
+  second write lands in one place in PR 4. It resets `st` before it writes,
+  which fixes a stale `seg_owner` carried into a fresh store (#101).
+- The I/O wrappers this section first listed are left for the fuse-trip
+  phase, the only thing that needs them. The revised proposal defers that
+  phase, so wrappers now would be churn with no user.
+
+Tests: green on every scenario, plus two that fail on `main` (the stale
+`seg_owner`). `blob_db.c` shrinks by 168 B with logging and 196 B without,
+on Cortex-M33 at `-Os`.
 
 ## 4. PR 2 and PR 3 — behaviour on today's format
 
