@@ -374,11 +374,17 @@ static int master_commit(void)
 ### 5.4 Format (B1)
 
 ```c
+/* Both master sectors are already erased by the caller. Each write is a
+ * header plus record[0] for the same state; the header's incompat holds the
+ * build's slot-flag features (D7). */
 static int master_format(void)
 {
-	/* both master sectors already erased by the caller's erase */
-	rc = write_hdr_and_rec0(B, /*rot_gen*/ 1, features = build's slot-flag features);
-	rc = write_hdr_and_rec0(A, 2, same);           /* active = A, log_next = 1 */
+	int rc = write_hdr_and_rec0(BLOB_DB_MASTER_B_SECTOR, 1 /* rot_gen */);
+
+	if (rc == 0) {
+		rc = write_hdr_and_rec0(BLOB_DB_MASTER_A_SECTOR, 2);
+	}
+	return rc;   /* on success: active = A, log_next = 1 */
 }
 ```
 
