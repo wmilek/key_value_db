@@ -350,15 +350,19 @@ code depends on fuses, a lost trip costs only that piece of evidence.
 **Registry.** The bit numbers live in `blob_db_internal.h`, next to the feature
 registry, because the trip points need them. The names exist only for
 printing, in the inspection module and the shell. A `BUILD_ASSERT` checks
-that no two fuses share a bit. Every bit, debug ones included, is assigned
-there once and keeps its meaning forever, so a post-mortem can decode a
-store without knowing which build wrote it.
+that no two fuses share a bit. Bits 0..23, once assigned, keep their
+meaning forever, so a post-mortem can decode them without knowing which
+build wrote the store.
 
-**Debug fuses.** Bits 24..31 are for debug evidence. They are tripped only by
-builds with a debug or test option, for example
-`CONFIG_BLOB_DB_TEST_CRASH_HOOKS`. A release build never trips them, but it
-carries them like every other bit, so a field store keeps the record that a
-debug build once wrote it, or that a development check fired.
+**Debug fuses.** Bits 24..31 are deliberately left undefined. They are for a
+developer looking for whether something happened: put
+`fuse_trip(BLOB_DB_FUSE_DEBUG(n))` where it is suspected, run the build, and
+read the fuses back later. The bit means whatever that developer chose. The
+registry gives these bits no names and no trip points, so they are never
+tripped by a merged build. The only guarantee is the one every bit has: no
+build destroys them, and only a format clears them. A store that was
+written by a debug build and later by a release build still shows what the
+debug build saw.
 
 | Bit | Fuse | Trips when |
 |---|---|---|
@@ -379,8 +383,7 @@ debug build once wrote it, or that a development check fired.
 | 14 | `SEG_SWEEP` | mount finds `seg_owner` set and sweeps (an interrupted large write) |
 | 15 | `AUTOFORMATTED` | set in record[0] by an autoformat |
 | 16..23 | reserved | for later fuses; copied like every other bit |
-| 24 | `DEBUG_BUILD` | a build with a debug or test option wrote a record (set by its first record) |
-| 25..31 | reserved, debug | for later debug fuses; tripped only by debug builds; copied like every other bit |
+| 24..31 | debug, undefined | never assigned; free for ad-hoc debugging; copied like every other bit |
 
 **Trust.** In a protected store the record, `fuses` included, is under the
 MAC, so nobody without the key can clear a bit. Replaying an older master
