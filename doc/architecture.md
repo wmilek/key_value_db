@@ -9,7 +9,7 @@ Status: v2 · Top-level document; per-layer detail lives in `doc/layers/`
 | Document | Contents |
 |---|---|
 | **this file** | The stack: layers, boundaries, composition model |
-| `doc/principles.md` | Binding design principles (P1–P8) for every layer |
+| `doc/principles.md` | Binding design principles (P1–P9) for every layer |
 | `doc/layers/l0_flash.md` | L0 — flash translation: the `blob_db_store` seam its providers must implement |
 | `doc/layers/l1_blob_db.md` | L1 — `blob_db` **contract & requirements** (implementation-agnostic) |
 | `doc/layers/l1_model_container.md` | L1 — the model container: **sufficiency proof** that the blob_db contract can carry the layers above; reference pattern + acceptance-test blueprint |
