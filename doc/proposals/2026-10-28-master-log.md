@@ -31,8 +31,9 @@ header records the geometry and three feature sets (`incompat`, `ro_compat`,
 the build requires, not a feature the store chooses. Compaction no longer
 touches the master: on UBI it never did, and in AEAD mode its nonces stop
 coming from the master counter. Each record also carries 32 **fuses**:
-private bits that record damage and recovery as post-mortem evidence. They can
-be set but never cleared, and only a format clears them.
+bits that record damage and recovery as post-mortem evidence. blob_db only
+carries them forward, adding new ones, and never interprets them. Nothing
+clears them except a format.
 
 ---
 
@@ -65,7 +66,7 @@ be set but never cleared, and only a format clears them.
 | D8 | Protection is a `suite` byte plus an `incompat` bit, and the build requires it | an ordinary feature the store declares (a forged unprotected master would be obeyed: a downgrade) |
 | D9 | No writes over programmed bits | clearing bits in place (§8: STM32F3, nRF word-write limits, ECC flash; and an attacker can clear bits too) |
 | D10 | Major 5 for the new layout; majors 1–4 are refused, never migrated | migration code for stores that exist only on development boards |
-| D11 | Fuses: a 32-bit OR-only word in every record, private to the library and diagnostic only | bits cleared in place (§8); counters (more bytes than a post-mortem needs); fuses in the header (written once per erase, so a trip would need a rotation) |
+| D11 | Fuses: a 32-bit OR-only word in every record that blob_db carries forward and never interprets | bits cleared in place (§8); counters (more bytes than a post-mortem needs); fuses in the header (written once per erase, so a trip would need a rotation) |
 | D12 | A format clears the fuses | carrying them over (a format is the intervention that ends the store's history, P9; carrying them needs a readable old master, which an autoformat by definition lacks) |
 
 ## 3. Master sector layout (major 5)
@@ -281,22 +282,26 @@ only records that something happened to it: a CRC failure, a master update
 that failed, a recovery at mount. They are post-mortem evidence for a store
 returned from the field. The rules:
 
-- **OR only.** A record writes the previous record's `fuses` OR the bits tripped
-  since. The library has one internal call, `fuse_trip(bit)`, and nothing
-  clears a bit. Rotation copies the word into record[0] like the rest of the
-  state.
-- **Private.** No call in `<app/lib/blob_db.h>` reads or sets them. The
-  inspection module and the shell (`CONFIG_BLOB_DB_INSPECT`) show them,
-  read-only.
-- **Diagnostic only.** No code reads a fuse to decide anything. A bit that
-  changed how mount, a read or compaction behaves would be a format feature
-  and would belong in `incompat`. So an unknown fuse bit is never a reason to
-  refuse a store.
-- **Unknown bits are kept.** A writer copies the whole 32-bit word forward,
-  including bits it has no name for. Bits 16..31 are reserved for later
-  builds, and a build that meets one keeps it. That is why the field has to
-  be in major 5 from phase 1: a build that wrote those bytes as reserved
-  zeros would clear every fuse.
+- **Not interpreted.** blob_db never acts on the stored word. No check,
+  branch, refusal, recovery or write policy depends on its value; a store
+  with every bit set behaves exactly like one with none. A bit that changed
+  behaviour would be a format feature and would belong in `incompat`.
+- **Passed over, fusing only new fuses.** The core does exactly three things
+  with the word. It reads it at mount from the newest record that verifies.
+  It writes `fuses = previous | new` into every record, rotation's record[0]
+  included. And it hands the word over, raw, to the diagnostic API. The only
+  internal call is `fuse_trip(bit)`, and nothing clears a bit.
+- **Opaque, all 32 bits alike.** Because the core interprets no bit, it does
+  not tell known bits from unknown ones: the whole word is copied, so a bit
+  set by a later build passes through an older one unchanged. Bits 16..31 are
+  reserved for later assignment. The field has to be in major 5 from phase 1,
+  since a build that wrote those bytes as reserved zeros would clear every
+  fuse.
+- **Exposed, not interpreted.** Printing and exposing are not interpreting.
+  No call in `<app/lib/blob_db.h>` reads or sets fuses. With
+  `CONFIG_BLOB_DB_INSPECT`, the inspection module returns the raw word (and
+  whether new fuses are still pending), and the shell prints it with bit
+  names. Making sense of the bits is for whoever reads them.
 - **Only a format clears them** (D12). `blob_db_format()` writes record[0] with
   `fuses = 0`. An autoformat (`CONFIG_BLOB_DB_AUTOFORMAT_ON_CORRUPT`) writes
   record[0] with `AUTOFORMATTED` set, so the new store says it replaced one
@@ -307,9 +312,10 @@ returned from the field. The rules:
   A CRC failure followed by intact data is damage. Together the two bits
   cover every CRC failure, and a post-mortem can still tell them apart.
 
-**Persisting.** A trip sets the bit in RAM, and tripping a bit that is
-already set does nothing. So a fault that every mount finds again is written
-once, not once per mount. Reads stay write-free: a CRC
+**Persisting.** What the library acts on is its own new trips, never the
+stored word. A trip ORs the bit into RAM. A bit already in the word is not
+new, so it leaves nothing pending, and a fault that every mount finds again
+is written once, not once per mount. Reads stay write-free: a CRC
 failure found by a read is written with the next record the store appends
 anyway (an id-ceiling step, `seg_owner`, compaction state, a rotation).
 Pending fuses also count as maintenance work, so `blob_db_maintain()` (and
@@ -331,9 +337,10 @@ reboot:
 A trip is lost only if power is cut before any record carries it. Since no
 code depends on fuses, a lost trip costs only that piece of evidence.
 
-**Registry.** In `blob_db_internal.h`, next to the feature registry. Each bit has
-a name for the inspection output, and a `BUILD_ASSERT` checks the names are
-unique:
+**Registry.** The bit numbers live in `blob_db_internal.h`, next to the feature
+registry, because the trip points need them. The names exist only for
+printing, in the inspection module and the shell. A `BUILD_ASSERT` checks
+that no two fuses share a bit:
 
 | Bit | Fuse | Trips when |
 |---|---|---|
@@ -353,7 +360,7 @@ unique:
 | 13 | `COMPACT_RECOVERED` | mount finds `COMPACTING` and recovers |
 | 14 | `SEG_SWEEP` | mount finds `seg_owner` set and sweeps (an interrupted large write) |
 | 15 | `AUTOFORMATTED` | set in record[0] by an autoformat |
-| 16..31 | reserved | 0 until assigned; kept by every writer |
+| 16..31 | reserved | not tripped by this design; copied like every other bit |
 
 **Trust.** In a protected store the record, `fuses` included, is under the
 MAC, so nobody without the key can clear a bit. Replaying an older master
@@ -480,7 +487,7 @@ QSPI, about 0.53 s per 64 KB erase):
 | `lib/blob_db/blob_db.c` | `write_master()` becomes `master_update()` and `rotate()`; mount's master classification, log search, feature check and doubt rule; slot walk takes `known` from the store; `persist_seg_owner()`, `persist_next_id_hint()`, compaction and recovery append records; `fuse_trip()` at each trip point in §4.5, the mount and wedge appends, pending fuses as `blob_db_maintain()` work, `fuses = 0` at format |
 | PR #63 | master MAC and tail move into the header and record layouts above; `cbase` becomes a random prefix; `seq_reserve()` is no longer called by compaction |
 | PR #62 | `DELTA` moves to slot flag bit 5 and is marked on first use |
-| `lib/blob_db/blob_db_inspect.c`, shell | show features, suite, geometry, log fill, rotation generation, and the fuses by name (pending ones marked); `struct blob_db_core_state` gains the fuse word |
+| `lib/blob_db/blob_db_inspect.c`, shell | show features, suite, geometry, log fill and rotation generation; return the raw fuse word and whether new fuses are pending, which the shell prints by bit name; `struct blob_db_core_state` gains both |
 | `doc/impl/l1_bucketlog.md` | §3.1, §5.1, §5.6, §5.6a, §6 and §13.1 rewritten for the log |
 
 ## 11. Test plan (P8; `native_sim`, both backends)
@@ -511,12 +518,14 @@ QSPI, about 0.53 s per 64 KB erase):
 10. **Fuses**: each trip point by fault injection: a bit flipped mid-bucket
     trips `SLOT_ROT`, a cut at the tail trips `SLOT_TORN` only, and so on for
     each row of §4.5. Each bit survives a remount, updates, rotations and
-    compactions. A bit from 16..31 planted by the test survives the same. A
+    compactions. A bit from 16..31 planted by the test passes through the same. A
     read that trips a fuse writes nothing (iostats), and `blob_db_maintain()`
     then appends one record. A mount that trips one appends one record before
     returning, and a refused mount writes nothing. A wedge makes its one
     best-effort append. `blob_db_format()` clears every bit, and an autoformat
-    leaves only `AUTOFORMATTED`.
+    leaves only `AUTOFORMATTED`. **Not interpreted**: every suite run on a
+    store whose fuses are all 32 set gives the same results and the same
+    iostats as on a store with none.
 
 ## 12. Phases
 
