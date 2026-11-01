@@ -62,12 +62,13 @@ clears them except a format.
 | D4 | Large payloads keep the mount-time sweep, as two log records | reclaiming orphans in compaction (§5.2, kept as open item 1) |
 | D5 | AEAD compacted slots take a random 63-bit nonce prefix per compaction | reserving `peb_size` values from the master counter (PR #63 §3.4) |
 | D6 | Features in three sets, ext4-style; a slot flag belongs to exactly one feature | a major number per combination (doubles with every feature) |
-| D7 | A feature that adds a slot flag is marked in the store on **first use** | marking at format (an older build would refuse a store that never used it) |
+| D7 | A feature that adds a slot flag is set **at format**, as ext4 sets `incompat` features at `mkfs`; an existing store gains one only by an explicit upgrade that puts it in every master header before any slot uses it (§4.2) | marking on first use (until the next rotation the bit lives only in the active sector's records, so a fallback to the other sector loses it while slots already use it) |
 | D8 | Protection is a `suite` byte plus an `incompat` bit, and the build requires it | an ordinary feature the store declares (a forged unprotected master would be obeyed: a downgrade) |
 | D9 | No writes over programmed bits | clearing bits in place (§8: STM32F3, nRF word-write limits, ECC flash; and an attacker can clear bits too) |
 | D10 | Major 5 for the new layout; majors 1–4 are refused, never migrated | migration code for stores that exist only on development boards |
 | D11 | Fuses: a 32-bit OR-only word in every record that blob_db carries forward and never interprets | bits cleared in place (§8); counters (more bytes than a post-mortem needs); fuses in the header (written once per erase, so a trip would need a rotation) |
 | D12 | A format clears the fuses | carrying them over (a format is the intervention that ends the store's history, P9; carrying them needs a readable old master, which an autoformat by definition lacks) |
+| D13 | The slot walk accepts the flags the **build** knows. A sealed slot whose CRC verifies but which carries a flag outside them makes its bucket refuse writes; it is never compacted | taking the accepted flags from the store's features (a lost bit would turn live slots into a "torn tail" that the next compaction drops); treating such a slot as torn (the same loss, from a single slot) |
 
 ## 3. Master sector layout (major 5)
 
@@ -120,7 +121,7 @@ another partition.
 | 8..15 | `next_id_hint` | the id ceiling, as today (§13.1) |
 | 16..23 | `seq_hint` | the AEAD nonce ceiling (PR #63 §3.2); 0 otherwise |
 | 24..31 | `seg_owner` | the segmented write in flight; 0 = none |
-| 32..35 | `incompat` | the header's bits, plus any marked since the rotation (§4.2) |
+| 32..35 | reserved, 0 | features live in the header only (§4.2) |
 | 36..39 | `fuses` | the previous record's fuses, plus any tripped since (§4.5) |
 | 40..43 | reserved, 0 | |
 | 44..47 | `crc32` | unprotected: over [0, 44); R = 48 |
@@ -161,7 +162,7 @@ already are.
 ```
 rotate(state):
     other = !active
-    replace(other, header(rot_gen + 1, features = header ∪ last record) ‖ record[0](state))
+    replace(other, header(rot_gen + 1, features = header) ‖ record[0](state))
     active = other; cursor = 128 + R
 ```
 
@@ -187,6 +188,8 @@ doubt  = the record just before cursor does not verify
 fuses  = the fuses of the newest record that verifies   # §4.5
 if doubt: scan the buckets and raise the id ceiling    # as today (§5.1)
 if state == COMPACTING: recover (§6.1), then append a CLEAN record
+if one ok sector has a feature bit the other ok sector lacks:
+    rotate                                               # finish an upgrade (§4.2)
 if mount tripped a fuse and appended no record: append one   # §4.5
 ```
 
@@ -221,24 +224,61 @@ write or read policy, and stay out of these sets.
 One table in `blob_db_internal.h` owns every bit, so two features cannot take
 the same slot flag:
 
-| `incompat` bit | Feature | Slot flags it owns | Marked |
+| `incompat` bit | Feature | Slot flags it owns | Set |
 |---|---|---|---|
-| 0 | `LARGE_PAYLOADS` | bit 2 `INDEXED`, bit 3 `SEGMENT` | on the first segmented write |
-| 1 | `PROTECTED` | bit 4 `COMPACTED` (AEAD suites) | at format |
-| 2 | `DELTA` (PR #62) | bit 5 `DELTA` (moved from bit 4) | on the first delta slot |
+| 0 | `LARGE_PAYLOADS` | bit 2 `INDEXED`, bit 3 `SEGMENT` | at format, or by an upgrade |
+| 1 | `PROTECTED` | bit 4 `COMPACTED` (AEAD suites) | at format only (§4.3) |
+| 2 | `DELTA` (PR #62) | bit 5 `DELTA` (moved from bit 4) | at format, or by an upgrade |
 
 `SEALED` (bit 0) and `TOMBSTONE` (bit 1) belong to every store. Bits 6 and 7
 are free, and `slot_hdr.reserved` stays kept for a key epoch (PR #63 §11.4).
-The slot walk takes the flags it accepts from the store's features, not from
-`#ifdef`s: `known = SEALED | TOMBSTONE | flags of each feature set in the store`.
 A `BUILD_ASSERT` checks that no two features own the same bit.
 
-**Marking on first use.** A build with `LARGE_PAYLOADS` writes a store that an
-older build can still mount, until the first segmented write. That write is
-preceded by a record whose `incompat` adds the bit, and the record must be on
-flash before the first slot that uses the feature. This is the same rule as
-the ceilings: persist first, then use. A rotation folds the record's bits into
-the new header. Bits are never cleared, except by a format.
+**Set at format, as ext4 does at `mkfs`.** `blob_db_format()`, the virgin
+format at mount, and an autoformat write the build's slot-flag features into
+the header. ext4 lets its driver set some `ro_compat` and `compat` bits on first
+use (`large_file`, `dir_nlink`), where losing one cannot make a reader misread
+data. It never does so for `incompat`, and blob_db does not either. A bit set
+on first use would live only in the active sector's records until the next
+rotation. During that time, a rotten active header, or UBI standing up an older
+copy of that block, makes mount fall back to the other sector, which has never
+seen the bit, while slots already use the feature. The cost is ext4's: a build
+without the feature refuses a store formatted with it, even if no slot uses
+it. Refusing is the safe direction.
+
+**The invariant.** Every master sector that classifies as ok carries every
+feature bit the store has. Format meets it: the active sector carries the
+bits, and the other sector is erased. Rotation keeps it, because the new header
+copies the old header's feature sets verbatim, bits the build does not know
+included. Features live only in the header; records carry none. Bits are never
+cleared, except by a format.
+
+**Upgrade.** An existing store gains a feature only by an explicit call (open
+item 7), never as a side effect of a write. The upgrade rotates twice, so both
+sectors' headers carry the new bit. That is two erases, paid once. Until both
+rotations have landed, the store does not use the feature. A mount that finds
+one ok sector with a bit the other ok sector lacks finishes the upgrade with
+one more rotation before it returns. The feature check (§4.4) takes the union
+of every ok header, so a build that does not know the bit refuses the store
+even halfway through the upgrade.
+
+**The slot walk accepts the build's flags (D13).** The flags a walk accepts are
+`SEALED | TOMBSTONE | the slot flags of every feature the build has`, fixed at
+compile time as today. The store's features decide only whether mount accepts
+the store (§4.4). The registry gives every flag one owner for good, so reading
+a slot with the build's meaning of a flag is never a misread. A walk that stops
+at a sealed slot with a plausible `val_len`, an intact CRC and a flag the build
+does not know has found a slot written by another build, not a torn append. Its
+bucket refuses writes with `-ENOTSUP` and is never compacted. Reads of any id
+in that bucket return `-EIO`, because a newer slot for that id may lie beyond
+the one the walk cannot read. That replaces a silently stale value. The fuse
+`FOREIGN_SLOT` records it. Like everything else on the store, the bucket is
+kept until a format (P9). Compaction also refuses (`-EIO`) to build an
+image when the old bucket still holds programmed bytes beyond the point where
+its walk stopped. A walk that stops at a torn slot cannot be followed by
+programmed bytes, because every append that fails forces a compaction before
+the next one. So the image would otherwise drop slots the walk could not
+read.
 
 ### 4.3 Protection
 
@@ -272,8 +312,9 @@ store.suite    == build.suite            # else -ENOTSUP
 store geometry == device geometry        # else -ENOTSUP
 ```
 
-`store.incompat` is the union of the header and the newest record that
-verifies. Every refusal writes nothing.
+Each `store.*` set is the union over every master sector that classifies as
+ok. Records carry no features, so the check runs on the headers alone, before
+any record is read. Every refusal writes nothing.
 
 ### 4.5 Fuses
 
@@ -382,7 +423,8 @@ debug build saw.
 | 13 | `COMPACT_RECOVERED` | mount finds `COMPACTING` and recovers |
 | 14 | `SEG_SWEEP` | mount finds `seg_owner` set and sweeps (an interrupted large write) |
 | 15 | `AUTOFORMATTED` | set in record[0] by an autoformat |
-| 16..23 | reserved | for later fuses; copied like every other bit |
+| 16 | `FOREIGN_SLOT` | a walk stops at a sealed, CRC-intact slot carrying a flag the build does not know (§4.2) |
+| 17..23 | reserved | for later fuses; copied like every other bit |
 | 24..31 | debug, undefined | never assigned; free for ad-hoc debugging; copied like every other bit |
 
 **Trust.** In a protected store the record, `fuses` included, is under the
@@ -456,7 +498,8 @@ compacted slot   nonce = cbase(8)      ‖ LE32(offset)     top bit of cbase set
 | a record append | the last record torn (CRC fails) or still erased | the previous record stands. The update was not acknowledged, so no ceiling or feature it carried was used. Doubt, so the bucket scan raises the id ceiling as today |
 | a rotation, before the header lands | the other sector erased or corrupt; the full sector ok | the full sector's newest record stands; doubt, scan. The next update rotates again |
 | a rotation, after the header, during record[0] | the new sector's header ok, no record verifies | that sector is unusable; fall back to the other; doubt, scan |
-| a feature-marking record | the bit absent | no slot uses the feature yet (persist before use), so the store is still what an older build can read |
+| an upgrade's first rotation | as a rotation (rows above); if it landed, one ok sector has the new bit and the other lacks it | the store does not use the feature yet. A build that knows the bit finishes the upgrade with the second rotation. One that does not know it refuses, because §4.4 takes the union of the ok headers |
+| an upgrade's second rotation | as a rotation | the same; both headers carry the bit once it lands |
 | a record that carries a new fuse | the bit absent | only that piece of evidence is lost: no code depends on a fuse. A mount-time trip trips again at the next mount, since what it found is still on flash |
 | `seg_owner` set / clear record | the old value | as `BLOB_DB_CUT_AFTER_OWNER_SET` / `_AFTER_RELEASE` today: an unset owner means no segment was written yet, a still-set owner means the sweep runs again (it is idempotent) |
 | COMPACTING / CLEAN record (scratch path) | as the corresponding master write today | `l1_bucketlog.md` §6.1 unchanged |
@@ -507,9 +550,9 @@ QSPI, about 0.53 s per 64 KB erase):
 | Where | Change |
 |---|---|
 | `lib/blob_db/blob_db_internal.h` | major-5 header and record structs; the feature and slot-flag registry; the fuse registry |
-| `lib/blob_db/blob_db.c` | `write_master()` becomes `master_update()` and `rotate()`; mount's master classification, log search, feature check and doubt rule; slot walk takes `known` from the store; `persist_seg_owner()`, `persist_next_id_hint()`, compaction and recovery append records; `fuse_trip()` at each trip point in §4.5, the mount and wedge appends, pending fuses as `blob_db_maintain()` work, `fuses = 0` at format |
+| `lib/blob_db/blob_db.c` | `write_master()` becomes `master_update()` and `rotate()`; mount's master classification, log search, feature check and doubt rule; features written at format, the upgrade's two rotations and finishing a half-done upgrade at mount; a sealed, intact slot with an unknown flag refuses its bucket instead of ending its log as torn, and compaction refuses to drop programmed bytes beyond its walk (D13); `persist_seg_owner()`, `persist_next_id_hint()`, compaction and recovery append records; `fuse_trip()` at each trip point in §4.5, the mount and wedge appends, pending fuses as `blob_db_maintain()` work, `fuses = 0` at format |
 | PR #63 | master MAC and tail move into the header and record layouts above; `cbase` becomes a random prefix; `seq_reserve()` is no longer called by compaction |
-| PR #62 | `DELTA` moves to slot flag bit 5 and is marked on first use |
+| PR #62 | `DELTA` moves to slot flag bit 5 and is set at format |
 | `lib/blob_db/blob_db_inspect.c`, shell | show features, suite, geometry, log fill and rotation generation; return the raw fuse word and whether new fuses are pending, which the shell prints by bit name; `struct blob_db_core_state` gains both |
 | `doc/impl/l1_bucketlog.md` | §3.1, §5.1, §5.6, §5.6a, §6 and §13.1 rewritten for the log |
 
@@ -523,12 +566,24 @@ QSPI, about 0.53 s per 64 KB erase):
 3. **The log end**: a torn last record, an erased-but-interrupted slot, and a
    rotten record in the middle give the newest committed state. A rotten last
    record, and a corrupt other sector, make mount scan.
-4. **Rotation**: fill a sector, rotate, remount; features marked before the
-   rotation are in the new header.
+4. **Rotation**: fill a sector, rotate, remount; the new header carries the
+   old header's feature sets verbatim, bits the build does not know included.
 5. **Features**: an unknown `incompat` or `ro_compat` bit refuses with
-   `-ENOTSUP` and writes nothing. A store with large payloads enabled but
-   unused mounts in a build without them; after the first segmented write it
-   is refused. The same for `DELTA`.
+   `-ENOTSUP` and writes nothing, whichever ok sector carries it. A store
+   formatted with large payloads is refused by a build without them, even if
+   no segmented write ever happened. The same for `DELTA`. **Fallback keeps
+   features**: in a store with segmented objects, corrupt the active sector's
+   header. Mount falls back to the other sector and still has
+   `LARGE_PAYLOADS`, and every object reads back intact. On UBI, also when the
+   active block's older copy is stood up. **Upgrade**: a cut before, between
+   and after its two rotations. Mount either finishes it or leaves the store
+   as it was, no segmented write happens until both headers carry the bit, and
+   a build without the feature refuses the store from the first rotation on.
+5a. **Foreign slot** (D13): forge a sealed slot with an intact CRC and an
+    unknown flag into the middle of a bucket. Writes to that bucket return
+    `-ENOTSUP`, reads `-EIO`, nothing is compacted or erased, and
+    `FOREIGN_SLOT` is set. A torn slot at a bucket's tail still compacts as
+    today. A compaction whose walk stops before programmed bytes refuses.
 6. **Protection**: a protected build refuses an unprotected store, another
    suite, a cleared `PROTECTED` bit, and a forged record (MAC). A record
    copied from an earlier rotation or moved within the sector is rejected.
@@ -559,7 +614,7 @@ QSPI, about 0.53 s per 64 KB erase):
 |---|---|
 | **1** | Major 5: header, records, rotation, mount search and doubt rule; ceilings, `seg_owner` and compaction state as records; geometry; features with `LARGE_PAYLOADS`; the fuse word with every bit but `MAC_FAIL` |
 | **2** | PR #63 rebased onto it: `suite` and `PROTECTED`, header and record MACs, the random compaction prefix; `MAC_FAIL` |
-| **3** | PR #62's `DELTA` rebased onto it: slot flag bit 5, marked on first use |
+| **3** | PR #62's `DELTA` rebased onto it: slot flag bit 5, set at format |
 
 ## 13. Open items
 
@@ -580,3 +635,8 @@ QSPI, about 0.53 s per 64 KB erase):
 6. **Evidence across a format**: fuses that outlive a format need storage
    outside the partition (OTP, UICR, a reserved sector). That is out of scope
    here, and D12 keeps the fuses with the store.
+7. **The upgrade call**: its name and form (`blob_db_feature_enable()`, or a
+   Kconfig opt-in that upgrades at mount) and its phase. Phase 1 needs none,
+   because enabling a feature on a development store can format it.
+   §4.2 fixes what the call must do: two rotations, and no use of the feature
+   before both have landed.
