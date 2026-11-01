@@ -17,6 +17,7 @@ Status: v2 · Top-level document; per-layer detail lives in `doc/layers/`
 | `doc/layers/l1_root_registry.md` | L1½ — root registry (optional helper): key → structure-root map; owns id = 1 when enabled |
 | `doc/layers/l2_containers.md` | L2 — containers: seq, kvlist, kvhash, kvtree, logring |
 | `doc/layers/l3_interfaces.md` | L3 — access interfaces: kvdb, blobfs, settings |
+| `doc/application_model.md` | Building an application on the stack: recommendations for an application's own data model — access interface, one registry key, superblock, versioning |
 | `doc/impl/l1_bucketlog.md` | **Implementation design** (non-normative): the v1 bucket-log allocator — formats, algorithms, costs, open items |
 | `doc/impl/l0_backends.md` | **Implementation design** (non-normative): the two L0 providers — operation mapping, geometry overhead, measured costs |
 | `doc/impl/l2_logring.md` | **Implementation design**: the `logring` per-entry log — format, algorithms, crash model |

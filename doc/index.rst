@@ -33,6 +33,7 @@ instructions live in the repository ``README.md``.
    layers/l1_root_registry
    layers/l2_containers
    layers/l3_interfaces
+   application_model
 
 .. toctree::
    :maxdepth: 1

@@ -29,6 +29,11 @@ extern "C" {
  * an instance is *first created* and then persisted, so every later open binds
  * the right one automatically.
  *
+ * kvdb suits a few settings or one flat map. An application with its own data
+ * model should not build it from kvdb instances, each of which takes a
+ * root-registry entry; it should keep one superblock behind one registry key
+ * (doc/application_model.md).
+ *
  * @section kvdb_instances Multiple instances
  *
  * A kvdb is named. Distinct names are fully independent stores — you can keep

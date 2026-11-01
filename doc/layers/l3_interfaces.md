@@ -56,6 +56,11 @@ different names is *detected* (`-EEXIST`), never silently merged.
 Each L3 interface `select`s `BLOB_ROOTREG`. Enabling a new interface, or a new
 named instance, is just another key — no root-format migration.
 
+That is for interface instances, not for an application's tables. The registry
+is shared by the whole partition and capped at `CONFIG_ROOTREG_MAX_ROOTS`
+entries; an application with its own data model takes **one** key, pointing at
+its superblock (`doc/application_model.md`).
+
 ## 3. `kvdb` — key/value database
 
 The headline interface: `NUL-terminated string key → opaque byte value`. A thin
