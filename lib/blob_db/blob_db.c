@@ -309,10 +309,13 @@ static int read_master(uint8_t slot, struct blob_db_master_hdr *out,
 	return 0;
 }
 
+/* Write a master to sector @p slot. The ceiling and the segmented-write
+ * marker always come from st, so every master carries the state the session
+ * holds; only the generation, the slot and the compaction state are the
+ * caller's. Callers go through master_commit() or master_format(). */
 static int write_master(uint8_t slot, uint32_t gen, uint8_t state,
-			uint16_t compacting_bid, uint64_t next_id_hint)
+			uint16_t compacting_bid)
 {
-	const uint64_t seg_owner = st.seg_owner;
 	int rc;
 
 	/* Staged 0xff-filled so any write-alignment padding matches erased
@@ -334,8 +337,8 @@ static int write_master(uint8_t slot, uint32_t gen, uint8_t state,
 	hdr->generation     = gen;
 	hdr->state          = state;
 	hdr->compacting_bid = compacting_bid;
-	hdr->next_id_hint   = next_id_hint;
-	hdr->seg_owner      = seg_owner;
+	hdr->next_id_hint   = st.next_id_hint;
+	hdr->seg_owner      = st.seg_owner;
 	hdr->hdr_crc32      = hdr_crc32(hdr, sizeof(*hdr));
 
 	const size_t a = st.write_align ? st.write_align : 1;
@@ -355,25 +358,69 @@ static int write_master(uint8_t slot, uint32_t gen, uint8_t state,
 	return 0;
 }
 
-/* Persist a raised leading id ceiling by committing a fresh CLEAN master on
- * the inactive slot (double-buffered: a torn write leaves the old ceiling,
- * which is still a safe — if lower — bound, and leaves only one valid master,
- * so mount re-raises it from the scan). On success the new master is
- * active. */
-static int persist_next_id_hint(uint64_t new_hint)
+/* Commit the session's master state: st.next_id_hint and st.seg_owner, with
+ * the given compaction state, to the inactive sector at the next generation.
+ * On success that sector becomes the active one. Double-buffered: a torn
+ * write leaves the previous master standing beside an invalid one, which mount
+ * treats as doubt (see mount_impl()).
+ *
+ * The only path that writes a master outside a format. A caller sets
+ * the st fields it changes, commits, and puts them back if the commit fails,
+ * so RAM never holds a state that is not on flash. */
+static int master_commit(uint8_t state, uint16_t compacting_bid)
 {
 	const uint8_t inactive = !st.active_master;
+	const int rc = write_master(inactive, st.master_gen + 1, state,
+				    compacting_bid);
 
-	int rc = write_master(inactive, st.master_gen + 1, BLOB_DB_STATE_CLEAN,
-			      0, new_hint);
 	if (rc < 0) {
-		LOG_ERR("persist next_id_hint=%llu failed: %d",
-			(unsigned long long)new_hint, rc);
 		return rc;
 	}
 	st.active_master = inactive;
 	st.master_gen++;
+	return 0;
+}
+
+/* Start the master state over, as a format does: next id 2, since the root
+ * (id 1) is consumed at format time (see @blob_db_root in blob_db.h), no
+ * segmented write in flight, and master A at generation 1, replacing whatever
+ * that sector held. The caller deals with master B. st is reset before the
+ * write, so the master carries nothing over from the session before the
+ * format. */
+static int master_format(void)
+{
+	st.next_id      = 2;
+	st.next_id_hint = 2;
+	st.seg_owner    = 0;
+
+	const int rc = write_master(BLOB_DB_MASTER_A_SECTOR, 1,
+				    BLOB_DB_STATE_CLEAN, 0);
+
+	if (rc < 0) {
+		return rc;
+	}
+	st.active_master = BLOB_DB_MASTER_A_SECTOR;
+	st.master_gen    = 1;
+	return 0;
+}
+
+/* Persist a raised leading id ceiling with a CLEAN master. A torn write
+ * leaves the old ceiling, which is still a safe — if lower — bound, beside an
+ * invalid master, so mount re-raises it from the scan. */
+static int persist_next_id_hint(uint64_t new_hint)
+{
+	const uint64_t prev = st.next_id_hint;
+
 	st.next_id_hint = new_hint;
+
+	int rc = master_commit(BLOB_DB_STATE_CLEAN, 0);
+
+	if (rc < 0) {
+		st.next_id_hint = prev;
+		LOG_ERR("persist next_id_hint=%llu failed: %d",
+			(unsigned long long)new_hint, rc);
+		return rc;
+	}
 	LOG_DBG("id ceiling raised to %llu (master gen=%u)",
 		(unsigned long long)new_hint, st.master_gen);
 	return 0;
@@ -483,10 +530,7 @@ static int format_masters_fresh(void)
 		return rc;
 	}
 
-	/* Root id (=1) is consumed at format time (see @blob_db_root in
-	 * blob_db.h), so the leading ceiling starts at 2. */
-	rc = write_master(BLOB_DB_MASTER_A_SECTOR, 1,
-			  BLOB_DB_STATE_CLEAN, 0, 2);
+	rc = master_format();
 	if (rc < 0) {
 		return rc;
 	}
@@ -495,11 +539,6 @@ static int format_masters_fresh(void)
 	if (rc < 0) {
 		return rc;
 	}
-	st.active_master = BLOB_DB_MASTER_A_SECTOR;
-	st.master_gen = 1;
-	st.next_id = 2;
-	st.next_id_hint = 2;
-	st.seg_owner = 0;
 	return bind_root_empty();
 }
 
@@ -1635,14 +1674,11 @@ static int compact_commit(uint16_t bid, const uint8_t *new_buf, size_t new_len)
 	 * repair the bound ids, but the ceiling exists to cover the ids a scan
 	 * cannot see: allocated-but-unbound. Carry the ceiling forward instead.
 	 */
-	uint8_t inactive = !st.active_master;
-	int rc = write_master(inactive, st.master_gen + 1,
-			      BLOB_DB_STATE_COMPACTING, bid, st.next_id_hint);
+	int rc = master_commit(BLOB_DB_STATE_COMPACTING, bid);
+
 	if (rc < 0) {
 		return rc;
 	}
-	st.active_master = inactive;
-	st.master_gen++;
 
 	/* Step 2: scratch, then seal it. The seal is what makes step 3 safe to
 	 * start: until it lands, recovery must leave the bucket alone. */
@@ -1688,12 +1724,8 @@ static int compact_commit(uint16_t bid, const uint8_t *new_buf, size_t new_len)
 	COMPACT_OR_WEDGE(blob_db_store_erase(scratch_off, st.peb_size));
 
 	/* Step 5: leave atomic window. */
-	inactive = !st.active_master;
-	COMPACT_OR_WEDGE(write_master(inactive, st.master_gen + 1,
-				      BLOB_DB_STATE_CLEAN, 0, st.next_id_hint));
+	COMPACT_OR_WEDGE(master_commit(BLOB_DB_STATE_CLEAN, 0));
 #undef COMPACT_OR_WEDGE
-	st.active_master = inactive;
-	st.master_gen++;
 
 	return 0;
 }
@@ -1803,19 +1835,13 @@ static int recover_compaction(uint16_t bid)
 		return rc;
 	}
 
-	const uint8_t inactive = !st.active_master;
-
-	/* The ceiling, for the reason given in compact_commit(). Only mount
-	 * calls this, and mount has just set next_id = next_id_hint, so the two
-	 * are equal here today; naming the ceiling keeps that an observation
-	 * rather than something this write depends on. */
-	rc = write_master(inactive, st.master_gen + 1,
-			  BLOB_DB_STATE_CLEAN, 0, st.next_id_hint);
+	/* master_commit() writes the ceiling, for the reason given in
+	 * compact_commit(). Only mount calls this, and mount has just set
+	 * next_id = next_id_hint, so the two are equal here today. */
+	rc = master_commit(BLOB_DB_STATE_CLEAN, 0);
 	if (rc < 0) {
 		return rc;
 	}
-	st.active_master = inactive;
-	st.master_gen++;
 
 	LOG_INF("recover: complete; master gen=%u", st.master_gen);
 	return 0;
@@ -1927,19 +1953,16 @@ static int persist_seg_owner(uint64_t owner)
 		return 0;
 	}
 
-	const uint8_t inactive = !st.active_master;
 	const uint64_t prev = st.seg_owner;
 
 	st.seg_owner = owner;
 
-	int rc = write_master(inactive, st.master_gen + 1, BLOB_DB_STATE_CLEAN,
-			      0, st.next_id_hint);
+	int rc = master_commit(BLOB_DB_STATE_CLEAN, 0);
+
 	if (rc < 0) {
 		st.seg_owner = prev;
 		return rc;
 	}
-	st.active_master = inactive;
-	st.master_gen++;
 	return 0;
 }
 
@@ -3626,18 +3649,11 @@ static int format_whole_store(void)
 		return rc;
 	}
 
-	/* Root id (=1) is consumed at format time — see bind_root_empty(). */
-	rc = write_master(BLOB_DB_MASTER_A_SECTOR, 1, BLOB_DB_STATE_CLEAN, 0, 2);
+	/* The erase above took master B with it. */
+	rc = master_format();
 	if (rc < 0) {
 		return rc;
 	}
-
-	st.active_master = BLOB_DB_MASTER_A_SECTOR;
-	st.master_gen    = 1;
-	st.next_id       = 2;
-	st.next_id_hint  = 2;
-	st.seg_owner     = 0;
-
 	return bind_root_empty();
 }
 
@@ -3804,17 +3820,15 @@ static int erase_all_impl(void)
 	 * and a torn root rebind is repaired by mount's root-invariant
 	 * check. The caller asked for destruction; how much of it lands
 	 * before a crash is not part of the contract. */
-	const uint8_t inactive = !st.active_master;
+	const uint64_t prev_hint = st.next_id_hint;
 
-	rc = write_master(inactive, st.master_gen + 1,
-			  BLOB_DB_STATE_CLEAN, 0, 2);
+	st.next_id_hint = 2;
+	rc = master_commit(BLOB_DB_STATE_CLEAN, 0);
 	if (rc < 0) {
+		st.next_id_hint = prev_hint;
 		return rc;
 	}
-	st.active_master = inactive;
-	st.master_gen++;
 	st.next_id = 2;
-	st.next_id_hint = 2;
 
 	LOG_INF("erase_all: complete; next_id=%llu (master gen=%u)",
 		(unsigned long long)st.next_id, st.master_gen);
