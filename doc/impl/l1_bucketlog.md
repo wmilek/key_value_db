@@ -539,6 +539,14 @@ each live SEGMENT slot owned by that id checks the owner's index — O(N) sector
 reads, O(1) RAM beyond the segment tables, idempotent, and restartable after a
 crash during the sweep itself.
 
+Every append above, the segment, index and segment-tombstone slots included,
+takes its cursor through `confirm_cursor()`, as the inline writers do (§6.2).
+A log that ends at a programmed but unparseable header reads as full, so the
+writer compacts before appending instead of programming over the torn bytes.
+Releasing a segment compacts a bucket with no room rather than skipping it:
+the caller clears `seg_owner` once the release returns, so a skipped segment
+would not be left for a sweep, it would leak.
+
 ### 5.7 `iterate` / `count`
 
 Bucket-by-bucket full scan; callback runs against the resident sector buffer.
@@ -650,7 +658,11 @@ which is the answer the caller reaches anyway when compaction reclaims nothing.
 
 Torn slot write → `flags` still `0xff` or CRC fails → end-of-log at that
 offset; committed slots before it are intact; tail garbage is reclaimed by
-the next compaction.
+the next compaction. A torn slot whose header can still size it is stepped over
+like any rotten slot (§3.4). One torn inside its header ends the log on
+programmed bytes, and the next append to that bucket would be programmed over
+them and fail its own CRC. So every writer treats such a bucket as full and
+compacts it first (`confirm_cursor()`).
 
 ## 7. Kconfig
 

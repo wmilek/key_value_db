@@ -1272,6 +1272,28 @@ static int confirm_cursor(uint16_t bid, uint64_t id, struct bucket_scan *sc)
 	return 0;
 }
 
+#if defined(CONFIG_BLOB_DB_LARGE_PAYLOADS)
+/* The append cursor of formatted bucket @p bid, found by a walk and passed
+ * through confirm_cursor(), so a log that ends at a torn slot reads as full.
+ * For the writers that take the cursor from a walk rather than from
+ * bucket_cursor() -- the segment, index and segment-tombstone appends. */
+static int walk_cursor(uint16_t bid, uint64_t id, off_t *cursor)
+{
+	struct bucket_scan sc;
+	int rc = scan_bucket_for(bid, id, (off_t)st.peb_size, &sc);
+
+	if (rc < 0) {
+		return rc;
+	}
+	rc = confirm_cursor(bid, id, &sc);
+	if (rc < 0) {
+		return rc;
+	}
+	*cursor = sc.write_cursor;
+	return 0;
+}
+#endif
+
 #if defined(CONFIG_BLOB_DB_SLOT_INDEX)
 /* The slot index's answer for @p id, checked against the slot it names: one
  * 12-byte read in place of the walk. -EAGAIN when the index has no answer, or
@@ -2185,26 +2207,19 @@ static int seg_write_chunk(uint64_t owner, uint16_t seq, const void *chunk,
 			}
 			cursor = BLOB_DB_BUCKET_DATA_OFF;
 		} else {
-			struct bucket_scan sc;
-
-			rc = scan_bucket_for(bid, sid, (off_t)st.peb_size, &sc);
+			rc = walk_cursor(bid, sid, &cursor);
 			if (rc < 0) {
 				return rc;
 			}
-			cursor = sc.write_cursor;
 		}
 
 		if (cursor + (off_t)ssz > (off_t)st.peb_size) {
 			rc = compact_bucket(bid);
 			if (rc == 0) {
-				struct bucket_scan sc;
-
-				rc = scan_bucket_for(bid, sid,
-						     (off_t)st.peb_size, &sc);
+				rc = walk_cursor(bid, sid, &cursor);
 				if (rc < 0) {
 					return rc;
 				}
-				cursor = sc.write_cursor;
 			}
 			if (cursor + (off_t)ssz > (off_t)st.peb_size) {
 				LOG_DBG("segment %u: bucket %u full, reprobing",
@@ -2227,32 +2242,63 @@ static int seg_write_chunk(uint64_t owner, uint16_t seq, const void *chunk,
 	return -ENOSPC;
 }
 
-/* Tombstone a generation of segments. Best effort: what fails here is left for
- * the sweep, which is why the caller keeps seg_owner set until it returns. */
+/* Tombstone one segment. Returns 1 when the bucket had to be compacted first
+ * (so its slots moved), 0 when the tombstone went in without that, and a
+ * negative errno when it was not written at all: the segment then stays live,
+ * and only a sweep for its owner can still reclaim it.
+ *
+ * A bucket without room is compacted rather than skipped. The callers clear
+ * seg_owner once they return, so a skipped segment is not left to a sweep, it
+ * is leaked; and a log ending at a torn slot reads as full (walk_cursor()),
+ * which is the common case here, not a rare one. */
+static int seg_release_one(uint64_t sid)
+{
+	const uint16_t bid = id_to_bucket(sid);
+	const off_t ssz = (off_t)slot_size_for(0);
+	bool formatted;
+	bool compacted = false;
+	off_t cursor;
+	int rc = read_bucket_hdr(bid, &formatted);
+
+	if (rc < 0) {
+		return rc;
+	}
+	if (!formatted) {
+		return -ENOENT;
+	}
+	rc = walk_cursor(bid, sid, &cursor);
+	if (rc < 0) {
+		return rc;
+	}
+	if (cursor + ssz > (off_t)st.peb_size) {
+		rc = compact_bucket(bid);
+		if (rc < 0) {
+			return rc;
+		}
+		compacted = true;
+		rc = walk_cursor(bid, sid, &cursor);
+		if (rc < 0) {
+			return rc;
+		}
+		if (cursor + ssz > (off_t)st.peb_size) {
+			return -ENOSPC;
+		}
+	}
+	rc = append_slot2(bid, cursor, sid,
+			  BLOB_DB_SLOT_F_TOMBSTONE | BLOB_DB_SLOT_F_SEGMENT,
+			  NULL, 0, NULL, 0);
+	if (rc < 0) {
+		return rc;
+	}
+	return compacted ? 1 : 0;
+}
+
+/* Tombstone a generation of segments. Best effort: a failure leaves that
+ * segment live (see seg_release_one()). */
 static void seg_release(const uint8_t *ids, uint16_t k)
 {
 	for (uint16_t j = 0; j < k; j++) {
-		const uint64_t sid = seg_id_at(ids, j);
-		const uint16_t bid = id_to_bucket(sid);
-		bool formatted;
-
-		if (read_bucket_hdr(bid, &formatted) < 0 || !formatted) {
-			continue;
-		}
-
-		struct bucket_scan sc;
-
-		if (scan_bucket_for(bid, sid, (off_t)st.peb_size, &sc) < 0) {
-			continue;
-		}
-		if (sc.write_cursor + (off_t)slot_size_for(0) >
-		    (off_t)st.peb_size) {
-			continue;   /* sweep will get it */
-		}
-		(void)append_slot2(bid, sc.write_cursor, sid,
-				   BLOB_DB_SLOT_F_TOMBSTONE |
-					   BLOB_DB_SLOT_F_SEGMENT,
-				   NULL, 0, NULL, 0);
+		(void)seg_release_one(seg_id_at(ids, j));
 	}
 }
 
@@ -2351,11 +2397,23 @@ static int seg_sweep(uint64_t owner)
 				continue;
 			}
 
-			uint8_t one[sizeof(uint64_t)];
-
-			memcpy(one, &sh.id, sizeof(one));
-			seg_release(one, 1);
-			dropped++;
+			rc = seg_release_one(sh.id);
+			if (rc >= 0) {
+				dropped++;
+			}
+			if (rc == 1) {
+				/* Compaction rewrote this bucket under the
+				 * walk: start it again. It ends, since every
+				 * restart follows a tombstone written, and
+				 * the walk skips a tombstoned segment. */
+				cursor = BLOB_DB_BUCKET_DATA_OFF;
+			} else if (rc < 0 && rc != -ENOENT) {
+				/* Not written. Every segment tombstone is the
+				 * same size, so none fits here; and if this
+				 * compacted, the cursor no longer names a
+				 * slot boundary. */
+				break;
+			}
 		}
 	}
 
@@ -2397,13 +2455,10 @@ static int index_commit(uint64_t id, const struct blob_db_index_hdr *h,
 		}
 		cursor = BLOB_DB_BUCKET_DATA_OFF;
 	} else {
-		struct bucket_scan sc;
-
-		rc = scan_bucket_for(bid, id, (off_t)st.peb_size, &sc);
+		rc = walk_cursor(bid, id, &cursor);
 		if (rc < 0) {
 			return rc;
 		}
-		cursor = sc.write_cursor;
 	}
 
 	if (cursor + (off_t)slot_size_for(idx_len) > (off_t)st.peb_size) {
@@ -2411,14 +2466,10 @@ static int index_commit(uint64_t id, const struct blob_db_index_hdr *h,
 		if (rc < 0) {
 			return rc;
 		}
-
-		struct bucket_scan sc;
-
-		rc = scan_bucket_for(bid, id, (off_t)st.peb_size, &sc);
+		rc = walk_cursor(bid, id, &cursor);
 		if (rc < 0) {
 			return rc;
 		}
-		cursor = sc.write_cursor;
 		if (cursor + (off_t)slot_size_for(idx_len) > (off_t)st.peb_size) {
 			return -ENOSPC;
 		}
