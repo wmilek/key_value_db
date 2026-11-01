@@ -1,7 +1,8 @@
 # Implementation plan — the master as a log, and format features
 
-2026-11-01 · plan for `2026-10-28-master-log.md` (cited below as "the proposal")
-· written against `main` at `d5461a0`
+2026-11-01 · plan for `2026-10-28-master-log.md` as revised in #99 (cited
+below as "the proposal")
+· written against `main` at `e00702c`
 · touches `lib/blob_db/`, `include/app/lib/blob_db_{inspect,iostats}.h`,
 `tests/lib/blob_db/`, `app_perf_blob_db/`, `doc/impl/l1_bucketlog.md`
 
@@ -9,469 +10,516 @@
 
 ## 0. Scope
 
-Phase 1 of the proposal is planned here in full: major 5, the log, rotation,
-the mount search and doubt rule, geometry, the feature sets with
-`LARGE_PAYLOADS`, and the fuse word. Phases 2 (PR #63) and 3 (PR #62) are
-rebases onto it, and §8 lists only what each one has to change.
+This plan covers phase 1 of the proposal: major 5, the log, rotation, mount,
+geometry, recovery keyed on the scratch seal (D17), the foreign-slot rules
+(D13), features set at format with `LARGE_PAYLOADS`, ceilings carried by
+every record (D14), and the fuse field carried forward with no trip points.
+Phases 2 and 3 (PR #63, PR #62) and the later fuse-trip phase appear in §7,
+listed only by what each needs from phase 1.
 
-Reading the code against the proposal turned up eight points where the
-proposal is incomplete or, in two cases, unsafe as written. §1 lists them
-with the fix this plan uses. The two unsafe ones are A1 and A2: as written,
-each lets an id be issued twice. Both fixes are small, and each should go
-back into the proposal before PR 2 lands.
+Five points in the proposal need an amendment before code (§1). B1 and B2
+are correctness problems: B1 can issue an id twice, and B2 can leave a
+bucket that refuses every write after one power cut. B3–B5 are gaps the
+proposal leaves open, and the code has to pick an answer for each. Every
+amendment says which text in the proposal it changes, so it can go back
+into the proposal before the PR that implements it lands.
 
-## 1. Changes to the proposal
+## 1. Amendments to the proposal
 
-| # | Proposal says | Problem | This plan |
-|---|---|---|---|
-| **A1** | §3.5: doubt when "the other sector is neither erased nor ok" | **A torn rotation hides lost ceilings.** Suppose sector Y is active and its header rots. Mount falls back to X, which is full and has an older ceiling. Doubt (Y is corrupt), so mount scans and raises the ceiling. Persisting the new ceiling needs a rotation into Y. If power is cut after Y's erase, the next mount sees X ok and Y erased, finds no doubt, and takes X's old ceiling. Ids above it that are already on flash get issued again. | Also doubt when **the other sector is erased and the active one is full**. Rotation only ever leaves a full sector behind, so the non-active ok sector is always full. A full sector beside an erased one is therefore exactly what a rotation torn after its erase looks like. Right after a format the other sector is erased too, but the active one is not full, so this costs nothing in the common case. |
-| **A2** | §3.3: "`cursor += R` also on failure" | **A failed append can leave a hole.** If `flash_area_write()` fails before programming anything (a driver timeout, `-EIO` from UBI), the slot stays erased. The next update writes the slot after it. The binary search (D3) assumes written slots form a prefix, so it can stop at the hole and adopt the record before it. That record verifies, so there is no doubt, and an acknowledged ceiling is lost. | **After a failed append, the sector is closed.** A RAM flag makes every later update rotate. In the same call, the failed append is followed by one rotation attempt, so the update still commits if the other sector works. In the active sector the written slots stay a strict prefix, and the binary search stays correct. It costs one erase, and only on a write failure. |
-| A3 | §3.4: new header gets `rot_gen + 1` | After a fallback the active sector is the *older* one, so +1 can equal the rot_gen of the sector it is about to replace. | `rot_gen = max(rot_gen of every ok header) + 1`. |
-| A4 | §4.4: check `store.incompat` = header ∪ newest record | If the newer sector carries a bit and mount falls back to the older one (A3's case), the store may already hold slots using that bit. | Check the union of **both ok headers** and the adopted record. |
-| A5 | §3.1: `rec_size` stored | Nothing says what a reader does with a value other than its own. | Refuse with `-ENOTSUP` unless `rec_size` equals the build's R. It is a geometry field, like `peb_size`. |
-| A6 | §3.5: scan on doubt; persist only if the scan out-ran the ceiling | Under today's A/B scheme, the next master write repairs a corrupt other sector. With the log, that sector can stay corrupt for up to 1 362 updates, and every mount until then scans every bucket. | A doubt mount always commits one record before it returns. If the doubt came from the other sector (corrupt, or a header with no verifying record) or from A1, the commit **rotates**. Otherwise it **appends**. Either way the next mount finds no doubt. |
-| A7 | §4.5 Wedge: "one best-effort record append, with the state unchanged" | In the code the wedge happens inside the atomic window, where the stored state is `COMPACTING(bid)`. | Stating it outright: the wedge record repeats `COMPACTING(bid)`. A `CLEAN` record there would skip recovery. |
-| A8 | §4.2: a record that marks the feature precedes the first segmented write | Every INDEXED or SEGMENT slot is already preceded by `persist_seg_owner(id ≠ 0)` (`blob_db.c` 2503, 2616, 2914, 3030), which commits a record. | The marking rides on that record, so marking `LARGE_PAYLOADS` costs nothing extra. Phase 3 needs a standalone `feature_mark()` for `DELTA`. |
+### B1 — Format writes both master sectors; any other sector that is not ok means doubt
+
+**Problem.** §3.5 doubts when the other sector is "neither erased nor ok". It
+does not doubt when the other sector is erased. That leaves the following
+path on flash_area, and on UBI with `ATOMIC_REPLACE=n`:
+
+1. Sector Y is active. Its header rots.
+2. Mount: X is the only ok sector, so `hi = X`, it is usable, and
+   `fell_back = no`. Y is corrupt, so mount doubts, scans, and raises
+   `next_id`, in RAM only (§3.5 step 2).
+3. Ending the doubt rotates into Y. Power is cut after Y's erase.
+4. Next mount: X is ok, Y is erased. None of the doubt conditions hold, so
+   mount takes X's ceiling. That ceiling is older than the ceilings Y carried,
+   so ids bound under Y's ceilings are issued again.
+
+§7 row 2 already says "the other sector erased or corrupt → doubt", which
+contradicts §3.5. Tightening the rule to "erased beside a full active
+sector" is not enough, because a sector closed by a failed write (§3.3) is
+not full.
+
+**Change.** Formats write both master sectors, so after a completed format
+no master sector is erased again except inside a rotation:
+
+- `blob_db_format()`, the virgin format at mount and an autoformat erase
+  both master sectors. They write B with `rot_gen = 1`, then A with
+  `rot_gen = 2`, each with a header and a record[0] for the same state.
+- §3.5: `doubt = … or the other sector is not ok` (erased, corrupt or
+  foreign). This is today's rule (`ca != MASTER_OK || cb != MASTER_OK`)
+  carried over.
+- Ending the doubt: "the other sector is not ok" is a reason to rotate,
+  alongside `fell_back` and damage.
+- A cut between the two format writes leaves A erased and B ok. Mount
+  doubts, and the scan is cheap because format invalidates every bucket
+  first. Mount then rotates into A. A cut inside B's write leaves no usable
+  master and an erased A: `-EIO`, as a torn first master gives today
+  (proposal test 3b).
+- Cost: one sector write per format. Formats erase both master sectors
+  already. Steady state is unchanged.
+
+**Proposal text.** §3.5 (the doubt rule and how the doubt ends), §4.2 (format
+writes both headers; the invariant is then "every ok sector carries every
+bit" with no erased sector beside an ok one), §7 rows 1–2, and test 3a (add
+"an erased other sector").
+
+### B2 — The compaction guard covers only bytes beyond one slot span
+
+**Problem.** §4.2 makes compaction refuse (`-EIO`) whenever the old bucket
+holds programmed bytes past the point where its walk stopped. The argument
+that nothing can follow a torn slot assumes bytes are programmed in order. A
+QSPI NOR page program (256 B, the nRF5340-DK's MX25R) programs the whole page
+at once, so a cut can leave programmed bits anywhere in the page, beyond a
+header torn too badly for the walk to size it. Every later write to that
+bucket compacts first (`confirm_cursor()`, #98), and every compaction
+refuses. One power cut leaves the bucket refusing writes until a format,
+which breaks P7.
+
+**Change.** A single append writes at most
+`span = slot_size_for(CONFIG_BLOB_DB_MAX_PAYLOAD_LEN)` bytes from where the
+walk stopped. Compaction refuses only if a programmed byte lies at or beyond
+`stop + span`. Programmed bytes inside that span are what one torn append
+leaves, and they are dropped as today. With B3 in place, the guard exists to
+catch data whose origin is unknown. The two known origins have their own
+answers: a foreign slot (D13), and a different payload cap (B3).
+
+**Proposal text.** The last two sentences of §4.2 and test 5a. Add: "a torn
+append that programmed bytes anywhere in its span, out of order, still
+compacts".
+
+### B3 — The maximum payload length and `write_align` become geometry
+
+**Problem.** The format depends on two values the header does not record:
+
+- `slot_walk_at()` (`blob_db.c:911`) ends the log at
+  `val_len > CONFIG_BLOB_DB_MAX_PAYLOAD_LEN`. A build with a smaller cap than
+  the build that wrote the store therefore reads a sealed, CRC-intact slot as
+  a torn tail. D13 does not catch it, because it requires a plausible
+  `val_len`. Today the next compaction then drops every slot after it. Under
+  the proposal, the B2 guard makes the bucket refuse writes.
+- Slot padding (`slot_size_for()`) rounds up to `write_align`, but
+  `rec_size` does not capture it, because 48 is a multiple of every
+  `write_align` from 1 to 16. A store written with one `write_align` and
+  walked with another parses slots at the wrong boundaries.
+
+**Change.** Header bytes 56..59, reserved until now:
+
+| Bytes | Field | Check at mount (every ok header, §4.4) |
+|---|---|---|
+| 56..57 | `max_payload_len` | must equal `CONFIG_BLOB_DB_MAX_PAYLOAD_LEN` |
+| 58..59 | `write_align` | must equal the device's |
+
+A mismatch is refused with `-ENOTSUP`, and nothing is written, the same as
+for `rec_size`. Requiring equality, rather than "the store's cap is at most
+the build's", keeps reading and writing symmetric. A build with a larger cap
+would write slots that the store's original build could no longer walk.
+Raising the cap therefore means a format, which is the same rule M8 applies
+to every other geometry value.
+
+**Proposal text.** The §3.1 table, M8, §4.4 (two more lines), and test 5b
+(refusals).
+
+### B4 — A store without a feature is written without it
+
+**Problem.** §4.4 lets a `LARGE_PAYLOADS` build mount a store formatted
+without the feature (`store.incompat ⊆ build.known`). D13 makes the walk
+accept the build's flags. Nothing then stops that build from writing INDEXED
+and SEGMENT slots into a store whose headers lack bit 0, which breaks the §4.2
+invariant ("every ok sector carries every feature bit the store has"). A
+build without the feature would then mount the store and hit foreign slots.
+
+**Change.** The store's bits decide what a build writes. The Kconfig option
+only decides what the build can read. A `LARGE_PAYLOADS` build on a store
+without bit 0 behaves like a build without the feature: `update()` and
+`write()` beyond `CONFIG_BLOB_DB_MAX_PAYLOAD_LEN` return `-EINVAL`, as they do
+there today. Reads are unchanged, since the store holds no segments. An
+upgrade (open item 7) is the only way to gain the feature. The rule applies
+to every slot-flag feature (`DELTA` in phase 3).
+
+Refusing the mount instead would be simpler, but it reverses the proposal's
+principle that "the store says which features it uses, and a build follows".
+
+**Proposal text.** §4.2 (a paragraph after "Set at format") and test 5 (an
+LP build on a non-LP store writes no segment; large writes return
+`-EINVAL`).
+
+### B5 — `erase_all` is the one record that lowers the ceiling
+
+**Problem.** D14 and §3.3 say that every record raises the ceilings with
+`max(...)`, "so no record ever publishes a ceiling below one already on
+flash". `blob_db_erase_all()` (`erase_all_impl()`) resets the id space and
+commits `next_id_hint = 2`, which is exactly such a record. The proposal does
+not mention it.
+
+**Change.** `erase_all`'s record sets `next_id_hint = 2 + 1 + STEP`
+directly, without the `max`. It is written only after every bucket is
+invalidated and the root is bound again, as today. This is safe for the
+reason today's comment gives: no id at or above 2 survives on flash except
+the root. A cut before the record lands leaves the old, higher ceiling,
+which is safe. A torn record means doubt, and the scan only raises the
+ceiling. `seq_hint` is never lowered: nonces under one key must never repeat,
+and `erase_all` does not change the key.
+
+**Proposal text.** §3.3 (an exception after the `max` rule), D14, and test
+2a (an `erase_all` followed by a cut at every byte of its record).
+
+### Earlier amendments, after #99
+
+The first version of this plan raised A1–A8 against the proposal before
+#99. Where each ended up:
+
+| | Outcome |
+|---|---|
+| A1 (torn rotation hides lost ceilings) | **still open; B1 replaces it**, with a fix that also covers closed sectors |
+| A2 (failed append leaves a gap) | adopted: D3, §3.2a, §3.3 |
+| A3 (`rot_gen = max + 1`) | dropped. With two sectors the rotation target is always the sector being replaced |
+| A4 (check features on every ok header) | adopted: §4.4 |
+| A5 (`rec_size` must match) | adopted: §3.1 |
+| A6 (a doubtful mount ends its doubt) | adopted: §3.5 |
+| A7 (the wedge record keeps `COMPACTING`) | dropped. D17 removes compaction state from the master |
+| A8 (mark the feature on the `seg_owner` record) | replaced by D7 (set at format) |
 
 ## 2. PR sequence
 
 | PR | Scope | Size (lib + tests) | Risk | Format |
 |---|---|---|---|---|
-| **1** | Refactor: one `master_commit()`, I/O wrappers | ~150 + 0 | low | unchanged (majors 1/2) |
-| **2** | Major 5: header, log, rotation, mount search, doubt, geometry; fuse word carried; iostats split | ~650 + ~600 | **high** | **break** (5; 1–4 refused) |
-| **3** | Feature sets and registry; `LARGE_PAYLOADS` marked on first use; slot flags from the store | ~200 + ~200 | medium | additive within 5 |
-| **4** | Fuses: trip points, persistence rules, inspect and shell | ~300 + ~400 | low–medium | none (field from PR 2) |
-| **5** | `l1_bucketlog.md` rewrite; DK re-measure in `RESULTS.md` | docs | low | — |
+| **1** | Refactor: one `master_commit()`, I/O wrappers | ~150 + 0 | low | unchanged |
+| **2** | Recovery keyed on the seal, on today's format (D17, first half) | ~80 + ~150 | low | unchanged |
+| **3** | Foreign slots and the compaction guard (D13 + B2) | ~150 + ~200 | medium | unchanged |
+| **4** | Major 5 (all of §5) | ~700 + ~700 | **high** | **break**: 5; 1–4 refused |
+| **5** | `l1_bucketlog.md`, `kvdb_book` tools, DK re-measure | docs | low | — |
 
-PR 2 must carry the fuse word, even though PR 4 is what trips fuses. The
-proposal requires every build that can write a major-5 record to carry the
-word forward (§4.5, first rule). A PR 2 build that wrote bytes 36..39 as
-zeros would be exactly the build that destroys fuses.
+PRs 2 and 3 are taken out of the format break on purpose. Neither depends on
+the master layout, and each fixes something the current code gets wrong:
 
-PRs 2–4 should merge back to back, with nothing released between them. Then
-the temporary measure in PR 2 (§4, last row) never reaches a board.
+- PR 2 fixes a rotten newest master hiding `COMPACTING` (proposal §6.1, last
+  paragraph).
+- PR 3 fixes a store written with flags this build does not know being
+  compacted down to its torn-tail reading.
 
-**Landing order against open PRs.** #89 changes `format_whole_store()` (one
-line, `blob_db_store_discard()`), #86 changes only the UBI backend and
-`ubi.c`, and #87 rewrites the slot walk where PR 3 and PR 4 hook in. Land all
-three first; each conflict is then a few lines. #63 and #62 rebase onto this
-work as phases 2 and 3 (§8).
+Both still work on majors 1/2. PR 4 can then remove the compaction master
+writes without changing the recovery logic in the same diff.
+
+**Landing order against open PRs.** Land #89 (`blob_db_store_discard()` in
+`format_whole_store()`), #86 (UBI backend only) and #87 (the slot walk, which
+PR 3 changes) first; each conflict is then a few lines. #63 and #62 rebase
+onto PR 4 as phases 2 and 3.
 
 ## 3. PR 1 — one commit path (no format change)
 
-Today eight call sites each run `write_master(inactive, gen + 1, …)` and then
-flip `active_master` and `master_gen` themselves: `persist_next_id_hint`,
+Eight sites each call `write_master(inactive, gen + 1, …)` and then flip
+`active_master` and `master_gen` themselves: `persist_next_id_hint`,
 `compact_commit` (×2), `recover_compaction`, `persist_seg_owner`,
-`erase_all_impl`, `format_masters_fresh` and `format_whole_store`. PR 2 has to
-change every one of them. A refactor first keeps PR 2's diff to the format
-itself.
+`erase_all_impl`, `format_masters_fresh` and `format_whole_store`.
 
 `lib/blob_db/blob_db.c`
-- `st` gains `uint8_t m_state; uint16_t m_cbid;`. Together with the existing
-  `next_id_hint` and `seg_owner`, that is the whole mutable state a record
-  will carry.
-- `static int master_commit(void)` writes the state in `st` and, on success,
-  advances the A/B pointer. Each caller sets the fields it changes, calls it,
-  and restores the old values on failure, as `persist_seg_owner()` does today.
-- `static int master_format(uint64_t next_id_hint)` covers the two format
-  paths (sector A written, sector B erased, generation 1).
-- I/O wrappers `io_read/io_write/io_erase/io_replace` replace the 33 direct
-  `blob_db_store_*` calls outside the master code. They do nothing yet. PR 4
-  makes them trip `IO_ERR`, and the master code keeps calling the store
-  directly, so a failed record trips `MASTER_WRITE_FAIL` only (proposal row
-  8 vs 9).
+- `static int master_commit(void)` writes the state held in `st`
+  (`next_id_hint`, `seg_owner`, and for now the compaction state). On
+  success it advances the A/B pointer. Each caller sets the fields it
+  changes, calls it, and restores the old values on failure, as
+  `persist_seg_owner()` already does.
+- `static int master_format(void)` covers both format paths, so B1's
+  second write lands in one place in PR 4.
+- `io_read/io_write/io_erase/io_replace` replace the direct `blob_db_store_*`
+  calls outside the master code. They do nothing yet; the fuse-trip phase
+  hooks `IO_ERR` here.
 
-Tests: unchanged and green on every scenario in `testcase.yaml`. Doing
-nothing visible is the point of this PR.
+Tests: unchanged and green on every scenario.
 
-## 4. PR 2 — major 5
+## 4. PR 2 and PR 3 — behaviour on today's format
 
-### 4.1 Layout (`blob_db_internal.h`)
+### 4.1 PR 2: recovery keyed on the seal
+
+- `mount_impl()` reads the scratch seal at every mount, after the master is
+  adopted and before the doubt scan. `recover_compaction()` takes the
+  bucket from the image's own header, which its CRC covers. It checks
+  `bucket_id < n_buckets`, and checks that the bucket header is valid as
+  today. It no longer needs the master's `compacting_bid`.
+- The `if (m->state == COMPACTING)` branch goes. `compact_commit()` still
+  writes `COMPACTING`/`CLEAN` around the window, so a build older than this
+  PR still recovers a store that this build left mid-compaction. PR 4 removes
+  those writes.
+- `recover_compaction()` writes its `CLEAN` master only when the stored state
+  is `COMPACTING`. A seal found beside a `CLEAN` master (the hole being
+  closed) needs no master write.
+- The check runs on every backend, the atomic UBI path included (§6.1:
+  atomic replace is a build option the format does not record).
+- Tests (§11.1a): convert `test_mid_compaction_crash_recovery` to a forged
+  sealed scratch. Add "a sealed scratch beside a `CLEAN` master is restored",
+  which fails on today's code. Add "a sealed scratch left by
+  `ATOMIC_REPLACE=n` is restored by an atomic build", as a two-scenario case
+  that shares one flash image, or by forging the seal on UBI. Run
+  `power_cut.c` unchanged.
+
+### 4.2 PR 3: foreign slots and the compaction guard
+
+- `slot_walk_at()` and `scan_bucket_for()` tell **foreign** apart from the
+  end of the log. A slot is foreign when it is sealed, has `val_len ≤ cap`,
+  fits the sector, has a CRC that verifies, and carries a flag outside
+  `BLOB_DB_SLOT_F_KNOWN`. The walk reports it through a new
+  `bucket_scan.foreign`, beside `tail_torn`. The known flags stay fixed at
+  compile time (D13).
+- A foreign bucket refuses every mutation with `-ENOTSUP`
+  (`update`/`write`/`delete` paths, before `confirm_cursor()`) and is never
+  compacted. Every read of an id hashing to it returns `-EIO`.
+  `iterate()`/`count()` return `-EIO` as soon as they reach it. The proposal
+  does not say what they do; this plan picks `-EIO`, because a silently short
+  count is the stale answer D13 exists to remove. The slot index forgets the
+  bucket, as `scan_bucket()` already does on an unknown flag.
+- Compaction guard (B2): `build_compacted_image()` returns the walk's stop
+  offset. `compact_bucket()` reads `[stop + span, peb_size)` out of the
+  resident `g_bbuf`, so no extra flash read, and refuses with `-EIO` if any
+  byte there is not `0xff`.
+- Tests (§11.5a, plus B2): a forged foreign slot in the middle of a bucket
+  gives writes `-ENOTSUP`, reads `-EIO`, and no compaction or erase
+  (iostats). A torn tail still compacts. A torn append with stray bits
+  programmed anywhere in its span still compacts (B2). Programmed bytes
+  beyond the span make compaction refuse.
+
+## 5. PR 4 — major 5
+
+### 5.1 Layout (`blob_db_internal.h`)
 
 ```c
-#define BLOB_DB_FORMAT_MAJOR      5      /* both builds: features replace 1/2 */
-#define BLOB_DB_FORMAT_MINOR      0
-#define BLOB_DB_MASTER_LOG_OFF    BLOB_DB_MASTER_HDR_MAX   /* 128 */
+#define BLOB_DB_FORMAT_MAJOR      5      /* every build; features replace 1/2 */
+#define BLOB_DB_FORMAT_MINOR      0      /* fixed for major 5 (D15)            */
 
-struct __packed blob_db_master_hdr {      /* 64 B; written once per erase */
-	struct blob_db_compat_hdr compat;  /*  0..11 frozen                 */
-	uint32_t rot_gen;                  /* 12..15                        */
-	uint32_t peb_size;                 /* 16..19                        */
-	uint16_t n_buckets;                /* 20..21                        */
-	uint16_t rec_size;                 /* 22..23 R, write_align-rounded */
-	uint32_t incompat;                 /* 24..27                        */
-	uint32_t ro_compat;                /* 28..31                        */
-	uint32_t compat;                   /* 32..35                        */
-	uint8_t  suite;                    /* 36    0 = unprotected         */
-	uint8_t  reserved0[3];             /* 37..39                        */
-	uint8_t  store_uuid[16];           /* 40..55 0 unless protected     */
-	uint32_t reserved1;                /* 56..59                        */
-	uint32_t hdr_crc32;                /* 60..63 over [0, 60)           */
+struct __packed blob_db_master_hdr {      /* 64 B unprotected */
+	struct blob_db_compat_hdr compat;  /*  0..11 frozen                  */
+	uint32_t rot_gen;                  /* 12..15                         */
+	uint32_t peb_size;                 /* 16..19                         */
+	uint16_t n_buckets;                /* 20..21                         */
+	uint16_t rec_size;                 /* 22..23                         */
+	uint32_t incompat;                 /* 24..27                         */
+	uint32_t ro_compat;                /* 28..31                         */
+	uint32_t compat;                   /* 32..35                         */
+	uint8_t  suite;                    /* 36                             */
+	uint8_t  reserved0[3];             /* 37..39                         */
+	uint8_t  store_uuid[16];           /* 40..55                         */
+	uint16_t max_payload_len;          /* 56..57  B3                     */
+	uint16_t write_align;              /* 58..59  B3                     */
+	uint32_t hdr_crc32;                /* 60..63 over [0, 60)            */
 };
 
-struct __packed blob_db_master_rec {      /* 48 B; one per update */
-	uint32_t rec_no;                   /*  0..3  == slot index          */
-	uint8_t  state;                    /*  4                            */
-	uint8_t  reserved0;                /*  5                            */
-	uint16_t compacting_bid;           /*  6..7                         */
-	uint64_t next_id_hint;             /*  8..15                        */
-	uint64_t seq_hint;                 /* 16..23 0 until phase 2        */
-	uint64_t seg_owner;                /* 24..31                        */
-	uint32_t incompat;                 /* 32..35                        */
-	uint32_t fuses;                    /* 36..39 FROZEN for major 5     */
-	uint32_t reserved1;                /* 40..43                        */
-	uint32_t crc32;                    /* 44..47 over [0, 44)           */
+struct __packed blob_db_master_rec {      /* 48 B unprotected */
+	uint32_t rec_no;                   /*  0..3  == slot index           */
+	uint32_t reserved0;                /*  4..7  (D17: no compaction state) */
+	uint64_t next_id_hint;             /*  8..15                         */
+	uint64_t seq_hint;                 /* 16..23 0 until phase 2         */
+	uint64_t seg_owner;                /* 24..31                         */
+	uint32_t reserved1;                /* 32..35 features: header only   */
+	uint32_t fuses;                    /* 36..39 FROZEN for major 5      */
+	uint32_t reserved2;                /* 40..43                         */
+	uint32_t crc32;                    /* 44..47 over LE32(rot_gen) ‖ [0,44) (D16) */
 };
 ```
 
-The proposal's offsets are fixed with `BUILD_ASSERT(offsetof(...))`, one per
-field. The assert on `fuses` carries a comment that moving it is a new major.
+There is one `BUILD_ASSERT(offsetof(...))` per field. The assert on `fuses`
+says that moving the field is a new major.
 
-### 4.2 RAM (`st`)
+### 5.2 RAM (`st`)
 
 | Today | Becomes |
 |---|---|
 | `active_master`, `master_gen` | `active_master`, `rot_gen` |
-| — | `uint16_t log_next` (next free slot), `uint16_t log_cap` ((peb − 128) / R), `bool log_closed` (A2) |
-| — | `uint32_t incompat`, `uint32_t fuses`, `uint32_t fuses_new` |
+| — | `uint16_t log_next`, `uint16_t log_cap`, `bool log_failed` (§3.3) |
+| — | `uint32_t incompat, ro_compat, compat` (the header's, copied at rotation), `uint32_t fuses` |
 
-That is 16 B, within M9. `fuses_new` holds bits tripped but not yet on
-flash; "pending" means `fuses_new != 0`.
+That is about 24 B, matching M9.
 
-### 4.3 Commit, append, rotate
+### 5.3 Commit, append, rotate (§3.3, §3.4, D14, B5)
 
 ```c
-static int master_commit(void)                 /* from PR 1, now a log */
+static int master_commit(void)
 {
-	if (!st.log_closed && st.log_next < st.log_cap) {
-		int rc = log_append();
-		if (rc == 0) {
-			goto committed;
-		}
-		st.log_closed = true;                  /* A2: never append past a hole */
-		fuse_trip(BLOB_DB_FUSE_MASTER_WRITE_FAIL);
+	struct blob_db_master_rec r;
+
+	rec_fill(&r);             /* hint = max(st.hint, next + 1 + STEP), unless
+	                           * st.ceiling_reset (B5); fuses = st.fuses */
+	int rc = (st.log_failed || st.log_next == st.log_cap)
+		 ? rotate(&r)
+		 : log_append(&r);  /* log_next++ whatever the outcome;
+		                     * on error log_failed = true */
+	if (rc == 0) {
+		st.next_id_hint = r.next_id_hint;   /* RAM after flash */
 	}
-	int rc = rotate();                             /* full, closed, or append failed */
-	if (rc < 0) {
-		fuse_trip(BLOB_DB_FUSE_MASTER_WRITE_FAIL);
-		return rc;
-	}
-committed:
-	st.fuses |= st.fuses_new;
-	st.fuses_new = 0;
-	return 0;
+	st.ceiling_reset = false;
+	return rc;
 }
 ```
 
-- `log_append()` fills a record from `st` with
-  `fuses = st.fuses | st.fuses_new`, the CRC, and padding to R with 0xff. It
-  writes it with `blob_db_store_write()` at `128 + log_next × R` and
-  increments `log_next` whatever the outcome.
-- `rotate()` stages the header and record[0] in one 0xff-filled buffer of
-  128 + R bytes, at most 256 B on the stack, twice today's 128 B. It writes
-  them with `blob_db_store_replace(other)`. On success it sets
-  `active_master = other`, `rot_gen = max + 1` (A3), `log_next = 1` and
-  `log_closed = false`. The header's `incompat` is `st.incompat`, which by
-  then already holds every bit the old header and records carried.
-- `write_align > 128` is refused at open, as `write_master()` refuses it
-  today.
+- `rotate()` stages the header and record[0] in a buffer of 128 + R bytes,
+  filled with `0xff`, at most 256 B on the stack. It writes them with
+  `blob_db_store_replace(other)`. The header copies `st`'s feature sets
+  verbatim and sets `rot_gen + 1`. A `rot_gen` that would wrap returns
+  `-ENOSPC` (§3.0).
+- `persist_next_id_hint()` keeps its trigger: commit only when
+  `next_id ≥ next_id_hint`. Other commits carry the ceiling forward (D14). A
+  run of segmented writes therefore needs no ceiling-only records.
+- `compact_commit()` and `recover_compaction()` lose their master writes
+  (D17, second half). The scratch-path window is erase scratch → image →
+  seal → erase bucket → image → erase scratch. `st` loses `m_state` and
+  `m_cbid`.
+- `erase_all_impl()` sets `st.ceiling_reset` and `next_id = 2`, then commits
+  (B5).
 
-### 4.4 Mount
+### 5.4 Format (B1)
 
-`read_master()` splits in two:
+```c
+static int master_format(void)
+{
+	/* both master sectors already erased by the caller's erase */
+	rc = write_hdr_and_rec0(B, /*rot_gen*/ 1, features = build's slot-flag features);
+	rc = write_hdr_and_rec0(A, 2, same);           /* active = A, log_next = 1 */
+}
+```
 
-- `master_classify(slot, &hdr, &cls)` reads only [0, 128). The
-  ERASED/CORRUPT/FOREIGN/OK rules stay as they are, with these additions:
-  major ≠ 5 is FOREIGN (D10); `peb_size`, `n_buckets` or `rec_size` (A5)
-  different from the device's is FOREIGN; feature bits are checked in PR 3.
-- `log_load(slot, &rec, &tail_bad)`:
-  1. Binary search for the first slot whose R bytes all read 0xff, in
-     [1, log_cap]. Record[0] is written together with the header, so slot 0
-     is never the end. That is about log₂(cap) reads of R bytes each.
-  2. Walk back from that slot to the first record whose CRC verifies and
-     whose `rec_no` equals its slot index. `tail_bad` says whether the slot
-     just before the end failed.
-  3. Return `-ENOENT` if no record verifies.
+`format_masters_fresh()` (virgin) keeps its order: invalidate the buckets,
+erase both masters, then `master_format()`. `format_whole_store()` erases
+the store (or calls `blob_db_store_discard()` once #89 lands), then calls
+`master_format()`. `fuses = 0` in both record[0]s (D12).
 
-`mount_impl()` is restructured around them:
+### 5.5 Mount (§3.5 with B1)
+
+`read_master()` splits into `master_classify()` (the header window only) and
+`log_load()`, which reads every slot of a sector (D3). Instead of 1 362
+reads of 48 B, `log_load()` reads the sector into `g_bbuf` once. Mount owns
+`g_bbuf` until the first bucket walk, and that is P3-neutral.
+`log_load()` returns `end`, `newest`, and whether the slot below `end` failed
+to verify.
 
 ```
 classify A, B
-FOREIGN on either                       -> -ENOTSUP, write nothing      (as today)
-neither OK                              -> virgin / autoformat / -EIO   (as today)
-order the OK sectors by rot_gen, newest first
-for each: log_load(); stop at the first that yields a record
-    a sector passed over                -> doubt, fallback
-none yields a record                    -> as "neither OK"
-doubt |= tail_bad
-       | other is CORRUPT
-       | other is ERASED and active is full        (A1)
-       | found_damage on either master             (as today)
-adopt the record into st; log_next = end; incompat = ∪ both headers ∪ record (A4)
-if COMPACTING: recover_compaction()      # ends with master_commit(CLEAN)
-if doubt: scan buckets, raise the ceiling, then
-          force_rotate if the doubt came from the other sector or A1, else append  (A6)
+FOREIGN on either                                       -> -ENOTSUP
+any ok header: features (§4.4), suite, hdr_len, rec_size, peb_size, n_buckets,
+               max_payload_len, write_align (B3)        -> -ENOTSUP if not acceptable
+both ok, equal rot_gen                                  -> -EIO
+no ok sector: both erased -> format (B1: both sectors); else no usable master
+hi / lo, usable, fell_back                              (§3.5 unchanged)
+doubt = tail_bad || fell_back || other not ok (B1) || found_damage
+sealed scratch -> recover_compaction()                  (PR 2)
+if doubt: scan, raise next_id in RAM
+feature bit in one ok header only -> rotate (finish the upgrade)
+if doubt and not ended by that rotation:
+    other not ok || fell_back || found_damage -> rotate  (B1 adds "erased")
+    else                                      -> append
 ```
 
-`recover_compaction()` and the doubt step can each commit once, so a mount
-writes at most two records. With `force_rotate`, the doubt commit is the
-rotation and the recovery commit is an append, so a mount still erases at
-most one sector.
+Mount writes at most one rotation and one append, plus whatever recovery
+writes to the scratch sector and the bucket.
 
-### 4.5 Call sites
+### 5.6 Features (§4.2, D7, B4)
 
-The code paths themselves do not change; each now writes one record where it
-used to write a whole sector (proposal §5.1, §6). `erase_all_impl()` commits
-`next_id_hint = 2` like any other update. A full-copy record makes lowering
-the ceiling as safe as it is today. `format_whole_store()` and
-`format_masters_fresh()` call `master_format()`, which erases both master
-sectors and writes the header plus record[0] to A with `fuses = 0`. PR 4 adds
-an argument for `AUTOFORMATTED`.
+- `blob_db_internal.h`: the registry from §4.2 and
+  `BLOB_DB_BUILD_{INCOMPAT,RO_COMPAT,REQUIRED,SUITE}`, with a
+  `BUILD_ASSERT` that no two features own a slot flag.
+- `master_format()` writes `BLOB_DB_BUILD_INCOMPAT`'s slot-flag features:
+  `LARGE_PAYLOADS` when the build has it.
+- B4: `static inline bool seg_enabled(void)` returns
+  `IS_ENABLED(CONFIG_BLOB_DB_LARGE_PAYLOADS) && (st.incompat & FEAT_LP)`.
+  Every write-side `#if defined(CONFIG_BLOB_DB_LARGE_PAYLOADS)` branch in
+  `update_impl()` and `write_impl()` (about 8 sites) tests it, and otherwise
+  falls through to the inline path and its `-EINVAL` above the cap. Read-side
+  branches stay compile-time: a store without the bit holds no segments.
+  `seg_geometry_init()` still runs, so a later upgrade needs no remount.
+- No upgrade call in phase 1 (open item 7). Mount's "finish the upgrade"
+  rotation is implemented and tested with forged headers, so a phase-1 build
+  handles a store that a later build left halfway through an upgrade.
 
-**Temporary, until PR 3:** a `LARGE_PAYLOADS` build sets `incompat` bit 0 at
-format. This does the job of today's major 2: a build without the feature
-refuses the store. PR 3 replaces it with marking on first use.
+### 5.7 Fuse field (§4.5)
 
-### 4.6 iostats
+`rec_fill()` writes `st.fuses`. Mount sets `st.fuses` from the adopted record,
+the lower sector's on a fallback. Formats write 0. Nothing trips, and no mask
+of known bits exists.
 
-`master_writes` is documented today as "one block erase each". It splits:
+### 5.8 iostats and inspect (public headers)
 
-| Field | Counts |
+| Where | Change |
 |---|---|
-| `master_records` | every record programmed, record[0] included |
-| `master_rotations` | header writes (each erases a master sector) |
+| `blob_db_iostats.h` | `master_writes` ("one block erase each") splits into `master_records` and `master_rotations` |
+| `app_perf_blob_db/src/main.c:316` | the `why` line prints both. The identity becomes `erases = master_rotations + bucket_formats + k × compactions`, and k drops by the two master writes on the scratch path |
+| `blob_db_inspect.h` | `master_gen` → `rot_gen`. Add the three feature sets, `suite`, `rec_size`, `max_payload_len`, `write_align`, `log_used`, `log_cap` and `fuses` (raw) |
+| `blob_db_shell.c` | `blob_db info` prints the above, with no master state (D17) |
 
-The identity in `test_iostats_causes_account_for_erases` and in
-`app_perf_blob_db`'s `why` lines becomes
-`erases == master_rotations + bucket_formats + k × compactions`.
-`app_perf_blob_db/src` prints both fields.
+### 5.9 Tests
 
-### 4.7 Tests
-
-`tests/lib/blob_db/src/main.c`. The raw forging helpers stay a private copy
-of the layout, on purpose (the comment at line 455 explains why):
-
-- `struct master_hdr_img` (64 B) and `struct master_rec_img` (48 B), with
-  offset asserts;
-- `master_hdr_read_raw()` and `master_hdr_write_raw()` (erase the sector,
-  then write the header and a record[0]);
-- `master_rec_append_raw(slot, rec)` (finds the end the way mount does, then
-  writes) and `master_rec_corrupt_raw(slot, i)`.
+`tests/lib/blob_db/src/main.c`. Its forging helpers (line 455) stay private
+copies of the layout, on purpose: `struct master_hdr_img` (64 B),
+`struct master_rec_img` (48 B), offset asserts, `master_hdr_write_raw()`,
+`master_rec_append_raw()` and `master_rec_corrupt_raw()`.
 
 | Existing case | Change |
 |---|---|
-| `test_mid_compaction_crash_recovery` | append a `COMPACTING(42)` record instead of writing a higher-gen B. Then assert that recovery appended a `CLEAN` record directly after it, in the same sector, with no new erase |
-| `test_foreign_major_*`, `test_split_major_*`, `test_format_discards_*`, `test_future_minor_*` | forge headers with major 6 or minor 1; the logic is unchanged |
-| `test_corrupt_prefix_falls_back_to_the_good_master`, `test_both_masters_corrupt_*`, `test_corrupt_master_beside_blank_*` | need two ok sectors, so force a rotation first (helper below) |
-| `test_fallback_past_corrupt_master_raises_ceiling` | becomes two cases: the newest record rots (doubt from `tail_bad`), and the newest header rots (fallback) |
-| `test_fallback_past_blank_master_raises_ceiling` | becomes **A1's regression test**: full X, rotation torn after Y's erase, mount must scan |
-| `ubi.c: test_rolled_back_master_still_raises_ceiling` | keep; UBI stands an older LEB copy back up only across a replace, which is now a rotation |
+| `test_iostats_causes_account_for_erases` | its `master_writes >= 2 × compactions` becomes false by design (D17). Assert `master_rotations == 0` across compactions, and the new identity |
+| `test_foreign_major_*`, `test_split_major_*`, `test_format_discards_*` | headers with major 6; the logic is unchanged |
+| `test_future_minor_is_tolerated` | minor 1 on major 5 still mounts (D15: the minor is ignored), and the next rotation writes 0 |
+| `test_corrupt_prefix_falls_back_*`, `test_both_masters_corrupt_*`, `test_corrupt_master_beside_blank_*` | both sectors are ok right after a format (B1), so no forced rotation is needed |
+| `test_fallback_past_corrupt_master_raises_ceiling` | the newest record rots / the active header rots |
+| `test_fallback_past_blank_master_raises_ceiling` | **B1's regression test**: the scenario in §1/B1, with the doubt-ending rotation cut after the erase. The next mount scans, and the id stays unique |
+| `ubi.c: test_rolled_back_master_still_raises_ceiling` | keep. A stood-up older LEB copy is now a whole rotation older |
 
-New cases. Each item of proposal §11 maps to a case here or in PRs 3–4.
+New cases cover the proposal's §11 (items 1–5b, 10) plus:
 
-1. `force_rotation()` helper: allocate ids until `blob_db_inspect` reports a
-   new `rot_gen` (82 records × 256 ids on native_sim's 4 KB sectors, which
-   takes milliseconds).
-2. **Log round trip:** iostats show 0 master erases for `lg pwrite`-style
-   segmented writes and for compaction on the atomic path (§11.1).
-3. **Log end:** a torn last record; a rotten record in the middle; rotten
-   last record → scan; corrupt other sector → scan, then rotate (A6), and the
-   second mount does not scan (§11.3).
-4. **Rotation:** fill, rotate, remount. The state survives, `rot_gen` is
-   monotonic (A3), and a fallback followed by a rotation never reuses a
-   rot_gen (§11.4).
-5. **A2's regression test:** a flash-simulator callback fails one write
-   without programming a byte. The next commit rotates, and the remount sees
-   the newest ceiling.
-6. **Geometry:** forge a header with another `n_buckets`, `peb_size` and
-   `rec_size`. Each is refused with `-ENOTSUP`, and the partition is
-   byte-for-byte unchanged (§11.7, unprotected half).
+- **B3:** a header with another `max_payload_len` or `write_align` is
+  refused. The partition is unchanged, byte for byte.
+- **B4:** an LP build formats without the bit (forged header): large
+  `update()`/`write()` return `-EINVAL`, and no INDEXED or SEGMENT slot is on
+  flash.
+- **B5:** `erase_all` and then a cut at every byte of its record. Each
+  outcome is the old ceiling or 2 + 1 + STEP, never another value. After
+  remount, no id equals a surviving one.
+- **Golden images** (§11.5b): `tests/lib/blob_db/src/golden.c` holds the
+  byte arrays written by hand from §3 and B3, and checks both parse and
+  emit.
 
-`tests/lib/blob_db/src/power_cut.c` is already offset-agnostic. It gains a
-case that cuts at every byte and every erase of an `alloc_id` that persists a
-ceiling across a rotation. After each cut it remounts and asserts that the
-next id is above every id handed out before the cut, including
-allocated-but-unbound ones (§11.2).
+**Test-only Kconfig:** `CONFIG_BLOB_DB_TEST_MASTER_LOG_CAP` (0 means the
+sector's capacity) caps `log_cap`. The new scenario `lib.blob_db.master_log_tiny`
+(cap 3, flash_area and UBI with `ATOMIC_REPLACE=n`) runs the whole suite,
+`power_cut.c` included, with a rotation every three commits. `power_cut.c`
+gains an `alloc_id` that crosses a rotation, cut at every byte and erase
+(§11.2). The scenario `lib.blob_db.fuses_all_set`, with
+`CONFIG_BLOB_DB_TEST_FUSES_AT_FORMAT=0xffffffff`, runs the whole suite on a
+store whose 32 bits are set (§11.10).
 
-**Test-only Kconfig.** `CONFIG_BLOB_DB_TEST_MASTER_LOG_CAP` (int, 0 means
-the sector's capacity) caps `log_cap`. A new scenario
-`lib.blob_db.master_log_tiny`, with cap 3, on flash_area and on UBI with
-`ATOMIC_REPLACE=n`, then runs the *whole* suite, `power_cut.c` included, with
-a rotation every three commits. That puts every existing crash and recovery
-case through rotation without writing them twice.
+## 6. PR 5 — documentation and measurement
 
-## 5. PR 3 — features
-
-`blob_db_internal.h`
-```c
-/* incompat bits. One table; a slot flag has exactly one owner. */
-#define BLOB_DB_FEAT_LARGE_PAYLOADS  BIT(0)   /* owns slot flags 2, 3 */
-#define BLOB_DB_FEAT_PROTECTED       BIT(1)   /* phase 2: flag 4      */
-#define BLOB_DB_FEAT_DELTA           BIT(2)   /* phase 3: flag 5      */
-
-#define BLOB_DB_FEAT_FLAGS_LARGE_PAYLOADS  (BLOB_DB_SLOT_F_INDEXED | BLOB_DB_SLOT_F_SEGMENT)
-#define BLOB_DB_SLOT_F_BASE                (BLOB_DB_SLOT_F_SEALED | BLOB_DB_SLOT_F_TOMBSTONE)
-
-#define BLOB_DB_BUILD_INCOMPAT   (IF_ENABLED(CONFIG_BLOB_DB_LARGE_PAYLOADS, (BLOB_DB_FEAT_LARGE_PAYLOADS |)) 0)
-#define BLOB_DB_BUILD_RO_COMPAT  0
-#define BLOB_DB_BUILD_REQUIRED   0                         /* phase 2: PROTECTED */
-#define BLOB_DB_BUILD_SUITE      0
-BUILD_ASSERT((BLOB_DB_FEAT_FLAGS_LARGE_PAYLOADS & BLOB_DB_SLOT_F_BASE) == 0, ...);
-/* one assert per pair of features as they are added */
-```
-
-`blob_db.c`
-- `features_acceptable()` runs the five checks of proposal §4.4. It is called
-  from `master_classify()` on header bits and again in mount on the union
-  (A4), always before the first write.
-- `st.slot_known = BASE | (st.incompat & LARGE_PAYLOADS ? FLAGS_LP : 0)`,
-  recomputed whenever `st.incompat` changes. It replaces
-  `BLOB_DB_SLOT_F_KNOWN` in `slot_walk_at()`, `scan_bucket()`,
-  `scan_bucket_for()` and `blob_db_core_slot_at()`. The compile-time mask is
-  removed.
-- `persist_seg_owner(id ≠ 0)` ORs in `LARGE_PAYLOADS` before it commits
-  (A8). It must commit even when `seg_owner == id` already holds and the bit
-  is missing; that case cannot happen today, but the code says so rather than
-  relying on it.
-- PR 2's temporary bit at format is removed.
-
-Tests (§11.5 and §11.9):
-- A store formatted by an LP build and never segmented mounts in a non-LP
-  build. After one large update it is refused with `-ENOTSUP`, with nothing
-  written. This needs both builds, so it is a two-image test: one scenario
-  writes `storage.bin` with `flash_simulator` file backing, and a second
-  scenario mounts that image. Alternatively, forge `incompat` on flash_area
-  in one build, which is what main.c's style suggests and is cheaper. This
-  plan takes the forging route, plus one cross-build check in CI if the
-  maintainers want it.
-- Unknown `incompat`, unknown `ro_compat`, and a bit present only in the
-  newer sector's header with mount falling back to the older one (A4): each
-  refused, nothing written.
-- A cut at every byte of the marking record leaves the bit absent and no
-  INDEXED or SEGMENT slot on flash (proposal §7 row 4). This reuses the
-  `BLOB_DB_CUT_AFTER_OWNER_SET` hook.
-
-## 6. PR 4 — fuses
-
-`blob_db_internal.h`: `BLOB_DB_FUSE_*` for bits 0..15 as in proposal §4.5,
-`BLOB_DB_FUSE_DEBUG(n)` as `BIT(24 + (n))`, and a `BUILD_ASSERT` that the
-assigned bits are distinct, by summing popcounts.
-
-`blob_db.c`
-```c
-static void fuse_trip(uint32_t bit)
-{
-	if (!(st.fuses & bit) && !(st.fuses_new & bit)) {
-		st.fuses_new |= bit;
-		blob_db_maint_kick();          /* pending work for the helper */
-	}
-}
-```
-
-Trip points, against today's code:
-
-| Fuse | Where |
-|---|---|
-| `SLOT_ROT` / `SLOT_TORN` | `slot_walk_at()` with `intact == false`, split on whether an erased header follows; `slot_verify()` returning `-EBADMSG`; `cursor_past_torn_tail()` → `SLOT_TORN` |
-| `BUCKET_HDR_ROT` | `bucket_hdr_valid()` / `scan_bucket()` / `read_bucket_hdr()`: magic matches but the CRC or the bid does not. Not an erased or invalidated (zeroed magic) header |
-| `MASTER_HDR_ROT` | `master_classify()` → CORRUPT, on either sector |
-| `MASTER_REC_ROT` / `_TORN` | `log_load()`: a failing record older than the newest / the newest written |
-| `STORE_DAMAGE` | mount, when `blob_db_store_open_found_damage()` is true for either master |
-| `IO_ERR` | the PR 1 wrappers |
-| `MASTER_WRITE_FAIL` | `master_commit()` (§4.3) |
-| `WEDGED` | `COMPACT_OR_WEDGE`, followed by one `(void)master_commit()` with the state left at `COMPACTING(bid)` (A7) |
-| `MASTER_DOUBT`, `ROTATION_FALLBACK`, `COMPACT_RECOVERED`, `SEG_SWEEP` | the corresponding branches of `mount_impl()` |
-| `AUTOFORMATTED` | `master_format(…, fuses)`: mount's autoformat branch passes the bit, `blob_db_format()` passes 0 |
-
-Persisting (proposal §4.5): mount commits once before returning if
-`fuses_new != 0` and it has not committed already (A6's commit counts).
-`blob_db_maintain()` treats pending fuses as one step of work: it reports
-`more` and commits one record. Nothing else changes: other paths fold
-`fuses_new` into the next record they write anyway. Reads never write.
-
-Inspect and shell:
-- `struct blob_db_inspect_info` (public) loses `master_gen` and gains
-  `rot_gen`, `log_used`, `log_cap`, `incompat`, `ro_compat`, `compat`,
-  `suite`, `fuses` (the word, raw) and `fuses_pending`.
-  `struct blob_db_core_state` gains the same.
-- `blob_db_shell.c` `info` prints the word with names for bits 0..15 and
-  `debug(n)` for 24..31. The names table lives in the shell only.
-
-Tests (§11.10):
-- **One case per trip point** by fault injection on flash_area: flip a bit
-  in a slot in the middle of a bucket, cut the tail, rot a bucket header, and
-  so on. Each fuse survives a remount, a rotation (cap 3 scenario) and a
-  compaction.
-- **Unknown bits pass through:** forge a record with
-  `fuses = 0xffff0000`, then drive updates, rotations, compaction,
-  `COMPACTING` recovery, a wedge (`blob_db_test_wedge()`) and a fallback. The
-  word read back still has every planted bit. `blob_db_format()` clears it.
-  An autoformat leaves only `AUTOFORMATTED`.
-- **Write-free reads:** a `get` that trips `SLOT_ROT` changes no
-  write or erase counter in iostats. `blob_db_maintain()` then writes one
-  record, and a second call writes none.
-- **Mount:** a mount that trips commits once. A refused mount writes nothing,
-  checked byte for byte on the partition.
-- **Not interpreted:** `CONFIG_BLOB_DB_TEST_FUSES_AT_FORMAT` (hex, default
-  0) is the word `master_format()` writes. Scenario
-  `lib.blob_db.fuses_all_set` sets it to `0xffffffff` and runs the whole
-  suite. One case in the default scenario runs a fixed workload on two
-  stores, fuses 0 and fuses all set (forged), and asserts identical iostats.
-
-## 7. PR 5 — documentation and measurement
-
-- `doc/impl/l1_bucketlog.md`: §3.1 (new layout), §5.1 (mount, with the A1
-  and A6 rules), §5.6 and §5.6a (records instead of master writes), §6 (crash
-  tables: add rows for a record append and for a rotation), §13.1 (ceiling
-  persistence). §5.7a covers the new inspect fields and the fuse printout.
-- `doc/layers/l1_blob_db.md` §5: major 5 and the feature sets replace the
-  major-per-combination text.
+- `doc/impl/l1_bucketlog.md`: §1.5, §3.1, §5.1, §5.6, §5.6a, §6, §13.1 and
+  §11 item 13, as the proposal's §10 lists, plus B1's format and B2's guard
+  in §6.2.
+- `doc/layers/l1_blob_db.md` §5: major 5 and the feature sets.
+- `kvdb_book`: `tools/blob-db-bucket-log-explorer/REQUIREMENTS.md` and
+  `tools/migration-paths/REQUIREMENTS.md`, as the proposal's §10 says.
 - `app_perf_blob_db/RESULTS.md`: re-run `lg pwrite` and churn on the
-  nRF5340-DK and compare with proposal §9. The claims to confirm are 0 master
-  erases per `lg pwrite` op and 24 erases for churn on flash_area. Mount time
-  is new: about 11 reads of 48 B on 64 KB sectors.
-- Mark the proposal **accepted**, with A1–A8 folded into its §3.3–§3.5 and
-  §4.4.
+  nRF5340-DK, and record mount time with the one-sector read.
+- Fold B1–B5 into the proposal and mark it **accepted**.
 
-Docs that describe a PR's behaviour should land in that PR. PR 5 is for what
-spans PRs and for the board run.
+## 7. Later phases, as they touch phase 1
 
-## 8. Phases 2 and 3 (rebases)
+- **Fuse trips** (§4.5a, after open item 8): `fuse_trip()` at the PR 1
+  wrappers, at `master_classify()`, `log_load()`, the foreign-slot detection
+  of PR 3, mount's branches and `COMPACT_OR_WEDGE`. Then the mount, wedge
+  and `blob_db_maintain()` persistence rules, and the `blob_db.h` docstring
+  change that the proposal's §10 names.
+- **PR #63 (phase 2):** header bytes 64..83 and record bytes 44..63 (R = 64),
+  `suite`, and `PROTECTED` in `BUILD_REQUIRED`. The random 12-byte `cbase`
+  base is used as base + offset (§6.2); `seq_reserve()` leaves compaction.
+  B3's fields are under the header MAC, like the rest of the geometry.
+- **PR #62 (phase 3):** slot flag bit 5, `incompat` bit 2 set at format, and
+  B4's `seg_enabled()` pattern for `DELTA`.
 
-**PR #63 (protection) onto major 5**
-- The master MAC and tail move to header bytes 64..83 (`hdr_len = 84`) and
-  record bytes 44..63 (`R = 64`). The record MAC binds `LE32(rot_gen)`.
-  `log_load()` checks in this order: erased, CRC, MAC.
-- `suite`, plus `PROTECTED` in `BLOB_DB_BUILD_REQUIRED`, `incompat` bit 1 set
-  at format, and `COMPACTED` moved to slot flag bit 4 under that feature.
-- `cbase` becomes 8 random bytes per compaction (`psa_generate_random`) with
-  the top bit set, and the mount salt's top bit is cleared.
-  `seq_reserve()` calls leave `compact_commit()`.
-- `MAC_FAIL` trips where the CRC verifies and the MAC does not.
-- Geometry is under the MAC, which closes PR #63 §9 item 4 on UBI. Add the
-  forged `leb_count` case there.
-
-**PR #62 (`DELTA`) onto major 5:** slot flag bit 5, `incompat` bit 2, and a
-standalone `feature_mark(BLOB_DB_FEAT_DELTA)` before the first delta slot.
-That function commits one record unless the bit is already in `st.incompat`.
-Its `BUILD_ASSERT` pairs it against `LARGE_PAYLOADS` and `PROTECTED`.
-
-## 9. Risks
+## 8. Risks
 
 | Risk | Mitigation |
 |---|---|
-| A slot that reads all 0xff after an interrupted program, on flash with ECC or with weakly programmed cells. The binary search takes it as the end; the next append then programs over it, and the write may fail or read back unstable | On flash with ECC the append fails, and A2 rotates. On NOR, a slot whose programmed bytes were all 0xff is erased in fact. In the remaining case of weak bits, a CRC failure on the next mount means doubt and a scan. No ceiling is lost: the torn record was never acknowledged |
-| UBI write ordering (`ubi_leb_write_at`: "writes to one LEB go in rising order, each at or past the end of the previous one") | Appends only move forward, a failed slot is never rewritten (A2), and rotation is `ubi_leb_change()`. The `lib.blob_db.ubi*` scenarios run with `UBI_SELF_CHECKS=y` |
-| Mount cost on very slow reads | log₂(1 362) ≈ 11 reads of 48 B, against two today. Measured in PR 5 |
-| PR 2's size | PR 1 takes the call-site churn. The cap-3 scenario reuses the whole existing crash suite. Review §4.4 against A1–A6 line by line |
-| Development boards holding majors 1–4 | Refused with `-ENOTSUP`, nothing written (D10). The log message names `blob_db_format()`, as it does today |
-
-## 10. Open questions for the maintainer
-
-1. **A1–A8.** Agree, then fold them into the proposal before PR 2.
-2. **Cross-build feature test (PR 3):** forge-only, or also a two-image CI
-   check?
-3. **Should inspection trip fuses?** `blob_db_core_slot_at()` shares
-   `slot_walk_at()`, so a `blob_db bucket` shell command that meets rot
-   would trip `SLOT_ROT`. This plan says yes, because it is evidence like any
-   other, and reads stay write-free either way.
+| PR 4's size | PR 1 takes the call-site churn; PRs 2 and 3 take the behaviour changes. The cap-3 scenario runs the whole crash suite through rotations |
+| An LP build becomes a non-LP writer on old dev stores (B4) | intended. Phase 1 refuses majors 1–4 anyway, so every dev store is formatted once (§12, "Landing phase 1"), and by an LP build if large payloads are wanted |
+| `max_payload_len` equality (B3) makes raising the cap a format | the same rule as every other geometry value. The log message names the two values and `blob_db_format()` |
+| The B2 span assumes a torn append never writes past its own span | an append programs only its own slot: `append_slot2()` writes `slot_size_for(val_len)` bytes, and `val_len ≤ cap` |
+| Reading the master sector into `g_bbuf` at mount | `g_bbuf` is free until the first bucket read. `recover_compaction()` reloads it from scratch afterwards, as today |
