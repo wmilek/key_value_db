@@ -30,7 +30,9 @@ header records the geometry and three feature sets (`incompat`, `ro_compat`,
 `compat`) in place of the major-number combinations. Protection is a `suite`
 the build requires, not a feature the store chooses. Compaction no longer
 touches the master: on UBI it never did, and in AEAD mode its nonces stop
-coming from the master counter.
+coming from the master counter. Each record also carries 32 **fuses**:
+private bits that record damage and recovery as post-mortem evidence. They can
+be set but never cleared, and only a format clears them.
 
 ---
 
@@ -46,7 +48,8 @@ coming from the master counter.
 | M6 | A store says which features it uses; a build refuses what it does not understand | `incompat` / `ro_compat` / `compat` in the header (§4) |
 | M7 | A protected build accepts only a store protected exactly as it expects | `suite` must equal the build's; the store never chooses protection (§4.3) |
 | M8 | The geometry is part of the format | `peb_size` and `n_buckets` in the header, checked at mount (§3.1) |
-| M9 | No new steady-state RAM | a log cursor and a record number (P3) |
+| M9 | No new steady-state RAM | a log cursor and a record number, plus the 4 B fuse word (P3) |
+| M10 | Evidence of damage and recovery survives until a format, and no other path clears it | 32 OR-only fuses in every record (§4.5) |
 
 ## 2. Decisions
 
@@ -62,6 +65,8 @@ coming from the master counter.
 | D8 | Protection is a `suite` byte plus an `incompat` bit, and the build requires it | an ordinary feature the store declares (a forged unprotected master would be obeyed: a downgrade) |
 | D9 | No writes over programmed bits | clearing bits in place (§8: STM32F3, nRF word-write limits, ECC flash; and an attacker can clear bits too) |
 | D10 | Major 5 for the new layout; majors 1–4 are refused, never migrated | migration code for stores that exist only on development boards |
+| D11 | Fuses: a 32-bit OR-only word in every record, private to the library and diagnostic only | bits cleared in place (§8); counters (more bytes than a post-mortem needs); fuses in the header (written once per erase, so a trip would need a rotation) |
+| D12 | A format clears the fuses | carrying them over (a format is the intervention that ends the store's history, P9; carrying them needs a readable old master, which an autoformat by definition lacks) |
 
 ## 3. Master sector layout (major 5)
 
@@ -115,7 +120,8 @@ another partition.
 | 16..23 | `seq_hint` | the AEAD nonce ceiling (PR #63 §3.2); 0 otherwise |
 | 24..31 | `seg_owner` | the segmented write in flight; 0 = none |
 | 32..35 | `incompat` | the header's bits, plus any marked since the rotation (§4.2) |
-| 36..43 | reserved, 0 | |
+| 36..39 | `fuses` | the previous record's fuses, plus any tripped since (§4.5) |
+| 40..43 | reserved, 0 | |
 | 44..47 | `crc32` | unprotected: over [0, 44); R = 48 |
 
 A protected record puts a MAC where the unprotected CRC was:
@@ -177,8 +183,10 @@ doubt  = the record just before cursor does not verify
       or no record in the active sector verifies       # a torn rotation: fall back to the other sector
       or the other sector is neither erased nor ok
       or the store reports damage on a master sector   # as today, for UBI
+fuses  = the fuses of the newest record that verifies   # §4.5
 if doubt: scan the buckets and raise the id ceiling    # as today (§5.1)
 if state == COMPACTING: recover (§6.1), then append a CLEAN record
+if mount tripped a fuse and appended no record: append one   # §4.5
 ```
 
 "Doubt" carries today's rule over: a ceiling that might have been
@@ -190,7 +198,7 @@ later full-state record replaces it.
 Cost: two header reads as today, plus about log₂(records) reads of R bytes:
 7 on 4 KB, 11 on 64 KB.
 
-## 4. Features
+## 4. Features and fuses
 
 ### 4.1 The three sets
 
@@ -266,6 +274,94 @@ store geometry == device geometry        # else -ENOTSUP
 `store.incompat` is the union of the header and the newest record that
 verifies. Every refusal writes nothing.
 
+### 4.5 Fuses
+
+Fuses are not features. A feature tells a build how to read the store; a fuse
+only records that something happened to it: a CRC failure, a master update
+that failed, a recovery at mount. They are post-mortem evidence for a store
+returned from the field. The rules:
+
+- **OR only.** A record writes the previous record's `fuses` OR the bits tripped
+  since. The library has one internal call, `fuse_trip(bit)`, and nothing
+  clears a bit. Rotation copies the word into record[0] like the rest of the
+  state.
+- **Private.** No call in `<app/lib/blob_db.h>` reads or sets them. The
+  inspection module and the shell (`CONFIG_BLOB_DB_INSPECT`) show them,
+  read-only.
+- **Diagnostic only.** No code reads a fuse to decide anything. A bit that
+  changed how mount, a read or compaction behaves would be a format feature
+  and would belong in `incompat`. So an unknown fuse bit is never a reason to
+  refuse a store.
+- **Unknown bits are kept.** A writer copies the whole 32-bit word forward,
+  including bits it has no name for. Bits 16..31 are reserved for later
+  builds, and a build that meets one keeps it. That is why the field has to
+  be in major 5 from phase 1: a build that wrote those bytes as reserved
+  zeros would clear every fuse.
+- **Only a format clears them** (D12). `blob_db_format()` writes record[0] with
+  `fuses = 0`. An autoformat (`CONFIG_BLOB_DB_AUTOFORMAT_ON_CORRUPT`) writes
+  record[0] with `AUTOFORMATTED` set, so the new store says it replaced one
+  that could not be read. If evidence is wanted, read the fuses before a
+  format.
+- **A torn tail is not rot.** A power cut leaves the last slot of a bucket, or
+  the last record of the log, torn. That is expected, so it gets its own bit.
+  A CRC failure followed by intact data is damage. Together the two bits
+  cover every CRC failure, and a post-mortem can still tell them apart.
+
+**Persisting.** A trip sets the bit in RAM, and tripping a bit that is
+already set does nothing. So a fault that every mount finds again is written
+once, not once per mount. Reads stay write-free: a CRC
+failure found by a read is written with the next record the store appends
+anyway (an id-ceiling step, `seg_owner`, compaction state, a rotation).
+Pending fuses also count as maintenance work, so `blob_db_maintain()` (and
+the background helper) appends one record for them, with no erase. Three
+cases write at once, because the evidence would otherwise be lost to a
+reboot:
+
+- **Mount** appends one record before returning when it tripped a fuse, so a
+  device in a boot loop still records why. A refusal (`-ENOTSUP`, no usable
+  master) writes nothing, as everywhere else.
+- **Wedge.** Before refusing further writes, a wedged store makes one
+  best-effort record append, with the state unchanged and `WEDGED` set. It
+  ignores a failure. This is the only write a wedged store makes, and it
+  goes to the master sector, not to the bucket or scratch that failed.
+- **A failed master write** sets `MASTER_WRITE_FAIL`, and the next record
+  carries it. If that record fails too, the bit stays pending for the one
+  after.
+
+A trip is lost only if power is cut before any record carries it. Since no
+code depends on fuses, a lost trip costs only that piece of evidence.
+
+**Registry.** In `blob_db_internal.h`, next to the feature registry. Each bit has
+a name for the inspection output, and a `BUILD_ASSERT` checks the names are
+unique:
+
+| Bit | Fuse | Trips when |
+|---|---|---|
+| 0 | `SLOT_ROT` | a slot fails its CRC and is not the last slot of its bucket |
+| 1 | `SLOT_TORN` | the last slot of a bucket fails its CRC (a power cut, or rot there) |
+| 2 | `BUCKET_HDR_ROT` | a bucket header fails its CRC |
+| 3 | `MASTER_HDR_ROT` | a master sector's header classifies as corrupt, on either sector |
+| 4 | `MASTER_REC_ROT` | a record before the newest written one fails its CRC |
+| 5 | `MASTER_REC_TORN` | the newest written record fails its CRC |
+| 6 | `STORE_DAMAGE` | the backend reports damage it found on open (UBI: `blob_db_store_open_found_damage()`) |
+| 7 | `MAC_FAIL` | protected: the CRC verifies but the MAC does not (tampering, not damage); phase 2 |
+| 8 | `IO_ERR` | a store read, write or erase returns an error, outside a master update |
+| 9 | `MASTER_WRITE_FAIL` | a record append or a rotation returns an error |
+| 10 | `WEDGED` | the store wedges inside compaction's atomic window |
+| 11 | `MASTER_DOUBT` | mount scans the buckets for the id ceiling (§3.5) |
+| 12 | `ROTATION_FALLBACK` | the active sector holds no record that verifies; mount uses the other |
+| 13 | `COMPACT_RECOVERED` | mount finds `COMPACTING` and recovers |
+| 14 | `SEG_SWEEP` | mount finds `seg_owner` set and sweeps (an interrupted large write) |
+| 15 | `AUTOFORMATTED` | set in record[0] by an autoformat |
+| 16..31 | reserved | 0 until assigned; kept by every writer |
+
+**Trust.** In a protected store the record, `fuses` included, is under the
+MAC, so nobody without the key can clear a bit. Replaying an older master
+sector removes bits, but it also rolls back the ceilings, so it is the
+rollback that PR #63's rollback anchor addresses, not a new hole. An
+unprotected store promises no integrity, and its fuses are evidence only
+against accidents.
+
 ## 5. Large payloads
 
 ### 5.1 The window as two records (decision)
@@ -331,6 +427,7 @@ compacted slot   nonce = cbase(8)      ‖ LE32(offset)     top bit of cbase set
 | a rotation, before the header lands | the other sector erased or corrupt; the full sector ok | the full sector's newest record stands; doubt, scan. The next update rotates again |
 | a rotation, after the header, during record[0] | the new sector's header ok, no record verifies | that sector is unusable; fall back to the other; doubt, scan |
 | a feature-marking record | the bit absent | no slot uses the feature yet (persist before use), so the store is still what an older build can read |
+| a record that carries a new fuse | the bit absent | only that piece of evidence is lost: no code depends on a fuse. A mount-time trip trips again at the next mount, since what it found is still on flash |
 | `seg_owner` set / clear record | the old value | as `BLOB_DB_CUT_AFTER_OWNER_SET` / `_AFTER_RELEASE` today: an unset owner means no segment was written yet, a still-set owner means the sweep runs again (it is idempotent) |
 | COMPACTING / CLEAN record (scratch path) | as the corresponding master write today | `l1_bucketlog.md` §6.1 unchanged |
 
@@ -371,18 +468,19 @@ QSPI, about 0.53 s per 64 KB erase):
 | AEAD compaction on 64 KB blocks (PR #63) | about +1 erase per compaction (not measured) | 0 |
 | id ceiling | 1 erase per 256 new ids | 1 record program per 256 new ids |
 | mount | 2 header reads | 2 header reads + ~7–11 record reads |
-| RAM | — | a cursor (2 B) and the active sector's `rot_gen` |
+| RAM | — | a cursor (2 B), the active sector's `rot_gen`, the fuse word (4 B) and a pending flag |
+| a fuse | — | 1 record program the first time it trips, at mount or with the next record or `blob_db_maintain()`; 0 erases, except a rotation when the sector is full |
 | flash wear on the master sectors | 1 erase per update | 1 erase per 62–1 362 updates |
 
 ## 10. Code and documentation impact
 
 | Where | Change |
 |---|---|
-| `lib/blob_db/blob_db_internal.h` | major-5 header and record structs; the feature and slot-flag registry |
-| `lib/blob_db/blob_db.c` | `write_master()` becomes `master_update()` and `rotate()`; mount's master classification, log search, feature check and doubt rule; slot walk takes `known` from the store; `persist_seg_owner()`, `persist_next_id_hint()`, compaction and recovery append records |
+| `lib/blob_db/blob_db_internal.h` | major-5 header and record structs; the feature and slot-flag registry; the fuse registry |
+| `lib/blob_db/blob_db.c` | `write_master()` becomes `master_update()` and `rotate()`; mount's master classification, log search, feature check and doubt rule; slot walk takes `known` from the store; `persist_seg_owner()`, `persist_next_id_hint()`, compaction and recovery append records; `fuse_trip()` at each trip point in §4.5, the mount and wedge appends, pending fuses as `blob_db_maintain()` work, `fuses = 0` at format |
 | PR #63 | master MAC and tail move into the header and record layouts above; `cbase` becomes a random prefix; `seq_reserve()` is no longer called by compaction |
 | PR #62 | `DELTA` moves to slot flag bit 5 and is marked on first use |
-| `lib/blob_db/blob_db_inspect.c`, shell | show features, suite, geometry, log fill and rotation generation |
+| `lib/blob_db/blob_db_inspect.c`, shell | show features, suite, geometry, log fill, rotation generation, and the fuses by name (pending ones marked); `struct blob_db_core_state` gains the fuse word |
 | `doc/impl/l1_bucketlog.md` | §3.1, §5.1, §5.6, §5.6a, §6 and §13.1 rewritten for the log |
 
 ## 11. Test plan (P8; `native_sim`, both backends)
@@ -410,13 +508,22 @@ QSPI, about 0.53 s per 64 KB erase):
 8. **AEAD nonces**: PR #63's recorder sees no nonce repeat across remounts and
    repeated compactions, and compaction writes no master on either path.
 9. **Registry**: a `BUILD_ASSERT` that no two features own a slot flag.
+10. **Fuses**: each trip point by fault injection: a bit flipped mid-bucket
+    trips `SLOT_ROT`, a cut at the tail trips `SLOT_TORN` only, and so on for
+    each row of §4.5. Each bit survives a remount, updates, rotations and
+    compactions. A bit from 16..31 planted by the test survives the same. A
+    read that trips a fuse writes nothing (iostats), and `blob_db_maintain()`
+    then appends one record. A mount that trips one appends one record before
+    returning, and a refused mount writes nothing. A wedge makes its one
+    best-effort append. `blob_db_format()` clears every bit, and an autoformat
+    leaves only `AUTOFORMATTED`.
 
 ## 12. Phases
 
 | Phase | Content |
 |---|---|
-| **1** | Major 5: header, records, rotation, mount search and doubt rule; ceilings, `seg_owner` and compaction state as records; geometry; features with `LARGE_PAYLOADS` |
-| **2** | PR #63 rebased onto it: `suite` and `PROTECTED`, header and record MACs, the random compaction prefix |
+| **1** | Major 5: header, records, rotation, mount search and doubt rule; ceilings, `seg_owner` and compaction state as records; geometry; features with `LARGE_PAYLOADS`; the fuse word with every bit but `MAC_FAIL` |
+| **2** | PR #63 rebased onto it: `suite` and `PROTECTED`, header and record MACs, the random compaction prefix; `MAC_FAIL` |
 | **3** | PR #62's `DELTA` rebased onto it: slot flag bit 5, marked on first use |
 
 ## 13. Open items
@@ -435,3 +542,6 @@ QSPI, about 0.53 s per 64 KB erase):
 5. **The id ceiling step**: with records cheap, `BLOB_DB_ID_HINT_STEP`
    (configurable in PR #62) mostly trades ids skipped at mount against
    records. 64-bit ids make the skip irrelevant, so 256 can stay.
+6. **Evidence across a format**: fuses that outlive a format need storage
+   outside the partition (OTP, UICR, a reserved sector). That is out of scope
+   here, and D12 keeps the fuses with the store.
