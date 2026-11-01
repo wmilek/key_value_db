@@ -58,7 +58,7 @@ clears them except a format.
 |---|---|---|
 | D1 | A header plus fixed-size records, each a **full copy** of the mutable state | delta records replayed in order (mount logic, and one rotten record would break the chain) |
 | D2 | Keep two master sectors; a full sector rotates into the other | one sector (a torn erase would leave no master) |
-| D3 | Mount reads every record slot of the active sector; the log ends one past the last slot that is not fully erased | a binary search on "erased" (it assumes no erased slot lies below a written one, but a failed write that programs nothing leaves exactly that, and the search can then stop below newer committed records; mount runs once, so the saving is not worth the assumption) |
+| D3 | The format guarantees that a sector's record slots are a written prefix followed by erased slots (§3.2a): a failed record write is followed by a rotation, never by a record in the next slot. Mount reads every record slot, and the invariant leaves a later build free to binary-search instead, with no format change | a binary search now (mount runs once, so the saving is not needed yet); leaving gaps to the reader (a store written without the invariant could never be binary-searched, by any later build) |
 | D4 | Large payloads keep the mount-time sweep, as two log records | reclaiming orphans in compaction (§5.2, kept as open item 1) |
 | D5 | AEAD compacted slots take a random 63-bit nonce prefix per compaction | reserving `peb_size` values from the master counter (PR #63 §3.4) |
 | D6 | Features in three sets, ext4-style; a slot flag belongs to exactly one feature | a major number per combination (doubles with every feature) |
@@ -144,13 +144,38 @@ Records per sector: (sector − 128) / R.
 | 4 KB | 82 | 62 |
 | 64 KB | 1 362 | 1 022 |
 
+### 3.2a The log invariant
+
+In every master sector, the record slots are a **written prefix followed by
+erased slots**. For some `end`, every slot below `end` is not fully erased (a
+record, a torn record, or a failed write), and every slot from `end` to the
+end of the sector reads fully erased. Every writer keeps this from phase 1,
+because a later reader meets stores that today's builds wrote:
+
+- Slots are written in order, and only at `end`.
+- After a record write returns an error, the slot may still read erased. So
+  the next master update rotates (§3.3) instead of writing the next slot,
+  which would leave an erased slot below a written one.
+- A slot is erased exactly when all R bytes read `0xff`. A written record
+  never does, because `rec_no` is below the record count and so never
+  `0xffffffff`. Padding up to `write_align` is written as `0xff`, but a
+  record's first bytes never are.
+
+A reader may therefore find `end` by a binary search on "fully erased", in
+about log₂(records) reads (7 on 4 KB, 11 on 64 KB). Mount reads every slot
+instead (D3), which costs little and also tolerates a store on which the
+invariant was broken. A future switch to the search is a reader change only.
+A power cut cannot break the invariant: it tears at most the slot at `end`,
+and nothing has been written after it.
+
 ### 3.3 Update
 
 ```
 master_update(state):
-    if cursor + R > peb_size: rotate(state); return
-    write record(rec_no = (cursor - 128) / R, state) at cursor
-    cursor += R          # also on failure: the slot may be programmed, partly or not at all; mount reads past it
+    if failed or cursor + R > peb_size: rotate(state); return
+    rc = write record(rec_no = (cursor - 128) / R, state) at cursor
+    cursor += R
+    if rc < 0: failed = true      # the slot may still read erased: keep §3.2a
 ```
 
 The write programs only erased bytes, moving forward through the sector:
@@ -179,7 +204,7 @@ read [0, 128) of both sectors; classify each as erased, corrupt, foreign or ok (
 foreign on either sector                               -> -ENOTSUP, write nothing
 features, suite or geometry not acceptable (§4.4)      -> -ENOTSUP, write nothing
 active = the ok sector with the higher rot_gen
-cursor = one past the last record slot that is not fully erased   # every slot is read (D3)
+cursor = one past the last record slot that is not fully erased   # every slot is read (D3); §3.2a also allows a binary search
 state  = the newest record before cursor that verifies
 doubt  = the record just before cursor does not verify
       or no record in the active sector verifies       # a torn rotation: fall back to the other sector
@@ -382,9 +407,12 @@ reboot:
 - **Wedge.** Before refusing further writes, a wedged store makes one
   best-effort record append, with the state unchanged and `WEDGED` set. It
   ignores a failure. This is the only write a wedged store makes, and it
-  goes to the master sector, not to the bucket or scratch that failed.
+  goes to the master sector, not to the bucket or scratch that failed. It
+  never rotates: when the sector is full, or a record write has already
+  failed (§3.3), it skips the append, because a rotation is an erase.
 - **A failed master write** sets `MASTER_WRITE_FAIL`, and the next record
-  carries it. If that record fails too, the bit stays pending for the one
+  carries it: record[0] of the rotation that follows a failed append
+  (§3.3). If that record fails too, the bit stays pending for the one
   after.
 
 A trip is lost only if power is cut before any record carries it. Since no
@@ -507,10 +535,11 @@ compacted slot   nonce = cbase(8)      ‖ LE32(offset)     top bit of cbase set
 | COMPACTING / CLEAN record (scratch path) | as the corresponding master write today | `l1_bucketlog.md` §6.1 unchanged |
 
 A record write that fails without a power cut may leave its slot programmed,
-partly programmed, or still erased. The cursor moves past it either way, and
-the next update writes the next slot. Mount finds the end of the log past any
-such slot, because it reads every slot (D3), and nothing is written into it
-later.
+partly programmed, or still erased. The cursor moves past it, and the next
+update rotates instead of writing the next slot, so no erased slot ever lies
+below a written one (§3.2a). A wedged store makes no next update, so its
+failed best-effort append is at most the last slot, like a torn one. A failed
+rotation leaves the active sector as it was; the next update tries it again.
 
 ## 8. Writing over programmed bits
 
@@ -547,6 +576,7 @@ QSPI, about 0.53 s per 64 KB erase):
 | id ceiling | 1 erase per 256 new ids | 1 record program per 256 new ids |
 | mount | 2 header reads | 2 header reads + every record slot of the active sector (up to 82 on 4 KB, 1 362 on 64 KB) |
 | RAM | — | a cursor (2 B), the active sector's `rot_gen`, the fuse word (4 B) and a pending flag |
+| a failed record write | — | the next update rotates: 1 erase, on a path that should not happen |
 | a fuse | — | 1 record program the first time it trips, at mount or with the next record or `blob_db_maintain()`; 0 erases, except a rotation when the sector is full |
 | flash wear on the master sectors | 1 erase per update | 1 erase per 62–1 362 updates |
 
@@ -568,9 +598,14 @@ QSPI, about 0.53 s per 64 KB erase):
 2. **Power cut** at every byte of a record append and of a rotation (header
    and record[0]): mount sees the old state or the new one, never another, and
    an id or nonce value is never issued twice.
-3. **The log end**: a torn last record, an erased-but-interrupted slot, a
-   rotten record in the middle, and a failed write that programmed nothing
-   followed by committed records all give the newest committed state. A rotten last
+3. **The log end**: a torn last record, an erased-but-interrupted slot, and a
+   rotten record in the middle give the newest committed state. **The
+   invariant** (§3.2a): a record write that fails having programmed nothing
+   is followed by a rotation, not by a record in the next slot. After every
+   test in the suite, every sector's record slots are a written prefix
+   followed by erased slots. A binary search for the end, kept in the test
+   suite as a reference reader, agrees with mount's full read on every store
+   the suite produces. A rotten last
    record, and a corrupt other sector, make mount scan.
 4. **Rotation**: fill a sector, rotate, remount; the new header carries the
    old header's feature sets verbatim, bits the build does not know included.
