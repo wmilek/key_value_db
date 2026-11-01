@@ -570,7 +570,7 @@ the next write formats it.
 ```
 blob_db info                      geometry, format, master, id counter
 blob_db stats [top_n]             whole store: bytes by class, ids per bucket,
-                                  fill histogram, fullest buckets
+                                  fill histogram, fullest buckets (used and live)
 blob_db buckets [first [count]]   per-bucket table (never-used buckets skipped)
 blob_db bucket <bid>              every slot of one bucket, oldest first
 blob_db id <id>                   its bucket, size, and its slot history

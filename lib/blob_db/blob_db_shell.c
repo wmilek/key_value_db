@@ -133,10 +133,11 @@ static int cmd_info(const struct shell *sh, size_t argc, char **argv)
 struct top_entry {
 	uint16_t bid;
 	uint32_t used;
+	uint32_t live;
 };
 
 static void top_insert(struct top_entry *top, size_t *n, size_t cap,
-		       uint16_t bid, uint32_t used)
+		       uint16_t bid, uint32_t used, uint32_t live)
 {
 	size_t i = *n;
 
@@ -152,7 +153,7 @@ static void top_insert(struct top_entry *top, size_t *n, size_t cap,
 		top[i] = top[i - 1];
 		i--;
 	}
-	top[i] = (struct top_entry){ .bid = bid, .used = used };
+	top[i] = (struct top_entry){ .bid = bid, .used = used, .live = live };
 }
 
 static int cmd_stats(const struct shell *sh, size_t argc, char **argv)
@@ -216,7 +217,8 @@ static int cmd_stats(const struct shell *sh, size_t argc, char **argv)
 
 		hist[bin]++;
 		if (top_n) {
-			top_insert(top, &n_top, top_n, bid, used);
+			top_insert(top, &n_top, top_n, bid, used,
+				   bs.live_bytes);
 		}
 	}
 
@@ -287,11 +289,15 @@ static int cmd_stats(const struct shell *sh, size_t argc, char **argv)
 
 	if (n_top) {
 		shell_print(sh, "");
-		shell_print(sh, "fullest buckets:");
+		shell_print(sh, "fullest buckets (used = live + garbage + torn):");
 		for (size_t i = 0; i < n_top; i++) {
-			shell_print(sh, "  bucket %-5u %6u B used " PM_FMT,
+			shell_print(sh, "  bucket %-5u %6u B used " PM_FMT
+				    "  %6u B live " PM_FMT,
 				    top[i].bid, top[i].used,
 				    PM_ARG(permille(top[i].used,
+						    in.bucket_capacity)),
+				    top[i].live,
+				    PM_ARG(permille(top[i].live,
 						    in.bucket_capacity)));
 		}
 	}
