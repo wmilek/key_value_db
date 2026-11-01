@@ -31,10 +31,10 @@ header records the geometry and three feature sets (`incompat`, `ro_compat`,
 the build requires, not a feature the store chooses. Compaction no longer
 touches the master: on UBI it never did, and in AEAD mode its nonces stop
 coming from the master counter. Each record also carries 32 **fuses**:
-bits that record damage and recovery as post-mortem evidence. blob_db only
-carries them forward, adding new ones, and never interprets them: the stored
-word only tells it that a bit already set needs no write. Nothing clears them
-except a format.
+bits that record damage and recovery as post-mortem evidence. The field and
+its rules are format from phase 1. Every record carries the word forward, OR-only,
+and nothing but a format clears it. Tripping fuses is behaviour, and it can
+come later (§4.5a).
 
 ---
 
@@ -124,7 +124,7 @@ another partition.
 | 16..23 | `seq_hint` | the AEAD nonce ceiling (PR #63 §3.2), raised by every record (§3.3); 0 otherwise |
 | 24..31 | `seg_owner` | the segmented write in flight; 0 = none |
 | 32..35 | reserved, 0 | features live in the header only (§4.2) |
-| 36..39 | `fuses` | the previous record's fuses, plus any tripped since (§4.5) |
+| 36..39 | `fuses` | the previous record's fuses, plus any tripped since; opaque, OR-only (§4.5) |
 | 40..43 | reserved, 0 | |
 | 44..47 | `crc32` | unprotected: over [0, 44); R = 48 |
 
@@ -235,7 +235,7 @@ doubt  = the record just before cursor does not verify
       or the store reports damage on a master sector   # as today, for UBI
 fuses  = the fuses of the newest record that verifies   # §4.5
 if doubt:
-    trip MASTER_DOUBT                                    # RAM only
+    trip MASTER_DOUBT                                    # RAM only; once fuses trip (§4.5a)
     scan the buckets and raise the id ceiling            # RAM only, as today (§5.1)
 if state == COMPACTING: recover (§6.1), then append a CLEAN record
 if one ok sector has a feature bit the other ok sector lacks:
@@ -246,7 +246,7 @@ if doubt still holds:                                    # end it, after the sca
         rotate                                           # rewrites the other sector
     else:
         append a record                                  # the last record now verifies
-if mount tripped a new fuse and appended no record: append one   # §4.5
+if mount tripped a new fuse and appended no record: append one   # once fuses trip (§4.5a)
 ```
 
 "Doubt" carries today's rule over: a ceiling that might have been
@@ -257,10 +257,11 @@ later full-state record replaces it.
 
 **Ending the doubt.** A mount that doubts also ends the doubt before it
 returns, so the next mount does not scan again. Only the doubt conditions
-decide this, never the fuse word: a mount that finds `MASTER_DOUBT` already set
-ends the doubt all the same. The order is fixed:
+decide this, never the fuse word. Once fuses trip (§4.5a), a mount that finds
+`MASTER_DOUBT` already set ends the doubt all the same. The order is fixed:
 
-1. Detect the doubt from the master state, and trip `MASTER_DOUBT` in RAM.
+1. Detect the doubt from the master state. Once fuses trip, also trip
+   `MASTER_DOUBT` in RAM.
 2. Scan the buckets and raise `next_id` in RAM. Nothing is written yet.
 3. Write once, carrying the raised ceiling (D14) and the pending fuses.
    - If the other sector is neither erased nor ok, if mount fell back after a
@@ -281,8 +282,8 @@ Without this, the doubt would last until the next rotation, because records
 are appended to the active sector and nothing else rewrites the other one.
 That can be never: on UBI with atomic replace, a workload that only rewrites
 existing ids appends no records at all. Rotating over a corrupt other sector
-discards it, as today's next master write does, and `MASTER_HDR_ROT` keeps the
-evidence. If UBI reports damage on the active sector again at the next attach,
+discards it, as today's next master write does. Once fuses trip, the
+evidence is kept in a fuse (§4.5a). If UBI reports damage on the active sector again at the next attach,
 that mount doubts again. That costs a scan, never a wrong ceiling.
 
 Cost: two header reads as today, plus a read of every record slot in the
@@ -359,8 +360,8 @@ at a sealed slot with a plausible `val_len`, an intact CRC and a flag the build
 does not know has found a slot written by another build, not a torn append. Its
 bucket refuses writes with `-ENOTSUP` and is never compacted. Reads of any id
 in that bucket return `-EIO`, because a newer slot for that id may lie beyond
-the one the walk cannot read. That replaces a silently stale value. The fuse
-`FOREIGN_SLOT` records it. Like everything else on the store, the bucket is
+the one the walk cannot read. That replaces a silently stale value. Once fuses
+trip, `FOREIGN_SLOT` records it (§4.5a). Like everything else on the store, the bucket is
 kept until a format (P9). Compaction also refuses (`-EIO`) to build an
 image when the old bucket still holds programmed bytes beyond the point where
 its walk stopped. A walk that stops at a torn slot cannot be followed by
@@ -404,103 +405,101 @@ Each `store.*` set is the union over every master sector that classifies as
 ok. Records carry no features, so the check runs on the headers alone, before
 any record is read. Every refusal writes nothing.
 
-### 4.5 Fuses
+### 4.5 Fuses: the format (phase 1)
 
 Fuses are not features. A feature tells a build how to read the store; a fuse
 only records that something happened to it: a CRC failure, a master update
 that failed, a recovery at mount. They are post-mortem evidence for a store
-returned from the field. The rules:
+returned from the field.
 
-- **Not interpreted.** The stored word is consulted for exactly one thing:
-  whether a trip is new, meaning its bit is not in the word yet, so that it
-  needs persisting. Nothing else reads it. No check, refusal, recovery, read
-  result or write path depends on its value. The only effect of a set bit is
-  that tripping it again writes nothing, so a store with every bit set does
-  exactly what a store with none does, minus the master records the
-  deduplication saves (§4.5 Persisting). A bit that changed behaviour beyond
-  that would be a format feature and would belong in `incompat`.
-- **Passed over, fusing only new fuses.** The core does exactly four things
-  with the word. It reads it at mount from the newest record that verifies.
-  It tests each trip against it, to tell whether the trip is new.
-  It writes `fuses = previous | new` into every record, rotation's record[0]
-  included. And it hands the word over, raw, to the diagnostic API. The only
-  internal call is `fuse_trip(bit)`, and nothing clears a bit.
-- **Opaque, all 32 bits alike.** Because the core interprets no bit, it does
-  not tell known bits from unknown ones. The new record's word is always the
-  old word OR new trips, never a word rebuilt from the bits a build knows,
-  and no mask of known bits exists anywhere. So a fuse defined after a build
-  was released passes through that build unchanged.
-- **No build can destroy a fuse it does not know.** Three rules close every
-  path:
-  - The field is in major 5 from phase 1, so every build that can write a
-    major-5 record carries the word. A build that wrote those bytes as
-    reserved zeros would clear every fuse.
-  - The field stays at record bytes 36..39 for as long as the major is 5.
-    A layout that moved it would be a new major, which older builds refuse.
-  - Older builds (majors 1–4) refuse a major-5 store and write nothing
-    (D10).
+The **field** is part of the major-5 format from phase 1, and its rules are
+fixed now. **Tripping** fuses, meaning which bits mean what, when they trip
+and how a trip is persisted, is behaviour. It can come in a later phase
+(§4.5a) without a format change. A phase-1 build trips nothing, but it keeps
+every rule below, so the bits a later build sets survive it.
 
-  Only a format, which is deliberate, clears them.
-- **Exposed, not interpreted.** Printing and exposing are not interpreting.
-  No call in `<app/lib/blob_db.h>` reads or sets fuses. With
-  `CONFIG_BLOB_DB_INSPECT`, the inspection module returns the raw word (and
-  whether new fuses are still pending), and the shell prints it with bit
-  names. Making sense of the bits is for whoever reads them.
-- **Only a format clears them** (D12). `blob_db_format()` writes record[0] with
-  `fuses = 0`. An autoformat (`CONFIG_BLOB_DB_AUTOFORMAT_ON_CORRUPT`) writes
-  record[0] with `AUTOFORMATTED` set, so the new store says it replaced one
-  that could not be read. If evidence is wanted, read the fuses before a
-  format.
-- **A torn tail is not rot.** A power cut leaves the last slot of a bucket, or
-  the last record of the log, torn. That is expected, so it gets its own bit.
-  A CRC failure followed by intact data is damage. Together the two bits
-  cover every CRC failure, and a post-mortem can still tell them apart.
+- **The field.** Record bytes 36..39, an opaque 32-bit word, for as long as
+  the major is 5. A layout that moved it would be a new major, which older
+  builds refuse.
+- **Carried forward, OR-only.** Every record a build writes carries
+  `previous | trips`, where `previous` is the word of the newest record that
+  verified at mount, or of the record this session wrote last. A build that
+  trips nothing writes `previous` unchanged. This covers every record:
+  updates, rotation's record[0], compaction and recovery records, and the
+  write that ends a doubt. No build clears a bit, and no build rebuilds the
+  word from the bits it knows: no mask of known bits exists anywhere. So a fuse
+  defined after a build was released passes through that build unchanged.
+- **No build can destroy a fuse it does not know.** The field is in major 5
+  from phase 1, so every build that can write a major-5 record carries the
+  word. A build that wrote those bytes as reserved zeros would clear every
+  fuse. Older builds (majors 1–4) refuse a major-5 store and write nothing
+  (D10).
+- **Only a format clears them** (D12). `blob_db_format()`, the virgin format
+  and an autoformat write record[0] with `fuses = 0`. Once trips exist, an
+  autoformat may set a bit saying so (§4.5a). If evidence is wanted, read the
+  fuses before a format.
+- **Never a feature.** No read result, refusal, recovery or layout decision
+  may depend on a fuse bit. A bit that changed how a store is read or written
+  would be a format feature and would belong in `incompat` (§4.1). The only
+  use of the stored word a later phase may make is to skip persisting a trip
+  whose bit is already set (§4.5a).
+- **Bit numbers are stable.** Bits 0..23 are for defined fuses: once assigned,
+  a bit keeps its meaning forever, so a post-mortem can decode a store
+  without knowing which build wrote it. Bits 24..31 are never assigned. They
+  are for ad-hoc debugging (§4.5a). Phase 1 assigns no bit; the table in
+  §4.5a is provisional until its phase.
 
-**Persisting.** A trip whose bit is already in the word is not new. It leaves
-nothing pending, and this is the one use of the stored word (Not interpreted,
-above). A new trip ORs the bit into RAM and leaves it pending until a record
-carries it. So a bit already set leaves nothing pending, and a fault that every mount finds again
-is written once, not once per mount. Reads stay write-free: a CRC
-failure found by a read is written with the next record the store appends
-anyway (an id-ceiling step, `seg_owner`, compaction state, a rotation).
-Pending fuses also count as maintenance work, so `blob_db_maintain()` (and
-the background helper) appends one record for them, with no erase. Three
-cases write at once, because the evidence would otherwise be lost to a
-reboot:
+**Trust.** In a protected store the record, `fuses` included, is under the
+MAC, so nobody without the key can clear a bit. Replaying an older master
+sector removes bits, but it also rolls back the ceilings, so it is the
+rollback that PR #63's rollback anchor addresses, not a new hole. An
+unprotected store promises no integrity, and its fuses are evidence only
+against accidents.
 
-- **Mount** appends one record before returning when it tripped a new fuse, so a
-  device in a boot loop still records why. A refusal (`-ENOTSUP`, no usable
-  master) writes nothing, as everywhere else.
-- **Wedge.** Before refusing further writes, a wedged store makes one
-  best-effort record append, with the state unchanged and `WEDGED` set. It
-  ignores a failure. This is the only write a wedged store makes, and it
-  goes to the master sector, not to the bucket or scratch that failed. It
-  never rotates: when the sector is full, or a record write has already
-  failed (§3.3), it skips the append, because a rotation is an erase.
-- **A failed master write** sets `MASTER_WRITE_FAIL`, and the next record
-  carries it: record[0] of the rotation that follows a failed append
-  (§3.3). If that record fails too, the bit stays pending for the one
-  after.
+### 4.5a Fuses: tripping (a later phase, provisional)
 
-A trip is lost only if power is cut before any record carries it. Since no
-code depends on fuses, a lost trip costs only that piece of evidence.
+This section sketches the behaviour. It is not part of the format, and it can
+change before its phase without touching any byte on flash.
 
-**Registry.** The bit numbers live in `blob_db_internal.h`, next to the feature
-registry, because the trip points need them. The names exist only for
-printing, in the inspection module and the shell. A `BUILD_ASSERT` checks
-that no two fuses share a bit. Bits 0..23, once assigned, keep their
-meaning forever, so a post-mortem can decode them without knowing which
-build wrote the store.
+- **Persisting.** A trip whose bit is already in the word is not new and
+  leaves nothing pending, so a fault that every mount finds again is written
+  once, not once per mount. A new trip ORs the bit into RAM and leaves it
+  pending until a record carries it. Reads stay write-free: a CRC failure
+  found by a read is written with the next record the store appends anyway.
+  Pending fuses also count as maintenance work, so `blob_db_maintain()`
+  appends one record for them, with no erase. Three cases write at once,
+  because the evidence would otherwise be lost to a reboot:
+  - **Mount** appends one record before returning when it tripped a new fuse.
+    A refusal (`-ENOTSUP`, no usable master) writes nothing.
+  - **Wedge.** Before refusing further writes, a wedged store makes one
+    best-effort record append with the state unchanged. It never rotates:
+    when the sector is full, or a record write has already failed (§3.3),
+    it skips the append, because a rotation is an erase.
+  - **A failed master write** is carried by the next record: record[0] of
+    the rotation that follows a failed append (§3.3).
 
-**Debug fuses.** Bits 24..31 are deliberately left undefined. They are for a
-developer looking for whether something happened: put
-`fuse_trip(BLOB_DB_FUSE_DEBUG(n))` where it is suspected, run the build, and
-read the fuses back later. The bit means whatever that developer chose. The
-registry gives these bits no names and no trip points, so they are never
-tripped by a merged build. The only guarantee is the one every bit has: no
-build destroys them, and only a format clears them. A store that was
-written by a debug build and later by a release build still shows what the
-debug build saw.
+  A trip is lost only if power is cut before any record carries it, and since
+  no code depends on fuses, that costs only that piece of evidence.
+- **Exposed, not interpreted.** No call in `<app/lib/blob_db.h>` reads or sets
+  fuses. With `CONFIG_BLOB_DB_INSPECT`, the inspection module returns the raw
+  word and whether new fuses are still pending, and the shell prints it with
+  bit names.
+- **Registry.** The bit numbers live in `blob_db_internal.h`, and a
+  `BUILD_ASSERT` checks that no two fuses share a bit. The names exist only
+  for printing.
+- **Debug fuses.** A developer puts `fuse_trip(BLOB_DB_FUSE_DEBUG(n))` where
+  something is suspected, runs the build, and reads the fuses back later. The
+  registry gives bits 24..31 no names and no trip points, so a merged build
+  never trips them.
+- **Torn versus rot** (open item 8). The provisional bits below separate a
+  power cut from damage by a slot's position, and that does not hold. A slot
+  whose header landed but whose payload tore stops being the last slot after
+  the next append. A torn tail with unsealed flags fails no CRC at all. A
+  torn rotation leaves a corrupt header. The bits must be settled before this
+  phase, either by making the distinction real or by naming the bits for what
+  was observed.
+
+Provisional bits:
 
 | Bit | Fuse | Trips when |
 |---|---|---|
@@ -511,7 +510,7 @@ debug build saw.
 | 4 | `MASTER_REC_ROT` | a record before the newest written one fails its CRC |
 | 5 | `MASTER_REC_TORN` | the newest written record fails its CRC |
 | 6 | `STORE_DAMAGE` | the backend reports damage it found on open (UBI: `blob_db_store_open_found_damage()`) |
-| 7 | `MAC_FAIL` | protected: the CRC verifies but the MAC does not (tampering, not damage); phase 2 |
+| 7 | `MAC_FAIL` | protected: the CRC verifies but the MAC does not (tampering, not damage) |
 | 8 | `IO_ERR` | a store read, write or erase returns an error, outside a master update |
 | 9 | `MASTER_WRITE_FAIL` | a record append or a rotation returns an error |
 | 10 | `WEDGED` | the store wedges inside compaction's atomic window |
@@ -523,13 +522,6 @@ debug build saw.
 | 16 | `FOREIGN_SLOT` | a walk stops at a sealed, CRC-intact slot carrying a flag the build does not know (§4.2) |
 | 17..23 | reserved | for later fuses; copied like every other bit |
 | 24..31 | debug, undefined | never assigned; free for ad-hoc debugging; copied like every other bit |
-
-**Trust.** In a protected store the record, `fuses` included, is under the
-MAC, so nobody without the key can clear a bit. Replaying an older master
-sector removes bits, but it also rolls back the ceilings, so it is the
-rollback that PR #63's rollback anchor addresses, not a new hole. An
-unprotected store promises no integrity, and its fuses are evidence only
-against accidents.
 
 ## 5. Large payloads
 
@@ -625,7 +617,7 @@ compacted slot   N = BE96(2⁹⁵ | ((c + offset) mod 2⁹⁵))      N[0] bit 7 
 | the write that ends a doubt (§3.5) | a torn record, or a torn rotation | doubt again: the next mount scans and writes again. The ceiling stays safe, because the write that would have ended the doubt never landed |
 | an upgrade's first rotation | as a rotation (rows above); if it landed, one ok sector has the new bit and the other lacks it | the store does not use the feature yet. A build that knows the bit finishes the upgrade with the second rotation. One that does not know it refuses, because §4.4 takes the union of the ok headers |
 | an upgrade's second rotation | as a rotation | the same; both headers carry the bit once it lands |
-| a record that carries a new fuse | the bit absent | only that piece of evidence is lost: no code depends on a fuse. A mount-time trip trips again at the next mount, since what it found is still on flash |
+| a record that carries a new fuse (once fuses trip, §4.5a) | the bit absent | only that piece of evidence is lost: no code depends on a fuse. A mount-time trip trips again at the next mount, since what it found is still on flash |
 | `seg_owner` set / clear record | the old value | as `BLOB_DB_CUT_AFTER_OWNER_SET` / `_AFTER_RELEASE` today: an unset owner means no segment was written yet, a still-set owner means the sweep runs again (it is idempotent) |
 | COMPACTING / CLEAN record (scratch path) | as the corresponding master write today | `l1_bucketlog.md` §6.1 unchanged |
 
@@ -673,7 +665,7 @@ QSPI, about 0.53 s per 64 KB erase):
 | RAM | — | a cursor (2 B), the active sector's `rot_gen`, the fuse word (4 B) and a pending flag |
 | a failed record write | — | the next update rotates: 1 erase, on a path that should not happen |
 | a doubtful mount | a scan at every mount until the next master write | one scan, then 1 record, or 1 rotation (1 erase) when the other sector is bad; the next mount does not scan |
-| a fuse | — | 1 record program the first time it trips, at mount or with the next record or `blob_db_maintain()`; 0 erases, except a rotation when the sector is full |
+| a fuse (once fuses trip, §4.5a) | — | 1 record program the first time it trips, at mount or with the next record or `blob_db_maintain()`; 0 erases, except a rotation when the sector is full |
 | flash wear on the master sectors | 1 erase per update | 1 erase per 62–1 362 updates |
 
 ## 10. Code and documentation impact
@@ -681,10 +673,10 @@ QSPI, about 0.53 s per 64 KB erase):
 | Where | Change |
 |---|---|
 | `lib/blob_db/blob_db_internal.h` | major-5 header and record structs; the feature and slot-flag registry; the fuse registry |
-| `lib/blob_db/blob_db.c` | `write_master()` becomes `master_update()` and `rotate()`; mount's master classification, log search, feature check and doubt rule; features written at format, the upgrade's two rotations and finishing a half-done upgrade at mount; a sealed, intact slot with an unknown flag refuses its bucket instead of ending its log as torn, and compaction refuses to drop programmed bytes beyond its walk (D13); `persist_seg_owner()`, `persist_next_id_hint()`, compaction and recovery append records, and every record raises both ceilings (D14); `fuse_trip()` at each trip point in §4.5, the mount and wedge appends, pending fuses as `blob_db_maintain()` work, `fuses = 0` at format |
+| `lib/blob_db/blob_db.c` | `write_master()` becomes `master_update()` and `rotate()`; mount's master classification, log search, feature check and doubt rule; features written at format, the upgrade's two rotations and finishing a half-done upgrade at mount; a sealed, intact slot with an unknown flag refuses its bucket instead of ending its log as torn, and compaction refuses to drop programmed bytes beyond its walk (D13); `persist_seg_owner()`, `persist_next_id_hint()`, compaction and recovery append records, and every record raises both ceilings (D14); every record carries the fuse word forward and a format writes 0 (phase 1); later, `fuse_trip()` at each trip point, the mount and wedge appends, and pending fuses as `blob_db_maintain()` work (§4.5a) |
 | PR #63 | master MAC and tail move into the header and record layouts above; `cbase` becomes a 12-byte random base, and the compacted nonce becomes base + offset (§6); `seq_reserve()` is no longer called by compaction |
 | PR #62 | `DELTA` moves to slot flag bit 5 and is set at format |
-| `lib/blob_db/blob_db_inspect.c`, shell | show features, suite, geometry, log fill and rotation generation; return the raw fuse word and whether new fuses are pending, which the shell prints by bit name; `struct blob_db_core_state` gains both |
+| `lib/blob_db/blob_db_inspect.c`, shell | show features, suite, geometry, log fill and rotation generation, and the raw fuse word; once fuses trip, whether new fuses are pending and the bit names (§4.5a); `struct blob_db_core_state` gains them |
 | `doc/impl/l1_bucketlog.md` | §3.1, §5.1, §5.6, §5.6a, §6 and §13.1 rewritten for the log |
 
 ## 11. Test plan (P8; `native_sim`, both backends)
@@ -712,7 +704,7 @@ QSPI, about 0.53 s per 64 KB erase):
     rotten last record, a fallback after a torn rotation, UBI damage on a
     master sector), mount scans once and writes once: a rotation or a
     record, as §3.5 says. The next ten mounts do not scan (iostats). The same
-    holds with `MASTER_DOUBT` already set before the first of them. On UBI
+    holds once fuses trip, with `MASTER_DOUBT` already set. On UBI
     with atomic replace, a workload that only rewrites existing ids still
     stops scanning after one mount. A cut at every point of the scan and of
     that write leaves the next mount scanning again, with a ceiling above
@@ -732,8 +724,8 @@ QSPI, about 0.53 s per 64 KB erase):
    a build without the feature refuses the store from the first rotation on.
 5a. **Foreign slot** (D13): forge a sealed slot with an intact CRC and an
     unknown flag into the middle of a bucket. Writes to that bucket return
-    `-ENOTSUP`, reads `-EIO`, nothing is compacted or erased, and
-    `FOREIGN_SLOT` is set. A torn slot at a bucket's tail still compacts as
+    `-ENOTSUP`, reads `-EIO`, and nothing is compacted or erased. Once fuses
+    trip, `FOREIGN_SLOT` is set. A torn slot at a bucket's tail still compacts as
     today. A compaction whose walk stops before programmed bytes refuses.
 6. **Protection**: a protected build refuses an unprotected store, another
    suite, a cleared `PROTECTED` bit, and a forged record (MAC). A record
@@ -750,34 +742,28 @@ QSPI, about 0.53 s per 64 KB erase):
    `psa_generate_random()` failure makes compaction, and the write that
    needed it, return the error, with the bucket's bytes unchanged.
 9. **Registry**: a `BUILD_ASSERT` that no two features own a slot flag.
-10. **Fuses**: each trip point by fault injection: a bit flipped mid-bucket
-    trips `SLOT_ROT`, a cut at the tail trips `SLOT_TORN` only, and so on for
-    each row of §4.5. Each bit survives a remount, updates, rotations and
-    compactions. **Unknown bits:** the test plants every bit the build does not
-    assign, in both the reserved and the debug range. They pass through updates,
-    rotations, compaction, recovery at mount, a wedge's append and a fall back
-    to an earlier record, and only a format clears them. A
-    read that trips a fuse writes nothing (iostats), and `blob_db_maintain()`
-    then appends one record. A mount that trips one appends one record before
-    returning, and a refused mount writes nothing. A wedge makes its one
-    best-effort append. `blob_db_format()` clears every bit, and an autoformat
-    leaves only `AUTOFORMATTED`. **Not interpreted**: every suite runs on a
-    store whose fuses are all 32 set and on a store with none. Every call
-    returns the same result and every read the same data. iostats agree
-    except for master record writes, and the rotations they lead to: the
-    all-set run makes no more of either, and makes fewer by exactly the
-    records the deduplication saved. A run that trips no fuse gives identical
-    iostats. **Deduplication**: a fault found again at every mount (a
-    corrupt other sector, say) writes one record at the first mount and none
-    at the next ten.
+10. **Fuse word** (phase 1, format): plant every one of the 32 bits. They
+    pass through updates, rotations, compaction and recovery records, the
+    write that ends a doubt, a fallback to an earlier record and a fallback to
+    the other sector, and only a format clears them. A phase-1 build changes no
+    bit. Every suite run on a store whose fuses are all set gives the same
+    results, data and iostats as on a store with none.
+10a. **Fuse trips** (with §4.5a): each trip point by fault injection, the
+    persistence rules (a read that trips writes nothing, `blob_db_maintain()`
+    then appends one record, a mount that trips appends one, a refused mount
+    writes nothing, the wedge's one append), and deduplication: a fault found
+    again at every mount writes one record at the first mount and none at the
+    next ten. With all 32 set, results and data are the same as with none,
+    and iostats differ only by the master records the deduplication saves.
 
 ## 12. Phases
 
 | Phase | Content |
 |---|---|
-| **1** | Major 5: header, records, rotation, mount search and doubt rule; ceilings, `seg_owner` and compaction state as records; geometry; features with `LARGE_PAYLOADS`; the fuse word with every bit but `MAC_FAIL` |
-| **2** | PR #63 rebased onto it: `suite` and `PROTECTED`, header and record MACs, the random compaction prefix; `MAC_FAIL` |
+| **1** | Major 5: header, records, rotation, mount search and doubt rule; ceilings, `seg_owner` and compaction state as records; geometry; features with `LARGE_PAYLOADS`; the fuse field and its carry-forward rules (§4.5), with no trip points |
+| **2** | PR #63 rebased onto it: `suite` and `PROTECTED`, header and record MACs, the random compaction base |
 | **3** | PR #62's `DELTA` rebased onto it: slot flag bit 5, set at format |
+| **later** | Fuse trips (§4.5a), after open item 8: no format change |
 
 ## 13. Open items
 
@@ -803,3 +789,7 @@ QSPI, about 0.53 s per 64 KB erase):
    because enabling a feature on a development store can format it.
    §4.2 fixes what the call must do: two rotations, and no use of the feature
    before both have landed.
+8. **Fuse bits** (§4.5a): which bits to define, and whether a power cut can be
+   told apart from damage, by making the provisional slot and master bits
+   exact or by naming them for what was observed. Behaviour only: the field's
+   rules (§4.5) do not depend on the answer.
