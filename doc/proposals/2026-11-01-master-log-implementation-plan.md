@@ -21,8 +21,9 @@ Five points in the proposal need an amendment before code (§1). B1 and B2
 are correctness problems: B1 can issue an id twice, and B2 can leave a
 bucket that refuses every write after one power cut. B3–B5 are gaps the
 proposal leaves open, and the code has to pick an answer for each. Every
-amendment says which text in the proposal it changes, so it can go back
-into the proposal before the PR that implements it lands.
+amendment says which text in the proposal it changes. All five are now folded
+into the proposal: B1 as D18, B2 as D13's compaction guard, B3 as D19, B4 as
+D20, and B5 as §3.3's `erase_all` exception.
 
 ## 1. Amendments to the proposal
 
@@ -498,7 +499,7 @@ store whose 32 bits are set (§11.10).
   `tools/migration-paths/REQUIREMENTS.md`, as the proposal's §10 says.
 - `app_perf_blob_db/RESULTS.md`: re-run `lg pwrite` and churn on the
   nRF5340-DK, and record mount time with the one-sector read.
-- Fold B1–B5 into the proposal and mark it **accepted**.
+- Mark the proposal **accepted**.
 
 ## 7. Later phases, as they touch phase 1
 
