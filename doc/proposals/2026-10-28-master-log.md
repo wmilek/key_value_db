@@ -282,15 +282,27 @@ read [0, 128) of both sectors; classify each as erased, corrupt, foreign or ok (
 foreign on either sector                               -> -ENOTSUP, write nothing
 features, suite, rec_size or geometry of any ok sector not acceptable (§3.1, §4.4) -> -ENOTSUP, write nothing
 both ok with equal rot_gen                             -> -EIO, write nothing (§3.1)
-active = the ok sector with the higher rot_gen
-any record that verifies with an unknown state         -> -ENOTSUP, write nothing (§3.2)
-cursor = one past the last record slot that is not fully erased   # every slot is read (D3); §3.2a also allows a binary search
-state  = the newest record before cursor that verifies
-doubt  = the record just before cursor does not verify
-      or no record in the active sector verifies       # a torn rotation: fall back to the other sector
+no ok sector:                                          # as today (l1_bucketlog.md §3.1)
+    both erased                                        -> format
+    otherwise                                          -> no usable master (below)
+
+for an ok sector x:                                    # every slot is read (D3); §3.2a also allows a binary search
+    end(x)    = one past the last record slot that is not fully erased
+    newest(x) = the newest record below end(x) that verifies, if any
+x is usable when newest(x) exists
+
+hi = the ok sector with the higher rot_gen; lo = the other, if ok
+if hi is usable:     active = hi; fell_back = no
+elif lo is usable:   active = lo; fell_back = yes      # a torn rotation, or every record of hi rotten
+else:                no usable master                  # -EIO, write nothing; or erase all with
+                                                       # AUTOFORMAT_ON_CORRUPT, as today
+any record read that verifies with an unknown state    -> -ENOTSUP, write nothing (§3.2)
+
+cursor = end(active); state = newest(active); fuses = state.fuses   # §4.5
+doubt  = the record just below cursor does not verify
+      or fell_back
       or the other sector is neither erased nor ok
       or the store reports damage on a master sector   # as today, for UBI
-fuses  = the fuses of the newest record that verifies   # §4.5
 if doubt:
     trip MASTER_DOUBT                                    # RAM only; once fuses trip (§4.5a)
     scan the buckets and raise the id ceiling            # RAM only, as today (§5.1)
@@ -299,12 +311,25 @@ if one ok sector has a feature bit the other ok sector lacks:
     rotate                                               # finish an upgrade (§4.2)
 if doubt still holds:                                    # end it, after the scan
     if the other sector is not erased and not ok,
-       or mount fell back, or the store reported damage:
+       or fell_back, or the store reported damage:
         rotate                                           # rewrites the other sector
     else:
         append a record                                  # the last record now verifies
 if mount tripped a new fuse and appended no record: append one   # once fuses trip (§4.5a)
 ```
+
+"Usable" separates a sector whose header is ok from one mount can take its
+state from. A sector with an ok header and no record that verifies (a rotation
+torn after its header landed, or every record rotten) is not usable. Mount
+then takes everything from the other sector, `cursor`, `state` and `fuses`
+included, and doubts. Its ending write is a rotation into the unusable sector.
+Neither sector usable is a store with no usable master, handled as today.
+That includes a first format torn after its header landed, with the other
+sector still erased: today a torn first master is refused with `-EIO` the
+same way, because only two erased sectors format by themselves. The feature,
+suite and geometry checks above run on every ok header, usable or not, so a
+rotation torn by a newer build still makes an older build refuse the store.
+The lower sector is read only when the higher one is not usable.
 
 "Doubt" carries today's rule over: a ceiling that might have been
 acknowledged and then lost makes mount scan. A torn last record was never
@@ -344,7 +369,8 @@ evidence is kept in a fuse (§4.5a). If UBI reports damage on the active sector 
 that mount doubts again. That costs a scan, never a wrong ceiling.
 
 Cost: two header reads as today, plus a read of every record slot in the
-active sector, up to 82 on 4 KB and 1 362 on 64 KB, once per mount. Every
+higher sector, up to 82 on 4 KB and 1 362 on 64 KB, once per mount. The lower
+sector's slots are read too when mount falls back. Every
 record that is not erased is checked, so a rotten record anywhere in the log
 trips `MASTER_REC_ROT`.
 
@@ -796,6 +822,14 @@ QSPI, about 0.53 s per 64 KB erase):
     stops scanning after one mount. A cut at every point of the scan and of
     that write leaves the next mount scanning again, with a ceiling above
     every id on flash.
+3b. **Usable sectors**: a header-only sector (a rotation torn after its
+    header) above a usable one makes mount take `cursor`, `state` and `fuses`
+    from the lower sector, doubt, and rotate into the header-only one. The
+    same with every record of the higher sector rotten. Two header-only
+    sectors, and one header-only sector beside an erased one (a first format
+    torn after its header), return `-EIO` and write nothing. With
+    `AUTOFORMAT_ON_CORRUPT` they are erased. A header-only sector from a newer
+    build, carrying an unknown `incompat` bit, refuses the store.
 4. **Rotation**: fill a sector, rotate, remount; the new header carries the
    old header's feature sets verbatim, bits the build does not know included.
 5. **Features**: an unknown `incompat` or `ro_compat` bit refuses with
