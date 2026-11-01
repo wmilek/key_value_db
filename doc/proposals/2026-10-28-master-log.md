@@ -70,6 +70,7 @@ except a format.
 | D11 | Fuses: a 32-bit OR-only word in every record that blob_db carries forward and never interprets, except to skip persisting a bit already set | bits cleared in place (§8); counters (more bytes than a post-mortem needs); fuses in the header (written once per erase, so a trip would need a rotation) |
 | D12 | A format clears the fuses | carrying them over (a format is the intervention that ends the store's history, P9; carrying them needs a readable old master, which an autoformat by definition lacks) |
 | D13 | The slot walk accepts the flags the **build** knows. A sealed slot whose CRC verifies but which carries a flag outside them makes its bucket refuse writes; it is never compacted | taking the accepted flags from the store's features (a lost bit would turn live slots into a "torn tail" that the next compaction drops); treating such a slot as torn (the same loss, from a single slot) |
+| D14 | Every record raises the id and nonce ceilings to the current value plus a step: `hint = max(hint, next + 1 + STEP)`. A ceiling-only record is written only when allocation reaches the ceiling and no other record has carried it forward | copying the persisted ceiling unchanged (allocation then needs a ceiling-only record every step, even right after another record was written) |
 
 ## 3. Master sector layout (major 5)
 
@@ -119,8 +120,8 @@ another partition.
 | 4 | `state` | `CLEAN` or `COMPACTING` |
 | 5 | reserved, 0 | |
 | 6..7 | `compacting_bid` | meaningful only when `COMPACTING` |
-| 8..15 | `next_id_hint` | the id ceiling, as today (§13.1) |
-| 16..23 | `seq_hint` | the AEAD nonce ceiling (PR #63 §3.2); 0 otherwise |
+| 8..15 | `next_id_hint` | the id ceiling (`l1_bucketlog.md` §13.1), raised by every record (§3.3) |
+| 16..23 | `seq_hint` | the AEAD nonce ceiling (PR #63 §3.2), raised by every record (§3.3); 0 otherwise |
 | 24..31 | `seg_owner` | the segmented write in flight; 0 = none |
 | 32..35 | reserved, 0 | features live in the header only (§4.2) |
 | 36..39 | `fuses` | the previous record's fuses, plus any tripped since (§4.5) |
@@ -182,6 +183,27 @@ master_update(state):
 The write programs only erased bytes, moving forward through the sector:
 `blob_db_store_write()`, which on UBI is `ubi_leb_write_at()`, as slot appends
 already are.
+
+**Every record raises the ceilings (D14).** Whatever a record is written for
+(an id-ceiling step, `seg_owner`, compaction state, a fuse, mount, or a
+rotation's record[0]), it carries
+
+```
+next_id_hint = max(next_id_hint, next_id + 1 + BLOB_DB_ID_HINT_STEP)
+seq_hint     = max(seq_hint,     seq     + 1 + BLOB_DB_SEQ_STEP)      # AEAD only
+```
+
+and RAM takes the new values only once the record has landed, as
+`persist_next_id_hint()` does today. The rule "persist first, then use" is
+unchanged:
+`alloc_id()` still appends a record before it hands out an id at or above the
+ceiling. That record is just rarely needed, because any other record written
+within the last step already carried the ceiling forward. The `max` keeps
+every ceiling monotonic, so no record ever publishes a ceiling below one
+already on flash. That is the hazard `compact_commit()` guards against by
+copying the ceiling instead of `next_id`. The ids a crash skips stay bounded
+by `STEP + 1`, because a record never puts the ceiling further ahead than
+that. A record whose write fails raises nothing.
 
 ### 3.4 Rotation
 
@@ -580,7 +602,7 @@ QSPI, about 0.53 s per 64 KB erase):
 | churn on `flash_area`, 1 000 updates | 40 erases = 16 master + 8 compactions × 3 | 24 erases + 16 record programs |
 | churn on UBI, atomic replace | 8 erases, 0 master | unchanged |
 | AEAD compaction on 64 KB blocks (PR #63) | about +1 erase per compaction (not measured) | 0 |
-| id ceiling | 1 erase per 256 new ids | 1 record program per 256 new ids |
+| id ceiling | 1 erase per 256 new ids | at most 1 record program per 256 new ids, and none when another record carried the ceiling forward within the step (D14) |
 | mount | 2 header reads | 2 header reads + every record slot of the active sector (up to 82 on 4 KB, 1 362 on 64 KB) |
 | RAM | — | a cursor (2 B), the active sector's `rot_gen`, the fuse word (4 B) and a pending flag |
 | a failed record write | — | the next update rotates: 1 erase, on a path that should not happen |
@@ -592,7 +614,7 @@ QSPI, about 0.53 s per 64 KB erase):
 | Where | Change |
 |---|---|
 | `lib/blob_db/blob_db_internal.h` | major-5 header and record structs; the feature and slot-flag registry; the fuse registry |
-| `lib/blob_db/blob_db.c` | `write_master()` becomes `master_update()` and `rotate()`; mount's master classification, log search, feature check and doubt rule; features written at format, the upgrade's two rotations and finishing a half-done upgrade at mount; a sealed, intact slot with an unknown flag refuses its bucket instead of ending its log as torn, and compaction refuses to drop programmed bytes beyond its walk (D13); `persist_seg_owner()`, `persist_next_id_hint()`, compaction and recovery append records; `fuse_trip()` at each trip point in §4.5, the mount and wedge appends, pending fuses as `blob_db_maintain()` work, `fuses = 0` at format |
+| `lib/blob_db/blob_db.c` | `write_master()` becomes `master_update()` and `rotate()`; mount's master classification, log search, feature check and doubt rule; features written at format, the upgrade's two rotations and finishing a half-done upgrade at mount; a sealed, intact slot with an unknown flag refuses its bucket instead of ending its log as torn, and compaction refuses to drop programmed bytes beyond its walk (D13); `persist_seg_owner()`, `persist_next_id_hint()`, compaction and recovery append records, and every record raises both ceilings (D14); `fuse_trip()` at each trip point in §4.5, the mount and wedge appends, pending fuses as `blob_db_maintain()` work, `fuses = 0` at format |
 | PR #63 | master MAC and tail move into the header and record layouts above; `cbase` becomes a random prefix; `seq_reserve()` is no longer called by compaction |
 | PR #62 | `DELTA` moves to slot flag bit 5 and is set at format |
 | `lib/blob_db/blob_db_inspect.c`, shell | show features, suite, geometry, log fill and rotation generation; return the raw fuse word and whether new fuses are pending, which the shell prints by bit name; `struct blob_db_core_state` gains both |
@@ -605,6 +627,11 @@ QSPI, about 0.53 s per 64 KB erase):
 2. **Power cut** at every byte of a record append and of a rotation (header
    and record[0]): mount sees the old state or the new one, never another, and
    an id or nonce value is never issued twice.
+2a. **Ceilings ride along** (D14): a run of segmented writes, which append
+    `seg_owner` records anyway, allocates many ids and writes no ceiling-only
+    record (iostats). Every record's ceiling is at least the one before it.
+    After a cut at any point, mount's `next_id` is at most `STEP + 1` above the
+    last id handed out, and never at or below it.
 3. **The log end**: a torn last record, an erased-but-interrupted slot, and a
    rotten record in the middle give the newest committed state. **The
    invariant** (§3.2a): a record write that fails having programmed nothing
