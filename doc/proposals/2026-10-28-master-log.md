@@ -25,7 +25,7 @@ can still change. Two things are wrong with it:
 **Short answer.** Each master sector becomes a header written once per erase,
 followed by an append-only log of fixed-size records. Each record is a full
 copy of the mutable state. An update programs one record into erased space
-and erases nothing, and a sector is erased once per 60 to 1 300 updates. The
+and erases nothing, and a sector is erased once per 62 to 1 362 updates (§3.2). The
 header records the geometry and three feature sets (`incompat`, `ro_compat`,
 `compat`) in place of the major-number combinations. Protection is a `suite`
 the build requires, not a feature the store chooses. Compaction no longer
@@ -52,7 +52,7 @@ come later (§4.5a).
 | M6 | A store says which features it uses; a build refuses what it does not understand | `incompat` / `ro_compat` / `compat` in the header (§4) |
 | M7 | A protected build accepts only a store protected exactly as it expects | `suite` must equal the build's; the store never chooses protection (§4.3) |
 | M8 | The geometry is part of the format | `peb_size` and `n_buckets` in the header, checked at mount (§3.1) |
-| M9 | No new steady-state RAM | a log cursor and a record number, plus the 4 B fuse word (P3) |
+| M9 | A few bytes of steady-state RAM, fixed at build time (P3) | the log cursor as a record index (2 B), the active sector's `rot_gen` (4 B), the header's feature sets (12 B), a failed-write flag, and the fuse word (4 B) |
 | M10 | Evidence of damage and recovery survives until a format, and no other path clears it | 32 OR-only fuses in every record (§4.5) |
 
 ## 2. Decisions
@@ -224,10 +224,11 @@ and nothing has been written after it.
 ### 3.3 Update
 
 ```
+# cursor: the index of the next record slot; n_rec = (peb_size - 128) / R
 master_update(state):
-    if failed or cursor + R > peb_size: rotate(state); return
-    rc = write record(rec_no = (cursor - 128) / R, state) at cursor
-    cursor += R
+    if failed or cursor == n_rec: rotate(state); return
+    rc = write record(rec_no = cursor, state) at 128 + cursor * R
+    cursor += 1
     if rc < 0: failed = true      # the slot may still read erased: keep §3.2a
 ```
 
@@ -262,7 +263,7 @@ that. A record whose write fails raises nothing.
 rotate(state):
     other = !active
     replace(other, header(rot_gen + 1, features = header) ‖ record[0](state))
-    active = other; cursor = 128 + R
+    active = other; cursor = 1; failed = false
 ```
 
 `blob_db_store_replace()` is an erase and a write on `flash_area`, and
@@ -807,7 +808,7 @@ QSPI, about 0.53 s per 64 KB erase):
 | AEAD compaction on 64 KB blocks (PR #63) | about +1 erase per compaction (not measured) | 0 |
 | id ceiling | 1 erase per 256 new ids | at most 1 record program per 256 new ids, and none when another record carried the ceiling forward within the step (D14) |
 | mount | 2 header reads | 2 header reads + every record slot of the active sector (up to 82 on 4 KB, 1 362 on 64 KB) |
-| RAM | — | a cursor (2 B), the active sector's `rot_gen`, the fuse word (4 B) and a pending flag |
+| RAM | — | about 24 B: the cursor as a record index (2 B; at most 1 362 records on 64 KB, 2 728 on 128 KB), the active sector's `rot_gen` (4 B), the header's three feature sets (12 B), copied verbatim at rotation, a failed-write flag, and the fuse word (4 B); once fuses trip, a pending flag |
 | a failed record write | — | the next update rotates: 1 erase, on a path that should not happen |
 | a doubtful mount | a scan at every mount until the next master write | one scan, then 1 record, or 1 rotation (1 erase) when the other sector is bad; the next mount does not scan |
 | a fuse (once fuses trip, §4.5a) | — | 1 record program the first time it trips, at mount or with the next record or `blob_db_maintain()`; 0 erases, except a rotation when the sector is full |
