@@ -292,11 +292,21 @@ returned from the field. The rules:
   included. And it hands the word over, raw, to the diagnostic API. The only
   internal call is `fuse_trip(bit)`, and nothing clears a bit.
 - **Opaque, all 32 bits alike.** Because the core interprets no bit, it does
-  not tell known bits from unknown ones: the whole word is copied, so a bit
-  set by a later build passes through an older one unchanged. Bits 16..31 are
-  reserved for later assignment. The field has to be in major 5 from phase 1,
-  since a build that wrote those bytes as reserved zeros would clear every
-  fuse.
+  not tell known bits from unknown ones. The new record's word is always the
+  old word OR new trips, never a word rebuilt from the bits a build knows,
+  and no mask of known bits exists anywhere. So a fuse defined after a build
+  was released passes through that build unchanged.
+- **No build can destroy a fuse it does not know.** Three rules close every
+  path:
+  - The field is in major 5 from phase 1, so every build that can write a
+    major-5 record carries the word. A build that wrote those bytes as
+    reserved zeros would clear every fuse.
+  - The field stays at record bytes 36..39 for as long as the major is 5.
+    A layout that moved it would be a new major, which older builds refuse.
+  - Older builds (majors 1–4) refuse a major-5 store and write nothing
+    (D10).
+
+  Only a format, which is deliberate, clears them.
 - **Exposed, not interpreted.** Printing and exposing are not interpreting.
   No call in `<app/lib/blob_db.h>` reads or sets fuses. With
   `CONFIG_BLOB_DB_INSPECT`, the inspection module returns the raw word (and
@@ -340,7 +350,15 @@ code depends on fuses, a lost trip costs only that piece of evidence.
 **Registry.** The bit numbers live in `blob_db_internal.h`, next to the feature
 registry, because the trip points need them. The names exist only for
 printing, in the inspection module and the shell. A `BUILD_ASSERT` checks
-that no two fuses share a bit:
+that no two fuses share a bit. Every bit, debug ones included, is assigned
+there once and keeps its meaning forever, so a post-mortem can decode a
+store without knowing which build wrote it.
+
+**Debug fuses.** Bits 24..31 are for debug evidence. They are tripped only by
+builds with a debug or test option, for example
+`CONFIG_BLOB_DB_TEST_CRASH_HOOKS`. A release build never trips them, but it
+carries them like every other bit, so a field store keeps the record that a
+debug build once wrote it, or that a development check fired.
 
 | Bit | Fuse | Trips when |
 |---|---|---|
@@ -360,7 +378,9 @@ that no two fuses share a bit:
 | 13 | `COMPACT_RECOVERED` | mount finds `COMPACTING` and recovers |
 | 14 | `SEG_SWEEP` | mount finds `seg_owner` set and sweeps (an interrupted large write) |
 | 15 | `AUTOFORMATTED` | set in record[0] by an autoformat |
-| 16..31 | reserved | not tripped by this design; copied like every other bit |
+| 16..23 | reserved | for later fuses; copied like every other bit |
+| 24 | `DEBUG_BUILD` | a build with a debug or test option wrote a record (set by its first record) |
+| 25..31 | reserved, debug | for later debug fuses; tripped only by debug builds; copied like every other bit |
 
 **Trust.** In a protected store the record, `fuses` included, is under the
 MAC, so nobody without the key can clear a bit. Replaying an older master
@@ -518,7 +538,10 @@ QSPI, about 0.53 s per 64 KB erase):
 10. **Fuses**: each trip point by fault injection: a bit flipped mid-bucket
     trips `SLOT_ROT`, a cut at the tail trips `SLOT_TORN` only, and so on for
     each row of §4.5. Each bit survives a remount, updates, rotations and
-    compactions. A bit from 16..31 planted by the test passes through the same. A
+    compactions. **Unknown bits:** the test plants every bit the build does not
+    assign, in both the reserved and the debug range. They pass through updates,
+    rotations, compaction, recovery at mount, a wedge's append and a fall back
+    to an earlier record, and only a format clears them. A
     read that trips a fuse writes nothing (iostats), and `blob_db_maintain()`
     then appends one record. A mount that trips one appends one record before
     returning, and a refused mount writes nothing. A wedge makes its one
