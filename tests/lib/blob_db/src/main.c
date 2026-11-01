@@ -1478,13 +1478,15 @@ ZTEST(blob_db, test_torn_scratch_write_does_not_clobber_bucket)
 	zassert_mem_equal(buf, "VICTIM", 6);
 }
 
-/* The other half of the window: the image DID land and was sealed, and the
- * bucket was already erased when power went. Recovery must restore it. */
-ZTEST(blob_db, test_sealed_scratch_is_restored_over_erased_bucket)
+/* Leave the state a crash inside the compaction window leaves once the image
+ * landed and was sealed and the bucket was already erased: bind @p val under
+ * a fresh id, copy its bucket into scratch, seal it, erase the bucket. The
+ * store is left unmounted; *bid_out is the bucket. Masters are untouched, so
+ * the caller decides what the master says. */
+static uint64_t forge_sealed_scratch_over_erased_bucket(const char *val,
+							 uint16_t *bid_out)
 {
-	SKIP_UNLESS_RAW_PARTITION();
-
-	uint64_t id = put_blob("RESTORE", 7);
+	const uint64_t id = put_blob(val, strlen(val));
 	const uint16_t n_buckets = 2045;
 	const uint16_t bid = (uint16_t)(id % n_buckets);
 	const off_t bucket_off = (off_t)(3 + bid) * TEST_SECTOR_SZ;
@@ -1492,8 +1494,6 @@ ZTEST(blob_db, test_sealed_scratch_is_restored_over_erased_bucket)
 
 	zassert_ok(blob_db_unmount());
 
-	/* Copy the live bucket image into scratch, seal it, then erase the
-	 * bucket — the state left by a crash between those two steps. */
 	static uint8_t image[TEST_SECTOR_SZ];
 	const struct flash_area *fa;
 
@@ -1530,6 +1530,45 @@ ZTEST(blob_db, test_sealed_scratch_is_restored_over_erased_bucket)
 	zassert_ok(flash_area_erase(fa, bucket_off, TEST_SECTOR_SZ));
 	flash_area_close(fa);
 
+	*bid_out = bid;
+	return id;
+}
+
+static void assert_blob_is(uint64_t id, const char *val, const char *why)
+{
+	uint8_t buf[16];
+	size_t got;
+
+	zassert_ok(blob_db_get(id, buf, sizeof(buf), &got), "%s", why);
+	zassert_equal(got, strlen(val), "%s", why);
+	zassert_mem_equal(buf, val, got, "%s", why);
+}
+
+static bool scratch_reads_erased(void)
+{
+	static uint8_t buf[TEST_SECTOR_SZ];
+	const struct flash_area *fa;
+
+	zassert_ok(flash_area_open(BLOB_DB_TEST_PARTITION_ID, &fa));
+	zassert_ok(flash_area_read(fa, 2 * TEST_SECTOR_SZ, buf, sizeof(buf)));
+	flash_area_close(fa);
+	for (size_t i = 0; i < sizeof(buf); i++) {
+		if (buf[i] != 0xff) {
+			return false;
+		}
+	}
+	return true;
+}
+
+/* The other half of the window: the image DID land and was sealed, and the
+ * bucket was already erased when power went. Recovery must restore it. */
+ZTEST(blob_db, test_sealed_scratch_is_restored_over_erased_bucket)
+{
+	SKIP_UNLESS_RAW_PARTITION();
+
+	uint16_t bid;
+	const uint64_t id = forge_sealed_scratch_over_erased_bucket("RESTORE",
+								     &bid);
 	struct master_img m;
 
 	master_read_raw(0, &m);
@@ -1540,14 +1579,123 @@ ZTEST(blob_db, test_sealed_scratch_is_restored_over_erased_bucket)
 	master_write_raw(1, &m);
 
 	zassert_ok(blob_db_mount());
+	assert_blob_is(id, "RESTORE",
+		       "a sealed image was not restored over the erased bucket");
+	zassert_true(scratch_reads_erased(), "recovery left scratch behind");
+}
 
-	uint8_t buf[8];
-	size_t got;
+/* The same cut, after which the COMPACTING master rotted: mount falls back to
+ * the CLEAN master before it. Keyed on the master state, recovery never ran
+ * and the bucket stayed erased; keyed on the seal, it is restored. */
+ZTEST(blob_db, test_sealed_scratch_hidden_by_a_rotten_master_is_restored)
+{
+	SKIP_UNLESS_RAW_PARTITION();
 
-	zassert_ok(blob_db_get(id, buf, sizeof(buf), &got),
-		   "a sealed image was not restored over the erased bucket");
-	zassert_equal(got, 7);
-	zassert_mem_equal(buf, "RESTORE", 7);
+	uint16_t bid;
+	const uint64_t id = forge_sealed_scratch_over_erased_bucket("HIDDEN",
+								     &bid);
+	struct master_img m;
+
+	master_read_raw(0, &m);
+	m.generation += 100;
+	m.state = 1;               /* COMPACTING */
+	m.cbid = bid;
+	master_seal(&m);
+	m.hdr_crc32 ^= 0x1;        /* the body rots after it landed */
+	master_write_raw(1, &m);
+
+	zassert_ok(blob_db_mount());
+	assert_blob_is(id, "HIDDEN",
+		       "a sealed image behind a rotten COMPACTING master was lost");
+	zassert_true(scratch_reads_erased(), "recovery left scratch behind");
+}
+
+/* A sealed scratch beside a CLEAN master, with nothing else forged: what an
+ * atomic-replace build meets when a build without atomic replace was cut
+ * inside the window and its COMPACTING master is gone. Restored, and no
+ * master is written for it: there is no compaction state to close. */
+ZTEST(blob_db, test_sealed_scratch_beside_a_clean_master_is_restored)
+{
+	SKIP_UNLESS_RAW_PARTITION();
+
+	uint16_t bid;
+	const uint64_t id = forge_sealed_scratch_over_erased_bucket("CLEAN", &bid);
+	struct master_img before, after;
+
+	master_read_raw(0, &before);
+	zassert_equal(before.state, 0, "precondition: a CLEAN master");
+
+	zassert_ok(blob_db_mount());
+	assert_blob_is(id, "CLEAN", "a sealed image beside a CLEAN master was lost");
+	zassert_true(scratch_reads_erased(), "recovery left scratch behind");
+
+	master_read_raw(0, &after);
+	zassert_equal(after.generation, before.generation,
+		      "restoring needs no master write when nothing was COMPACTING");
+}
+
+/* The master and the sealed image disagree on the bucket. The image's own
+ * header, under the seal's CRC, is what was being compacted, so that bucket
+ * is restored; the master's bucket is left alone. Before, recovery took the
+ * master's word, found the image "foreign", and erased it with the only
+ * complete copy of the erased bucket. */
+ZTEST(blob_db, test_sealed_image_names_the_bucket_to_restore)
+{
+	SKIP_UNLESS_RAW_PARTITION();
+
+	const uint64_t bystander = put_blob("BYSTANDER", 9);
+	uint16_t bid;
+	const uint64_t id = forge_sealed_scratch_over_erased_bucket("IMAGE", &bid);
+	struct master_img m;
+
+	zassert_not_equal((uint16_t)(bystander % 2045), bid,
+			  "precondition: two different buckets");
+
+	master_read_raw(0, &m);
+	m.generation += 100;
+	m.state = 1;               /* COMPACTING */
+	m.cbid = (uint16_t)(bystander % 2045);
+	master_seal(&m);
+	master_write_raw(1, &m);
+
+	zassert_ok(blob_db_mount());
+	assert_blob_is(id, "IMAGE", "the bucket the sealed image names was lost");
+	assert_blob_is(bystander, "BYSTANDER",
+		       "the bucket the master names was disturbed");
+	zassert_true(scratch_reads_erased(), "recovery left scratch behind");
+}
+
+/* Scratch with content but no seal, beside a CLEAN master: no compaction was
+ * in its window, so mount writes nothing. The next compaction erases scratch
+ * before it uses it. */
+ZTEST(blob_db, test_unsealed_scratch_beside_a_clean_master_is_left_alone)
+{
+	SKIP_UNLESS_RAW_PARTITION();
+
+	static const uint8_t junk[16] = "not a seal, no!";
+	const uint64_t id = put_blob("KEEP", 4);
+	const off_t scratch_off = 2 * TEST_SECTOR_SZ;
+	const struct flash_area *fa;
+	uint8_t back[sizeof(junk)];
+	struct blob_db_iostats io;
+
+	zassert_ok(blob_db_unmount());
+	zassert_ok(flash_area_open(BLOB_DB_TEST_PARTITION_ID, &fa));
+	zassert_ok(flash_area_erase(fa, scratch_off, TEST_SECTOR_SZ));
+	zassert_ok(flash_area_write(fa, scratch_off, junk, sizeof(junk)));
+	zassert_ok(flash_area_write(fa, scratch_off + TEST_SECTOR_SZ - sizeof(junk),
+				    junk, sizeof(junk)));
+
+	blob_db_iostats_reset();
+	zassert_ok(blob_db_mount());
+	blob_db_iostats_get(&io);
+	zassert_equal(io.erases, 0, "mount erased %u blocks", io.erases);
+	zassert_equal(io.writes, 0, "mount wrote %u times", io.writes);
+
+	zassert_ok(flash_area_read(fa, scratch_off, back, sizeof(back)));
+	zassert_mem_equal(back, junk, sizeof(junk), "scratch was touched");
+	flash_area_close(fa);
+	assert_blob_is(id, "KEEP", "a blob outside scratch was disturbed");
 }
 
 #ifdef CONFIG_BLOB_DB_LARGE_PAYLOADS

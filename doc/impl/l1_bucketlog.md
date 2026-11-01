@@ -313,7 +313,8 @@ if neither valid:
     else: return -EIO                                     # §3.1
 else:
     pick higher valid generation
-    if state == COMPACTING: finish/abort per crash table (§6.1), write CLEAN master
+    if scratch is sealed: restore the bucket its image names; erase scratch  # every mount, §6.1
+    if state == COMPACTING: write CLEAN master
 next_id = next_id_hint                                    # §13.1
 
 if exactly one master valid, or the store reports damage on a master sector:
@@ -632,6 +633,20 @@ wins). Compaction composes them.
 | during the scratch seal write | B = COMPACTING, seal partial → unsealed | as above; the bucket was never touched |
 | during bucket erase/restore | B = COMPACTING, scratch **sealed** | copy scratch → bucket; erase scratch; write CLEAN |
 | during final master-A write | B still COMPACTING | re-run recovery (idempotent); write CLEAN |
+| any of the above, then the COMPACTING master rots | A CLEAN, B invalid; scratch sealed or not | sealed: copy scratch → bucket, erase scratch, no master write. Unsealed: nothing, the bucket was never touched |
+
+**The seal decides, not the master.** Mount checks the seal at every mount,
+whatever the adopted master's state, and on every backend. Scratch is sealed
+only after the whole image landed and erased before the window closes, so a
+sealed scratch exists exactly while the bucket may be erased or half written,
+and its image is the bucket's complete new content. The bucket comes from the
+image's own header, which the seal covers. Keying on `COMPACTING` alone
+missed a compaction whose `COMPACTING` master rotted: mount fell back to the
+`CLEAN` master before it and left the bucket as the cut had. Atomic-replace
+builds check too, because a store compacted through scratch by a build without
+atomic replace can carry a sealed scratch into one with it. A mount with
+nothing to recover reads the 16 B seal and nothing else. `COMPACTING` and
+`CLEAN` are still written around the window, so older builds still recover.
 
 **"Scratch valid" must mean "the whole image landed", and the bucket header
 cannot say that.** The header sits at offset 0 of the image, so it is written
@@ -738,7 +753,8 @@ draft implementation and will be reworked against the final API; the
 10. corrupted slot truncates its bucket cleanly on remount
 11. full bucket triggers compaction; bind succeeds after
 12. compaction drops tombstones/overrides; preserves all live ids
-13. simulated mid-compaction crash (forged COMPACTING master) recovers
+13. simulated mid-compaction crash recovers: forged COMPACTING master, and a
+    sealed scratch beside a CLEAN master (the COMPACTING one rotted)
 14. scale: 100 k blobs, random subset round-trips (Kconfig-gated)
 15. batch ops (`BLOB_DB_MULTI`): `multi_get`/`multi_exists`/`multi_delete`
     over a mixed set (present, missing, dead ids) — per-element results
