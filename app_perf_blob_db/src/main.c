@@ -12,12 +12,13 @@
  *   mount empty — remount a store holding only the root: mount's floor
  *
  * Then twice, once building the list by prepending and once by appending.
- * Each pass runs erase_all() followed by blob_db_prepare(N_OPS), so the timed
- * insert loop measures the append-only write path — the one-time sector-erase
- * cost is paid up-front by prepare() and reported separately.
- *   prepare — pre-format N_OPS buckets ahead of the alloc cursor (one 64 KB
- *             sector erase per bucket on mx25r64; the append/prepend loops
- *             below never trigger a bucket format because of this)
+ * Each pass runs erase_all() followed by blob_db_maintain() until nothing is
+ * left, so the timed insert loop measures the append-only write path — the
+ * erases blob_db can do ahead are paid up-front and reported separately.
+ *   maint   — on flash_area, format every fresh bucket (one 64 KB sector
+ *             erase each on mx25r64); on UBI, reclaim the blocks waiting
+ *             for an erase. Either way the append/prepend loops below find
+ *             an erased block for every bucket they first write.
  *   prepend — alloc_id + bind(new, next=head) + update(root=new_id)
  *   append  — alloc_id + bind(new, next=0) + update(prev_tail, next=new_id)
  *             (O(1) via a caller-side tail cache)
@@ -223,6 +224,23 @@ static uint32_t lcg(uint32_t *state)
 {
 	*state = (*state * 1103515245u) + 12345u;
 	return *state >> 8;
+}
+
+/* Run blob_db_maintain() until nothing is left; returns the steps taken. */
+static int maintain_all(void)
+{
+	struct blob_db_maint_result res;
+	int steps = 0;
+
+	do {
+		const int rc = blob_db_maintain(1, &res);
+
+		if (rc < 0) {
+			return rc;
+		}
+		steps += (int)res.performed;
+	} while (res.more);
+	return steps;
 }
 
 static void bench_line(const char *what, int ops, int64_t ms)
@@ -465,7 +483,7 @@ static int bench_large(void)
 	fill_obj(0x5a);
 
 	/* Cold: buckets are unformatted, so every segment pays a sector erase.
-	 * Deliberately NOT prepare()d — the contrast with the warm pass below
+	 * Deliberately NOT maintained — the contrast with the warm pass below
 	 * is what quantifies the erase cost. */
 	io_reset();
 	int64_t t = k_uptime_get();
@@ -729,11 +747,11 @@ static int bench_churn(void)
 	printk("\n-- churn (CHURN_OPS=%u  CHURN_SET=%u  CHURN_LEN=%u) --\n",
 	       (unsigned)CHURN_OPS, (unsigned)CHURN_SET, (unsigned)CHURN_LEN);
 
-	int prepared = blob_db_prepare(CHURN_SET);
+	int maintained = maintain_all();
 
-	if (prepared < 0) {
-		LOG_ERR("churn prepare: %d", prepared);
-		return prepared;
+	if (maintained < 0) {
+		LOG_ERR("churn maintain: %d", maintained);
+		return maintained;
 	}
 
 	for (int k = 0; k < CHURN_SET; k++) {
@@ -816,7 +834,7 @@ static int bench_churn(void)
 	return churn_verify("after churn");
 }
 
-/* One list-building phase: erase, prepare, insert N_OPS nodes, then read and
+/* One list-building phase: erase, maintain, insert N_OPS nodes, then read and
  * update them. `append` picks the insert shape. */
 static int bench_list(bool append, uint8_t *val)
 {
@@ -830,14 +848,14 @@ static int bench_list(bool append, uint8_t *val)
 
 	io_reset();
 	int64_t tp = k_uptime_get();
-	int prepared = blob_db_prepare(N_OPS);
+	int maintained = maintain_all();
 
-	if (prepared < 0) {
-		LOG_ERR("prepare: %d", prepared);
-		return prepared;
+	if (maintained < 0) {
+		LOG_ERR("maintain: %d", maintained);
+		return maintained;
 	}
-	bench_line("prepare", prepared, k_uptime_delta(&tp));
-	io_line("prepare", 0);
+	bench_line("maint", maintained, k_uptime_delta(&tp));
+	io_line("maint", 0);
 
 	io_reset();
 	int64_t t0 = k_uptime_get();

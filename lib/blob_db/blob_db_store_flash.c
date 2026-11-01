@@ -77,6 +77,9 @@ int blob_db_store_open(struct blob_db_store_geom *geom, bool discard)
 	geom->peb_size = peb_size;
 	geom->write_align = write_align;
 	geom->n_pebs = (uint16_t)(fa_size / peb_size);
+	/* A never-written bucket costs its first update a sector erase;
+	 * blob_db_maintain() takes it off that path. */
+	geom->preformat = true;
 	return 0;
 
 err_close:
@@ -136,7 +139,9 @@ bool blob_db_store_open_found_damage(off_t off)
 	return false;
 }
 
-/* Every erase happens on the write path, so nothing is ever deferred. */
+/* Everything this backend could defer is the core's: formatting fresh
+ * buckets (geom->preformat). The erases of compaction happen on the write
+ * path and cannot be done ahead on raw flash. */
 int blob_db_store_maintain(uint32_t budget, uint32_t *performed, bool *more)
 {
 	ARG_UNUSED(budget);

@@ -338,7 +338,7 @@ one command per call and named after it — `persondb card assign` is
 ```
 persondb open | close             open (building a store if there is none), detach
 persondb destroy                  remove this store, and only it
-persondb prepare                  pre-format erase blocks
+persondb prepare                  do the erases blob_db can do ahead
 persondb stat [reset]             geometry and counters; reset zeroes the counters
 persondb person get <id>
 persondb person add <id> <name> [dept] [title]   no cards or perms, valid forever

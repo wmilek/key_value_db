@@ -58,7 +58,7 @@ struct blob_db_iostats {
 				  *   each — including the two every
 				  *   non-atomic compaction writes */
 	uint32_t bucket_formats; /**< bucket headers written to a fresh block:
-				  *   prepare(), a bucket's first use, and the
+				  *   maintain(), a bucket's first use, and the
 				  *   root bucket in format/erase_all */
 	uint32_t compactions;    /**< buckets compacted (each erases the bucket
 				  *   and, unless the backend replaces

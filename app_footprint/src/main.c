@@ -178,7 +178,7 @@ static void run_blob_db(void)
 	uint64_t id;
 
 	use(blob_db_mount());
-	use(blob_db_prepare(1));
+	use(blob_db_maintain(1, NULL));
 	id = blob_db_alloc_id();
 	use(blob_db_update(id, buf, sizeof(buf)));
 	use(blob_db_get(id, buf, sizeof(buf), &len));

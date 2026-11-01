@@ -150,7 +150,7 @@ static int cmd_destroy(const struct shell *sh, size_t argc, char **argv)
 static int cmd_prepare(const struct shell *sh, size_t argc, char **argv)
 {
 	int64_t ms;
-	int formatted;
+	int steps;
 	int rc = need_open(sh);
 
 	ARG_UNUSED(argc);
@@ -158,9 +158,9 @@ static int cmd_prepare(const struct shell *sh, size_t argc, char **argv)
 	if (rc) {
 		return rc;
 	}
-	rc = scenario_prepare(&g_s, &formatted, &ms);
-	shell_print(sh, "prepare: %d — %d buckets formatted in %lld ms", rc,
-		    formatted, (long long)ms);
+	rc = scenario_prepare(&g_s, &steps, &ms);
+	shell_print(sh, "prepare: %d — %d maintenance steps in %lld ms", rc,
+		    steps, (long long)ms);
 	return rc;
 }
 
@@ -609,7 +609,7 @@ SHELL_STATIC_SUBCMD_SET_CREATE(
 	SHELL_CMD_ARG(close, NULL, "Detach and unmount", cmd_close, 1, 0),
 	SHELL_CMD_ARG(destroy, NULL, "Remove this store, and only it",
 		      cmd_destroy, 1, 0),
-	SHELL_CMD_ARG(prepare, NULL, "Pre-format erase blocks", cmd_prepare, 1, 0),
+	SHELL_CMD_ARG(prepare, NULL, "Do the erases blob_db can do ahead", cmd_prepare, 1, 0),
 	SHELL_CMD_ARG(stat, NULL, "stat [reset] — geometry and counters",
 		      cmd_stat, 1, 1),
 	SHELL_CMD(person, &person_cmds, "Persons", NULL),
