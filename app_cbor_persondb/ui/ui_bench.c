@@ -126,7 +126,7 @@ int ui_main(void)
 
 	/* Take the one-off sector erases out of the timed loops so the fill
 	 * measures the warm write path (and so their cost is visible). */
-	int prepared = 0;
+	int prepared = 0;   /* blob_db_maintain() steps */
 	int64_t prep_ms = 0;
 
 	rc = scenario_prepare(&s, &prepared, &prep_ms);
@@ -134,7 +134,7 @@ int ui_main(void)
 		printk("prepare failed: %d\n", rc);
 		goto out;
 	}
-	printk("prepare      : %6" PRId64 " ms (%d buckets formatted)\n",
+	printk("prepare      : %6" PRId64 " ms (%d maintenance steps)\n",
 	       prep_ms, prepared);
 
 	/* Fill. Resumable across reboots: this returns when the dataset is

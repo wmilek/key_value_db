@@ -10,6 +10,8 @@ project(blob_db_test)
 # is built and linked automatically when CONFIG_BLOB_DB=y. Re-adding lib/
 # here would create a duplicate `blob_db` target, so we only add the test.
 target_sources(app PRIVATE src/main.c)
+# blob_db_maintain(), its work-queue helper and the library lock.
+target_sources(app PRIVATE src/maint.c)
 # Power cuts during a compaction, injected under the store seam by the flash
 # simulator, so they hold on every backend.
 target_sources(app PRIVATE src/power_cut.c)

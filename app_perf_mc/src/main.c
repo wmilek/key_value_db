@@ -90,6 +90,23 @@ LOG_MODULE_REGISTER(app_perf_mc, CONFIG_APP_PERF_MC_LOG_LEVEL);
 
 #define VAL_LEN 24
 
+/* Run blob_db_maintain() until nothing is left; returns the steps taken. */
+static int maintain_all(void)
+{
+	struct blob_db_maint_result res;
+	int steps = 0;
+
+	do {
+		const int rc = blob_db_maintain(1, &res);
+
+		if (rc < 0) {
+			return rc;
+		}
+		steps += (int)res.performed;
+	} while (res.more);
+	return steps;
+}
+
 static void bench_line(const char *what, int ops, int64_t ms)
 {
 	uint64_t milli_ops_per_s =
@@ -457,14 +474,14 @@ int main(void)
 	}
 
 	int64_t t = phase_begin();
-	int prepared = blob_db_prepare(CONFIG_APP_PERF_MC_PREPARE);
+	int maintained = maintain_all();
 
-	if (prepared < 0) {
-		rc = prepared;
-		LOG_ERR("prepare: %d", prepared);
+	if (maintained < 0) {
+		rc = maintained;
+		LOG_ERR("maintain: %d", maintained);
 		goto out;
 	}
-	phase_end("prepare", prepared, &t);
+	phase_end("maint", maintained, &t);
 
 	rc = rootreg_init();
 	if (rc < 0) {
