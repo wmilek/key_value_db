@@ -335,3 +335,304 @@ ZTEST(blob_db_torn_append, test_compaction_keeps_slots_after_a_torn_one)
 	zassert_true(ta_is(a, 0x11));
 	zassert_equal(blob_db_count(), count + 1);
 }
+
+#if defined(CONFIG_BLOB_DB_LARGE_PAYLOADS)
+/* --- The same through the segmented writers ---------------------------------
+ *
+ * A large object's segment, index and segment-tombstone slots are appended by
+ * code of their own, which takes its cursor from a walk rather than from the
+ * inline writers' path. Each case below tears a plain append at the tail of a
+ * bucket and then makes one of those slots land in it. Programmed over the
+ * torn bytes, the slot would fail its own CRC: a segment of an acknowledged
+ * update lost, the commit itself lost, or a released segment left live. */
+
+/* Several segments, and a short last one. */
+#define TA_BIG_LEN (3u * CONFIG_BLOB_DB_MAX_PAYLOAD_LEN + 123u)
+
+static uint8_t ta_big[TA_BIG_LEN];
+static uint8_t ta_got[TA_BIG_LEN];
+
+static void ta_fill(uint8_t *buf, size_t len, uint8_t seed)
+{
+	for (size_t i = 0; i < len; i++) {
+		buf[i] = (uint8_t)((i * 31u + seed) ^ (i >> 8));
+	}
+}
+
+static uint16_t ta_n_buckets(void)
+{
+	struct blob_db_inspect_info in;
+
+	zassert_ok(blob_db_inspect_info_get(&in));
+	return (uint16_t)in.n_buckets;
+}
+
+static uint16_t ta_bucket(uint64_t id)
+{
+	return (uint16_t)(id % ta_n_buckets());
+}
+
+/* A fresh id that hashes to bucket @p bid. */
+static uint64_t ta_id_in(uint16_t bid)
+{
+	uint64_t id;
+
+	do {
+		id = blob_db_alloc_id();
+		zassert_not_equal(id, 0);
+	} while (ta_bucket(id) != bid);
+	return id;
+}
+
+/* Spend ids until the next one alloc_id() hands out -- which is the next
+ * segment's -- hashes to bucket @p bid. Ids are sequential within a mount. */
+static void ta_next_id_in(uint16_t bid)
+{
+	uint64_t id;
+
+	do {
+		id = blob_db_alloc_id();
+		zassert_not_equal(id, 0);
+	} while (ta_bucket(id + 1) != bid);
+}
+
+static void ta_put_big(uint64_t id, uint8_t seed)
+{
+	ta_fill(ta_big, TA_BIG_LEN, seed);
+	zassert_ok(blob_db_update(id, ta_big, TA_BIG_LEN));
+}
+
+/* @p id holds TA_BIG_LEN bytes of @p seed's pattern, the first @p patch_len
+ * of them replaced by bytes of @p patch_seed. */
+static bool ta_big_is(uint64_t id, uint8_t seed, size_t patch_len,
+		      uint8_t patch_seed)
+{
+	size_t n = 0;
+
+	if (blob_db_size(id, &n) != 0 || n != TA_BIG_LEN) {
+		return false;
+	}
+	memset(ta_got, 0, sizeof(ta_got));
+	if (blob_db_read(id, 0, ta_got, TA_BIG_LEN, &n) != 0 || n != TA_BIG_LEN) {
+		return false;
+	}
+	ta_fill(ta_big, TA_BIG_LEN, seed);
+	ta_fill(ta_big, patch_len, patch_seed);
+	return memcmp(ta_got, ta_big, TA_BIG_LEN) == 0;
+}
+
+static int ta_tally_live_segment(const struct blob_db_inspect_slot *s, void *user)
+{
+	if (s->segment) {
+		*(int *)user += (s->state == BLOB_DB_INSPECT_TOMBSTONE) ? -1 : 1;
+	}
+	return 0;
+}
+
+/* Segment slots written minus segment tombstones: each segment is written
+ * once and released at most once, so this is how many are live. */
+static int ta_live_segments_in(uint16_t bid)
+{
+	struct blob_db_inspect_bucket bs;
+	int live = 0;
+
+	zassert_ok(blob_db_inspect_bucket_get(bid, &bs, ta_tally_live_segment, &live));
+	return live;
+}
+
+static int ta_live_segments(void)
+{
+	const uint16_t n = ta_n_buckets();
+	int live = 0;
+
+	for (uint16_t bid = 0; bid < n; bid++) {
+		live += ta_live_segments_in(bid);
+	}
+	return live;
+}
+
+static void ta_remount(void)
+{
+	blob_db_unmount();
+	zassert_ok(blob_db_mount());
+}
+
+/* Cut the power inside an update of the small object @p a after @p cut bytes,
+ * then remount. With fewer than the 4 bytes of flags, reserved and val_len on
+ * flash, the walk cannot size the slot: a's bucket now ends at a torn one,
+ * whose bytes are programmed. (A cut later in the slot leaves one the walk
+ * steps over, and the next append lands on erased flash past it.) */
+#define TA_HEAD_CUTS 4
+
+static void ta_tear(uint64_t a, uint32_t cut)
+{
+	struct blob_db_inspect_bucket bs;
+	const uint16_t bid = ta_bucket(a);
+	uint8_t v[TA_LEN];
+
+	zassert_true(cut > 0 && cut < TA_HEAD_CUTS);
+	zassert_ok(blob_db_inspect_bucket_get(bid, &bs, NULL, NULL));
+	zassert_equal(bs.tail_bytes, 0, "precondition: bucket %u ends cleanly", bid);
+
+	ta.cut = false;
+	ta.budget = cut;
+	ta.armed = true;
+	memset(v, 0x33, sizeof(v));
+	(void)blob_db_update(a, v, sizeof(v));
+	zassert_true(ta.cut, "the append finished before the cut");
+	ta.armed = false;
+	ta.cut = false;
+	ta_remount();
+	zassert_ok(blob_db_inspect_bucket_get(bid, &bs, NULL, NULL));
+	zassert_true(bs.tail_bytes > 0, "cut %u: bucket %u does not end at a torn slot",
+		     cut, bid);
+	zassert_true(ta_is(a, 0x11), "cut %u: a is not its old value", cut);
+}
+
+/* Run @p body once per cut inside the slot head, on a fresh store each time. */
+static void ta_each_head_cut(void (*body)(uint32_t cut))
+{
+	for (uint32_t cut = 1; cut < TA_HEAD_CUTS; cut++) {
+		if (cut > 1) {
+			zassert_ok(blob_db_format());
+		}
+		body(cut);
+	}
+}
+
+/* A segment of a segmented update lands on the torn tail. */
+static void ta_segment_after_a_torn_append_is_kept(uint32_t cut)
+{
+	const uint64_t obj = blob_db_alloc_id();
+
+	ta_put_big(obj, 0x11);
+
+	const int segs = ta_live_segments();
+	const uint64_t a = blob_db_alloc_id();
+	const uint16_t bid = ta_bucket(a);
+
+	zassert_true(segs > 1, "precondition: the object is segmented");
+	zassert_not_equal(bid, ta_bucket(obj), "precondition: index elsewhere");
+	ta_put(a, 0x11);
+	ta_tear(a, cut);
+
+	ta_next_id_in(bid);
+	ta_put_big(obj, 0x22);
+	zassert_equal(ta_live_segments_in(bid), 1,
+		      "the first new segment is not live in the torn bucket %u", bid);
+	zassert_true(ta_big_is(obj, 0x22, 0, 0), "acknowledged update unreadable");
+
+	ta_remount();
+	zassert_true(ta_big_is(obj, 0x22, 0, 0), "acknowledged update lost on remount");
+	zassert_true(ta_is(a, 0x11), "a changed");
+	zassert_equal(ta_live_segments(), segs, "segments leaked or lost");
+}
+
+ZTEST(blob_db_torn_append, test_segment_after_a_torn_append_is_kept)
+{
+	ta_each_head_cut(ta_segment_after_a_torn_append_is_kept);
+}
+
+/* The index record -- the commit of a segmented update -- lands on the torn
+ * tail of the object's own bucket. */
+static void ta_index_after_a_torn_append_is_kept(uint32_t cut)
+{
+	const uint64_t obj = blob_db_alloc_id();
+
+	ta_put_big(obj, 0x11);
+
+	const int segs = ta_live_segments();
+	const uint64_t a = ta_id_in(ta_bucket(obj));
+
+	ta_put(a, 0x11);
+	ta_tear(a, cut);
+
+	ta_put_big(obj, 0x22);
+	zassert_true(ta_big_is(obj, 0x22, 0, 0), "acknowledged update unreadable");
+
+	ta_remount();
+	zassert_true(ta_big_is(obj, 0x22, 0, 0), "acknowledged commit lost on remount");
+	zassert_true(ta_is(a, 0x11), "a changed");
+	zassert_equal(ta_live_segments(), segs, "segments leaked or lost");
+}
+
+ZTEST(blob_db_torn_append, test_index_after_a_torn_append_is_kept)
+{
+	ta_each_head_cut(ta_index_after_a_torn_append_is_kept);
+}
+
+/* A partial write: its rewritten segment and its index each land on a torn
+ * tail. */
+static void ta_pwrite_after_torn_appends_is_kept(uint32_t cut)
+{
+	const uint64_t obj = blob_db_alloc_id();
+
+	ta_put_big(obj, 0x11);
+
+	const int segs = ta_live_segments();
+	const uint64_t a = blob_db_alloc_id();
+	const uint64_t b = ta_id_in(ta_bucket(obj));
+	const uint16_t bid = ta_bucket(a);
+
+	zassert_not_equal(bid, ta_bucket(obj), "precondition: index elsewhere");
+	ta_put(a, 0x11);
+	ta_put(b, 0x11);
+	ta_tear(a, cut);
+	ta_tear(b, cut);
+
+	/* The first 100 bytes: chunk 0 alone is rewritten. */
+	const size_t patch = 100;
+
+	ta_fill(ta_big, patch, 0x5a);
+	ta_next_id_in(bid);
+	zassert_ok(blob_db_write(obj, 0, ta_big, patch));
+	zassert_equal(ta_live_segments_in(bid), 1,
+		      "the rewritten segment is not live in the torn bucket %u", bid);
+	zassert_true(ta_big_is(obj, 0x11, patch, 0x5a), "acknowledged write unreadable");
+
+	ta_remount();
+	zassert_true(ta_big_is(obj, 0x11, patch, 0x5a), "acknowledged write lost on remount");
+	zassert_true(ta_is(a, 0x11), "a changed");
+	zassert_true(ta_is(b, 0x11), "b changed");
+	zassert_equal(ta_live_segments(), segs, "segments leaked or lost");
+}
+
+ZTEST(blob_db_torn_append, test_pwrite_after_torn_appends_is_kept)
+{
+	ta_each_head_cut(ta_pwrite_after_torn_appends_is_kept);
+}
+
+/* A delete's segment tombstone lands on the torn tail. Lost, it leaves that
+ * segment live with no index naming it: leaked for good, since the delete
+ * clears its sweep intent once it returns. */
+static void ta_delete_after_a_torn_append_releases_segments(uint32_t cut)
+{
+	const uint64_t a = blob_db_alloc_id();
+	const uint16_t bid = ta_bucket(a);
+	const uint64_t obj = blob_db_alloc_id();
+
+	zassert_not_equal(bid, ta_bucket(obj), "precondition: index elsewhere");
+	ta_put(a, 0x11);
+	ta_next_id_in(bid);
+	ta_put_big(obj, 0x11);
+	zassert_equal(ta_live_segments_in(bid), 1,
+		      "precondition: the first segment is in bucket %u", bid);
+	ta_tear(a, cut);
+
+	zassert_ok(blob_db_delete(obj));
+	zassert_false(blob_db_exists(obj));
+	zassert_equal(ta_live_segments(), 0, "delete left %d segment(s) live",
+		      ta_live_segments());
+
+	ta_remount();
+	zassert_false(blob_db_exists(obj), "acknowledged delete undone on remount");
+	zassert_equal(ta_live_segments(), 0, "delete leaked %d segment(s)",
+		      ta_live_segments());
+	zassert_true(ta_is(a, 0x11), "a changed");
+}
+
+ZTEST(blob_db_torn_append, test_delete_after_a_torn_append_releases_segments)
+{
+	ta_each_head_cut(ta_delete_after_a_torn_append_releases_segments);
+}
+#endif /* CONFIG_BLOB_DB_LARGE_PAYLOADS */
