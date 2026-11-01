@@ -611,8 +611,9 @@ compacted slot   N = BE96(2⁹⁵ | ((c + offset) mod 2⁹⁵))      N[0] bit 7 
   random nonces because they would have needed entropy per write.
 - `seq_hint` then covers appended slots only. Every record raises it (D14),
   and an append needs a record only when `seq` reaches the ceiling.
-- The bucket header's 4 bytes that PR #63's layout left after `cbase` become
-  part of `cbase`. The key epoch keeps `slot_hdr.reserved` (§4.2).
+- All 12 bytes of `cbase` are random, and none is left reserved: this
+  section's earlier 8-byte prefix had left 4. The key epoch keeps
+  `slot_hdr.reserved` (§4.2).
 
 ## 7. Crash analysis (P7)
 
@@ -742,6 +743,12 @@ QSPI, about 0.53 s per 64 KB erase):
    key is refused in a protected build (PR #63 §9 item 4, UBI half).
 8. **AEAD nonces**: PR #63's recorder sees no nonce repeat across remounts and
    repeated compactions, and compaction writes no master on either path.
+   Every recorded nonce has `N[0]` bit 7 clear for an appended slot and set for
+   a compacted one, including with `seq` started above 2³¹. A forced `cbase`
+   near 2⁹⁵ − 1 wraps within the low 95 bits and keeps the bit set. A
+   `COMPACTED` slot under a header with `cbase = 0` fails to open. An injected
+   `psa_generate_random()` failure makes compaction, and the write that
+   needed it, return the error, with the bucket's bytes unchanged.
 9. **Registry**: a `BUILD_ASSERT` that no two features own a slot flag.
 10. **Fuses**: each trip point by fault injection: a bit flipped mid-bucket
     trips `SLOT_ROT`, a cut at the tail trips `SLOT_TORN` only, and so on for
