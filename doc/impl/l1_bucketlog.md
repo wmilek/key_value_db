@@ -99,10 +99,12 @@ id is never re-issued even after every trace of it has been compacted away.
 That is what lets the layers above treat a stale id as safely dead rather than
 as a pointer that might silently resolve to somebody else's blob.
 
-Two sectors sit outside this scheme: a **master** (double-buffered across two
-sectors) carrying the generation counter, compaction state and the id ceiling,
-and a **scratch** sector that compaction stages into so a crash mid-rebuild
-cannot lose the bucket.
+Three sectors sit outside this scheme: two **master** sectors, each a header
+and an append-only log of state records (the id ceiling, the segmented write in
+flight), and a **scratch** sector that compaction stages into so a crash
+mid-rebuild cannot lose the bucket. The master is the same idea as a bucket
+applied to the allocator's own state: an update appends a record and erases
+nothing, and a full log rotates into the other sector (§3.1).
 
 ### 1.5 Cost summary
 
@@ -110,19 +112,20 @@ Costs achieved by this design (satisfying contract §3):
 
 | Op | Flash reads | Flash writes | RAM (transient) |
 |---|---|---|---|
-| `mount` | 2 (master A + B) + root bucket walk; + 2045 (bucket scan) with a master in doubt¹ | 0 (or format if first ever) | O(1) |
-| `alloc_id()` | 0 | 0 (occasional id-hint persist) | O(1) |
+| `mount` | 2 master headers + ~log₂(records per sector) record slots (7 on 4 KB, 11 on 64 KB) + root bucket walk; + 2045 (bucket scan) with the ceiling in doubt¹ | 0; 1 record or 1 rotation to end a doubt (or format if first ever) | O(1) |
+| `alloc_id()` | 0 | 0 (a master record every ~257 ids, unless another record carried the ceiling) | O(1) |
 | `get(id)` | 1 bucket header + 12 B per slot + 1 payload | 0 | O(1) |
 | `update(id, …)` | 1 bucket header + 12 B per slot² | 1 (slot; on rebind the old slot becomes garbage) + occasional compact | O(1) |
 | `delete(id)` | as `get` (verify presence) | 1 (tombstone) | O(1) |
 | `exists(id)` | as `get` | 0 | O(1) |
 | `count` / `iterate` | 2045 (full scan) | 0 | O(1) |
-| `compact_bucket` | 1 + master writes | 1 scratch + 1 bucket restore + 2 master | O(1) |
+| `compact_bucket` | 1 | 1 scratch + 1 bucket restore; no master write | O(1) |
 
-¹ With both masters valid, mount trusts the newer one's id ceiling and reads
-no other bucket. With a master in doubt (§5.1) it scans all buckets for the max
-id — up to ~8 MB of reads, ≈100–200 ms on typical NOR (each slot's header
-is read because its `val_len` is needed to skip to the next slot).
+¹ With nothing in doubt, mount trusts the newest master record's id ceiling and
+reads no other bucket. With the ceiling in doubt (§5.1) it scans all buckets
+for the max id — up to ~8 MB of reads, ≈100–200 ms on typical NOR (each slot's
+header is read because its `val_len` is needed to skip to the next slot) — and
+then writes once, so the next mount does not scan again.
 ² Release builds perform no existence check — `update` on a dead id is UB
 (contract §2). A debug build may spend one bucket read to verify and assert
 (§13.5).
@@ -134,8 +137,8 @@ one erase block ("PEB"); on other flash, geometry comes from
 `flash_area_get_sectors`.
 
 ```
-sector  0       master A          ← metadata, gen counter, compaction state
-sector  1       master B          ← double-buffer of master
+sector  0       master A          ← header + record log (§3.1)
+sector  1       master B          ← the other master sector, rotated into
 sector  2       scratch           ← shared compaction scratch
 sectors 3..2047 bucket 0..2044    ← N = 2045 hash buckets, 4 KB each
 ```
@@ -145,72 +148,116 @@ Per-bucket mean at 100 k blobs: 49 entries.
 
 ## 3. On-flash format
 
-### 3.1 Master sector (64 B header; rest of the sector reserved)
+### 3.1 Master sectors (format major 5)
 
-Two parts: a frozen compatibility prefix that any version can parse, and a
-body that belongs to the current format major.
+Each master sector is a header written once per erase, followed by an
+append-only log of fixed-size records, each a full copy of the mutable state
+(`doc/proposals/2026-10-28-master-log.md` §3):
 
 ```
-/* --- frozen prefix (12 B) — this layout never changes ------------------- */
+offset 0      header (64 B)     written once, right after the erase
+offset 128    record[0]         written with the header
+offset 128+R  record[1] ...     appended, one per update
+              erased to the end of the sector
+```
+
+R is the 48 B record rounded up to the write unit. Filler (header end to 128,
+record end to R) is `0xff`, reserved fields 0, integers little-endian.
+
+```
+/* --- header: frozen prefix (12 B) — this layout never changes ----------- */
 magic[4]         = 'B','D','M','S'          /* allocator identity (D1)      */
-format_major[1]  = 1                        /* incompatible; refuse unknown */
-format_minor[1]  = 0                        /* additive; safe to ignore     */
-hdr_len[2]       = 64                       /* total header length          */
+format_major[1]  = 5
+format_minor[1]  = 0                        /* always 0 in major 5; ignored */
+hdr_len[2]       = 64
 reserved[2]
 prefix_crc16[2]  = CRC16-CCITT(0xffff) over the preceding 10 B
+/* --- header body --------------------------------------------------------- */
+rot_gen[4]          +1 per rotation; the ok sector with the higher one is newer
+peb_size[4]         must equal the device's
+n_buckets[2]        must equal the device's
+rec_size[2]         R; must equal the build's
+incompat[4]         features a reader must know (bit 0: LARGE_PAYLOADS)
+ro_compat[4]        features a writer must know
+compat[4]           features anyone may ignore
+suite[1]            0 = unprotected
+reserved0[3]
+store_uuid[16]      0 unless protected
+max_payload_len[2]  CONFIG_BLOB_DB_MAX_PAYLOAD_LEN; must equal the build's
+write_align[2]      the write unit slots are padded to; must equal the device's
+hdr_crc32[4]        CRC32-IEEE over bytes [0, 60)
 
-/* --- body (format major 1) ---------------------------------------------- */
-generation[4]    = monotonic LE             /* latest valid gen wins        */
-state[1]         = CLEAN | COMPACTING
-compacting_bid[2]
-reserved0[1]
-next_id_hint[8]  = id-counter persistence   /* see §5.1 and §13.1           */
-reserved1[32]                               /* future MINOR revisions       */
-hdr_crc32[4]     = CRC32-IEEE over bytes [0, 60)
+/* --- record (48 B) -------------------------------------------------------- */
+rec_no[4]           its slot index in this sector
+reserved0[4]        compaction keeps no state in the master (§6.1)
+next_id_hint[8]     the leading id ceiling (§13.1)
+seq_hint[8]         0 unless protected
+seg_owner[8]        the segmented write in flight; 0 = none (§5.6a)
+reserved1[4]        features live in the header only
+fuses[4]            opaque, carried forward unchanged; only a format clears it
+reserved2[4]
+crc32[4]            CRC32-IEEE over LE32(rot_gen) ‖ bytes [0, 44)
 ```
 
-Double-buffered: writes alternate between sectors 0/1 with incrementing
-generation; a torn master write loses the new generation and the previous
-master still wins.
+A record's CRC covers its own header's `rot_gen`, and `rec_no` must equal its
+slot, so a record verifies only where it was written: one copied from an
+earlier rotation, or moved within the sector, fails as damage.
 
-**Two CRCs, and the split is load-bearing.** A *newer* writer still produces a
-prefix whose CRC verifies, so an older reader can trust `format_major` and
-refuse the store deliberately. Bit rot produces a prefix whose CRC fails —
-a different situation, in which the other master may still be good. One
-combined CRC would conflate them, and worse, would move as the header grows,
-so an older reader could not even locate it.
+**Two CRCs in the prefix, and the split is load-bearing.** A *newer* writer
+still produces a prefix whose CRC verifies, so an older reader can trust
+`format_major` and refuse the store deliberately. Bit rot produces a prefix
+whose CRC fails — a different situation, in which the other master may still be
+good.
 
-The body is a fixed 64 B with reserved padding so `hdr_crc32` stays at a
-constant offset over a constant span. A MINOR revision consumes reserved space
-and moves nothing; older software validates the same span and reads the fields
-it knows. Anything that does not fit — or that older software would *misread*
-rather than merely miss, such as a new slot flag — is a MAJOR change instead.
+**Updating.** An update appends one record at the log's end and erases nothing.
+The written slots are always a prefix followed by erased slots: after a record
+write fails, the next update rotates rather than write the next slot, because
+the failed slot may still read erased. That invariant is what lets mount find
+the end by a binary search instead of reading the sector. A full log, or a
+failed write, **rotates**: the other sector is replaced with a header at
+`rot_gen + 1`, the session's feature sets, and record[0]. That is one erase per 82 updates on
+4 KB sectors, one per 1 362 on 64 KB.
 
-**Mount classifies each master sector**, and only one of the four outcomes may
-write to flash:
+**Format** writes both sectors, B at `rot_gen` 1 and then A at 2, each a header
+and a record[0] for the same state. After a format, no master sector reads
+erased except inside a rotation, which is what lets mount treat an erased
+sector beside an ok one as doubt (§5.1).
+
+**Features** (§4 of the proposal). `incompat`, `ro_compat` and `compat` replace
+the old major per feature combination. A slot-flag feature is set at format:
+`LARGE_PAYLOADS` owns slot flags `INDEXED` and `SEGMENT`. A build writes those
+flags only into a store whose headers carry the bit, so a build without the
+feature may mount a store formatted without it. A build refuses a store with an
+`incompat` or `ro_compat` bit it does not know, in any ok header.
+
+**Mount classifies each master header:**
 
 | Sector reads as | Class | Mount |
 |---|---|---|
 | all `0xff` across the header window | erased | virgin — format, if the other is erased too |
-| prefix CRC fails | corrupt | ignore it; the other master may be good |
-| prefix verifies, foreign magic or unknown major | **foreign** | `-ENOTSUP`, touch nothing |
-| prefix and body verify | ok | candidate; highest generation wins |
+| prefix or header CRC fails | corrupt | ignore it; the other master may be good |
+| prefix verifies, foreign magic or a major other than 5 | **foreign** | `-ENOTSUP`, touch nothing |
+| prefix and header verify | ok | checked against the build and device (below), then a candidate |
 
-A foreign sector on *either* slot refuses the whole store, before generation
-is considered: an interrupted upgrade can leave the old format on one slot and
-a newer one on the other, and falling back to the older would silently mount a
-stale view. When neither master is usable, mount formats only if both read
-erased; any other pair — bit rot, a power cut while a format wrote the first
-master, another backend's substrate (§13.7) — is refused with `-EIO` and
-nothing written, and `blob_db_format()` is the deliberate discard.
-`BLOB_DB_AUTOFORMAT_ON_CORRUPT` (default `n`) makes mount do that discard
-itself: it erases the whole partition, buckets included, so no surviving blob
-can meet the reset id counter. Blank
-masters do not imply blank buckets: `blob_db_format()` erases from offset 0 up,
-so a power cut part way leaves live buckets behind blank masters. Formatting
-therefore first invalidates every bucket header still present, then writes the
-master; a cut before that write leaves the masters blank and the next mount
-repeats it.
+Every ok header must carry this build's suite, `hdr_len` and payload cap, the
+device's `peb_size`, `n_buckets` and write unit, the build's R, and only
+feature bits the build knows; otherwise mount refuses with `-ENOTSUP` and writes
+nothing. Two ok headers at the same `rot_gen` cannot be ordered: `-EIO`.
+
+A foreign sector on *either* slot refuses the whole store: an interrupted
+upgrade can leave this format on one slot and a newer one on the other, and
+falling back would silently mount a stale view. Majors 1–4, written before the
+master log, are foreign too: they are refused, never migrated. When no master
+is usable, mount formats only if both read erased; any other state — bit rot,
+a power cut while a format wrote its first sector, another backend's substrate
+(§13.7) — is refused with `-EIO` and nothing written, and `blob_db_format()` is
+the deliberate discard. `BLOB_DB_AUTOFORMAT_ON_CORRUPT` (default `n`) makes
+mount do that discard itself: it erases the whole partition, buckets included,
+so no surviving blob can meet the reset id counter. Blank masters do not imply
+blank buckets: `blob_db_format()` erases from offset 0 up, so a power cut part
+way leaves live buckets behind blank masters. Formatting therefore first
+invalidates every bucket header still present, then writes the masters; a cut
+before that leaves the masters blank and the next mount repeats it.
 
 ### 3.2 Bucket layout (one sector)
 
@@ -287,10 +334,11 @@ segment slot flags = SEALED|SEGMENT, at an internal id
 payload rather than the slot header so the header stays 4 bytes for the millions
 of small slots that will never be segments.
 
-Introducing these flags is a **MAJOR** format change (§3.1): older software
-would read an index record as though it were the object's payload. A build
-without the feature keeps writing major 1; a build with it writes major 2 and
-reads either.
+These flags change what a payload means — a reader without the feature would
+read an index record as though it were the object's payload — so they belong
+to the `incompat` feature `LARGE_PAYLOADS` (§3.1). A build with the feature
+sets it at format; a build without it refuses a store that has it, and a build
+with it writes no segment into a store that lacks it.
 
 **Capacity is bounded by the index record**, which is itself a single-slot
 payload: `seg_count <= (MAX_PAYLOAD_LEN - 16) / 8`, and the reachable object
@@ -318,48 +366,74 @@ Multiple slots may exist for one id (rebinds, tombstone); `get` takes the
 ### 5.1 Mount
 
 ```
-read master A, B
-if neither valid:
-    if both erased: invalidate every bucket header; write master; bind root
-    elif AUTOFORMAT_ON_CORRUPT: erase everything; write master; bind root
-    else: return -EIO                                     # §3.1
-else:
-    pick higher valid generation
-    if scratch is sealed: restore the bucket its image names; erase scratch  # every mount, §6.1
-    if state == COMPACTING: write CLEAN master
-next_id = next_id_hint                                    # §13.1
-
-if exactly one master valid, or the store reports damage on a master sector:
+classify both master headers                              # §3.1
+foreign, or an ok header the build or device does not match -> -ENOTSUP
+both ok at the same rot_gen                               -> -EIO
+no ok sector:
+    both erased: invalidate every bucket header; format both masters; bind root
+    elif AUTOFORMAT_ON_CORRUPT: erase everything; format; bind root
+    else: return -EIO
+read the higher ok sector's log: end = past the last non-erased slot,
+    found by a binary search on "fully erased" (the written slots are a prefix),
+    newest = the newest record below end that verifies, walking back from end
+no record verifies there: read the lower ok sector instead   (fell back)
+no record verifies anywhere: no usable master, as above
+next_id = newest.next_id_hint                             # §13.1
+doubt = the slot just below end fails
+     or fell back
+     or the other sector is not ok (corrupt, or erased)
+     or the store reports damage on a master sector       # UBI
+if scratch is sealed: restore the bucket its image names; erase scratch  # §6.1
+if doubt:
     max_id_seen = next_id - 1
-    for bid in [0..N):
-        walk slots: max_id_seen = max(max_id_seen, slot.id)   # tombstones count too
-    if max_id_seen >= next_id: next_id = max_id_seen + 1; persist a new ceiling
+    for bid in [0..N): walk slots: max_id_seen = max(max_id_seen, slot.id)
+    next_id = max(next_id, max_id_seen + 1)               # RAM only
+if the ok headers disagree on features: rotate (up to twice) # a half-done upgrade
+if doubt and no rotation yet:
+    other sector bad, fell back, or damage: rotate        # rewrites the other sector
+    else: append one record                               # the last record verifies again
 ```
 
-Every master write carries the highest ceiling saved so far, and `alloc_id`
-saves a ceiling before handing out any id below it, so when both masters are
-valid the newer one's ceiling already exceeds every id on flash, and mount
-trusts it. With only one valid master the newer may be the one lost — to bit
-rot, or to a torn write of a ceiling this scan raised — and the two cannot be
-told apart, so mount scans. That also covers a store formatted and not yet
-written since, whose second master is still blank; its buckets are nearly all
-unformatted, one header read each.
+Every record carries the highest ceiling saved so far, and `alloc_id` saves a
+ceiling before handing out any id at or above it, so the newest record that
+verifies covers every id on flash unless a newer record may have been lost:
+torn or rotten as the last one written, in the sector mount fell back past,
+or in an other sector that is no longer ok. In each case mount scans.
 
-A store that keeps old copies of a block can hide that loss. Under UBI, a
+An **erased** other sector is doubt too. After a format both sectors are
+written, so a blank one beside an ok one is only ever a rotation torn after its
+erase. That matters for the rotation that ends a doubt. Suppose the newer
+sector's header rots: mount takes the older one, doubts, scans and rotates into
+the rotten sector. If power is cut after that erase, the next mount sees the
+older sector beside an erased one. Without this rule it would take the older
+ceiling and hand out the ids bound above it a second time.
+
+**The doubt ends before mount returns.** The scan raises `next_id` in RAM; the
+write after it is what tells the next mount the ceiling is safe, so it comes
+after the scan, never before. When the doubt came from the other sector, the
+write is a rotation into it; when only the last record failed, one appended
+record. A cut during that write leaves doubt again, and the next mount scans
+and writes again; the scan itself writes nothing. Without this, the doubt would
+last until the next rotation, which on UBI with atomic replace can be never.
+
+A store that keeps old copies of a block can hide a lost record. Under UBI, a
 newest master that fails its data seal at attach is replaced by its previous
-copy if reclaim has not taken it yet — a valid master with an older ceiling,
-beside a valid other one, which the generations cannot tell from a healthy
-pair. UBI reports the damage it acted on, and the backend passes it on through
-`blob_db_store_open_found_damage()`; damage on either master sector, or damage
-UBI could not attribute to a block, makes mount scan too.
+copy if reclaim has not taken it yet — a whole rotation older, valid, beside a
+valid other one. UBI reports the damage it acted on, and the backend passes it
+on through `blob_db_store_open_found_damage()`; damage on either master sector,
+or damage UBI could not attribute to a block, is doubt too.
 
 ### 5.2 `alloc_id`
 
 ```
-id = next_id++
-if (next_id & 0xff) == 0: persist next_id_hint via master write   # see §13.1
-return id
+if next_id >= next_id_hint: append a master record     # raises the ceiling, §13.1
+return next_id++
 ```
+
+Every master record raises the ceiling to `next_id + 1 + STEP` (256), so a
+record written for any other reason — a segmented write's `seg_owner`, a
+mount ending its doubt — carries the ceiling forward, and allocation needs a
+record of its own only when none was written within the step.
 
 ### 5.3 `update` — first bind and rebind (same append path)
 
@@ -480,30 +554,30 @@ Verify presence (1 read); append a TOMBSTONE slot (`val_len = 0`).
 
 ### 5.6 `compact_bucket(bid)`
 
-Build the compacted image (live slots only) in RAM, then:
+Build the compacted image (live slots only) in RAM, check that what it drops
+past the end of its walk is only what one torn append can leave (§6.2), then:
 
 ```
-write master B  (gen+1, COMPACTING, bid, hint↑)  ─┐   hint↑: cover the highest
-erase scratch; write new image to scratch          │   id being dropped, so an
-seal scratch (trailer, written last — §6.1)        │   erased tombstone cannot
-erase bucket;  write new image to bucket           │   unprotect its id
-erase scratch                                      │   (subsumed by §13.1)
-write master A  (gen+2, CLEAN)                    ─┘
+erase scratch; write new image to scratch; seal it   ── enters the window
+erase bucket;  write new image to bucket
+erase scratch                                        ── leaves the window
 ```
 
-The window is bracketed by master writes; any crash inside is recovered at
-mount (§6.1).
+No master is written. The sealed scratch is what marks the window, and mount
+restores the bucket from it whatever the master says (§6.1). On a backend that
+replaces a block atomically (UBI with `CONFIG_BLOB_DB_UBI_ATOMIC_REPLACE`), the
+bucket is replaced in one call and scratch is not used.
 
 ### 5.6a Segmented `update` / `delete`, and the sweep
 
 ```
 update(id, payload, len) with len > MAX_PAYLOAD_LEN:
   0. capture the outgoing index's seg_id[] (if the id holds one)
-  1. master: seg_owner = id                      ── enters the sweep window
+  1. master record: seg_owner = id               ── enters the sweep window
   2. for j in 0..K-1: alloc an internal id, append a SEGMENT slot
   3. append the INDEXED slot at id                ── ATOMIC COMMIT
   4. tombstone the outgoing segments
-  5. master: seg_owner = 0                        ── leaves the sweep window
+  5. master record: seg_owner = 0                ── leaves the sweep window
 
 delete(id) holding an index: same window, tombstone the index at step 3.
 ```
@@ -524,15 +598,18 @@ rewriting only the segments the range covers:
 ```
 pwrite(id, offset, buf, len) on a segmented object:
   new_total = max(total_len, offset + len);  new_K = ceil(new_total / seg_len)
-  1. master: seg_owner = id
+  1. master record: seg_owner = id
   2. new table := old table
   3. for each segment the range touches, or beyond the old count:
        materialise the chunk (old bytes, caller's bytes overlaid, zeros past
        the old end) and append it under a FRESH id; new table[j] = that id
   4. append the INDEXED slot                      ── ATOMIC COMMIT
   5. tombstone only the ids where old table != new table
-  6. master: seg_owner = 0
+  6. master record: seg_owner = 0
 ```
+
+Steps 1 and 5 (1 and 6) are one master record each: a write of R bytes, no
+erase.
 
 `seg_len` is inherited from the existing index and never recomputed: the
 surviving segments are already cut at that stride, so changing it would
@@ -546,7 +623,7 @@ it to segmented in place. Such a payload still fits the caller's RAM, so
 `get` + `update` promotes it, and keeping that out of the library avoids a
 second whole-object staging buffer inside it.
 
-Mount runs the sweep only when the master carries a non-zero `seg_owner`, so the
+Mount runs the sweep only when the adopted record carries a non-zero `seg_owner`, so the
 clean path pays nothing. The sweep walks every bucket by slot header, and for
 each live SEGMENT slot owned by that id checks the owner's index — O(N) sector
 reads, O(1) RAM beyond the segment tables, idempotent, and restartable after a
@@ -626,39 +703,52 @@ tombstone per element; the write count is unchanged, and the only saving is a
 shared sector read (and at most one compaction) when several ids fall in the
 same bucket — rare for a collected set (≈ k/N per bucket), so writes benefit
 far less than reads. No element ever crosses into another's atomicity: each
-slot append / master write is the same single-op commit as the scalar path,
+slot append / master record is the same single-op commit as the scalar path,
 so a crash mid-batch leaves exactly the completed elements (contract §2).
 
 ## 6. Atomicity & crash recovery
 
 Two atomic-commit primitives: a **single slot append** (torn → CRC fails →
-treated as end-of-log) and a **master sector write** (torn → older master
-wins). Compaction composes them.
+treated as end-of-log) and a **master record** (torn → the previous record
+stands, and mount doubts). Compaction uses neither: its window is marked by the
+scratch seal alone.
+
+### 6.0 Master crash table
+
+| Crash during | Mount sees | Outcome |
+|---|---|---|
+| a record append | the last record torn, or the slot still erased | the previous record stands; the update was never acknowledged. A torn record is doubt: scan, then one append |
+| a rotation, before the header lands | the other sector erased or corrupt; the full sector ok | the full sector's newest record stands; doubt (an erased sector counts), scan, rotate |
+| a rotation, after the header, during record[0] | a header with no record that verifies | that sector is unusable; fall back to the other; doubt, scan, rotate into it |
+| the write that ends a doubt | a torn record or a torn rotation | doubt again: the next mount scans and writes again |
+| a format, between its two sector writes | B ok, A erased | doubt; a scan of buckets the format has emptied; rotate into A |
+| a format, inside B's write | no usable master, A erased | `-EIO`, nothing written; `blob_db_format()` starts again |
+| a `seg_owner` set / clear record | the old value | as `BLOB_DB_CUT_AFTER_OWNER_SET` / `_AFTER_RELEASE`: an unset owner means no segment was written yet, a still-set one means the sweep runs again |
+| `erase_all`'s record | the old record, or a torn one | the old, higher ceiling stands, or doubt and a scan; never a ceiling below an id on flash |
+
+A record write that fails without a power cut may leave its slot programmed,
+partly programmed or erased. The next update rotates instead of writing the
+next slot, so no erased slot ever lies below a written one.
 
 ### 6.1 Compaction crash table
 
 | Crash point | Mount sees | Recovery |
 |---|---|---|
-| before any write | both masters CLEAN | nothing |
-| during master-B write | B invalid, A CLEAN | not-yet-compacting |
-| during scratch erase/write | B = COMPACTING, scratch **unsealed** | discard scratch; bucket untouched; write CLEAN |
-| during the scratch seal write | B = COMPACTING, seal partial → unsealed | as above; the bucket was never touched |
-| during bucket erase/restore | B = COMPACTING, scratch **sealed** | copy scratch → bucket; erase scratch; write CLEAN |
-| during final master-A write | B still COMPACTING | re-run recovery (idempotent); write CLEAN |
-| any of the above, then the COMPACTING master rots | A CLEAN, B invalid; scratch sealed or not | sealed: copy scratch → bucket, erase scratch, no master write. Unsealed: nothing, the bucket was never touched |
+| before any write | scratch erased | nothing |
+| during scratch erase/write | scratch **unsealed** | nothing; the bucket was never touched, and the next compaction erases scratch first |
+| during the scratch seal write | seal partial → unsealed | as above |
+| during bucket erase/restore | scratch **sealed** | copy scratch → bucket; erase scratch |
+| during the final scratch erase | sealed, or partly erased → unsealed | sealed: restore the same bytes again (idempotent). Unsealed: the bucket is already complete |
 
-**The seal decides, not the master.** Mount checks the seal at every mount,
-whatever the adopted master's state, and on every backend. Scratch is sealed
-only after the whole image landed and erased before the window closes, so a
-sealed scratch exists exactly while the bucket may be erased or half written,
-and its image is the bucket's complete new content. The bucket comes from the
-image's own header, which the seal covers. Keying on `COMPACTING` alone
-missed a compaction whose `COMPACTING` master rotted: mount fell back to the
-`CLEAN` master before it and left the bucket as the cut had. Atomic-replace
-builds check too, because a store compacted through scratch by a build without
-atomic replace can carry a sealed scratch into one with it. A mount with
-nothing to recover reads the 16 B seal and nothing else. `COMPACTING` and
-`CLEAN` are still written around the window, so older builds still recover.
+**The seal decides, and the master holds no compaction state.** Mount checks
+the seal at every mount, on every backend. Scratch is sealed only after the
+whole image landed and erased before the window closes, so a sealed scratch
+exists exactly while the bucket may be erased or half written, and its image is
+the bucket's complete new content. The bucket comes from the image's own
+header, which the seal covers. Atomic-replace builds check too, because a store
+compacted through scratch by a build without atomic replace can carry a sealed
+scratch into one with it. A mount with nothing to recover reads the 16 B seal
+and nothing else. Recovery writes no master.
 
 **"Scratch valid" must mean "the whole image landed", and the bucket header
 cannot say that.** The header sits at offset 0 of the image, so it is written
@@ -745,13 +835,13 @@ for headers), `<zephyr/logging/log.h>`.
 | Scenario | Outcome |
 |---|---|
 | Crash mid-slot write | CRC/erased-flags → end-of-log; committed slots intact |
-| Crash mid-compaction | master state machine + scratch (§6.1); ids unaffected |
-| Crash mid-master write | older valid master wins |
+| Crash mid-compaction | the scratch seal (§6.1); ids unaffected |
+| Crash mid-master record or rotation | the previous record stands; mount doubts, scans and writes once (§6.0) |
 | Bit corruption in a slot | CRC catches it; **only that slot** is unreachable — the header-driven walk steps over it (§3.4) and the next compaction drops it. Readers fall back to the newest intact slot for the id |
 | Partition full | `update` returns `-ENOSPC` after attempting compaction of the target bucket |
 | One bucket overflows | as above, per-bucket; round-robin allocation keeps fill uniform, so buckets fill together |
 | Id space exhaustion | 2⁶⁴ allocations ≈ 5800 years at 100 M/s — not reachable |
-| Crash during a segmented write | one rule — an unlisted segment is garbage — covers all three points; mount sweeps when the master carries `seg_owner` (§5.6a) |
+| Crash during a segmented write | one rule — an unlisted segment is garbage — covers all three points; mount sweeps when the adopted record carries `seg_owner` (§5.6a) |
 | Segment missing or mislabelled on read | `-EIO`; the segment header's `owner_id`/`seq` are checked against what the index claimed, so a stale or foreign slot cannot be served as content |
 
 ## 11. Unit-test plan (draft)
@@ -775,8 +865,14 @@ draft implementation and will be reworked against the final API; the
 10. corrupted slot truncates its bucket cleanly on remount
 11. full bucket triggers compaction; bind succeeds after
 12. compaction drops tombstones/overrides; preserves all live ids
-13. simulated mid-compaction crash recovers: forged COMPACTING master, and a
-    sealed scratch beside a CLEAN master (the COMPACTING one rotted)
+13. simulated mid-compaction crash recovers from the scratch seal alone,
+    whatever the master holds, with no master write
+16. master log (`src/master_log.c`): the format's image of both sectors;
+    records erase nothing; rotation; a failed record write rotates; geometry,
+    suite and unknown feature bits refused in either sector; mount's doubt
+    rules and the one write that ends each; power cuts at every byte of a
+    record append and of a rotation (`src/power_cut.c`); the whole suite with a
+    3-record log (`*.master_log_tiny`)
 14. scale: 100 k blobs, random subset round-trips (Kconfig-gated)
 15. batch ops (`BLOB_DB_MULTI`): `multi_get`/`multi_exists`/`multi_delete`
     over a mixed set (present, missing, dead ids) — per-element results
@@ -795,17 +891,19 @@ draft implementation and will be reworked against the final API; the
 ## 13. Open implementation items (to fine-tune before/during implementation)
 
 1. **Durable id allocation — adopt a leading ceiling.** *(Implemented.)*
-   `next_id_hint` on the master is now a **leading ceiling**: an exclusive
-   upper bound on every id ever returned by `alloc_id`. `alloc_id` persists a
-   fresh ceiling `BLOB_DB_ID_HINT_STEP` (256) ids ahead whenever the current
-   one is reached, and mount takes `next_id = next_id_hint` (the bucket scan,
-   run only when a master is in doubt, may *raise* it, never lower it —
-   §5.1). This protects
+   `next_id_hint` in a master record is a **leading ceiling**: an exclusive
+   upper bound on every id ever returned by `alloc_id`. Every record raises it
+   to `BLOB_DB_ID_HINT_STEP` (256) past the next id, `alloc_id` appends a
+   record when it reaches the ceiling and no other record has carried it, and
+   mount takes `next_id = next_id_hint` (the bucket scan, run only when the
+   ceiling is in doubt, may *raise* it, never lower it — §5.1). The one record
+   that lowers it is `erase_all`'s, written after every bucket is invalidated,
+   to one step past id 2. This protects
    allocated-but-unbound ids across a crash — the property the model
    container's intent recovery and (future) root-registry `get_or_create`
    depend on. It subsumes both earlier monotonicity patches (tombstones toward
-   the scan max, the `hint↑` compaction ride-along). Cost: one master write
-   per block of 256 allocations. Note: the ceiling never lowers, so `next_id`
+   the scan max, the `hint↑` compaction ride-along). Cost: at most one master
+   record, no erase, per block of 256 allocations. Note: the ceiling never lowers, so `next_id`
    never recovers to a previously issued value after a crash — which is why
    the root convention is realized as a *reserved* id (contract D7): format
    itself consumes and binds id = 1, so no client ever depends on the counter
@@ -825,7 +923,8 @@ draft implementation and will be reworked against the final API; the
 4. **Master format version field.** *(Resolved.)* Superseded by the frozen
    compatibility prefix (§3.1): `format_major` / `format_minor` / `hdr_len`
    under their own CRC, so software of any vintage can classify a store it did
-   not write and refuse it rather than reformat it.
+   not write and refuse it rather than reformat it. Major 5 adds feature sets in
+   the header for everything that would once have taken a minor or a major.
 5. **Debug bound-check for UB `update`** — optional Kconfig
    (`BLOB_DB_ASSERT_BOUND`): get-shaped scan + `__ASSERT` in debug builds,
    nothing in release.
@@ -846,9 +945,8 @@ draft implementation and will be reworked against the final API; the
    with `-ENOTSUP` because UBI's own attach refuses first. Candidate fix: a
    backend-id byte inside the frozen prefix so a substrate mismatch
    classifies as `FOREIGN` and is refused with `-ENOTSUP`. That is an
-   on-flash format change — cheap now, since the prefix already carries
-   `hdr_len` and reserved space, and it needs a `format_minor` bump at
-   most.
+   on-flash format change: in major 5 it would be a feature bit or a header
+   field, not a `format_minor` bump, which major 5 does not use.
 
 ---
 

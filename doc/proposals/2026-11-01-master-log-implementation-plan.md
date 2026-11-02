@@ -191,11 +191,11 @@ The first version of this plan raised A1–A8 against the proposal before
 
 | PR | Scope | Size (lib + tests) | Risk | Format |
 |---|---|---|---|---|
-| **1** | Refactor: one `master_commit()`, one `master_format()` (#101) | ~120 + ~40 | low | unchanged |
-| **2** | Recovery keyed on the seal, on today's format (D17, first half) | ~80 + ~150 | low | unchanged |
-| **3** | Foreign slots and the compaction guard (D13 + B2) | ~150 + ~200 | medium | unchanged |
-| **4** | Major 5 (all of §5) | ~700 + ~700 | **high** | **break**: 5; 1–4 refused |
-| **5** | `l1_bucketlog.md`, `kvdb_book` tools, DK re-measure | docs | low | — |
+| **1** | Refactor: one `master_commit()`, one `master_format()` (#101, merged) | ~120 + ~40 | low | unchanged |
+| **2** | Recovery keyed on the seal, on today's format (D17, first half) (#102, merged) | ~80 + ~150 | low | unchanged |
+| **3** | Foreign slots and the compaction guard (D13 + B2) (#103) | ~150 + ~200 | medium | unchanged |
+| **4** | Major 5 (all of §5) (#104) | ~700 + ~700 | **high** | **break**: 5; 1–4 refused |
+| **5** | `l1_bucketlog.md`, `kvdb_book` tools, DK re-measure (nRF52840-DK A/B on #104, in `app_perf_blob_db/RESULTS.md`; mount after the binary search not yet re-measured) | docs | low | — |
 
 PRs 2 and 3 are taken out of the format break on purpose. Neither depends on
 the master layout, and each fixes something the current code gets wrong:
@@ -405,9 +405,11 @@ the store (or calls `blob_db_store_discard()` once #89 lands), then calls
 ### 5.5 Mount (§3.5 with B1)
 
 `read_master()` splits into `master_classify()` (the header window only) and
-`log_load()`, which reads every slot of a sector (D3). Instead of 1 362
-reads of 48 B, `log_load()` reads the sector into `g_bbuf` once. Mount owns
-`g_bbuf` until the first bucket walk, and that is P3-neutral.
+`log_load()`. As first shipped in PR 4, `log_load()` read the whole sector
+into `g_bbuf`; the nRF52840-DK A/B on #104 measured that at +35–43 ms per
+mount on 64 KB masters, so it now binary-searches for `end` on "fully
+erased" (D3, §3.2a) and reads only the record slots it needs, still through
+`g_bbuf`, which mount owns until the first bucket walk (P3-neutral).
 `log_load()` returns `end`, `newest`, and whether the slot below `end` failed
 to verify.
 
