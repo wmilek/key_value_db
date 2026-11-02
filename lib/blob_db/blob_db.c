@@ -16,6 +16,7 @@
 
 #include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
+#include <zephyr/sys/byteorder.h>
 #include <zephyr/sys/crc.h>
 
 #include <app/lib/blob_db.h>
@@ -34,9 +35,9 @@ static const uint8_t BUCKET_MAGIC[4] = { 'B', 'D', 'B', 'H' };
 static const uint8_t SCRATCH_MAGIC[4] = { 'B', 'D', 'S', 'L' };
 
 /* Forward declarations (compaction helpers live below blob_db_mount). */
-static int recover_compaction(uint8_t master_state, uint16_t master_cbid);
+static int recover_compaction(void);
 static int compact_bucket(uint16_t bid);
-static int persist_next_id_hint(uint64_t new_hint);
+static int persist_next_id_hint(void);
 static int bind_root_empty(void);
 static int invalidate_buckets(int skip_bid);
 static int format_whole_store(void);
@@ -94,6 +95,14 @@ static inline void idx_invalidate(void);
  * holds g_lock for its whole duration, so sharing them across calls is safe. */
 #define BLOB_DB_SECTOR_BUF_MAX CONFIG_BLOB_DB_SECTOR_BUF_SIZE
 
+/* Largest write unit blob_db stages for: slots and master records are padded
+ * to it. Open refuses a device with a larger one. */
+#define BLOB_DB_MAX_WRITE_ALIGN 32
+
+/* One master record, padded to the largest write unit. */
+#define BLOB_DB_MASTER_REC_MAX                                                 \
+	ROUND_UP(sizeof(struct blob_db_master_rec), BLOB_DB_MAX_WRITE_ALIGN)
+
 /* Sector-sized scratch buffers. g_bbuf is used by every read-a-bucket op
  * (mount, get, update, delete, exists, count, iterate) and by compaction
  * as the "old" image; g_bbuf_new is used by compaction as the "new" image.
@@ -135,7 +144,16 @@ static struct {
 	uint16_t  n_pebs;
 	uint16_t  n_buckets;
 	uint8_t   active_master;   /* 0 or 1 */
-	uint32_t  master_gen;
+	uint32_t  rot_gen;         /* the active master sector's header */
+	uint16_t  rec_size;        /* R: one master record, write_align-rounded */
+	uint16_t  log_cap;         /* record slots per master sector */
+	uint16_t  log_next;        /* the next record slot of the active sector */
+	bool      log_failed;      /* a record write failed: rotate next (§3.3) */
+	bool      ceiling_reset;   /* erase_all's record lowers the ceiling (§3.3) */
+	uint32_t  incompat;        /* the store's feature sets: the union of */
+	uint32_t  ro_compat;       /* every ok header, copied at rotation */
+	uint32_t  compat;
+	uint32_t  fuses;           /* opaque; carried into every record (§4.5) */
 	uint64_t  next_id;         /* RAM: next id alloc_id will hand out */
 	uint64_t  next_id_hint;    /* durable leading ceiling (see internal.h) */
 	uint64_t  seg_owner;       /* segmented write in flight; 0 = none */
@@ -202,7 +220,13 @@ void blob_db_iostats_reset(void)
 #define IO_CAUSE_BYTES(field, n)   ((void)0)
 #endif /* CONFIG_BLOB_DB_IOSTATS */
 
-/* Master sector helpers -------------------------------------------------- */
+/* Master sector helpers --------------------------------------------------
+ *
+ * Major 5 (doc/proposals/2026-10-28-master-log.md §3): each master sector is
+ * a header written once per erase and an append-only log of fixed-size
+ * records, each a full copy of the mutable state. An update programs one
+ * record and erases nothing; a full sector rotates into the other one.
+ */
 
 /* CRC16-CCITT over the frozen part of the compatibility prefix (everything
  * before prefix_crc16 itself). */
@@ -212,13 +236,13 @@ static uint16_t prefix_crc(const void *buf)
 			   offsetof(struct blob_db_compat_hdr, prefix_crc16));
 }
 
-/* How a master sector presents itself. The distinction between FOREIGN and
- * CORRUPT is the whole point of the separate prefix CRC (see
+/* How a master sector's header presents itself. The distinction between
+ * FOREIGN and CORRUPT is the whole point of the separate prefix CRC (see
  * blob_db_internal.h): a newer writer produces a prefix that verifies, so we
  * can trust its version and refuse on purpose; bit rot produces one that does
  * not, and the other master may still be good. */
 enum master_class {
-	MASTER_ERASED,   /* header region is all 0xff — never written */
+	MASTER_ERASED,   /* header window is all 0xff — never written */
 	MASTER_CORRUPT,  /* written, but unparseable — treat as absent */
 	MASTER_FOREIGN,  /* parses, and says it is a format we do not know */
 	MASTER_OK,
@@ -228,14 +252,44 @@ static const char *const master_class_str[] = {
 	"erased", "corrupt", "foreign", "ok"
 };
 
-static int read_master(uint8_t slot, struct blob_db_master_hdr *out,
-		       enum master_class *cls)
+static bool all_erased(const uint8_t *buf, size_t len)
+{
+	for (size_t i = 0; i < len; i++) {
+		if (buf[i] != 0xff) {
+			return false;
+		}
+	}
+	return true;
+}
+
+static uint32_t master_hdr_crc(const struct blob_db_master_hdr *h)
+{
+	return crc32_ieee((const uint8_t *)h,
+			  offsetof(struct blob_db_master_hdr, hdr_crc32));
+}
+
+/* A record's CRC covers LE32(rot_gen) of its header too (D16). */
+static uint32_t master_rec_crc(uint32_t rot_gen,
+			       const struct blob_db_master_rec *r)
+{
+	uint8_t gen[4];
+
+	sys_put_le32(rot_gen, gen);
+	return crc32_ieee_update(crc32_ieee(gen, sizeof(gen)),
+				 (const uint8_t *)r,
+				 offsetof(struct blob_db_master_rec, crc32));
+}
+
+/* Read and classify the header of master sector @p slot. */
+static int master_classify(uint8_t slot, struct blob_db_master_hdr *out,
+			   enum master_class *cls)
 {
 	uint8_t __aligned(4) buf[BLOB_DB_MASTER_HDR_MAX];
 
 	*cls = MASTER_CORRUPT;
 
 	int rc = blob_db_store_read(peb_offset(slot), buf, sizeof(buf));
+
 	if (rc < 0) {
 		LOG_ERR("master %u read failed: %d", slot, rc);
 		return rc;
@@ -244,15 +298,7 @@ static int read_master(uint8_t slot, struct blob_db_master_hdr *out,
 	/* Erased means virgin, and only virgin may be formatted. Check the
 	 * whole staging window, not just the prefix, so a sector holding
 	 * anything at all is never mistaken for untouched flash. */
-	bool erased = true;
-
-	for (size_t i = 0; i < sizeof(buf); i++) {
-		if (buf[i] != 0xff) {
-			erased = false;
-			break;
-		}
-	}
-	if (erased) {
+	if (all_erased(buf, sizeof(buf))) {
 		*cls = MASTER_ERASED;
 		return 0;
 	}
@@ -273,11 +319,9 @@ static int read_master(uint8_t slot, struct blob_db_master_hdr *out,
 		*cls = MASTER_FOREIGN;
 		return 0;
 	}
-	/* Read anything up to our own major; refuse above it. An older store
-	 * cannot contain records this build does not understand, so adopting it
-	 * is safe — the next master write upgrades it. */
-	if (c->format_major > BLOB_DB_FORMAT_MAJOR || c->format_major == 0) {
-		LOG_ERR("master %u: format major %u, this build reads up to %u",
+	/* Exactly our major: 1-4 are refused, never migrated (D10). */
+	if (c->format_major != BLOB_DB_FORMAT_MAJOR) {
+		LOG_ERR("master %u: format major %u, this build reads %u",
 			slot, c->format_major, BLOB_DB_FORMAT_MAJOR);
 		*cls = MASTER_FOREIGN;
 		return 0;
@@ -290,143 +334,324 @@ static int read_master(uint8_t slot, struct blob_db_master_hdr *out,
 		*cls = MASTER_FOREIGN;
 		return 0;
 	}
-	if (c->format_minor > BLOB_DB_FORMAT_MINOR) {
-		/* Additive revision: fields we do not know sit in reserved
-		 * space at offsets we do not read. Mount it. */
-		LOG_INF("master %u: format 1.%u (this build is 1.%u) — "
-			"reading the fields we know",
-			slot, c->format_minor, BLOB_DB_FORMAT_MINOR);
-	}
+	/* format_minor is ignored (D15): what a store needs is in its
+	 * feature sets, which master_accept() checks. */
 
-	/* hdr_crc32 is at a fixed offset for this major, so the span is ours
-	 * to compute regardless of what a newer minor appended. */
-	uint32_t want = hdr_crc32(buf, sizeof(struct blob_db_master_hdr));
-
-	if (((const struct blob_db_master_hdr *)buf)->hdr_crc32 != want) {
-		LOG_WRN("master %u: body CRC mismatch — treating as corrupt",
+	memcpy(out, buf, sizeof(*out));
+	if (out->hdr_crc32 != master_hdr_crc(out)) {
+		LOG_WRN("master %u: header CRC mismatch — treating as corrupt",
 			slot);
 		return 0;   /* MASTER_CORRUPT */
 	}
-
-	memcpy(out, buf, sizeof(*out));
 	*cls = MASTER_OK;
 	return 0;
 }
 
-/* Write a master to sector @p slot. The ceiling and the segmented-write
- * marker always come from st, so every master carries the state the session
- * holds; only the generation, the slot and the compaction state are the
- * caller's. Callers go through master_commit() or master_format(). */
-static int write_master(uint8_t slot, uint32_t gen, uint8_t state,
-			uint16_t compacting_bid)
+/* Whether this build and this device can use a store whose master sector
+ * @p slot carries header @p h (§3.1, §4.4). Checked on every ok header, usable
+ * or not, before anything is written. */
+static int master_accept(uint8_t slot, const struct blob_db_master_hdr *h)
 {
+	const char *what = NULL;
+
+	const uint32_t missing = h->incompat & ~BLOB_DB_BUILD_INCOMPAT;
+
+	if (missing & ~BLOB_DB_LIB_INCOMPAT) {
+		what = "an incompat feature this build does not know";
+	} else if (missing & BLOB_DB_FEAT_LARGE_PAYLOADS) {
+		what = "LARGE_PAYLOADS, which this build is configured without "
+		       "(CONFIG_BLOB_DB_LARGE_PAYLOADS)";
+	} else if (h->ro_compat & ~BLOB_DB_BUILD_RO_COMPAT) {
+		/* No read-only mount yet: refused like incompat (§4.1). */
+		what = "a ro_compat feature this build does not know";
+	} else if ((BLOB_DB_BUILD_REQUIRED & ~h->incompat) != 0) {
+		what = "no feature this build requires";
+	} else if (h->suite != BLOB_DB_BUILD_SUITE ||
+		   h->prefix.hdr_len != BLOB_DB_BUILD_HDR_LEN) {
+		what = "another protection suite";
+	} else if (h->peb_size != st.peb_size || h->n_buckets != st.n_buckets) {
+		what = "another geometry";
+	} else if (h->rec_size != st.rec_size) {
+		what = "another record size";
+	} else if (h->max_payload_len != CONFIG_BLOB_DB_MAX_PAYLOAD_LEN) {
+		what = "another CONFIG_BLOB_DB_MAX_PAYLOAD_LEN";
+	} else if (h->write_align != st.write_align) {
+		what = "another write alignment";
+	} else {
+		return 0;
+	}
+	LOG_ERR("master %u: the store has %s (incompat 0x%x ro_compat 0x%x "
+		"suite %u, %u B x %u buckets, R %u, max payload %u, align %u); "
+		"refusing",
+		slot, what, h->incompat, h->ro_compat, h->suite, h->peb_size,
+		h->n_buckets, h->rec_size, h->max_payload_len, h->write_align);
+	return -ENOTSUP;
+}
+
+/* What a sector's record log holds (§3.5): end is one past the last slot that
+ * is not fully erased, newest the newest record below it that verifies
+ * (-1: none), and tail_bad whether the slot just below end fails. */
+struct master_log {
+	uint16_t end;
+	int      newest;
+	bool     tail_bad;
+	struct blob_db_master_rec rec;
+};
+
+static bool master_rec_ok(uint32_t rot_gen, const uint8_t *slot, uint16_t i,
+			  struct blob_db_master_rec *out)
+{
+	memcpy(out, slot, sizeof(*out));
+	return out->rec_no == i && out->crc32 == master_rec_crc(rot_gen, out);
+}
+
+/* Read record slot i of a master sector into g_bbuf. */
+static int master_slot_read(uint8_t slot, uint16_t i)
+{
+	return blob_db_store_read(peb_offset(slot) + BLOB_DB_MASTER_LOG_OFF +
+				  (off_t)i * st.rec_size, g_bbuf, st.rec_size);
+}
+
+/* Find end by a binary search on "fully erased", which the log invariant
+ * allows (§3.2a: the written slots are a prefix, and every writer keeps it),
+ * then walk back from it to the newest record that verifies. About log2(cap)
+ * slot reads plus one per bad record at the tail, instead of the sector: on a
+ * 64 KB master, 12 reads of R bytes where reading every slot (D3 as first
+ * written) cost 64 KB and tens of ms per mount on a DK. */
+static int master_log_load(uint8_t slot, uint32_t rot_gen,
+			   struct master_log *log)
+{
+	uint16_t lo = 0;
+	uint16_t hi = st.log_cap;
 	int rc;
 
-	/* Staged 0xff-filled so any write-alignment padding matches erased
-	 * flash rather than introducing zero bits. */
-	uint8_t __aligned(4) buf[BLOB_DB_MASTER_HDR_MAX];
+	/* Slots below lo are written; slots from hi on read erased. */
+	while (lo < hi) {
+		const uint16_t mid = lo + (hi - lo) / 2;
 
-	memset(buf, 0xff, sizeof(buf));
-
-	struct blob_db_master_hdr *hdr = (struct blob_db_master_hdr *)buf;
-
-	memset(hdr, 0, sizeof(*hdr));
-	memcpy(hdr->compat.magic, MASTER_MAGIC, 4);
-	hdr->compat.format_major = BLOB_DB_FORMAT_MAJOR;
-	hdr->compat.format_minor = BLOB_DB_FORMAT_MINOR;
-	hdr->compat.hdr_len      = sizeof(*hdr);
-	hdr->compat.reserved     = 0;
-	hdr->compat.prefix_crc16 = prefix_crc(hdr);
-
-	hdr->generation     = gen;
-	hdr->state          = state;
-	hdr->compacting_bid = compacting_bid;
-	hdr->next_id_hint   = st.next_id_hint;
-	hdr->seg_owner      = st.seg_owner;
-	hdr->hdr_crc32      = hdr_crc32(hdr, sizeof(*hdr));
-
-	const size_t a = st.write_align ? st.write_align : 1;
-	const size_t len = ROUND_UP(sizeof(*hdr), a);
-
-	if (len > sizeof(buf)) {
-		LOG_ERR("write_align %zu too large to stage a master", a);
-		return -ENOTSUP;
+		rc = master_slot_read(slot, mid);
+		if (rc < 0) {
+			return rc;
+		}
+		if (all_erased(g_bbuf, st.rec_size)) {
+			hi = mid;
+		} else {
+			lo = mid + 1;
+		}
 	}
+	log->end = lo;
+	log->newest = -1;
+	log->tail_bad = false;
+	for (int i = (int)log->end - 1; i >= 0; i--) {
+		rc = master_slot_read(slot, (uint16_t)i);
+		if (rc < 0) {
+			return rc;
+		}
+		if (master_rec_ok(rot_gen, g_bbuf, (uint16_t)i, &log->rec)) {
+			log->newest = i;
+			break;
+		}
+		if (i == (int)log->end - 1) {
+			log->tail_bad = true;
+		}
+	}
+	return 0;
+}
 
-	IO_CAUSE(master_writes);
-	rc = blob_db_store_replace(peb_offset(slot), buf, len);
+/* The record the next master update writes: the session's state, with the
+ * ceiling carried forward. Every record raises the id ceiling to STEP past the
+ * next id (D14), so allocation rarely needs a record of its own; the max keeps
+ * it monotonic. erase_all's record is the one that lowers it (§3.3). */
+static void master_rec_fill(struct blob_db_master_rec *r)
+{
+	const uint64_t want = st.next_id + 1 + BLOB_DB_ID_HINT_STEP;
+
+	memset(r, 0, sizeof(*r));
+	r->next_id_hint = st.ceiling_reset ? want : MAX(st.next_id_hint, want);
+	r->seq_hint     = 0;   /* unprotected */
+	r->seg_owner    = st.seg_owner;
+	r->fuses        = st.fuses;
+}
+
+static void master_rec_stage(uint8_t *buf, struct blob_db_master_rec *r,
+			     uint32_t rec_no, uint32_t rot_gen)
+{
+	r->rec_no = rec_no;
+	r->crc32  = master_rec_crc(rot_gen, r);
+	memset(buf, 0xff, st.rec_size);
+	memcpy(buf, r, sizeof(*r));
+}
+
+/* Replace master sector @p slot with a header at @p rot_gen and record[0]
+ * holding @p r. The header carries the session's feature sets, which hold
+ * every ok header's bits, unknown ones included (§4.2). */
+static int master_write_sector(uint8_t slot, uint32_t rot_gen,
+			       struct blob_db_master_rec *r)
+{
+	uint8_t __aligned(4) buf[BLOB_DB_MASTER_LOG_OFF + BLOB_DB_MASTER_REC_MAX];
+	struct blob_db_master_hdr *h = (struct blob_db_master_hdr *)buf;
+
+	memset(buf, 0xff, BLOB_DB_MASTER_LOG_OFF);
+	memset(h, 0, sizeof(*h));
+	memcpy(h->prefix.magic, MASTER_MAGIC, 4);
+	h->prefix.format_major = BLOB_DB_FORMAT_MAJOR;
+	h->prefix.format_minor = BLOB_DB_FORMAT_MINOR;
+	h->prefix.hdr_len      = BLOB_DB_BUILD_HDR_LEN;
+	h->prefix.prefix_crc16 = prefix_crc(h);
+	h->rot_gen         = rot_gen;
+	h->peb_size        = (uint32_t)st.peb_size;
+	h->n_buckets       = st.n_buckets;
+	h->rec_size        = st.rec_size;
+	h->incompat        = st.incompat;
+	h->ro_compat       = st.ro_compat;
+	h->compat          = st.compat;
+	h->suite           = BLOB_DB_BUILD_SUITE;
+	h->max_payload_len = CONFIG_BLOB_DB_MAX_PAYLOAD_LEN;
+	h->write_align     = (uint16_t)st.write_align;
+	h->hdr_crc32       = master_hdr_crc(h);
+
+	master_rec_stage(buf + BLOB_DB_MASTER_LOG_OFF, r, 0, rot_gen);
+
+	IO_CAUSE(master_rotations);
+	IO_CAUSE(master_records);
+
+	const int rc = blob_db_store_replace(peb_offset(slot), buf,
+					     BLOB_DB_MASTER_LOG_OFF + st.rec_size);
+
 	if (rc < 0) {
 		LOG_ERR("master %u write failed: %d", slot, rc);
-		return rc;
 	}
-	return 0;
+	return rc;
 }
 
-/* Commit the session's master state: st.next_id_hint and st.seg_owner, with
- * the given compaction state, to the inactive sector at the next generation.
- * On success that sector becomes the active one. Double-buffered: a torn
- * write leaves the previous master standing beside an invalid one, which mount
- * treats as doubt (see mount_impl()).
- *
- * The only path that writes a master outside a format. A caller sets
- * the st fields it changes, commits, and puts them back if the commit fails,
- * so RAM never holds a state that is not on flash. */
-static int master_commit(uint8_t state, uint16_t compacting_bid)
+/* Rotate into the other sector, carrying @p r as its record[0] (§3.4). */
+static int master_rotate(struct blob_db_master_rec *r)
 {
-	const uint8_t inactive = !st.active_master;
-	const int rc = write_master(inactive, st.master_gen + 1, state,
-				    compacting_bid);
+	const uint8_t other = !st.active_master;
+
+	if (st.rot_gen == UINT32_MAX) {
+		LOG_ERR("master rot_gen would wrap");
+		return -ENOSPC;
+	}
+
+	const int rc = master_write_sector(other, st.rot_gen + 1, r);
 
 	if (rc < 0) {
 		return rc;
 	}
-	st.active_master = inactive;
-	st.master_gen++;
+	st.active_master = other;
+	st.rot_gen++;
+	st.log_next = 1;
+	st.log_failed = false;
 	return 0;
 }
 
-/* Start the master state over, as a format does: next id 2, since the root
- * (id 1) is consumed at format time (see @blob_db_root in blob_db.h), no
- * segmented write in flight, and master A at generation 1, replacing whatever
- * that sector held. The caller deals with master B. st is reset before the
- * write, so the master carries nothing over from the session before the
- * format. */
+/* Commit the session's master state: one record appended to the active
+ * sector, or a rotation when the sector is full or a record write has failed
+ * (§3.3). A failed append leaves its slot possibly erased, so the log must
+ * not continue past it: the next update rotates, and the written slots stay a
+ * prefix (§3.2a).
+ *
+ * With @p force_rotate, it rotates whatever room is left.
+ *
+ * The only path that writes a master outside a format. A caller sets the st
+ * fields it changes, commits, and puts them back if the commit fails, so RAM
+ * never holds a state that is not on flash; the ceiling RAM takes is the
+ * record's, once it has landed. */
+static int master_commit_how(bool force_rotate)
+{
+	struct blob_db_master_rec r;
+	int rc;
+
+	master_rec_fill(&r);
+	if (force_rotate || st.log_failed || st.log_next >= st.log_cap) {
+		rc = master_rotate(&r);
+	} else {
+		uint8_t __aligned(4) buf[BLOB_DB_MASTER_REC_MAX];
+		const off_t at = peb_offset(st.active_master) +
+				 BLOB_DB_MASTER_LOG_OFF +
+				 (off_t)st.log_next * st.rec_size;
+
+		master_rec_stage(buf, &r, st.log_next, st.rot_gen);
+		IO_CAUSE(master_records);
+		rc = blob_db_store_write(at, buf, st.rec_size);
+		st.log_next++;   /* also on failure: that slot is not erased */
+		if (rc < 0) {
+			LOG_ERR("master record write failed: %d; the next update "
+				"rotates", rc);
+			st.log_failed = true;
+		}
+	}
+	st.ceiling_reset = false;
+	if (rc == 0) {
+		st.next_id_hint = r.next_id_hint;
+	}
+	return rc;
+}
+
+static int master_commit(void)
+{
+	return master_commit_how(false);
+}
+
+/* A rotation now, whatever room is left: what ends a mount's doubt when the
+ * other sector is bad, and what finishes an upgrade (§3.5). */
+static int master_commit_rotate(void)
+{
+	return master_commit_how(true);
+}
+
+/* Start the master state over, as a format does (§3.4a, D18): next id 2,
+ * since the root (id 1) is consumed at format time (see @blob_db_root in
+ * blob_db.h), no segmented write in flight, no fuses (D12), and this build's
+ * features (D7). Both sectors are written, B at rot_gen 1 and then A at 2, so
+ * that after a format no master sector reads erased except inside a rotation,
+ * and mount can treat an erased sector beside an ok one as doubt. The caller
+ * has emptied the buckets first. */
 static int master_format(void)
 {
-	st.next_id      = 2;
-	st.next_id_hint = 2;
-	st.seg_owner    = 0;
+	struct blob_db_master_rec r;
+	int rc;
 
-	const int rc = write_master(BLOB_DB_MASTER_A_SECTOR, 1,
-				    BLOB_DB_STATE_CLEAN, 0);
+	st.next_id       = 2;
+	st.seg_owner     = 0;
+	st.fuses         = 0;
+	st.incompat      = BLOB_DB_BUILD_INCOMPAT;
+	st.ro_compat     = BLOB_DB_BUILD_RO_COMPAT;
+	st.compat        = 0;
+	st.ceiling_reset = true;
+	master_rec_fill(&r);
+	st.ceiling_reset = false;
 
+	rc = master_write_sector(BLOB_DB_MASTER_B_SECTOR, 1, &r);
+	if (rc == 0) {
+		rc = master_write_sector(BLOB_DB_MASTER_A_SECTOR, 2, &r);
+	}
 	if (rc < 0) {
 		return rc;
 	}
 	st.active_master = BLOB_DB_MASTER_A_SECTOR;
-	st.master_gen    = 1;
+	st.rot_gen       = 2;
+	st.log_next      = 1;
+	st.log_failed    = false;
+	st.next_id_hint  = r.next_id_hint;
 	return 0;
 }
 
-/* Persist a raised leading id ceiling with a CLEAN master. A torn write
- * leaves the old ceiling, which is still a safe — if lower — bound, beside an
- * invalid master, so mount re-raises it from the scan. */
-static int persist_next_id_hint(uint64_t new_hint)
+/* Persist the id ceiling: one record, which raises it to STEP past the next
+ * id. A torn write leaves the old ceiling, which is still a safe — if lower —
+ * bound, and doubt for the next mount, which re-raises it from the scan. */
+static int persist_next_id_hint(void)
 {
-	const uint64_t prev = st.next_id_hint;
-
-	st.next_id_hint = new_hint;
-
-	int rc = master_commit(BLOB_DB_STATE_CLEAN, 0);
+	int rc = master_commit();
 
 	if (rc < 0) {
-		st.next_id_hint = prev;
-		LOG_ERR("persist next_id_hint=%llu failed: %d",
-			(unsigned long long)new_hint, rc);
+		LOG_ERR("persist next_id_hint failed: %d", rc);
 		return rc;
 	}
-	LOG_DBG("id ceiling raised to %llu (master gen=%u)",
-		(unsigned long long)new_hint, st.master_gen);
+	LOG_DBG("id ceiling raised to %llu (rot_gen %u, record %u)",
+		(unsigned long long)st.next_id_hint, st.rot_gen,
+		st.log_next - 1);
 	return 0;
 }
 
@@ -538,11 +763,6 @@ static int format_masters_fresh(void)
 	if (rc < 0) {
 		return rc;
 	}
-	rc = blob_db_store_erase(peb_offset(BLOB_DB_MASTER_B_SECTOR),
-			      st.peb_size);
-	if (rc < 0) {
-		return rc;
-	}
 	return bind_root_empty();
 }
 
@@ -576,16 +796,37 @@ static int store_open_and_validate(bool discard)
 		goto err_close;
 	}
 
-	/* Floor as well as ceiling: read_master() stages a fixed
-	 * BLOB_DB_MASTER_HDR_MAX window, and a read must never cross a PEB
-	 * boundary (blob_db_store.h). It also keeps the sustainable-payload
-	 * arithmetic below from underflowing on an absurd geometry. */
-	if (st.peb_size < BLOB_DB_MASTER_HDR_MAX) {
-		LOG_ERR("sector size %zu below the %u B minimum blob_db supports",
-			st.peb_size, BLOB_DB_MASTER_HDR_MAX);
+	/* Slots and master records are padded to the write unit, and the
+	 * record log starts at offset 128 (§3.1). */
+	if (st.write_align > BLOB_DB_MAX_WRITE_ALIGN ||
+	    (st.write_align & (st.write_align - 1)) != 0) {
+		LOG_ERR("write unit %zu B: blob_db needs a power of two up to %u",
+			st.write_align, BLOB_DB_MAX_WRITE_ALIGN);
 		rc = -ENOTSUP;
 		goto err_close;
 	}
+	st.rec_size = (uint16_t)ROUND_UP(sizeof(struct blob_db_master_rec),
+					 st.write_align);
+
+	/* Floor as well as ceiling: master_classify() stages a fixed
+	 * BLOB_DB_MASTER_HDR_MAX window, a read must never cross a PEB
+	 * boundary (blob_db_store.h), and the sector must hold the header
+	 * window and at least two records. It also keeps the
+	 * sustainable-payload arithmetic below from underflowing on an absurd
+	 * geometry. */
+	if (st.peb_size < BLOB_DB_MASTER_LOG_OFF + 2u * st.rec_size) {
+		LOG_ERR("sector size %zu below the %zu B minimum blob_db supports",
+			st.peb_size, BLOB_DB_MASTER_LOG_OFF + 2u * st.rec_size);
+		rc = -ENOTSUP;
+		goto err_close;
+	}
+	st.log_cap = (uint16_t)MIN((st.peb_size - BLOB_DB_MASTER_LOG_OFF) /
+				   st.rec_size,
+				   (size_t)UINT16_MAX);
+#if defined(CONFIG_BLOB_DB_TEST_MASTER_LOG_CAP) && CONFIG_BLOB_DB_TEST_MASTER_LOG_CAP > 0
+	/* Tests: rotate every few commits, so the whole suite exercises it. */
+	st.log_cap = MIN(st.log_cap, (uint16_t)CONFIG_BLOB_DB_TEST_MASTER_LOG_CAP);
+#endif
 
 	if (st.n_pebs < BLOB_DB_FIRST_BUCKET + 1) {
 		LOG_ERR("partition too small: %u sectors (need ≥ %u)",
@@ -643,51 +884,113 @@ static int mount_impl(void)
 	 * the buckets (below), the scan fills it at no flash cost of its own. */
 	blob_db_sidx_reset(st.n_buckets);
 
-	/* Pick the authoritative master. */
-	struct blob_db_master_hdr m_a, m_b;
-	enum master_class ca, cb;
+	/* Classify both master headers (§3.5). */
+	struct blob_db_master_hdr h[2];
+	enum master_class c[2];
 
-	rc = read_master(BLOB_DB_MASTER_A_SECTOR, &m_a, &ca);
-	if (rc < 0) {
-		goto err_close;
+	for (uint8_t i = 0; i < 2; i++) {
+		rc = master_classify(i, &h[i], &c[i]);
+		if (rc < 0) {
+			goto err_close;
+		}
 	}
-	rc = read_master(BLOB_DB_MASTER_B_SECTOR, &m_b, &cb);
-	if (rc < 0) {
-		goto err_close;
-	}
-	LOG_DBG("master A=%s B=%s", master_class_str[ca], master_class_str[cb]);
+	LOG_DBG("master A=%s B=%s", master_class_str[c[0]],
+		master_class_str[c[1]]);
 
 	/* A parseable master declaring a format we do not know is never
 	 * touched — not mounted, and above all not formatted. This is the
 	 * -ENOTSUP the contract has always promised (l1_blob_db.md §4, §5.1).
 	 * Checked before anything else, and on BOTH sectors: if an interrupted
 	 * upgrade left A on our format and B ahead of it, falling back to A
-	 * would silently mount a stale view of an upgraded store. */
-	if (ca == MASTER_FOREIGN || cb == MASTER_FOREIGN) {
+	 * would silently mount a stale view of an upgraded store. The feature,
+	 * suite and geometry checks run on every ok header for the same
+	 * reason: a rotation torn by a newer build still makes this build
+	 * refuse the store. */
+	if (c[0] == MASTER_FOREIGN || c[1] == MASTER_FOREIGN) {
 		LOG_ERR("refusing to mount a foreign store (A=%s B=%s); "
 			"use blob_db_format() to discard it deliberately",
-			master_class_str[ca], master_class_str[cb]);
+			master_class_str[c[0]], master_class_str[c[1]]);
 		rc = -ENOTSUP;
 		goto err_close;
 	}
+	st.incompat = 0;
+	st.ro_compat = 0;
+	st.compat = 0;
+	for (uint8_t i = 0; i < 2; i++) {
+		if (c[i] != MASTER_OK) {
+			continue;
+		}
+		rc = master_accept(i, &h[i]);
+		if (rc < 0) {
+			goto err_close;
+		}
+		st.incompat |= h[i].incompat;
+		st.ro_compat |= h[i].ro_compat;
+		st.compat |= h[i].compat;
+	}
 
-	/* Whether the adopted master's ceiling has to be checked against the
-	 * buckets. Every master write carries the highest ceiling saved so far,
-	 * and alloc_id saves a ceiling before handing out any id below it, so
-	 * when both masters are valid the newer one's ceiling exceeds every id
-	 * on flash (§13.1) and mount trusts it. With only one valid master we
-	 * may be falling back past a newer one — lost to bit rot, or to a torn
-	 * write of the ceiling this very scan raised last time — so scan. That
-	 * also covers a store formatted but not yet written to since, whose
-	 * second master is still blank; its buckets are nearly all empty.
-	 *
-	 * A backend that keeps old copies (UBI) can hide the loss: it answers a
-	 * newest master that fails its seal by standing the previous copy back
-	 * up, valid but with an older ceiling, beside a valid other master. So
-	 * damage the store found on either master sector also means scan. */
+	const bool both_ok = c[0] == MASTER_OK && c[1] == MASTER_OK;
+
+	/* No writer gives two ok sectors the same rot_gen: either could hold
+	 * the newer state (§3.1). */
+	if (both_ok && h[0].rot_gen == h[1].rot_gen) {
+		LOG_ERR("both masters at rot_gen %u; refusing — blob_db_format() "
+			"discards the store", h[0].rot_gen);
+		rc = -EIO;
+		goto err_close;
+	}
+
+	/* Pick the sector to take the state from: the higher ok one, unless
+	 * it holds no record that verifies (a rotation torn after its header,
+	 * or every record rotten), and then the other (§3.5). */
+	struct master_log log = { .newest = -1 };
+	bool fell_back = false;
+	int active = -1;
+
+	if (c[0] == MASTER_OK || c[1] == MASTER_OK) {
+		const uint8_t hi = (!both_ok) ? (c[0] == MASTER_OK ? 0 : 1)
+					      : (h[0].rot_gen > h[1].rot_gen ? 0 : 1);
+		const uint8_t lo = !hi;
+
+		rc = master_log_load(hi, h[hi].rot_gen, &log);
+		if (rc < 0) {
+			goto err_close;
+		}
+		if (log.newest >= 0) {
+			active = hi;
+		} else if (c[lo] == MASTER_OK) {
+			LOG_WRN("master %c holds no record that verifies; "
+				"falling back to %c", 'A' + hi, 'A' + lo);
+			rc = master_log_load(lo, h[lo].rot_gen, &log);
+			if (rc < 0) {
+				goto err_close;
+			}
+			if (log.newest >= 0) {
+				active = lo;
+				fell_back = true;
+			}
+		}
+	}
+
+	/* Whether the adopted ceiling has to be checked against the buckets,
+	 * and how the mount then ends that doubt. Every record carries the
+	 * highest ceiling saved so far, and alloc_id saves a ceiling before
+	 * handing out any id below it, so the newest record that verifies
+	 * covers every id on flash (§13.1) unless a newer one may have been
+	 * lost:
+	 *   - the newest written record fails its CRC (torn, or rotten);
+	 *   - mount fell back to the other sector;
+	 *   - the other sector is not ok: corrupt, or erased, which after a
+	 *     format (both sectors written, D18) only a rotation torn after its
+	 *     erase leaves;
+	 *   - the store found damage on a master sector (UBI can stand an older
+	 *     copy of a block back up, valid but stale).
+	 * The last three are ended by a rotation, which rewrites the other
+	 * sector; a bad last record by an append after it. */
 	bool scan_ids = false;
+	bool end_by_rotation = false;
 
-	if (ca != MASTER_OK && cb != MASTER_OK) {
+	if (active < 0) {
 		/* A partition whose masters are both blank is formatted.
 		 * Anything else — bit rot, a power cut while the first master
 		 * was written, another backend's substrate (doc/impl/
@@ -695,63 +998,61 @@ static int mount_impl(void)
 		 * CONFIG_BLOB_DB_AUTOFORMAT_ON_CORRUPT does what
 		 * blob_db_format() would, erasing every bucket with the masters
 		 * so no surviving blob can meet a reset id counter. */
-		if (ca == MASTER_ERASED && cb == MASTER_ERASED) {
+		if (c[0] == MASTER_ERASED && c[1] == MASTER_ERASED) {
 			LOG_INF("virgin partition; formatting");
 			rc = format_masters_fresh();
 		} else if (IS_ENABLED(CONFIG_BLOB_DB_AUTOFORMAT_ON_CORRUPT)) {
 			LOG_WRN("no usable master (A=%s B=%s); erasing the "
 				"store per CONFIG_BLOB_DB_AUTOFORMAT_ON_CORRUPT",
-				master_class_str[ca], master_class_str[cb]);
+				master_class_str[c[0]], master_class_str[c[1]]);
 			rc = format_whole_store();
 		} else {
 			LOG_ERR("no usable master (A=%s B=%s); refusing — "
 				"blob_db_format() discards the store",
-				master_class_str[ca], master_class_str[cb]);
+				master_class_str[c[0]], master_class_str[c[1]]);
 			rc = -EIO;
 		}
 		if (rc < 0) {
 			goto err_close;
 		}
 	} else {
-		scan_ids = ca != MASTER_OK || cb != MASTER_OK ||
-			   blob_db_store_open_found_damage(
-				   peb_offset(BLOB_DB_MASTER_A_SECTOR)) ||
-			   blob_db_store_open_found_damage(
-				   peb_offset(BLOB_DB_MASTER_B_SECTOR));
+		const uint8_t other = !active;
+		const bool damage =
+			blob_db_store_open_found_damage(
+				peb_offset(BLOB_DB_MASTER_A_SECTOR)) ||
+			blob_db_store_open_found_damage(
+				peb_offset(BLOB_DB_MASTER_B_SECTOR));
 
-		bool pick_a;
+		end_by_rotation = fell_back || c[other] != MASTER_OK || damage;
+		scan_ids = end_by_rotation || log.tail_bad;
 
-		if (ca == MASTER_OK && cb != MASTER_OK) {
-			pick_a = true;
-		} else if (ca != MASTER_OK && cb == MASTER_OK) {
-			pick_a = false;
-		} else {
-			pick_a = m_a.generation >= m_b.generation;
-		}
-		const struct blob_db_master_hdr *m = pick_a ? &m_a : &m_b;
-
-		st.active_master = pick_a ? BLOB_DB_MASTER_A_SECTOR
-					  : BLOB_DB_MASTER_B_SECTOR;
-		st.master_gen = m->generation;
-		st.next_id_hint = m->next_id_hint;
-		st.next_id = m->next_id_hint;   /* ceiling is authoritative (§13.1) */
-		st.seg_owner = m->seg_owner;
-		LOG_INF("master %c gen=%u state=%u next_id_hint=%llu",
-			pick_a ? 'A' : 'B',
-			st.master_gen, m->state, st.next_id);
+		st.active_master = (uint8_t)active;
+		st.rot_gen = h[active].rot_gen;
+		st.log_next = log.end;
+		st.log_failed = false;
+		st.ceiling_reset = false;
+		st.next_id_hint = log.rec.next_id_hint;
+		st.next_id = log.rec.next_id_hint;   /* ceiling is authoritative */
+		st.seg_owner = log.rec.seg_owner;
+		st.fuses = log.rec.fuses;
+		LOG_INF("master %c rot_gen=%u record %d of %u next_id_hint=%llu%s",
+			'A' + active, st.rot_gen, log.newest, st.log_cap,
+			(unsigned long long)st.next_id, scan_ids ? " (doubt)" : "");
 
 		/* Every mount, whatever the master says: the scratch seal is
 		 * what tells an interrupted compaction (recover_compaction()).
 		 * Before the doubt scan below, so it sees the restored bucket. */
-		rc = recover_compaction(m->state, m->compacting_bid);
+		rc = recover_compaction();
 		if (rc < 0) {
 			goto err_close;
 		}
 	}
 
-	/* The adopted ceiling is in doubt: find the highest id on flash. If it
-	 * out-runs the ceiling, raise the ceiling AND persist it before any
-	 * allocation can hand the id back out. */
+	/* The adopted ceiling is in doubt: find the highest id on flash and
+	 * raise next_id past it, in RAM. The write below is what tells the
+	 * next mount the ceiling is safe, so it comes after the scan: written
+	 * first, a cut during the scan would leave a clean-looking master
+	 * whose ceiling was never checked. */
 	if (scan_ids) {
 		uint64_t max_id = (st.next_id == 0) ? 0 : (st.next_id - 1);
 
@@ -762,16 +1063,46 @@ static int mount_impl(void)
 				goto err_close;
 			}
 		}
-		if (max_id + 1 > st.next_id_hint) {
+		if (max_id + 1 > st.next_id) {
 			LOG_WRN("bucket scan out-ran ceiling (%llu >= %llu); "
 				"raising", (unsigned long long)max_id,
-				st.next_id_hint);
+				(unsigned long long)st.next_id);
 			st.next_id = max_id + 1;
-			rc = persist_next_id_hint(max_id + 1 +
-						  BLOB_DB_ID_HINT_STEP);
-			if (rc < 0) {
-				goto err_close;
-			}
+		}
+	}
+
+	/* A half-done upgrade: one ok header has a feature bit the other
+	 * lacks. Rotations write the union (st's sets), so at most two make
+	 * both headers carry every bit (§4.2). Any rotation also ends a doubt:
+	 * it rewrites the other sector and gives the active one a fresh
+	 * record that verifies. */
+	bool rotated = false;
+
+	if (active >= 0 && both_ok &&
+	    (h[0].incompat != h[1].incompat || h[0].ro_compat != h[1].ro_compat ||
+	     h[0].compat != h[1].compat)) {
+		const struct blob_db_master_hdr *old_active = &h[active];
+
+		LOG_WRN("master headers disagree on features; finishing the "
+			"upgrade");
+		rc = master_commit_rotate();
+		if (rc == 0 && (old_active->incompat != st.incompat ||
+				old_active->ro_compat != st.ro_compat ||
+				old_active->compat != st.compat)) {
+			rc = master_commit_rotate();
+		}
+		if (rc < 0) {
+			goto err_close;
+		}
+		rotated = true;
+	}
+
+	/* End the doubt before returning, so the next mount does not scan
+	 * again (§3.5): otherwise it would last until the next rotation. */
+	if (scan_ids && !rotated) {
+		rc = end_by_rotation ? master_commit_rotate() : master_commit();
+		if (rc < 0) {
+			goto err_close;
 		}
 	}
 
@@ -818,7 +1149,7 @@ static int mount_impl(void)
 				st.next_id = 2;
 			}
 			if (st.next_id_hint < 2) {
-				rc = persist_next_id_hint(2 + BLOB_DB_ID_HINT_STEP);
+				rc = persist_next_id_hint();
 				if (rc < 0) {
 					goto err_close;
 				}
@@ -1570,7 +1901,6 @@ static int find_live_slot(uint16_t bid, uint64_t id, struct bucket_scan *sc,
 /* Build and write a slot at bucket+write_cursor. Slot size on flash is
  * padded to write_block_size; padding bytes are 0xff so any truncated
  * write still reads as erased in the padding region. */
-#define BLOB_DB_MAX_WRITE_ALIGN 32
 
 /* Scatter form: the slot's payload is `hdr_len` bytes from `hdr` followed by
  * `val_len - hdr_len` bytes from `payload`. Lets a segment or index record be
@@ -1799,16 +2129,15 @@ static bool scratch_seal_valid(const uint8_t *image, size_t *image_len)
 	return true;
 }
 
-/* Phase-2: persist the compacted image via master + scratch + bucket sequence.
+/* Phase-2: persist the compacted image through the scratch sector.
  *
- *   1. write master inactive = COMPACTING(bid)                 ── enters atomic window
- *   2. erase scratch; write scratch = new image
- *   3. erase bucket; write bucket = new image
- *   4. erase scratch
- *   5. write master inactive = CLEAN                           ── leaves atomic window
+ *   1. erase scratch; write scratch = new image; seal it   ── enters the window
+ *   2. erase bucket; write bucket = new image
+ *   3. erase scratch                                       ── leaves the window
  *
- * If we crash anywhere in 1..5, mount-time recover_compaction() restores a
- * consistent state per the crash table in design §8.
+ * No master is written (D17): a sealed scratch is what marks the window, and
+ * mount-time recover_compaction() restores the bucket from it whatever the
+ * master says (doc/impl/l1_bucketlog.md §6.1).
  */
 static int compact_commit(uint16_t bid, const uint8_t *new_buf, size_t new_len)
 {
@@ -1827,34 +2156,17 @@ static int compact_commit(uint16_t bid, const uint8_t *new_buf, size_t new_len)
 
 	/* A backend that replaces a block atomically needs none of the window
 	 * below: the bucket holds the old image or the new one whatever the
-	 * power does, so there is nothing for recover_compaction() to settle and
-	 * no reason to stamp COMPACTING. A failed replace leaves the old image,
-	 * so it is reported rather than wedging the store. */
+	 * power does, so there is nothing for recover_compaction() to settle. A
+	 * failed replace leaves the old image, so it is reported rather than
+	 * wedging the store. */
 	if (blob_db_store_replace_is_atomic()) {
 		return blob_db_store_replace(bucket_off, new_buf, new_len);
 	}
 
-	/* Step 1: enter atomic window.
-	 *
-	 * Every master this function stamps carries st.next_id_hint, not
-	 * st.next_id. The field is a leading ceiling (§13.1), and alloc_id
-	 * batches its master writes: it persists a ceiling BLOB_DB_ID_HINT_STEP
-	 * ids ahead, then hands ids out from RAM until it reaches that ceiling.
-	 * Writing the allocation pointer here would publish a master below the
-	 * ceiling alloc_id is still allocating against — lowering the durable
-	 * bound without lowering the RAM copy alloc_id compares to, so nothing
-	 * would re-persist it before the next mount. Mount's bucket scan would
-	 * repair the bound ids, but the ceiling exists to cover the ids a scan
-	 * cannot see: allocated-but-unbound. Carry the ceiling forward instead.
-	 */
-	int rc = master_commit(BLOB_DB_STATE_COMPACTING, bid);
+	int rc;
 
-	if (rc < 0) {
-		return rc;
-	}
-
-	/* Step 2: scratch, then seal it. The seal is what makes step 3 safe to
-	 * start: until it lands, recovery must leave the bucket alone. */
+	/* Step 1: scratch, then seal it. The seal is what makes step 2 safe to
+	 * start: until it lands, recovery leaves the bucket alone. */
 	rc = blob_db_store_erase(scratch_off, st.peb_size);
 	if (rc < 0) {
 		return rc;
@@ -1868,7 +2180,7 @@ static int compact_commit(uint16_t bid, const uint8_t *new_buf, size_t new_len)
 		return rc;
 	}
 
-	/* From here to step 4 the sealed scratch is authoritative: a mount now
+	/* From here to step 3 the sealed scratch is authoritative: a mount now
 	 * would restore it over this bucket. So an I/O error in this window
 	 * cannot simply be reported and shrugged off — the caller would carry
 	 * on, its next append into this bucket would be acknowledged, and a
@@ -1889,15 +2201,12 @@ static int compact_commit(uint16_t bid, const uint8_t *new_buf, size_t new_len)
 		}						\
 	} while (0)
 
-	/* Step 3: bucket. */
+	/* Step 2: bucket. */
 	COMPACT_OR_WEDGE(blob_db_store_erase(bucket_off, st.peb_size));
 	COMPACT_OR_WEDGE(blob_db_store_write(bucket_off, new_buf, new_len));
 
-	/* Step 4: erase scratch. */
+	/* Step 3: erase scratch, which closes the window. */
 	COMPACT_OR_WEDGE(blob_db_store_erase(scratch_off, st.peb_size));
-
-	/* Step 5: leave atomic window. */
-	COMPACT_OR_WEDGE(master_commit(BLOB_DB_STATE_CLEAN, 0));
 #undef COMPACT_OR_WEDGE
 
 	return 0;
@@ -2013,74 +2322,41 @@ static int scratch_sealed_bucket(size_t *image_len)
  * seal fails the seal's CRCs, and an unsealed scratch means the bucket was
  * never touched.
  *
- * Keying on the master's COMPACTING state instead, as mount did before,
- * misses a compaction whose COMPACTING master rotted: mount falls back to
- * the CLEAN master before it, skips recovery, and the bucket keeps whatever
- * a cut left of it. The check also runs when the backend replaces atomically,
- * because a store compacted through scratch by a build without atomic
- * replace can carry a sealed scratch into one with it.
- *
- * master_state and master_cbid are the adopted master's. COMPACTING still
- * ends with a CLEAN master, so a build that keys on the master state sees the
- * window closed; compact_commit() keeps writing both for the same reason. */
-static int recover_compaction(uint8_t master_state, uint16_t master_cbid)
+ * The master holds no compaction state (D17), so nothing a master says, or
+ * a rotten master hides, can make mount skip this. The check also runs when
+ * the backend replaces atomically, because a store compacted through scratch
+ * by a build without atomic replace can carry a sealed scratch into one with
+ * it. An unsealed scratch with content is left as it is: the next compaction
+ * erases it first. */
+static int recover_compaction(void)
 {
 	const off_t scratch_off = peb_offset(BLOB_DB_SCRATCH_SECTOR);
-	const bool compacting = master_state == BLOB_DB_STATE_COMPACTING;
 	size_t image_len = 0;
 	int rc = scratch_sealed_bucket(&image_len);
 
-	if (rc < -1) {
+	if (rc < 0) {
+		return rc == -1 ? 0 : rc;
+	}
+
+	const uint16_t bid = (uint16_t)rc;
+
+	LOG_WRN("recover: scratch sealed for bid %u (%zu B); restoring bucket",
+		bid, image_len);
+	rc = blob_db_store_erase(bucket_offset(bid), st.peb_size);
+	if (rc < 0) {
 		return rc;
 	}
-	if (rc >= 0) {
-		const uint16_t bid = (uint16_t)rc;
-
-		if (compacting && bid != master_cbid) {
-			LOG_WRN("recover: master says bucket %u, the sealed "
-				"image says %u; restoring %u", master_cbid,
-				bid, bid);
-		}
-		LOG_WRN("recover: scratch sealed for bid %u (%zu B); "
-			"restoring bucket", bid, image_len);
-		rc = blob_db_store_erase(bucket_offset(bid), st.peb_size);
-		if (rc < 0) {
-			return rc;
-		}
-		/* Only the image: the rest of the bucket must stay erased so
-		 * appends can continue after it. */
-		rc = blob_db_store_write(bucket_offset(bid), g_bbuf, image_len);
-		if (rc < 0) {
-			return rc;
-		}
-	} else if (!compacting) {
-		/* Nothing to recover. An unsealed scratch with content is left
-		 * as it is: the next compaction erases it first. */
-		return 0;
-	} else {
-		LOG_WRN("recover: COMPACTING(%u) with an unsealed scratch; "
-			"bucket left as-is", master_cbid);
+	/* Only the image: the rest of the bucket must stay erased so appends
+	 * can continue after it. */
+	rc = blob_db_store_write(bucket_offset(bid), g_bbuf, image_len);
+	if (rc < 0) {
+		return rc;
 	}
-
 	rc = blob_db_store_erase(scratch_off, st.peb_size);
-	if (rc < 0) {
-		return rc;
-	}
-	if (!compacting) {
+	if (rc == 0) {
 		LOG_INF("recover: complete");
-		return 0;
 	}
-
-	/* master_commit() writes the ceiling, for the reason given in
-	 * compact_commit(). Only mount calls this, and mount has just set
-	 * next_id = next_id_hint, so the two are equal here today. */
-	rc = master_commit(BLOB_DB_STATE_CLEAN, 0);
-	if (rc < 0) {
-		return rc;
-	}
-
-	LOG_INF("recover: complete; master gen=%u", st.master_gen);
-	return 0;
+	return rc;
 }
 
 #if defined(CONFIG_BLOB_DB_LARGE_PAYLOADS)
@@ -2111,6 +2387,13 @@ static uint16_t g_seg_max;      /* segments an index record can address */
 static inline size_t inline_max(void)
 {
 	return CONFIG_BLOB_DB_MAX_PAYLOAD_LEN;
+}
+
+/* Whether this store may hold segmented objects: the build reads them, and
+ * the store's headers carry the feature (D20). */
+static inline bool seg_enabled(void)
+{
+	return (st.incompat & BLOB_DB_FEAT_LARGE_PAYLOADS) != 0;
 }
 
 /* Resolve segment geometry and refuse a build that cannot reach the configured
@@ -2182,7 +2465,7 @@ void blob_db_test_wedge(void)
 #endif
 
 /* Record a segmented mutation in flight, so mount knows to sweep. Costs one
- * master write; a segmented update already costs K slot writes. */
+ * master record, no erase; a segmented update already costs K slot writes. */
 static int persist_seg_owner(uint64_t owner)
 {
 	if (st.seg_owner == owner) {
@@ -2193,7 +2476,7 @@ static int persist_seg_owner(uint64_t owner)
 
 	st.seg_owner = owner;
 
-	int rc = master_commit(BLOB_DB_STATE_CLEAN, 0);
+	int rc = master_commit();
 
 	if (rc < 0) {
 		st.seg_owner = prev;
@@ -2983,8 +3266,7 @@ static uint64_t alloc_id_impl(void)
 	 * strictly below a persisted ceiling, so a crash before it is ever
 	 * bound cannot let a later mount re-issue it (contract §2, §13.1). */
 	if (st.next_id >= st.next_id_hint) {
-		int rc = persist_next_id_hint(st.next_id + 1 +
-					      BLOB_DB_ID_HINT_STEP);
+		int rc = persist_next_id_hint();
 		if (rc < 0) {
 			LOG_ERR("alloc_id: cannot persist ceiling: %d", rc);
 			return 0;
@@ -3079,6 +3361,12 @@ static int update_impl(uint64_t id, const void *payload, size_t len)
 	}
 #if defined(CONFIG_BLOB_DB_LARGE_PAYLOADS)
 	if (len > CONFIG_BLOB_DB_MAX_OBJECT_LEN) {
+		return -EINVAL;
+	}
+	/* A store formatted without large payloads is written as a build
+	 * without them would write it (D20): its headers do not carry the
+	 * feature, so a build that cannot read segments may mount it. */
+	if (len > CONFIG_BLOB_DB_MAX_PAYLOAD_LEN && !seg_enabled()) {
 		return -EINVAL;
 	}
 #else
@@ -3547,7 +3835,15 @@ void blob_db_core_state_get(struct blob_db_core_state *out)
 		.n_pebs        = st.n_pebs,
 		.n_buckets     = st.n_buckets,
 		.active_master = st.active_master,
-		.master_gen    = st.master_gen,
+		.rot_gen       = st.rot_gen,
+		.rec_size      = st.rec_size,
+		.log_used      = st.log_next,
+		.log_cap       = st.log_cap,
+		.incompat      = st.incompat,
+		.ro_compat     = st.ro_compat,
+		.compat        = st.compat,
+		.suite         = BLOB_DB_BUILD_SUITE,
+		.fuses         = st.fuses,
 		.next_id       = st.next_id,
 		.next_id_hint  = st.next_id_hint,
 		.seg_owner     = st.seg_owner,
@@ -3896,7 +4192,6 @@ static int format_whole_store(void)
 		return rc;
 	}
 
-	/* The erase above took master B with it. */
 	rc = master_format();
 	if (rc < 0) {
 		return rc;
@@ -4059,26 +4354,29 @@ static int erase_all_impl(void)
 		return rc;
 	}
 
-	/* Reset the id space via a new master on the inactive slot. Note that
-	 * erase_all as a whole is NOT crash-atomic: a crash after some magics
-	 * were zeroed leaves those buckets gone while the rest survive under
-	 * the old master. That partial state is still consistent — the old
-	 * (higher) next_id_hint stays authoritative so no id is ever reused,
-	 * and a torn root rebind is repaired by mount's root-invariant
-	 * check. The caller asked for destruction; how much of it lands
-	 * before a crash is not part of the contract. */
-	const uint64_t prev_hint = st.next_id_hint;
+	/* Reset the id space with a record that lowers the ceiling: the one
+	 * record that does (§3.3). Safe because every bucket is invalidated and
+	 * the root bound again first, so no id at or above 2 is left on flash
+	 * but the root's. erase_all as a whole is NOT crash-atomic: a crash
+	 * after some magics were zeroed leaves those buckets gone while the
+	 * rest survive under the old record. That partial state is still
+	 * consistent — the old (higher) ceiling stays authoritative so no id is
+	 * ever reused, and a torn root rebind is repaired by mount's
+	 * root-invariant check. The caller asked for destruction; how much of
+	 * it lands before a crash is not part of the contract. */
+	const uint64_t prev_next = st.next_id;
 
-	st.next_id_hint = 2;
-	rc = master_commit(BLOB_DB_STATE_CLEAN, 0);
+	st.next_id = 2;
+	st.ceiling_reset = true;
+	rc = master_commit();
 	if (rc < 0) {
-		st.next_id_hint = prev_hint;
+		st.next_id = prev_next;
 		return rc;
 	}
-	st.next_id = 2;
 
-	LOG_INF("erase_all: complete; next_id=%llu (master gen=%u)",
-		(unsigned long long)st.next_id, st.master_gen);
+	LOG_INF("erase_all: complete; next_id=%llu (ceiling %llu)",
+		(unsigned long long)st.next_id,
+		(unsigned long long)st.next_id_hint);
 	return 0;
 }
 

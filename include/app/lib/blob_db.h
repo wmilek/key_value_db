@@ -135,8 +135,12 @@ extern "C" {
  * payload.
  *
  * An **unrecognized** store is never destroyed. If a master sector parses but
- * declares a format this build does not understand — a newer version, or
- * another allocator's magic — mount returns `-ENOTSUP` and writes nothing;
+ * declares a format this build does not understand — another major version
+ * (stores of majors 1-4, written before the master log, included), a feature
+ * this build does not know or is configured without (a store formatted with
+ * `CONFIG_BLOB_DB_LARGE_PAYLOADS`, opened by a build without it), another
+ * payload cap or device geometry, or another allocator's magic — mount
+ * returns `-ENOTSUP` and writes nothing;
  * discarding it is the caller's decision, via `blob_db_format()`, which for
  * that reason does not itself require a mount. Only a
  * partition whose master sectors both read as erased is treated as virgin and
@@ -152,9 +156,12 @@ extern "C" {
  * @retval -EIO    flash I/O error, partition not found, or no usable master
  *                 on a partition that is not blank (unless
  *                 `CONFIG_BLOB_DB_AUTOFORMAT_ON_CORRUPT`)
- * @retval -ENOTSUP foreign on-flash format, a sector larger than
- *                 `CONFIG_BLOB_DB_SECTOR_BUF_SIZE`, or a payload cap the
- *                 partition geometry cannot sustain
+ * @retval -ENOTSUP foreign on-flash format or features, a store written with
+ *                 another `CONFIG_BLOB_DB_MAX_PAYLOAD_LEN` or geometry, a
+ *                 sector larger than `CONFIG_BLOB_DB_SECTOR_BUF_SIZE`, a write
+ *                 unit larger than 32 B, a payload cap the partition geometry
+ *                 cannot sustain, or a root bucket holding a slot this build
+ *                 cannot read (see @ref blob_db_foreign)
  * @retval -ENODEV partition_label not present in the device tree
  */
 int blob_db_mount(void);

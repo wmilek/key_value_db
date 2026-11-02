@@ -519,3 +519,126 @@ ZTEST(blob_db_power_cut, test_cut_during_each_erase_tail_erased)
 {
 	erase_sweep(TEAR_TAIL_ERASED, "erase, tail erased,");
 }
+
+/* Master records -----------------------------------------------------------
+ *
+ * The same power cuts inside the other commit primitive: the master record
+ * that persists the id ceiling, appended to the log or written by a rotation
+ * (doc/proposals/2026-10-28-master-log.md §11 item 2). After every cut, mount
+ * must recover, every id handed out before the cut must stay behind the next
+ * one, and nothing bound may be lost.
+ */
+
+static struct {
+	uint64_t bound;   /* a bound blob that must survive every cut */
+	uint64_t last;    /* the last id handed out before the cut */
+	uint32_t bytes;   /* the reference commit's bytes and erases */
+	uint32_t erases;
+} mc;
+
+/* Allocate up to the point where the next alloc_id writes a ceiling record:
+ * into a full log when @p rotate, so that record is a rotation. */
+static void mc_build(bool rotate)
+{
+	struct blob_db_inspect_info in;
+
+	mc.bound = blob_db_alloc_id();
+	zassert_not_equal(mc.bound, 0);
+	val_bind(mc.bound, "bound", 0);
+	mc.last = mc.bound;
+
+	for (;;) {
+		zassert_ok(blob_db_inspect_info_get(&in));
+		if (in.next_id == in.next_id_hint &&
+		    (in.master_log_used == in.master_log_cap) == rotate) {
+			break;
+		}
+		mc.last = blob_db_alloc_id();
+		zassert_not_equal(mc.last, 0);
+	}
+	zassert_ok(blob_db_unmount());
+	flash_save();
+
+	/* The reference commit, uncut. */
+	zassert_ok(blob_db_mount());
+	pwr_reset();
+	zassert_true(blob_db_alloc_id() > mc.last);
+	mc.bytes = pwr.bytes;
+	mc.erases = pwr.erases;
+	zassert_ok(blob_db_unmount());
+	zassert_true(mc.bytes > 0, "the alloc wrote no record");
+	if (rotate) {
+		zassert_true(mc.bytes > 128, "the record was not a rotation");
+	}
+}
+
+static void mc_cut(void (*arm)(uint32_t, enum erase_tear), uint32_t at,
+		   enum erase_tear tear, const char *what)
+{
+	uint8_t v[VAL_LEN];
+
+	flash_restore();
+	zassert_ok(blob_db_mount());
+	pwr_reset();
+	arm(at, tear);
+
+	const uint64_t got = blob_db_alloc_id();
+
+	zassert_true(pwr.cut, "%s %u: the cut never fired", what, at);
+	zassert_ok(blob_db_unmount());
+	pwr_reset();
+	zassert_ok(blob_db_mount(), "%s %u: mount after the cut failed", what, at);
+
+	const uint64_t next = blob_db_alloc_id();
+
+	zassert_true(next > mc.last && (got == 0 || next > got),
+		     "%s %u: id %llu issued again (last %llu, cut alloc %llu)",
+		     what, at, (unsigned long long)next,
+		     (unsigned long long)mc.last, (unsigned long long)got);
+	val_make(v, "bound", 0);
+	zassert_true(val_is(mc.bound, v), "%s %u: a bound blob was lost", what, at);
+
+	/* And the recovered master stays what it now is. */
+	zassert_ok(blob_db_unmount());
+	zassert_ok(blob_db_mount(), "%s %u: second remount failed", what, at);
+	zassert_true(blob_db_alloc_id() > next, "%s %u: id issued again after "
+		     "a second remount", what, at);
+	zassert_ok(blob_db_unmount());
+}
+
+static void mc_sweep(bool rotate)
+{
+	mc_build(rotate);
+	for (uint32_t k = 0; k < mc.bytes; k++) {
+		mc_cut(arm_write, k, 0, "write byte");
+	}
+	for (uint32_t e = 0; e < mc.erases; e++) {
+		mc_cut(arm_erase, e, TEAR_HEAD_ERASED, "erase, head erased,");
+		mc_cut(arm_erase, e, TEAR_TAIL_ERASED, "erase, tail erased,");
+	}
+	TC_PRINT("%s: %u B and %u erases cut\n", rotate ? "rotation" : "append",
+		 mc.bytes, mc.erases);
+}
+
+static void power_cut_master_before(void *fixture)
+{
+	ARG_UNUSED(fixture);
+	pwr_reset();
+	blob_db_unmount();
+	zassert_ok(blob_db_mount());
+	zassert_ok(blob_db_format());
+	memset(&mc, 0, sizeof(mc));
+}
+
+ZTEST_SUITE(blob_db_power_cut_master, NULL, power_cut_setup,
+	    power_cut_master_before, power_cut_after, power_cut_teardown);
+
+ZTEST(blob_db_power_cut_master, test_cut_inside_a_record_append)
+{
+	mc_sweep(false);
+}
+
+ZTEST(blob_db_power_cut_master, test_cut_inside_a_rotation)
+{
+	mc_sweep(true);
+}

@@ -45,7 +45,16 @@ struct blob_db_inspect_info {
 	uint8_t  format_major;    /**< on-flash format this build writes       */
 	uint8_t  format_minor;
 	uint8_t  active_master;   /**< 0 or 1                                  */
-	uint32_t master_gen;      /**< generation of the active master         */
+	uint32_t rot_gen;         /**< rotation generation of the active master */
+	uint16_t master_rec_size; /**< bytes per master record (R)             */
+	uint16_t master_log_used; /**< record slots written in the active one  */
+	uint16_t master_log_cap;  /**< record slots per master sector          */
+	uint32_t incompat;        /**< the store's incompat feature bits       */
+	uint32_t ro_compat;       /**< the store's ro_compat feature bits      */
+	uint32_t compat;          /**< the store's compat feature bits         */
+	uint8_t  suite;           /**< protection suite; 0 = unprotected       */
+	uint32_t fuses;           /**< the fuse word, raw: post-mortem evidence
+				   *   blob_db carries but never interprets */
 	uint64_t next_id;         /**< what `blob_db_alloc_id()` returns next  */
 	uint64_t next_id_hint;    /**< durable id ceiling on the master        */
 	uint64_t seg_owner;       /**< segmented write in flight; 0 = none     */
