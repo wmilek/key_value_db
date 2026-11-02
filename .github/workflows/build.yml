@@ -147,6 +147,13 @@ jobs:
           west build -p always -b nrf52840dk/nrf52840 -d build/nrf52_perf_l0 \
             key_value_db/app_perf_l0
 
+      # app_diag is the firmware flashed to inspect a store on the board;
+      # twister only runs its native_sim build.
+      - name: Build app_diag (ARM)
+        run: |
+          west build -p always -b nrf5340dk/nrf5340/cpuapp -d build/nrf_diag \
+            key_value_db/app_diag
+
       # Same reasoning for app_cbor_persondb: both frontends, because the shell
       # one pulls in a subsystem the benchmark build never links.
       - name: Build app_cbor_persondb — benchmark frontend (ARM)

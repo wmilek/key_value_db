@@ -6,7 +6,8 @@
  *
  * Parsing and printing only, over the public introspection API
  * (<app/lib/blob_db_inspect.h>, CONFIG_BLOB_DB_INSPECT) and
- * blob_db_maintain(). Only `maintain` with a budget writes to flash.
+ * blob_db_maintain(). Only `maintain` with a budget writes to flash, and,
+ * with CONFIG_BLOB_DB_SHELL_ADMIN, `mount` and `format`.
  * Every blob_db call takes the blob_db lock, so commands are safe while the
  * application uses the store; a command that reads several buckets sees
  * each as it is then, not one snapshot.
@@ -562,6 +563,105 @@ static int cmd_maintain(const struct shell *sh, size_t argc, char **argv)
 	return 0;
 }
 
+#if defined(CONFIG_BLOB_DB_SHELL_ADMIN)
+/* blob_db mount | unmount | format yes ----------------------------------- */
+
+/* Mount is not read-only: it finishes an interrupted compaction and formats a
+ * partition whose masters both read as erased. The help text says so; the
+ * output says which of those happened only through the log.
+ *
+ * A refusal's errno covers several causes that call for different remedies,
+ * and only the log names the one that happened. So each refusal prints the
+ * causes it can stand for, which of them blob_db guarantees to leave the
+ * partition untouched (blob_db_mount()'s contract), and the remedy for each:
+ * `format yes` for a store this build cannot use, nothing the shell can do
+ * for a build that cannot use the partition. */
+static int cmd_mount(const struct shell *sh, size_t argc, char **argv)
+{
+	ARG_UNUSED(argc);
+	ARG_UNUSED(argv);
+
+	const int64_t t0 = k_uptime_get();
+	const int rc = blob_db_mount();
+
+	switch (rc) {
+	case 0:
+		shell_print(sh, "mounted, %lld ms",
+			    (long long)(k_uptime_get() - t0));
+		return 0;
+	case -EALREADY:
+		shell_print(sh, "already mounted");
+		return 0;
+	case -ENOTSUP:
+		shell_error(sh, "mount: -ENOTSUP, not mounted; the log names "
+			    "the cause:");
+		shell_error(sh, "  store in a format this build does not read "
+			    "(foreign magic, a newer major): left untouched; "
+			    "`blob_db format yes` discards it");
+		shell_error(sh, "  partition or build this blob_db cannot use "
+			    "(sector size, payload cap): formatting does not "
+			    "help; rebuild to match the partition");
+		return rc;
+	case -EIO:
+		shell_error(sh, "mount: -EIO, not mounted; the log names the "
+			    "cause:");
+		shell_error(sh, "  no usable master on a partition that is not "
+			    "blank: left untouched; `blob_db format yes` "
+			    "discards the store");
+		shell_error(sh, "  flash I/O error or no partition: formatting "
+			    "does not help");
+		return rc;
+	default:
+		shell_error(sh, "mount: %d, not mounted", rc);
+		return rc;
+	}
+}
+
+static int cmd_unmount(const struct shell *sh, size_t argc, char **argv)
+{
+	ARG_UNUSED(argc);
+	ARG_UNUSED(argv);
+
+	const int rc = blob_db_unmount();
+
+	if (rc < 0) {
+		shell_error(sh, "unmount: %d", rc);
+		return rc;
+	}
+	shell_print(sh, "unmounted");
+	return 0;
+}
+
+/* Destroys every blob. Takes the literal word `yes` so a stray `format` from
+ * history or a typo does nothing. */
+static int cmd_format(const struct shell *sh, size_t argc, char **argv)
+{
+	if (argc < 2 || strcmp(argv[1], "yes") != 0) {
+		shell_error(sh, "format erases every blob; run "
+			    "`blob_db format yes` to do it");
+		return -EINVAL;
+	}
+
+	const int64_t t0 = k_uptime_get();
+	const int rc = blob_db_format();
+
+	if (rc == -ENOTSUP) {
+		/* blob_db_format() refuses only what no store could fix. */
+		shell_error(sh, "format: -ENOTSUP: this build cannot use the "
+			    "partition (sector size, payload cap; the log "
+			    "names it); rebuild to match the partition");
+		return rc;
+	}
+	if (rc < 0) {
+		shell_error(sh, "format: %d", rc);
+		return rc;
+	}
+	shell_print(sh, "formatted and mounted, %lld ms",
+		    (long long)(k_uptime_get() - t0));
+	return 0;
+}
+#endif
+
 #if defined(CONFIG_BLOB_DB_IOSTATS)
 /* blob_db iostats [reset] ------------------------------------------------- */
 
@@ -622,6 +722,20 @@ SHELL_STATIC_SUBCMD_SET_CREATE(sub_blob_db,
 		"Run erases ahead of time; WRITES: a step erases a block\n"
 		"usage: maintain [budget]  (default 0: report only)",
 		cmd_maintain, 1, 1),
+#if defined(CONFIG_BLOB_DB_SHELL_ADMIN)
+	SHELL_CMD_ARG(mount, NULL,
+		"Mount the store; WRITES: finishes an interrupted compaction, "
+		"formats a blank partition",
+		cmd_mount, 1, 0),
+	SHELL_CMD_ARG(unmount, NULL,
+		"Unmount the store",
+		cmd_unmount, 1, 0),
+	SHELL_CMD_ARG(format, NULL,
+		"Erase the partition and start an empty store; DESTROYS every "
+		"blob, works unmounted, leaves it mounted\n"
+		"usage: format yes",
+		cmd_format, 1, 1),
+#endif
 #if defined(CONFIG_BLOB_DB_IOSTATS)
 	SHELL_CMD_ARG(iostats, NULL,
 		"Flash I/O counters\n"

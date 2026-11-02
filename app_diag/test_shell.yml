@@ -1,0 +1,24 @@
+# Run by twister's shell harness (scenario app.diag.admin in sample.yaml) on a
+# blank image: nothing mounted at boot, then the lifecycle commands in turn.
+# Each `expected` is a regex matched from the start of a line, after the
+# shell's colour codes; hence the leading `.*`.
+- command: "blob_db info"
+  expected: ".*blob_db not mounted"
+- command: "blob_db format"
+  expected: ".*run `blob_db format yes` to do it"
+- command: "blob_db info"
+  expected: ".*blob_db not mounted"
+- command: "blob_db mount"
+  expected: ".*mounted, "
+- command: "blob_db info"
+  expected: ".*next id"
+- command: "blob_db mount"
+  expected: ".*already mounted"
+- command: "blob_db unmount"
+  expected: ".*unmounted"
+- command: "blob_db info"
+  expected: ".*blob_db not mounted"
+- command: "blob_db format yes"
+  expected: ".*formatted and mounted"
+- command: "blob_db stats"
+  expected: ".*1 live ids"

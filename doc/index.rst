@@ -58,6 +58,7 @@ instructions live in the repository ``README.md``.
    proposals/2026-10-09-kvhash-spill
    proposals/2026-10-28-master-log
    proposals/2026-11-01-master-log-implementation-plan
+   proposals/2026-11-02-kvdb-tools
 
 .. toctree::
    :maxdepth: 1
