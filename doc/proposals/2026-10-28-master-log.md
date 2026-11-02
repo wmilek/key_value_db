@@ -148,8 +148,8 @@ anchor, not of the classification. Once fuses trip, `MAC_FAIL` records it
 
 **Every ok header must agree with the build and the device**, not only the
 active one. Each sector that classifies as ok must carry the device's
-`peb_size`, `n_buckets` and `write_align`, the build's `suite` and
-`max_payload_len`, the `hdr_len` of that suite, and the `rec_size` the build
+`peb_size`, `n_buckets` and `write_align`, the build's `suite`, a
+`max_payload_len` no larger than the build's (D21), the `hdr_len` of that suite, and the `rec_size` the build
 computes for that suite and the device's `write_align`. Otherwise mount
 refuses the store with `-ENOTSUP` and writes nothing.
 
@@ -159,10 +159,11 @@ smaller cap would read a sealed, intact slot as a torn tail, and the bucket's
 next compaction would drop it and every slot after it. Every slot is padded
 to `write_align` (`slot_size_for()`), so another value walks the bucket at
 the wrong boundaries. `rec_size` does not show it, because 48 is a multiple
-of every `write_align` up to 16. Equality, not "at most", keeps both
-directions safe: a build with a larger cap would write slots the store's own
-build can no longer walk. Raising the cap is a format, as changing any other
-geometry is. The CRC and MAC sit at fixed offsets in the record (§3.2), whatever R
+of every `write_align` up to 16. The other direction is safe to read: every
+slot on a store with a smaller cap fits the build's. What is not safe is
+writing a slot above the store's cap while a header a smaller-cap build would
+accept still stands, so mount first raises the cap in both headers (D21,
+§4.4). Changing any other geometry is a format. The CRC and MAC sit at fixed offsets in the record (§3.2), whatever R
 is. R only adds filler, so a store whose `rec_size` differs from the build's
 was written by another build or for another device. `write_align` must be a
 power of two no larger than 128, because records start at offset 128. A
