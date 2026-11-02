@@ -34,7 +34,7 @@ static const uint8_t BUCKET_MAGIC[4] = { 'B', 'D', 'B', 'H' };
 static const uint8_t SCRATCH_MAGIC[4] = { 'B', 'D', 'S', 'L' };
 
 /* Forward declarations (compaction helpers live below blob_db_mount). */
-static int recover_compaction(uint16_t bid);
+static int recover_compaction(uint8_t master_state, uint16_t master_cbid);
 static int compact_bucket(uint16_t bid);
 static int persist_next_id_hint(uint64_t new_hint);
 static int bind_root_empty(void);
@@ -736,11 +736,12 @@ static int mount_impl(void)
 			pick_a ? 'A' : 'B',
 			st.master_gen, m->state, st.next_id);
 
-		if (m->state == BLOB_DB_STATE_COMPACTING) {
-			rc = recover_compaction(m->compacting_bid);
-			if (rc < 0) {
-				goto err_close;
-			}
+		/* Every mount, whatever the master says: the scratch seal is
+		 * what tells an interrupted compaction (recover_compaction()).
+		 * Before the doubt scan below, so it sees the restored bucket. */
+		rc = recover_compaction(m->state, m->compacting_bid);
+		if (rc < 0) {
+			goto err_close;
 		}
 	}
 
@@ -1779,37 +1780,87 @@ static int compact_bucket(uint16_t bid)
 	return rc;
 }
 
-/* Mount-time recovery for a partition we found in COMPACTING(bid) state.
+/* The bucket a sealed scratch image belongs to, or -1 when scratch holds no
+ * complete image. Reads the 16 B seal first, so a mount with nothing to
+ * recover costs one small read; only a seal that verifies costs the whole
+ * sector, into g_bbuf, which the caller restores from.
  *
- * Decision rule: if the scratch sector contains a valid bucket header
- * with the matching bid, treat scratch as authoritative — copy it back
- * over the bucket. If scratch is invalid, the bucket is still the
- * original (we crashed before scratch was sealed). Either way, finish
- * by erasing scratch and writing a CLEAN master.
- */
-static int recover_compaction(uint16_t bid)
+ * The bucket comes from the image's own header, which the seal's CRC covers,
+ * not from the master. */
+static int scratch_sealed_bucket(size_t *image_len)
 {
-	if (bid >= st.n_buckets) {
-		LOG_ERR("recover: compacting_bid %u out of range (n=%u)",
-			bid, st.n_buckets);
-		return -EIO;
-	}
-
 	const off_t scratch_off = peb_offset(BLOB_DB_SCRATCH_SECTOR);
+	struct blob_db_scratch_seal seal;
+	int rc = blob_db_store_read(scratch_off + scratch_seal_off(), &seal,
+				    sizeof(seal));
 
-	int rc = blob_db_store_read(scratch_off, g_bbuf, st.peb_size);
 	if (rc < 0) {
 		return rc;
 	}
+	if (memcmp(seal.magic, SCRATCH_MAGIC, 4) != 0 ||
+	    seal.seal_crc32 != hdr_crc32(&seal, sizeof(seal))) {
+		return -1;
+	}
 
-	/* The tail seal — not the bucket header — decides whether the whole
-	 * image landed. The header is written first, so it survives a tear that
-	 * lost everything after it; restoring on the strength of the header
-	 * therefore overwrote intact buckets with truncated images. */
+	rc = blob_db_store_read(scratch_off, g_bbuf, st.peb_size);
+	if (rc < 0) {
+		return rc;
+	}
+	if (!scratch_seal_valid(g_bbuf, image_len)) {
+		return -1;   /* the image tore after the seal's own bytes landed */
+	}
+
+	const uint16_t bid =
+		((const struct blob_db_bucket_hdr *)g_bbuf)->bucket_id;
+
+	if (bid >= st.n_buckets || !bucket_hdr_valid(g_bbuf, bid)) {
+		LOG_WRN("recover: sealed scratch names bucket %u, not one of "
+			"%u; left as-is", bid, st.n_buckets);
+		return -1;
+	}
+	return bid;
+}
+
+/* Mount-time recovery of an interrupted compaction, run at every mount.
+ *
+ * The scratch seal decides, not the master. compact_commit() seals scratch
+ * only after the whole image is in it, and erases scratch before it leaves
+ * the window, so a sealed scratch exists exactly while the bucket may be
+ * erased or half rewritten, and the image is that bucket's complete new
+ * content. Restoring it is right at every point of that window: before the
+ * bucket's erase it writes what the bucket was about to receive, and after
+ * the bucket was rewritten it writes the same bytes again. A torn image or
+ * seal fails the seal's CRCs, and an unsealed scratch means the bucket was
+ * never touched.
+ *
+ * Keying on the master's COMPACTING state instead, as mount did before,
+ * misses a compaction whose COMPACTING master rotted: mount falls back to
+ * the CLEAN master before it, skips recovery, and the bucket keeps whatever
+ * a cut left of it. The check also runs when the backend replaces atomically,
+ * because a store compacted through scratch by a build without atomic
+ * replace can carry a sealed scratch into one with it.
+ *
+ * master_state and master_cbid are the adopted master's. COMPACTING still
+ * ends with a CLEAN master, so a build that keys on the master state sees the
+ * window closed; compact_commit() keeps writing both for the same reason. */
+static int recover_compaction(uint8_t master_state, uint16_t master_cbid)
+{
+	const off_t scratch_off = peb_offset(BLOB_DB_SCRATCH_SECTOR);
+	const bool compacting = master_state == BLOB_DB_STATE_COMPACTING;
 	size_t image_len = 0;
+	int rc = scratch_sealed_bucket(&image_len);
 
-	if (scratch_seal_valid(g_bbuf, &image_len) &&
-	    bucket_hdr_valid(g_bbuf, bid)) {
+	if (rc < -1) {
+		return rc;
+	}
+	if (rc >= 0) {
+		const uint16_t bid = (uint16_t)rc;
+
+		if (compacting && bid != master_cbid) {
+			LOG_WRN("recover: master says bucket %u, the sealed "
+				"image says %u; restoring %u", master_cbid,
+				bid, bid);
+		}
 		LOG_WRN("recover: scratch sealed for bid %u (%zu B); "
 			"restoring bucket", bid, image_len);
 		rc = blob_db_store_erase(bucket_offset(bid), st.peb_size);
@@ -1822,17 +1873,22 @@ static int recover_compaction(uint16_t bid)
 		if (rc < 0) {
 			return rc;
 		}
+	} else if (!compacting) {
+		/* Nothing to recover. An unsealed scratch with content is left
+		 * as it is: the next compaction erases it first. */
+		return 0;
 	} else {
-		/* Either the image never completed (crash before the seal, so
-		 * the bucket was never touched) or it is not for this bucket.
-		 * Leaving the bucket alone is the safe half of the window. */
-		LOG_WRN("recover: scratch unsealed or foreign; bucket %u left as-is",
-			bid);
+		LOG_WRN("recover: COMPACTING(%u) with an unsealed scratch; "
+			"bucket left as-is", master_cbid);
 	}
 
 	rc = blob_db_store_erase(scratch_off, st.peb_size);
 	if (rc < 0) {
 		return rc;
+	}
+	if (!compacting) {
+		LOG_INF("recover: complete");
+		return 0;
 	}
 
 	/* master_commit() writes the ceiling, for the reason given in
