@@ -563,7 +563,14 @@ static int cmd_maintain(const struct shell *sh, size_t argc, char **argv)
 
 /* Mount is not read-only: it finishes an interrupted compaction and formats a
  * partition whose masters both read as erased. The help text says so; the
- * output says which of those happened only through the log. */
+ * output says which of those happened only through the log.
+ *
+ * A refusal's errno covers several causes that call for different remedies,
+ * and only the log names the one that happened. So each refusal prints the
+ * causes it can stand for, which of them blob_db guarantees to leave the
+ * partition untouched (blob_db_mount()'s contract), and the remedy for each:
+ * `format yes` for a store this build cannot use, nothing the shell can do
+ * for a build that cannot use the partition. */
 static int cmd_mount(const struct shell *sh, size_t argc, char **argv)
 {
 	ARG_UNUSED(argc);
@@ -581,16 +588,26 @@ static int cmd_mount(const struct shell *sh, size_t argc, char **argv)
 		shell_print(sh, "already mounted");
 		return 0;
 	case -ENOTSUP:
-		shell_error(sh, "mount: -ENOTSUP: a format or geometry this "
-			    "build does not support; nothing written");
+		shell_error(sh, "mount: -ENOTSUP, not mounted; the log names "
+			    "the cause:");
+		shell_error(sh, "  store in a format this build does not read "
+			    "(foreign magic, a newer major): left untouched; "
+			    "`blob_db format yes` discards it");
+		shell_error(sh, "  partition or build this blob_db cannot use "
+			    "(sector size, payload cap): formatting does not "
+			    "help; rebuild to match the partition");
 		return rc;
 	case -EIO:
-		shell_error(sh, "mount: -EIO: flash error or no usable master; "
-			    "nothing written (`blob_db format yes` discards "
-			    "the store)");
+		shell_error(sh, "mount: -EIO, not mounted; the log names the "
+			    "cause:");
+		shell_error(sh, "  no usable master on a partition that is not "
+			    "blank: left untouched; `blob_db format yes` "
+			    "discards the store");
+		shell_error(sh, "  flash I/O error or no partition: formatting "
+			    "does not help");
 		return rc;
 	default:
-		shell_error(sh, "mount: %d", rc);
+		shell_error(sh, "mount: %d, not mounted", rc);
 		return rc;
 	}
 }
@@ -623,6 +640,13 @@ static int cmd_format(const struct shell *sh, size_t argc, char **argv)
 	const int64_t t0 = k_uptime_get();
 	const int rc = blob_db_format();
 
+	if (rc == -ENOTSUP) {
+		/* blob_db_format() refuses only what no store could fix. */
+		shell_error(sh, "format: -ENOTSUP: this build cannot use the "
+			    "partition (sector size, payload cap; the log "
+			    "names it); rebuild to match the partition");
+		return rc;
+	}
 	if (rc < 0) {
 		shell_error(sh, "format: %d", rc);
 		return rc;
