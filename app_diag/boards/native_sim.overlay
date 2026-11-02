@@ -1,0 +1,53 @@
+/*
+ * Copyright (c) 2026
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * native_sim: the store gets a simulated flash device of its own, shaped like
+ * the nRF5340-DK's on-board MX25R6435F partition (8 MB, 64 KB erase blocks,
+ * 4 B write alignment, erased = 0xff). The partition starts at offset 0 and
+ * fills the device, so the device's backing file IS a partition image:
+ *
+ *   ./zephyr.exe --kvdb=storage.bin
+ *
+ * opens a raw dump of the DK's storage partition as it is, and a file the
+ * host build leaves behind can be programmed back unchanged.
+ *
+ * The board's own flash0 keeps its MCUboot and image partitions; only its
+ * small storage partition is removed so that storage_partition, the node
+ * label blob_db binds to, names this one.
+ */
+
+/delete-node/ &storage_partition;
+
+/ {
+	kvdb_flash_controller: flash-controller@80000000 {
+		compatible = "zephyr,sim-flash";
+		reg = <0x80000000 DT_SIZE_M(8)>;
+		ranges;
+		#address-cells = <1>;
+		#size-cells = <1>;
+		erase-value = <0xff>;
+
+		kvdb_flash: flash@80000000 {
+			compatible = "soc-nv-flash";
+			/* Names the --kvdb, --kvdb_erase, --kvdb_rm and --kvdb_in_ram
+			 * command-line options of the flash simulator.
+			 */
+			label = "kvdb";
+			reg = <0x80000000 DT_SIZE_M(8)>;
+			erase-block-size = <65536>;
+			write-block-size = <4>;
+
+			partitions {
+				compatible = "fixed-partitions";
+				#address-cells = <1>;
+				#size-cells = <1>;
+
+				storage_partition: partition@0 {
+					label = "storage";
+					reg = <0x00000000 DT_SIZE_M(8)>;
+				};
+			};
+		};
+	};
+};

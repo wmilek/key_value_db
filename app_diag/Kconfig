@@ -1,0 +1,29 @@
+# kvdb diagnostics app — Kconfig entry point.
+#
+# Copyright (c) 2026
+# SPDX-License-Identifier: Apache-2.0
+
+menu "Zephyr"
+source "Kconfig.zephyr"
+endmenu
+
+module = APP_DIAG
+module-str = APP_DIAG
+source "subsys/logging/Kconfig.template.log_config"
+
+config APP_DIAG_MOUNT_AT_BOOT
+	bool "Mount blob_db at boot"
+	help
+	  Call blob_db_mount() from main() before the shell takes over, so the
+	  "blob_db" shell group has a store to inspect.
+
+	  Off by default because mounting is not read-only. A mount finishes
+	  an interrupted compaction from the scratch seal, formats a partition
+	  whose master sectors both read as erased, and, on the UBI backend,
+	  attaches the volume. Each of those writes flash, and each can change
+	  the state a diagnostic session was meant to look at. Off, the app
+	  touches the storage partition only through the commands typed at it:
+	  "flash" reads raw bytes and "blob_db" answers "not mounted".
+
+	  There is no shell command that mounts: turning this on is the only
+	  way to get a mounted store in this app.

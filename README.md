@@ -254,7 +254,7 @@ it demonstrates.
 This is what CI runs ([`build.yml`](.github/workflows/build.yml)), plus an
 app build on the non-default `flash_area` backend. At the merge gate it also
 cross-builds for ARM: the demo on both storage backends and with `kvdb`
-enabled, `samples/kvhash`, `app_perf_blob_db`, and `app_cbor_persondb` in both of its
+enabled, `samples/kvhash`, `app_perf_blob_db`, `app_diag`, and `app_cbor_persondb` in both of its
 frontends — so the binaries that produce the hardware numbers cannot rot
 between runs on real hardware.
 
@@ -290,6 +290,7 @@ the source.
 | [`app_perf_kvdb/`](app_perf_kvdb) | `kvdb` demo + benchmark with **cross-reboot verification**: every value is predicted from a stored generation counter, so a rerun proves the previous run survived — and an interrupted run is detected and proven atomic. Also times kvhash's `count` and a full `next` walk, and proves the walk returns exactly the predicted set | [`RESULTS.md`](app_perf_kvdb/RESULTS.md) |
 | [`app_cbor_persondb/`](app_cbor_persondb) | a CBOR person/credential database — 10 000 people over the L2 Map shape, with the access decision, crash safety and capacity planning a real product needs. Both a **worked example** of building on this stack and a **probe** of it | [`RESULTS.md`](app_cbor_persondb/RESULTS.md) |
 | [`app_footprint/`](app_footprint) | **FLASH footprint**: a Zephyr image on the nRF5340-DK grown one layer at a time by each layer's own Kconfig symbol (flash driver, UBI, blob_db, rootreg, kvhash, logring, kvdb, blobfs), Kconfig toggles as deltas, and `app_cbor_persondb` as the finished app; every byte attributed from the linker map by `footprint.py` | [`RESULTS.md`](app_footprint/RESULTS.md) |
+| [`app_diag/`](app_diag) | **diagnostics shell**: an app that only exposes the existing shell commands (`blob_db`, `flash`, `kernel`, `device`) and mounts nothing unless built with `CONFIG_APP_DIAG_MOUNT_AT_BOOT=y`. On `native_sim` the store's flash is a partition image (`--kvdb=<file>`), so the same build inspects images offline. First step of [`doc/proposals/2026-11-02-kvdb-tools.md`](doc/proposals/2026-11-02-kvdb-tools.md) | — |
 
 `app_perf_l0` is the one to reach for when a change moves flash traffic and
 there is no board on the desk. It is the only app here that links none of the
@@ -425,6 +426,7 @@ app_perf*/            benchmarks (+ hardware reference RESULTS.md)
                       tools/l0_timing.py, models/, geometry/
 app_cbor_persondb/    worked example & probe (README · DESIGN · FINDINGS · RESULTS)
 app_footprint/        FLASH footprint by layer and Kconfig option (footprint.py)
+app_diag/             diagnostics shell, on the device and on images (native_sim)
 tests/lib/            ztest suites: blob_db · blob_db_contract · rootreg · kvdb
                       · blobfs
 tests/support/        shared test shims (crash injection)
