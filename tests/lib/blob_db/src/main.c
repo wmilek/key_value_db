@@ -2394,6 +2394,48 @@ ZTEST(blob_db, test_crash_during_delete_is_all_or_nothing)
 		      "sweep left %d segments of a deleted object",
 		      live_segment_slots());
 }
+
+/* A format starts the store over, intent marker included. A segmented write
+ * cut after step 1 leaves seg_owner naming its id in RAM; the master a format
+ * then writes must still say "no segmented write in flight", or the fresh
+ * store's next mount sweeps for an object that no longer exists. */
+ZTEST(blob_db, test_format_does_not_carry_a_stale_seg_owner)
+{
+	SKIP_UNLESS_RAW_PARTITION();
+
+	int segs;
+	uint64_t id = seeded_object(&segs);
+	struct master_img m;
+
+	rewrite_cut_at(id, BLOB_DB_CUT_AFTER_OWNER_SET);
+	zassert_ok(blob_db_format());
+
+	master_read_raw(0, &m);
+	zassert_equal(m.generation, 1, "format writes master A at generation 1");
+	zassert_equal(m.seg_owner, 0, "format carried seg_owner %llu over",
+		      (unsigned long long)m.seg_owner);
+}
+
+/* The same through the virgin format at mount: blank masters in front of a
+ * session that last saw a segmented write cut after step 1. */
+ZTEST(blob_db, test_virgin_format_does_not_carry_a_stale_seg_owner)
+{
+	SKIP_UNLESS_RAW_PARTITION();
+
+	int segs;
+	uint64_t id = seeded_object(&segs);
+	struct master_img m;
+
+	rewrite_cut_at(id, BLOB_DB_CUT_AFTER_OWNER_SET);
+	zassert_ok(blob_db_unmount());
+	masters_erase();
+	zassert_ok(blob_db_mount());
+
+	master_read_raw(0, &m);
+	zassert_equal(m.generation, 1, "the virgin format writes master A");
+	zassert_equal(m.seg_owner, 0, "virgin format carried seg_owner %llu over",
+		      (unsigned long long)m.seg_owner);
+}
 #endif /* CONFIG_BLOB_DB_TEST_CRASH_HOOKS */
 
 #if defined(CONFIG_BLOB_DB_TEST_CRASH_HOOKS)
