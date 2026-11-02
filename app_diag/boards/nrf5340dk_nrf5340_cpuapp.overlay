@@ -1,0 +1,20 @@
+/*
+ * The store on the on-board MX25R64 QSPI NOR: its first 8 MB, 64 KB sectors,
+ * as in app_perf_blob_db. The native_sim build of this app models the same
+ * partition, so a raw dump of this range opens there unchanged.
+ */
+
+/delete-node/ &storage_partition;
+
+&mx25r64 {
+	partitions {
+		compatible = "fixed-partitions";
+		#address-cells = <1>;
+		#size-cells = <1>;
+
+		storage_partition: partition@0 {
+			label = "storage";
+			reg = <0x00000000 0x00800000>;
+		};
+	};
+};

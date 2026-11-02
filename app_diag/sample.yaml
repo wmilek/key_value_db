@@ -1,0 +1,47 @@
+sample:
+  description: kvdb diagnostics shell (existing commands, no mount by default)
+  name: kvdb-diag
+common:
+  tags: [storage, shell]
+  harness: console
+tests:
+  # The default build: boots to the shell and leaves the store unmounted.
+  app.diag:
+    platform_allow:
+      - native_sim
+    integration_platforms:
+      - native_sim
+    harness_config:
+      type: multi_line
+      ordered: true
+      regex:
+        - "kvdb diag: UBI backend, storage partition 8192 KiB"
+        - "kvdb diag: not mounted"
+
+  # Mount at boot opted in: a blank image is formatted and mounted.
+  app.diag.mount:
+    platform_allow:
+      - native_sim
+    extra_configs:
+      - CONFIG_APP_DIAG_MOUNT_AT_BOOT=y
+    harness_config:
+      type: one_line
+      regex:
+        - "kvdb diag: mounted"
+
+  # The lifecycle commands, typed at the shell: format refused without `yes`,
+  # mount, remount, unmount, format. Commands and replies: test_shell.yml.
+  app.diag.admin:
+    platform_allow:
+      - native_sim
+    harness: shell
+    harness_config:
+      shell_commands_file: test_shell.yml
+
+  # `kernel reboot cold` restarts unmounted, and the store formatted before it
+  # mounts again without being formatted. A pytest test rather than a
+  # test_shell.yml step: the restarted shell's first prompt needs waiting for.
+  app.diag.reboot:
+    platform_allow:
+      - native_sim
+    harness: pytest
