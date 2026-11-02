@@ -28,3 +28,12 @@ tests:
       type: one_line
       regex:
         - "kvdb diag: mounted"
+
+  # The lifecycle commands, typed at the shell: format refused without `yes`,
+  # mount, remount, unmount, format. Commands and replies: test_shell.yml.
+  app.diag.admin:
+    platform_allow:
+      - native_sim
+    harness: shell
+    harness_config:
+      shell_commands_file: test_shell.yml

@@ -14,8 +14,8 @@ source "subsys/logging/Kconfig.template.log_config"
 config APP_DIAG_MOUNT_AT_BOOT
 	bool "Mount blob_db at boot"
 	help
-	  Call blob_db_mount() from main() before the shell takes over, so the
-	  "blob_db" shell group has a store to inspect.
+	  Call blob_db_mount() from main() before the shell takes over, as
+	  `blob_db mount` would.
 
 	  Off by default because mounting is not read-only. A mount finishes
 	  an interrupted compaction from the scratch seal, formats a partition
@@ -23,7 +23,5 @@ config APP_DIAG_MOUNT_AT_BOOT
 	  attaches the volume. Each of those writes flash, and each can change
 	  the state a diagnostic session was meant to look at. Off, the app
 	  touches the storage partition only through the commands typed at it:
-	  "flash" reads raw bytes and "blob_db" answers "not mounted".
-
-	  There is no shell command that mounts: turning this on is the only
-	  way to get a mounted store in this app.
+	  "flash" reads raw bytes, "blob_db" answers "not mounted" until
+	  `blob_db mount` or `blob_db format yes` is run.

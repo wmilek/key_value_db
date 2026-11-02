@@ -1,6 +1,6 @@
 # Design change proposal — kvdb tools: one shell, on the device and on images
 
-Status: **proposal**, step 1 landed (`app_diag/`) · 2026-11-02
+Status: **proposal**, step 1 and part of step 2 landed (`app_diag/`, `blob_db mount` · `unmount` · `format`) · 2026-11-02
 · Builds on: `lib/blob_db/blob_db_shell.c`, `include/app/lib/blob_db_inspect.h`,
   the store seam `lib/blob_db/blob_db_store.h`
 · Governed by `doc/principles.md`
@@ -51,6 +51,7 @@ Planned groups, by layer (none beyond `blob_db`, `flash`, `kernel` and
 
 ```
 blob_db  info · stats · buckets · bucket · id · dump · maintain · iostats    exists
+         mount · unmount · format yes                                        exists (SHELL_ADMIN)
          ls · get · verify                                                   later
 ubi      info · peb · ec-hist (wear)                                         L0
 rootreg  ls · get · set · rm                                                 L1½
@@ -70,12 +71,16 @@ start can therefore change, or destroy, the state it was started to examine.
 So:
 
 - Nothing mounts at boot unless the build asks for it
-  (`CONFIG_APP_DIAG_MOUNT_AT_BOOT`, default `n`).
+  (`CONFIG_APP_DIAG_MOUNT_AT_BOOT`, default `n`). The operator mounts with
+  `blob_db mount`, or discards the store with `blob_db format yes`.
 - `BLOB_DB_AUTOFORMAT_ON_CORRUPT` and `BLOB_DB_MAINT_WORK` are off in the
   diagnostics build. blobfs, whose file-system registration is another way to
   a mount, is not built.
-- Later steps add an explicit `mount` command, and a copy-on-write store
-  under the store seam (§2, step 3). Reads come from the image; writes go to a
+- `mount`, `unmount` and `format` sit behind their own option,
+  `CONFIG_BLOB_DB_SHELL_ADMIN` (default `n`). An application that enables the
+  read-only `blob_db` group while it holds container handles must not gain a
+  command that unmounts or wipes the store under them.
+- A later step adds a copy-on-write store under the store seam (§2, step 3). Reads come from the image; writes go to a
   RAM overlay that is discarded unless committed. "What would recovery do to
   this image?" then becomes a question that is safe to ask.
 
@@ -133,7 +138,7 @@ Fault injection reuses `tests/support/flash_fault`.
 | Step | Content | New commands |
 |---|---|---|
 | **1** (landed) | `app_diag/`: shell only, existing groups (`blob_db`, `blob_db iostats`, `flash`, `kernel`, `device`); no mount unless `CONFIG_APP_DIAG_MOUNT_AT_BOOT=y`; nRF5340-DK build plus a `native_sim` build whose store flash is a partition image (`--kvdb=<file>`); twister runs both variants | none |
-| 2 | Explicit `blob_db mount` / `unmount`; read-only groups for `rootreg`, `kvdb`, `blobfs` | yes |
+| 2 | `blob_db mount` / `unmount` / `format yes` behind `CONFIG_BLOB_DB_SHELL_ADMIN` (**landed**); read-only groups for `rootreg`, `kvdb`, `blobfs` | yes |
 | 3 | Copy-on-write store under the seam, so a mount on an image writes nothing unless committed; `west kvdb` wrapper (build per profile, run on an image, batch input, machine-readable output) | wrapper only |
 | 4 | fsck L0/L1, then container walkers and reachability | `fsck` |
 | 5 | `danger` group behind a Kconfig option and `unlock`; fault injection | `danger` |
@@ -153,11 +158,16 @@ no later step changes what an earlier one does.
   writes. The board's own flash keeps its other partitions.
 - `app_diag/boards/native_sim.conf` puts the shell on the invoking terminal
   (`CONFIG_UART_NATIVE_PTY_0_ON_STDINOUT`), so commands can be piped in.
+- `lib/blob_db/blob_db_shell.c` gained `mount`, `unmount` and `format yes`
+  under `CONFIG_BLOB_DB_SHELL_ADMIN`, which `app_diag` enables. `format`
+  without `yes` does nothing.
 - Measured on `native_sim`: a session that does not mount (`flash read`,
   `blob_db iostats`, `blob_db info` answering "not mounted") leaves the
   image's md5 unchanged. With the opt-in, a blank image is formatted (UBI,
   then blob_db) and mounted, and a second mount of the same image leaves it
-  unchanged.
+  unchanged. Twister's shell harness runs format (refused without `yes`),
+  mount, a second mount, unmount and format against a blank image
+  (`app.diag.admin`). Both backends were exercised by hand.
 
 ## 4. Open questions
 

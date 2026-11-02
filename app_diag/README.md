@@ -8,13 +8,16 @@ a partition image. The plan it is the first step of is
 
 ## What it contains
 
-Only the commands that already exist. The app registers none of its own.
+The app registers no commands of its own. It enables the groups the libraries
+and Zephyr provide.
 
 | Group | Source | Needs a mount | Writes |
 |---|---|---|---|
 | `blob_db info` · `stats` · `buckets` · `bucket` · `id` · `dump` | `lib/blob_db/blob_db_shell.c` | yes | no |
 | `blob_db maintain [budget]` | same | yes | with a budget: erases |
 | `blob_db iostats [reset]` | same (`CONFIG_BLOB_DB_IOSTATS`) | no | no |
+| `blob_db mount` · `unmount` | same (`CONFIG_BLOB_DB_SHELL_ADMIN`) | no | `mount` may: see below |
+| `blob_db format yes` | same (`CONFIG_BLOB_DB_SHELL_ADMIN`) | no | erases the partition; leaves it mounted |
 | `flash read` · `write` · `erase` · … | Zephyr `CONFIG_FLASH_SHELL` | no | `write`, `erase`, `copy`, `load`, `test` |
 | `kernel …`, `device list` | Zephyr kernel and device shells | no | no |
 
@@ -27,15 +30,21 @@ the state a diagnostic session was opened to look at, so by default nothing
 mounts:
 
 - `main()` mounts only with `CONFIG_APP_DIAG_MOUNT_AT_BOOT=y` (default `n`).
-  No shell command mounts.
+  Otherwise the store is mounted when `blob_db mount` (or
+  `blob_db format yes`) is typed.
 - `CONFIG_BLOB_DB_AUTOFORMAT_ON_CORRUPT=n` and `CONFIG_BLOB_DB_MAINT_WORK=n`
   are pinned in `prj.conf`.
 - blobfs is not built, so the file system it registers cannot be a path to a
   mount either.
 
-Unmounted, the `blob_db` group answers `blob_db not mounted`, and the
-partition is reached only through the `flash` commands typed at it. On
+Until then the `blob_db` inspection commands answer `blob_db not mounted`,
+and the partition is reached only through the `flash` commands. On
 `native_sim` a session without a mount leaves the image byte-identical.
+
+`blob_db mount` writes nothing when it refuses. `-ENOTSUP` means a format or
+geometry this build does not support. `-EIO` means a flash error, or no usable
+master on a partition that is not blank. `blob_db format yes` discards such a
+store; without the word `yes` it does nothing.
 
 ## Geometry and format
 
@@ -79,15 +88,16 @@ printf 'blob_db info\nblob_db stats\n' | \
   ./build/diag/zephyr/zephyr.exe --kvdb=storage.bin -stop_at=2
 ```
 
-To inspect the store:
+To inspect the store, mount it first:
 
 ```bash
-west build -b native_sim -d build/diag_mount key_value_db/app_diag -- \
-  -DCONFIG_APP_DIAG_MOUNT_AT_BOOT=y
+printf 'blob_db mount\nblob_db info\nblob_db stats\n' | \
+  ./build/diag/zephyr/zephyr.exe --kvdb=storage.bin -stop_at=2
 ```
 
 Make a copy of the image first if it must stay as it was: the mount may
-write to it.
+write to it. To get a fresh empty store in a new file, run
+`blob_db format yes`.
 
 In the shell, the store's flash device is `flash-controller@80000000`:
 
@@ -108,7 +118,10 @@ The shell runs on the board's console UART. The storage partition is the first
 
 ## Tests
 
-`sample.yaml` runs both builds on `native_sim` under twister:
+`sample.yaml` runs three scenarios on `native_sim` under twister:
 
 - `app.diag`: boots to the shell, unmounted.
-- `app.diag.mount`: formats a blank image and mounts it.
+- `app.diag.mount`: mounts at boot, formatting a blank image.
+- `app.diag.admin`: twister's shell harness types the commands in
+  `test_shell.yml`. Format is refused without `yes`; then mount, a second
+  mount, unmount, format.

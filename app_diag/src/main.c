@@ -4,11 +4,11 @@
  *
  * kvdb diagnostics: an application that does nothing but expose the shell.
  *
- * The commands are the ones the libraries and Zephyr already register
- * (blob_db, flash, kernel, device); this file adds none. It says what was
- * built, and mounts the store only when CONFIG_APP_DIAG_MOUNT_AT_BOOT asks
- * for it: by default nothing writes the storage partition until a command
- * typed at the shell does.
+ * The commands are the ones the libraries and Zephyr register (blob_db,
+ * flash, kernel, device); this file adds none. It says what was built, and
+ * mounts the store only when CONFIG_APP_DIAG_MOUNT_AT_BOOT asks for it: by
+ * default nothing writes the storage partition until a command typed at the
+ * shell does (`blob_db mount`, `blob_db format yes`, `flash write`).
  */
 
 #include <zephyr/kernel.h>
@@ -27,7 +27,7 @@ int main(void)
 		PARTITION_DEVICE(storage_partition)->name);
 
 	if (!IS_ENABLED(CONFIG_APP_DIAG_MOUNT_AT_BOOT)) {
-		LOG_INF("kvdb diag: not mounted (CONFIG_APP_DIAG_MOUNT_AT_BOOT=n)");
+		LOG_INF("kvdb diag: not mounted; `blob_db mount` mounts");
 		return 0;
 	}
 
