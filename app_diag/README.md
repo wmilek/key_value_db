@@ -47,6 +47,19 @@ geometry this build does not support. `-EIO` means a flash error, or no usable
 master on a partition that is not blank. `blob_db format yes` discards such a
 store; without the word `yes` it does nothing.
 
+## Logging
+
+The build compiles in the stack's debug messages, which a product build leaves
+out, and shows them from boot: `blob_db` (including the store backend) and UBI
+at DBG. Mount's classification of the two masters (`master A=ok B=erased`,
+`A=foreign`) and the reason for a refusal are logged by the library. The
+shell's reply lists what each refusal can mean and the remedy for each, and
+the log line above it says which one happened.
+
+Logging is immediate, so a message prints before the shell's reply to the
+command that caused it, and a burst is not dropped. `log enable inf blob_db`
+(or `wrn`, or another module) turns a module down at run time.
+
 ## Geometry and format
 
 An image is readable only by a build that matches the firmware that wrote it:
