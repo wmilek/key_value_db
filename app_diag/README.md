@@ -20,6 +20,7 @@ and Zephyr provide.
 | `blob_db format yes` | same (`CONFIG_BLOB_DB_SHELL_ADMIN`) | no | erases the partition; leaves it mounted |
 | `flash read` · `write` · `erase` · … | Zephyr `CONFIG_FLASH_SHELL` | no | `write`, `erase`, `copy`, `load`, `test` |
 | `kernel …`, `device list` | Zephyr kernel and device shells | no | no |
+| `kernel reboot cold` · `warm` | Zephyr kernel shell (`CONFIG_REBOOT`) | no | no; the store sees a power cut between operations |
 
 ## No automatic mount
 
@@ -81,7 +82,9 @@ after the device label:
 - `--kvdb_in_ram` works on a blank in-RAM device and writes no file.
 
 The shell is on the terminal the tool was started from, so commands can also
-be piped in. `-stop_at=<seconds>` ends the run:
+be piped in. `-stop_at=<seconds>` ends the run. `kernel reboot cold` re-runs
+the tool with the same arguments, so the image named by `--kvdb` carries
+across it. Each reboot starts the run, and `-stop_at`, from zero:
 
 ```bash
 printf 'blob_db info\nblob_db stats\n' | \
@@ -125,3 +128,5 @@ The shell runs on the board's console UART. The storage partition is the first
 - `app.diag.admin`: twister's shell harness types the commands in
   `test_shell.yml`. Format is refused without `yes`; then mount, a second
   mount, unmount, format.
+- `app.diag.reboot`: `pytest/test_reboot.py` formats, reboots, and checks the
+  app comes back unmounted and mounts the same store without formatting.

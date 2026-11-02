@@ -37,3 +37,11 @@ tests:
     harness: shell
     harness_config:
       shell_commands_file: test_shell.yml
+
+  # `kernel reboot cold` restarts unmounted, and the store formatted before it
+  # mounts again without being formatted. A pytest test rather than a
+  # test_shell.yml step: the restarted shell's first prompt needs waiting for.
+  app.diag.reboot:
+    platform_allow:
+      - native_sim
+    harness: pytest
