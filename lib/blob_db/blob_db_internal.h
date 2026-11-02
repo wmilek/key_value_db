@@ -103,6 +103,11 @@ BUILD_ASSERT((BLOB_DB_FEAT_FLAGS_LARGE_PAYLOADS &
 	      (BLOB_DB_SLOT_F_SEALED | BLOB_DB_SLOT_F_TOMBSTONE)) == 0,
 	     "a feature's slot flags must not overlap the base flags");
 
+/* The incompat features this library implements, whether or not a build is
+ * configured with them: a store carrying one of them needs a differently
+ * configured build, not a newer one. */
+#define BLOB_DB_LIB_INCOMPAT      BLOB_DB_FEAT_LARGE_PAYLOADS
+
 /* What this build knows, writes at format, and requires of a store. */
 #ifdef CONFIG_BLOB_DB_LARGE_PAYLOADS
 #define BLOB_DB_BUILD_INCOMPAT    BLOB_DB_FEAT_LARGE_PAYLOADS

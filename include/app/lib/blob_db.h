@@ -137,8 +137,10 @@ extern "C" {
  * An **unrecognized** store is never destroyed. If a master sector parses but
  * declares a format this build does not understand — another major version
  * (stores of majors 1-4, written before the master log, included), a feature
- * this build does not know, another payload cap or device geometry, or another
- * allocator's magic — mount returns `-ENOTSUP` and writes nothing;
+ * this build does not know or is configured without (a store formatted with
+ * `CONFIG_BLOB_DB_LARGE_PAYLOADS`, opened by a build without it), another
+ * payload cap or device geometry, or another allocator's magic — mount
+ * returns `-ENOTSUP` and writes nothing;
  * discarding it is the caller's decision, via `blob_db_format()`, which for
  * that reason does not itself require a mount. Only a
  * partition whose master sectors both read as erased is treated as virgin and
