@@ -11,6 +11,16 @@ Every wall-clock figure here comes from the board. On `native_sim` they
 are all `0 ms`, because the flash simulator models no latency; only the
 `io …` counters are meaningful there.
 
+**These captures predate format major 5** (the master as a log,
+`doc/proposals/2026-10-28-master-log.md`). Major 5 removes the erase from
+every master update and from compaction. The proposal's §9 estimates what
+should change on the DK: `lg pwrite`'s 64 master erases become 64 record
+programs and no erase, which were nearly all of its 1.0–1.1 s per op;
+`churn` on flash_area drops from 40 erases to 24; churn on UBI with atomic
+replace is unchanged; mount adds one master-sector read. None of that is
+measured yet. Re-run `app_perf_blob_db` (1.2.0 or later) on the nRF5340-DK
+and replace the tables below; until then they describe the old format.
+
 That is no longer the end of the story: `app_perf_l0` measures what an
 L0 operation costs, and `app_perf_l0/tools/l0_timing.py predict` turns
 these counters into predicted wall-clock, so a `native_sim` run at this

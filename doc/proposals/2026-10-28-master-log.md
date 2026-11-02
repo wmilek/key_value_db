@@ -1,6 +1,9 @@
 # Design change proposal — the master as a log, and format features
 
-Status: **proposal** · 2026-10-28
+Status: **accepted** · 2026-10-28 · phase 1 implemented in #101–#104,
+documented in `doc/impl/l1_bucketlog.md` (implementation plan:
+`2026-11-01-master-log-implementation-plan.md`); phases 2, 3 and the fuse trips
+are open
 · Target implementation design: `doc/impl/l1_bucketlog.md` (§3.1 master sector, §5.1 mount, §5.6 compaction, §5.6a segmented writes, §6 crash tables)
 · Also changes: PR #63 (`blob_db_protect`: master and bucket header formats, compaction nonces) and PR #62 (`BLOB_DB_DELTA`: its slot flag)
 · Evidence: `app_perf_blob_db/RESULTS.md` (`why` lines: master writes per phase)
