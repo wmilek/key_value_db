@@ -313,15 +313,19 @@ static void io_line(const char *what, size_t useful_bytes)
 	/* What the erases above were for. Only printed when something happened:
 	 * a read phase has nothing to explain. Deliberately not an `io` line —
 	 * l0_timing.py parses those, and these are causes, not more cost. */
-	const uint32_t mw = now.master_writes - io_mark.master_writes;
+	const uint32_t mr = now.master_records - io_mark.master_records;
+	const uint32_t mo = now.master_rotations - io_mark.master_rotations;
 	const uint32_t bf = now.bucket_formats - io_mark.bucket_formats;
 	const uint32_t cp = now.compactions - io_mark.compactions;
 	const uint64_t bcp = now.bytes_compacted - io_mark.bytes_compacted;
 
-	if (mw || bf || cp) {
-		printk("  why %-10s: master writes %4u   bucket formats %4u   "
-		       "compactions %4u (%llu B live rewritten)\n",
-		       what, mw, bf, cp, (unsigned long long)bcp);
+	/* A master record erases nothing; a rotation erases one block, so
+	 * erases = rotations + bucket formats + k x compactions. */
+	if (mr || mo || bf || cp) {
+		printk("  why %-10s: master rotations %4u (records %4u)   "
+		       "bucket formats %4u   compactions %4u (%llu B live "
+		       "rewritten)\n", what, mo, mr, bf, cp,
+		       (unsigned long long)bcp);
 	}
 }
 

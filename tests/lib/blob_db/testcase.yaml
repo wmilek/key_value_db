@@ -2,8 +2,10 @@ common:
   tags: [storage, blob_db]
   platform_allow: native_sim
   # src/power_cut.c replays a compaction once per byte it writes, with three
-  # mounts each; on UBI that alone takes most of a minute (twister's default).
-  timeout: 240
+  # mounts each, and a master record append and a rotation the same way; on
+  # UBI, where every mount attaches the whole device, that takes several
+  # minutes (twister's default is one).
+  timeout: 480
 # blob_db defaults to the UBI backend, but most of this suite injects faults by
 # writing the raw partition at offsets that are only blob_db's on flash_area
 # (see SKIP_UNLESS_RAW_PARTITION in src/main.c). The first three scenarios
@@ -146,6 +148,22 @@ tests:
       - CONFIG_BLOB_DB_SLOT_INDEX_ENTRIES=64
       - CONFIG_BLOB_DB_SLOT_INDEX_VERIFY=y
       - CONFIG_ASSERT=y
+  # A master log of 3 records (CONFIG_BLOB_DB_TEST_MASTER_LOG_CAP), so the
+  # master rotates every few updates and the whole suite, power cuts and
+  # segmented-write crash hooks included, runs across rotations
+  # (doc/proposals/2026-10-28-master-log.md §3.4).
+  lib.blob_db.master_log_tiny:
+    extra_configs:
+      - CONFIG_BLOB_DB_BACKEND_FLASH_AREA=y
+      - CONFIG_BLOB_DB_TEST_MASTER_LOG_CAP=3
+      - CONFIG_BLOB_DB_LARGE_PAYLOADS=y
+      - CONFIG_MAIN_STACK_SIZE=32768
+      - CONFIG_BLOB_DB_TEST_CRASH_HOOKS=y
+  lib.blob_db.ubi.master_log_tiny:
+    extra_configs:
+      - CONFIG_BLOB_DB_BACKEND_UBI=y
+      - CONFIG_UBI_SELF_CHECKS=y
+      - CONFIG_BLOB_DB_TEST_MASTER_LOG_CAP=3
   # blob_db_maintain() run by its work-queue helper, on both backends.
   lib.blob_db.maint_work:
     extra_configs:

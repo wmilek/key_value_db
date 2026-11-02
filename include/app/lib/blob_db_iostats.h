@@ -52,11 +52,15 @@ struct blob_db_iostats {
 	 * phase that erased more than expected needs these to say why. Their
 	 * cost is already included in the counters above, never in addition to
 	 * them. Counted above the storage seam, so both backends report the same
-	 * events; both also charge each master write and bucket format as one
+	 * events; both also charge each master rotation and bucket format as one
 	 * erase of a whole block plus one write. */
-	uint32_t master_writes;  /**< master records written, one block erase
-				  *   each — including the two every
-				  *   non-atomic compaction writes */
+	uint32_t master_records; /**< master records written, each one write
+				  *   and no erase; includes the record[0]
+				  *   every rotation writes */
+	uint32_t master_rotations; /**< master sectors rewritten, one block
+				    *   erase each: a full log, a failed
+				    *   record write, the end of a mount's
+				    *   doubt, and the two a format writes */
 	uint32_t bucket_formats; /**< bucket headers written to a fresh block:
 				  *   maintain(), a bucket's first use, and the
 				  *   root bucket in format/erase_all */

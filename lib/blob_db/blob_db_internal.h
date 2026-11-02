@@ -28,45 +28,33 @@
 #define BLOB_DB_MASTER_MAGIC      "BDMS"
 #define BLOB_DB_BUCKET_MAGIC      "BDBH"
 
-/* Master state machine values. */
-#define BLOB_DB_STATE_CLEAN       0x00
-#define BLOB_DB_STATE_COMPACTING  0x01
-
-/* On-flash format version.
+/* On-flash format version (doc/proposals/2026-10-28-master-log.md).
  *
- * MAJOR marks an incompatible change: software that does not know a major
- * refuses the store with -ENOTSUP rather than touching it. MINOR marks an
- * additive one: fields are appended to the master body and hdr_len grows, so
- * older software validates and reads the prefix of the header it knows and
- * ignores the tail. A minor bump must keep hdr_len <= BLOB_DB_MASTER_HDR_MAX;
- * exceeding that is a major change.
+ * MAJOR marks an incompatible layout: software that does not know a major
+ * refuses the store with -ENOTSUP rather than touching it. Major 5 is the
+ * master as a log; majors 1-4 are refused, never migrated (D10).
+ *
+ * MINOR is 0 for all of major 5 (D15). Everything major 5 gains later is a
+ * feature bit in the header (BLOB_DB_FEAT_*), which every writer copies at
+ * rotation; a minor number would be overwritten by an older writer's.
  */
-/* A build that can write segmented objects declares major 2, because a slot
- * flag changes what a payload *means* and older software would misread an
- * index record as data. A build without the feature keeps writing major 1 and
- * stays interchangeable with software that predates it. Either build reads
- * anything up to its own major, so enabling the feature adopts an existing
- * store rather than refusing it — and upgrades it to major 2 on the next
- * master write. */
-#ifdef CONFIG_BLOB_DB_LARGE_PAYLOADS
-#define BLOB_DB_FORMAT_MAJOR      2
-#else
-#define BLOB_DB_FORMAT_MAJOR      1
-#endif
+#define BLOB_DB_FORMAT_MAJOR      5
 #define BLOB_DB_FORMAT_MINOR      0
 
-/* Largest master header any version may declare. Bounds the read buffer that
- * older software must be able to stage a foreign header in. */
+/* The window every reader stages at the start of a master sector. The major-5
+ * header sits at its start; the record log begins at its end. */
 #define BLOB_DB_MASTER_HDR_MAX    128
+#define BLOB_DB_MASTER_LOG_OFF    BLOB_DB_MASTER_HDR_MAX
 
 /* Durable id allocation (contract §2 "no reuse", impl design §13.1).
  *
- * next_id_hint on the master is a LEADING ceiling: an exclusive upper bound
- * on every id ever returned by alloc_id — i.e. no id >= next_id_hint has been
- * (or ever will be, until the hint is raised) handed out. Mount takes
+ * next_id_hint in a master record is a LEADING ceiling: an exclusive upper
+ * bound on every id ever returned by alloc_id — i.e. no id >= next_id_hint has
+ * been (or ever will be, until the hint is raised) handed out. Mount takes
  * next_id = next_id_hint, so an allocated-but-unbound id is never re-issued
- * after a crash. alloc_id persists a fresh ceiling this many ids ahead
- * whenever the current one is reached, amortizing the master write. */
+ * after a crash. Every record raises the ceiling to this many ids past the
+ * next one (D14), so alloc_id needs a record of its own only when no other
+ * record has carried the ceiling forward within the step. */
 #define BLOB_DB_ID_HINT_STEP      256
 
 /* Slot flags. After erase the flags byte is 0xff, which trivially fails
@@ -78,18 +66,20 @@
 /* Large objects (CONFIG_BLOB_DB_LARGE_PAYLOADS). INDEXED marks the slot at the
  * object's own id whose payload is a segment table; SEGMENT marks a slot
  * holding one chunk of another object. Both change what a payload means, so
- * introducing them is a MAJOR format change. */
+ * they belong to the incompat feature BLOB_DB_FEAT_LARGE_PAYLOADS below. */
 #define BLOB_DB_SLOT_F_INDEXED    (1u << 2)
 #define BLOB_DB_SLOT_F_SEGMENT    (1u << 3)
 
 /* Every flag bit this version understands. A slot carrying a bit outside this
  * mask was written by software we do not understand, and its payload must not
- * be handed out as data — see slot_view_at().
+ * be handed out as data. Nor may it be dropped: a whole one closes its bucket
+ * to reads and writes, and compaction leaves it alone — see
+ * slot_foreign_head().
  *
- * This is defense in depth, not the primary guard: introducing a slot flag
- * changes what a payload *means*, so it is a MAJOR format change and mount
- * refuses the store before any slot is read (§ format version above). The mask
- * covers the case where that discipline is broken.
+ * This is defense in depth, not the primary guard: a slot flag belongs to an
+ * incompat feature, set in the master header at format, and mount refuses a
+ * store whose features this build does not know before any slot is read. The
+ * mask covers the case where that discipline is broken.
  */
 #ifdef CONFIG_BLOB_DB_LARGE_PAYLOADS
 #define BLOB_DB_SLOT_F_KNOWN                                                   \
@@ -99,6 +89,35 @@
 #define BLOB_DB_SLOT_F_KNOWN                                                   \
 	(BLOB_DB_SLOT_F_SEALED | BLOB_DB_SLOT_F_TOMBSTONE)
 #endif
+
+/* Format features (§4 of the master-log proposal). One registry owns every
+ * bit, so two features cannot claim the same slot flag. A slot-flag feature
+ * is set at format (D7), and a build writes its flags only into a store whose
+ * headers carry it (D20). */
+#define BLOB_DB_FEAT_LARGE_PAYLOADS  (1u << 0)   /* incompat; INDEXED, SEGMENT */
+/* bit 1: PROTECTED (phase 2, PR #63); bit 2: DELTA (phase 3, PR #62) */
+
+#define BLOB_DB_FEAT_FLAGS_LARGE_PAYLOADS                                      \
+	(BLOB_DB_SLOT_F_INDEXED | BLOB_DB_SLOT_F_SEGMENT)
+BUILD_ASSERT((BLOB_DB_FEAT_FLAGS_LARGE_PAYLOADS &
+	      (BLOB_DB_SLOT_F_SEALED | BLOB_DB_SLOT_F_TOMBSTONE)) == 0,
+	     "a feature's slot flags must not overlap the base flags");
+
+/* The incompat features this library implements, whether or not a build is
+ * configured with them: a store carrying one of them needs a differently
+ * configured build, not a newer one. */
+#define BLOB_DB_LIB_INCOMPAT      BLOB_DB_FEAT_LARGE_PAYLOADS
+
+/* What this build knows, writes at format, and requires of a store. */
+#ifdef CONFIG_BLOB_DB_LARGE_PAYLOADS
+#define BLOB_DB_BUILD_INCOMPAT    BLOB_DB_FEAT_LARGE_PAYLOADS
+#else
+#define BLOB_DB_BUILD_INCOMPAT    0u
+#endif
+#define BLOB_DB_BUILD_RO_COMPAT   0u
+#define BLOB_DB_BUILD_REQUIRED    0u   /* phase 2: PROTECTED */
+#define BLOB_DB_BUILD_SUITE       0u
+#define BLOB_DB_BUILD_HDR_LEN     64u  /* phase 2: 84 when protected */
 
 /* Frozen compatibility prefix (12 B).
  *
@@ -125,31 +144,68 @@ struct __packed blob_db_compat_hdr {
 BUILD_ASSERT(sizeof(struct blob_db_compat_hdr) == 12,
 	     "blob_db_compat_hdr is frozen; changing it breaks every reader");
 
-/* Master sector header (64 B). Lives at offset 0 of sectors 0 and 1; the
- * sector with the higher valid generation is authoritative.
+/* Major-5 master sector (doc/proposals/2026-10-28-master-log.md §3):
  *
- * Fixed size with reserved padding, deliberately: hdr_crc32 stays at a
- * constant offset over a constant span, so a later MINOR revision that
- * consumes reserved space does not move anything an older reader depends on.
- * A change that cannot fit here — or that older software would misread rather
- * than merely miss — is a MAJOR change instead. The sector is >= 4 KB, so the
- * padding is free.
- */
+ *     offset 0     blob_db_master_hdr   written once per erase
+ *     offset 128   record[0]            written with the header
+ *     128 + i*R    record[i]            appended, one per update
+ *
+ * R is sizeof(struct blob_db_master_rec) rounded up to write_align. Filler
+ * (header end to 128, record end to R) is written 0xff; reserved fields 0.
+ * Integers are little-endian. */
+
+/* Header (64 B). Nothing in it changes until the sector is erased again. */
 struct __packed blob_db_master_hdr {
-	struct blob_db_compat_hdr compat;  /*  0..11                            */
-	uint32_t generation;      /* 12..15  monotonic LE                       */
-	uint8_t  state;           /* 16      BLOB_DB_STATE_*                    */
-	uint16_t compacting_bid;  /* 17..18  meaningful only when COMPACTING    */
-	uint8_t  reserved0;       /* 19                                         */
-	uint64_t next_id_hint;    /* 20..27  leading id ceiling                 */
-	uint64_t seg_owner;       /* 28..35  segment sweep intent; 0 = none     */
-	uint8_t  reserved1[24];   /* 36..59  future MINOR revisions             */
-	uint32_t hdr_crc32;       /* 60..63  CRC32-IEEE over bytes [0, 60)      */
+	struct blob_db_compat_hdr prefix;  /*  0..11 frozen                     */
+	uint32_t rot_gen;         /* 12..15  +1 per rotation; higher is newer   */
+	uint32_t peb_size;        /* 16..19  must equal the device's            */
+	uint16_t n_buckets;       /* 20..21  must equal the device's            */
+	uint16_t rec_size;        /* 22..23  R; must equal the build's          */
+	uint32_t incompat;        /* 24..27  a reader must know every bit       */
+	uint32_t ro_compat;       /* 28..31  a writer must know every bit       */
+	uint32_t compat;          /* 32..35  anyone may ignore a bit            */
+	uint8_t  suite;           /* 36      0 = unprotected                    */
+	uint8_t  reserved0[3];    /* 37..39                                     */
+	uint8_t  store_uuid[16];  /* 40..55  0 unless protected                 */
+	uint16_t max_payload_len; /* 56..57  must equal the build's cap (D19)   */
+	uint16_t write_align;     /* 58..59  must equal the device's (D19)      */
+	uint32_t hdr_crc32;       /* 60..63  CRC32-IEEE over [0, 60)            */
 };
 BUILD_ASSERT(sizeof(struct blob_db_master_hdr) == 64,
 	     "blob_db_master_hdr layout drift");
+BUILD_ASSERT(offsetof(struct blob_db_master_hdr, rot_gen) == 12, "hdr drift");
+BUILD_ASSERT(offsetof(struct blob_db_master_hdr, incompat) == 24, "hdr drift");
+BUILD_ASSERT(offsetof(struct blob_db_master_hdr, suite) == 36, "hdr drift");
+BUILD_ASSERT(offsetof(struct blob_db_master_hdr, store_uuid) == 40, "hdr drift");
+BUILD_ASSERT(offsetof(struct blob_db_master_hdr, max_payload_len) == 56,
+	     "hdr drift");
+BUILD_ASSERT(offsetof(struct blob_db_master_hdr, hdr_crc32) == 60, "hdr drift");
 BUILD_ASSERT(sizeof(struct blob_db_master_hdr) <= BLOB_DB_MASTER_HDR_MAX,
 	     "master header exceeds the bound older readers can stage");
+
+/* Record (48 B unprotected): a full copy of the mutable state. Its CRC covers
+ * LE32(rot_gen) of its own header too (D16), and rec_no must equal its slot,
+ * so a record verifies only where it was written. */
+struct __packed blob_db_master_rec {
+	uint32_t rec_no;          /*  0..3   == slot index in this sector       */
+	uint32_t reserved0;       /*  4..7   compaction keeps no state (D17)    */
+	uint64_t next_id_hint;    /*  8..15  leading id ceiling                 */
+	uint64_t seq_hint;        /* 16..23  AEAD nonce ceiling; 0 unprotected  */
+	uint64_t seg_owner;       /* 24..31  segmented write in flight; 0 none  */
+	uint32_t reserved1;       /* 32..35  features live in the header only   */
+	uint32_t fuses;           /* 36..39  opaque, OR-only (§4.5). FROZEN for
+				   *         major 5: moving it is a new major,
+				   *         or an older build would clear it.  */
+	uint32_t reserved2;       /* 40..43                                     */
+	uint32_t crc32;           /* 44..47  CRC32-IEEE over LE32(rot_gen) ‖ [0, 44) */
+};
+BUILD_ASSERT(sizeof(struct blob_db_master_rec) == 48,
+	     "blob_db_master_rec layout drift");
+BUILD_ASSERT(offsetof(struct blob_db_master_rec, next_id_hint) == 8, "rec drift");
+BUILD_ASSERT(offsetof(struct blob_db_master_rec, seg_owner) == 24, "rec drift");
+BUILD_ASSERT(offsetof(struct blob_db_master_rec, fuses) == 36,
+	     "the fuse word is frozen at record bytes 36..39 for major 5");
+BUILD_ASSERT(offsetof(struct blob_db_master_rec, crc32) == 44, "rec drift");
 
 /* Bucket sector header (16 B). Lives at offset 0 of every bucket sector,
  * written once after that sector is erased. */
@@ -277,7 +333,15 @@ struct blob_db_core_state {
 	uint16_t n_pebs;
 	uint16_t n_buckets;
 	uint8_t  active_master;
-	uint32_t master_gen;
+	uint32_t rot_gen;
+	uint16_t rec_size;
+	uint16_t log_used;
+	uint16_t log_cap;
+	uint32_t incompat;
+	uint32_t ro_compat;
+	uint32_t compat;
+	uint8_t  suite;
+	uint32_t fuses;
 	uint64_t next_id;
 	uint64_t next_id_hint;
 	uint64_t seg_owner;

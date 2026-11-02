@@ -113,8 +113,13 @@ static int cmd_info(const struct shell *sh, size_t argc, char **argv)
 	shell_print(sh, "write align   : %zu B", in.write_align);
 	shell_print(sh, "slot          : %zu B overhead, payload <= %zu B",
 		    in.slot_overhead, in.max_payload_len);
-	shell_print(sh, "master        : %c, generation %u",
-		    in.active_master ? 'B' : 'A', in.master_gen);
+	shell_print(sh, "master        : %c, rot_gen %u, log %u/%u records "
+		    "of %u B", in.active_master ? 'B' : 'A', in.rot_gen,
+		    in.master_log_used, in.master_log_cap, in.master_rec_size);
+	shell_print(sh, "features      : incompat 0x%08x ro_compat 0x%08x "
+		    "compat 0x%08x suite %u", in.incompat, in.ro_compat,
+		    in.compat, in.suite);
+	shell_print(sh, "fuses         : 0x%08x", in.fuses);
 	shell_print(sh, "next id       : %llu (durable ceiling %llu)",
 		    (unsigned long long)in.next_id,
 		    (unsigned long long)in.next_id_hint);
@@ -681,10 +686,10 @@ static int cmd_iostats(const struct shell *sh, size_t argc, char **argv)
 		    (unsigned long long)io.bytes_written);
 	shell_print(sh, "erases : %u ops, %llu B", io.erases,
 		    (unsigned long long)io.bytes_erased);
-	shell_print(sh, "causes : %u master writes, %u bucket formats, "
-		    "%u compactions (%llu B rewritten)", io.master_writes,
-		    io.bucket_formats, io.compactions,
-		    (unsigned long long)io.bytes_compacted);
+	shell_print(sh, "causes : %u master rotations (%u records), %u bucket "
+		    "formats, %u compactions (%llu B rewritten)",
+		    io.master_rotations, io.master_records, io.bucket_formats,
+		    io.compactions, (unsigned long long)io.bytes_compacted);
 	return 0;
 }
 #endif
