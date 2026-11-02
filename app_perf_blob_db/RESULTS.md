@@ -11,15 +11,11 @@ Every wall-clock figure here comes from the board. On `native_sim` they
 are all `0 ms`, because the flash simulator models no latency; only the
 `io …` counters are meaningful there.
 
-**These captures predate format major 5** (the master as a log,
-`doc/proposals/2026-10-28-master-log.md`). Major 5 removes the erase from
-every master update and from compaction. The proposal's §9 estimates what
-should change on the DK: `lg pwrite`'s 64 master erases become 64 record
-programs and no erase, which were nearly all of its 1.0–1.1 s per op;
-`churn` on flash_area drops from 40 erases to 24; churn on UBI with atomic
-replace is unchanged; mount adds one master-sector read. None of that is
-measured yet. Re-run `app_perf_blob_db` (1.2.0 or later) on the nRF5340-DK
-and replace the tables below; until then they describe the old format.
+**Format major 5** (the master as a log,
+`doc/proposals/2026-10-28-master-log.md`) is measured in the next section,
+an nRF52840-DK A/B on UBI. The sections after it predate major 5: their
+master updates and compactions each erase a sector, which major 5 no longer
+does.
 
 That is no longer the end of the story: `app_perf_l0` measures what an
 L0 operation costs, and `app_perf_l0/tools/l0_timing.py predict` turns
@@ -55,6 +51,64 @@ can be read straight off the tables:
   accounting*, run 1. The pre-cache baseline.
 - **`255ce7a`** — *blob_db: fix data loss when a compaction scratch write
   is torn*, the commit immediately before PR 2. Small-blob phases only.
+
+## Format major 5 — nRF52840-DK A/B (`3eab92e` vs `2254b8d`)
+
+Measured by the repository owner on PR #104, before the mount fix below.
+
+- **Board:** nRF52840-DK (PCA10056), MX25R6435F on QSPI in high-performance
+  mode. 8 MiB UBI partition: 128 PEBs of 64 KiB, 118 buckets.
+- **Builds:** `main` (`3eab92e`) and the major-5 PR (`2254b8d`), both with
+  `CONFIG_BLOB_DB_LARGE_PAYLOADS=y` and default N_OPS. DK-local changes only:
+  board files, a printk of UBI erase counters at attach, a `blob_db_format()`
+  at boot.
+- **Runs:** two per build, alternating main, PR, main, PR on one board and one
+  UBI device. Runs of one build agree within 0.5 %, and their `io` counters
+  are byte-identical. The table gives each build's first run.
+
+| phase | main | major 5 | major 5 / main | erases main → 5 | bytes read main → 5 |
+|---|--:|--:|--:|--:|--:|
+| mount empty | 140.0 ms | 175.0 ms | 1.25× | 0 → 0 | 314 → 65 722 |
+| maint | 502.6 ms | 502.7 ms | 1.00× | 0 → 0 | 0 → 0 |
+| prepend | 10.4 ms | 10.3 ms | 0.99× | 101 → 100 | 130 384 → 130 384 |
+| read | 520 µs | 500 µs | 0.96× | 0 → 0 | 8 650 → 8 650 |
+| update | 1430 µs | 1400 µs | 0.98× | 0 → 0 | 17 176 → 17 176 |
+| append | 394.6 ms | 390.5 ms | 0.99× | 101 → 100 | 16 294 → 16 294 |
+| mount list | 255.0 ms | 298.0 ms | 1.17× | 0 → 0 | 334 → 65 742 |
+| lg write | 16 211.8 ms | 15 066.0 ms | 0.93× | 126 → 117 | 2 744 → 2 744 |
+| lg rewrite | 1486.2 ms | 345.8 ms | 0.23× | 9 → 0 | 16 248 → 16 248 |
+| lg read | 1701 µs | 1585 µs | 0.93× | 0 → 0 | 8 753 112 → 8 753 112 |
+| lg pread q0 | 3156 µs | 2968 µs | 0.94× | 0 → 0 | 89 440 → 89 440 |
+| lg pread q1 | 3218 µs | 3031 µs | 0.94× | 0 → 0 | 91 522 → 91 522 |
+| lg pread q2 | 3593 µs | 3437 µs | 0.96× | 0 → 0 | 91 366 → 91 366 |
+| lg pread q3 | 3531 µs | 3437 µs | 0.97× | 0 → 0 | 91 028 → 91 028 |
+| lg pwrite | 1024.5 ms | 16.8 ms | 0.02× | 64 → 0 | 99 696 → 99 696 |
+| mount large | 238.0 ms | 278.0 ms | 1.17× | 0 → 0 | 350 → 65 758 |
+| churn | 9509 µs | 8926 µs | 0.94× | 8 → 8 | 1 757 220 → 1 769 364 |
+| mount churn | 270.0 ms | 305.0 ms | 1.13× | 0 → 0 | 350 → 65 758 |
+
+`partial vs whole-object write`: 1.45× on main (1024.5 vs 1486.3 ms/op),
+20.57× on major 5 (16.8 vs 345.8 ms/op).
+
+**What moved.**
+
+- **`lg pwrite`, 61× faster.** On main its 64 master updates were 64 sector
+  erases; on major 5 they are 64 records and no erase (`master rotations 0
+  (records 64)`). That is the proposal's §9 estimate, confirmed.
+- **`lg rewrite`, 4.3× faster**, and **`lg write`, 7 % faster**: 9 master erases
+  fewer each.
+- **The erase identity holds in every phase:** `erases = master_rotations +
+  bucket_formats + k × compactions`. Bucket formats, compaction erases and
+  bytes written do not change.
+- **Read phases** are 3–7 % faster with identical bytes and op counts: most
+  likely code placement, which moves this SoC by up to ±6 % between builds of
+  identical code.
+- **Mount was 35–43 ms slower**, because it read the whole 64 KiB active
+  master sector to find the log's end (65.7 KB vs 0.3 KB). Mount now finds the
+  end by a binary search on "fully erased" (proposal D3, §3.2a): 11 record
+  slots plus one to verify on a 64 KiB master, about 0.6 KB in place of
+  64 KiB. The mount rows above are from before that change and have not been
+  re-measured.
 
 ## 1.1.0 — first board run (`65700a8`)
 

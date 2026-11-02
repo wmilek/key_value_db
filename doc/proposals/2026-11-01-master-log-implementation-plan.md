@@ -405,9 +405,11 @@ the store (or calls `blob_db_store_discard()` once #89 lands), then calls
 ### 5.5 Mount (§3.5 with B1)
 
 `read_master()` splits into `master_classify()` (the header window only) and
-`log_load()`, which reads every slot of a sector (D3). Instead of 1 362
-reads of 48 B, `log_load()` reads the sector into `g_bbuf` once. Mount owns
-`g_bbuf` until the first bucket walk, and that is P3-neutral.
+`log_load()`. As first shipped in PR 4, `log_load()` read the whole sector
+into `g_bbuf`; the nRF52840-DK A/B on #104 measured that at +35–43 ms per
+mount on 64 KB masters, so it now binary-searches for `end` on "fully
+erased" (D3, §3.2a) and reads only the record slots it needs, still through
+`g_bbuf`, which mount owns until the first bucket walk (P3-neutral).
 `log_load()` returns `end`, `newest`, and whether the slot below `end` failed
 to verify.
 

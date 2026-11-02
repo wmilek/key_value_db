@@ -112,7 +112,7 @@ Costs achieved by this design (satisfying contract §3):
 
 | Op | Flash reads | Flash writes | RAM (transient) |
 |---|---|---|---|
-| `mount` | 2 master headers + 1 master sector + root bucket walk; + 2045 (bucket scan) with the ceiling in doubt¹ | 0; 1 record or 1 rotation to end a doubt (or format if first ever) | O(1) |
+| `mount` | 2 master headers + ~log₂(records per sector) record slots (7 on 4 KB, 11 on 64 KB) + root bucket walk; + 2045 (bucket scan) with the ceiling in doubt¹ | 0; 1 record or 1 rotation to end a doubt (or format if first ever) | O(1) |
 | `alloc_id()` | 0 | 0 (a master record every ~257 ids, unless another record carried the ceiling) | O(1) |
 | `get(id)` | 1 bucket header + 12 B per slot + 1 payload | 0 | O(1) |
 | `update(id, …)` | 1 bucket header + 12 B per slot² | 1 (slot; on rebind the old slot becomes garbage) + occasional compact | O(1) |
@@ -212,9 +212,10 @@ good.
 **Updating.** An update appends one record at the log's end and erases nothing.
 The written slots are always a prefix followed by erased slots: after a record
 write fails, the next update rotates rather than write the next slot, because
-the failed slot may still read erased. A full log, or a failed write,
-**rotates**: the other sector is replaced with a header at `rot_gen + 1`, the
-session's feature sets, and record[0]. That is one erase per 82 updates on
+the failed slot may still read erased. That invariant is what lets mount find
+the end by a binary search instead of reading the sector. A full log, or a
+failed write, **rotates**: the other sector is replaced with a header at
+`rot_gen + 1`, the session's feature sets, and record[0]. That is one erase per 82 updates on
 4 KB sectors, one per 1 362 on 64 KB.
 
 **Format** writes both sectors, B at `rot_gen` 1 and then A at 2, each a header
@@ -373,7 +374,8 @@ no ok sector:
     elif AUTOFORMAT_ON_CORRUPT: erase everything; format; bind root
     else: return -EIO
 read the higher ok sector's log: end = past the last non-erased slot,
-    newest = the newest record below end that verifies
+    found by a binary search on "fully erased" (the written slots are a prefix),
+    newest = the newest record below end that verifies, walking back from end
 no record verifies there: read the lower ok sector instead   (fell back)
 no record verifies anywhere: no usable master, as above
 next_id = newest.next_id_hint                             # §13.1

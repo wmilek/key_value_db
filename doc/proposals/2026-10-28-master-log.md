@@ -64,7 +64,7 @@ come later (§4.5a).
 |---|---|---|
 | D1 | A header plus fixed-size records, each a **full copy** of the mutable state | delta records replayed in order (mount logic, and one rotten record would break the chain) |
 | D2 | Keep two master sectors; a full sector rotates into the other | one sector (a torn erase would leave no master) |
-| D3 | The format guarantees that a sector's record slots are a written prefix followed by erased slots (§3.2a): a failed record write is followed by a rotation, never by a record in the next slot. Mount reads every record slot, and the invariant leaves a later build free to binary-search instead, with no format change | a binary search now (mount runs once, so the saving is not needed yet); leaving gaps to the reader (a store written without the invariant could never be binary-searched, by any later build) |
+| D3 | The format guarantees that a sector's record slots are a written prefix followed by erased slots (§3.2a): a failed record write is followed by a rotation, never by a record in the next slot. Mount finds the end by a binary search on "fully erased" and reads only the slots it needs (amended after the nRF52840-DK A/B on #104: reading every slot of a 64 KB master cost +35–43 ms per mount) | reading every slot (what PR 4 first shipped: it tolerates a store on which the invariant was broken, but no writer breaks it, and it costs a sector read per mount); leaving gaps to the reader (a store written without the invariant could never be binary-searched, by any later build) |
 | D4 | Large payloads keep the mount-time sweep, as two log records | reclaiming orphans in compaction (§5.2, kept as open item 1) |
 | D5 | AEAD compacted slots take a random 95-bit nonce base per compaction, and their nonce is the base plus the slot's offset; one named nonce bit separates them from appended slots (§6) | reserving `peb_size` values from the master counter (PR #63 §3.4); a 63-bit random prefix with the offset beside it (about 2⁻¹⁷ over 10⁷ compactions, beyond the 2⁻³² budget) |
 | D6 | Features in three sets, ext4-style; a slot flag belongs to exactly one feature | a major number per combination (doubles with every feature) |
@@ -234,9 +234,9 @@ because a later reader meets stores that today's builds wrote:
   record's first bytes never are.
 
 A reader may therefore find `end` by a binary search on "fully erased", in
-about log₂(records) reads (7 on 4 KB, 11 on 64 KB). Mount reads every slot
-instead (D3), which costs little and also tolerates a store on which the
-invariant was broken. A future switch to the search is a reader change only.
+about log₂(records) reads (7 on 4 KB, 11 on 64 KB), and mount does (D3). The
+search is a reader change only: no format change, and every store written by
+any major-5 build already keeps the invariant.
 A power cut cannot break the invariant: it tears at most the slot at `end`,
 and nothing has been written after it.
 
@@ -337,7 +337,7 @@ no ok sector:                                          # as today (l1_bucketlog.
     both erased                                        -> format
     otherwise                                          -> no usable master (below)
 
-for an ok sector x:                                    # every slot is read (D3); §3.2a also allows a binary search
+for an ok sector x:                                    # a binary search on "fully erased" (D3, §3.2a)
     end(x)    = one past the last record slot that is not fully erased
     newest(x) = the newest record below end(x) that verifies, if any
 x is usable when newest(x) exists
@@ -430,11 +430,15 @@ discards it, as today's next master write does. Once fuses trip, the
 evidence is kept in a fuse (§4.5a). If UBI reports damage on the active sector again at the next attach,
 that mount doubts again. That costs a scan, never a wrong ceiling.
 
-Cost: two header reads as today, plus a read of every record slot in the
-higher sector, up to 82 on 4 KB and 1 362 on 64 KB, once per mount. The lower
-sector's slots are read too when mount falls back. Every
-record that is not erased is checked, so a rotten record anywhere in the log
-trips `MASTER_REC_ROT`.
+Cost: two header reads as today, plus the binary search for `end` in the
+higher sector (7 record reads on 4 KB, 11 on 64 KB) and one read per record
+walked back from it, once per mount. The lower sector is searched too when
+mount falls back. Mount checks only the records it reads: the newest that
+verifies, and any that fail above it. A rotten record below the newest is
+not seen at mount, so `MASTER_REC_ROT` (§4.5a, provisional) needs a full log
+read off the mount path, such as maintenance, when fuses land. (PR 4 first
+read every slot; on a 64 KB master that was +35–43 ms per mount on an
+nRF52840-DK, D3.)
 
 ### 3.6 Extending the format
 
@@ -903,7 +907,7 @@ QSPI, about 0.53 s per 64 KB erase):
 | churn on UBI, atomic replace | 8 erases, 0 master | unchanged |
 | AEAD compaction on 64 KB blocks (PR #63) | about +1 erase per compaction (not measured) | 0 |
 | id ceiling | 1 erase per 256 new ids | at most 1 record program per 256 new ids, and none when another record carried the ceiling forward within the step (D14) |
-| mount | 2 header reads | 2 header reads + every record slot of the active sector (up to 82 on 4 KB, 1 362 on 64 KB) |
+| mount | 2 header reads | 2 header reads + a binary search of the active log (7 record reads on 4 KB, 11 on 64 KB) + 1 to verify the newest |
 | RAM | — | about 24 B: the cursor as a record index (2 B; at most 1 362 records on 64 KB, 2 728 on 128 KB), the active sector's `rot_gen` (4 B), the header's three feature sets (12 B), copied verbatim at rotation, a failed-write flag, and the fuse word (4 B); once fuses trip, a pending flag |
 | a failed record write | — | the next update rotates: 1 erase, on a path that should not happen |
 | a doubtful mount | a scan at every mount until the next master write | one scan, then 1 record, or 1 rotation (1 erase) when the other sector is bad; the next mount does not scan |
@@ -954,9 +958,9 @@ QSPI, about 0.53 s per 64 KB erase):
    invariant** (§3.2a): a record write that fails having programmed nothing
    is followed by a rotation, not by a record in the next slot. After every
    test in the suite, every sector's record slots are a written prefix
-   followed by erased slots. A binary search for the end, kept in the test
-   suite as a reference reader, agrees with mount's full read on every store
-   the suite produces. A rotten last
+   followed by erased slots. A full read of every slot, kept in the test
+   suite as a reference reader, agrees with mount's binary search at every
+   fill level, and mount reads less than a sector. A rotten last
    record, and a corrupt other sector, make mount scan.
 3a. **Ending the doubt**: for each doubt condition (a corrupt other sector,
     an erased other sector, a rotten last record, a fallback after a torn
