@@ -90,6 +90,25 @@ Measured by the repository owner on PR #104, before the mount fix below.
 `partial vs whole-object write`: 1.45× on main (1024.5 vs 1486.3 ms/op),
 20.57× on major 5 (16.8 vs 345.8 ms/op).
 
+That ratio is of time per API call, not of operation counts: one whole-object
+`blob_db_update()` of a 64 KiB object (`lg rewrite`, 4 calls) against one
+64-byte partial `blob_db_write()` into such an object (`lg pwrite`, 32 calls).
+Per call on major 5:
+
+| per call | partial `blob_db_write` (64 B) | whole-object `blob_db_update` (64 KiB) | ratio |
+|---|--:|--:|--:|
+| flash reads | 52 (3.1 KB) | 272 (4.1 KB) | 5× |
+| flash writes | 5 (2.4 KB) | 69 (67.4 KB) | 14× |
+| bytes programmed | 2 403 B | 67 380 B | 28× |
+| erases | 0 | 0 | — |
+| **time** | **16.8 ms** | **345.8 ms** | **20.6×** |
+
+The time ratio falls between the write-count ratio and the bytes-programmed
+ratio, as it should when the time is mostly programming plus a fixed cost per
+operation. On main each of these calls also paid about two 64 KiB sector
+erases (about 0.5 s each), which dominated both and held main's ratio to
+1.45×.
+
 **What moved.**
 
 - **`lg pwrite`, 61× faster.** On main its 64 master updates were 64 sector
