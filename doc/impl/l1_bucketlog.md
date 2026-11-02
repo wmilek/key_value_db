@@ -183,7 +183,7 @@ compat[4]           features anyone may ignore
 suite[1]            0 = unprotected
 reserved0[3]
 store_uuid[16]      0 unless protected
-max_payload_len[2]  CONFIG_BLOB_DB_MAX_PAYLOAD_LEN; must equal the build's
+max_payload_len[2]  CONFIG_BLOB_DB_MAX_PAYLOAD_LEN; at most the build's (raised, below)
 write_align[2]      the write unit slots are padded to; must equal the device's
 hdr_crc32[4]        CRC32-IEEE over bytes [0, 60)
 
@@ -239,10 +239,21 @@ feature may mount a store formatted without it. A build refuses a store with an
 | prefix verifies, foreign magic or a major other than 5 | **foreign** | `-ENOTSUP`, touch nothing |
 | prefix and header verify | ok | checked against the build and device (below), then a candidate |
 
-Every ok header must carry this build's suite, `hdr_len` and payload cap, the
-device's `peb_size`, `n_buckets` and write unit, the build's R, and only
-feature bits the build knows; otherwise mount refuses with `-ENOTSUP` and writes
-nothing. Two ok headers at the same `rot_gen` cannot be ordered: `-EIO`.
+Every ok header must carry this build's suite and `hdr_len`, a payload cap no
+larger than this build's, the device's `peb_size`, `n_buckets` and write unit,
+the build's R, and only feature bits the build knows; otherwise mount refuses
+with `-ENOTSUP` and writes nothing. Two ok headers at the same `rot_gen` cannot
+be ordered: `-EIO`.
+
+**A smaller payload cap is raised (D21).** Every slot on such a store fits this
+build's cap, so this build reads it as it is. What it must not do is write a
+slot above the old cap while a sector that a build with the old cap would
+accept still stands, or a fallback to that sector would hand the store to a
+build that reads the new slot as a torn tail. So mount rotates, as for a
+half-done feature upgrade, until both headers carry this build's cap: two
+rotations (two erases), one if a cut left the job half done, all before mount
+returns and anything else is written. From then on, builds with the old cap
+refuse the store.
 
 A foreign sector on *either* slot refuses the whole store: an interrupted
 upgrade can leave this format on one slot and a newer one on the other, and
@@ -388,7 +399,8 @@ if doubt:
     max_id_seen = next_id - 1
     for bid in [0..N): walk slots: max_id_seen = max(max_id_seen, slot.id)
     next_id = max(next_id, max_id_seen + 1)               # RAM only
-if the ok headers disagree on features: rotate (up to twice) # a half-done upgrade
+if the ok headers disagree on features,                  # a half-done upgrade
+   or an ok header's cap is below the build's: rotate (up to twice)   # D21
 if doubt and no rotation yet:
     other sector bad, fell back, or damage: rotate        # rewrites the other sector
     else: append one record                               # the last record verifies again

@@ -80,8 +80,9 @@ come later (§4.5a).
 | D16 | A record's CRC covers `LE32(rot_gen)` too, in every suite, so a record verifies only under its own header | binding it in the protected MAC only (a stale unprotected record would verify) |
 | D17 | Compaction keeps no state in the master. Every mount checks the scratch seal and restores the bucket that a sealed image names (§6.1) | `COMPACTING` and `CLEAN` records around each scratch-path compaction (a rotten `COMPACTING` record hides an interrupted compaction and loses the bucket's data; two records per compaction) |
 | D18 | A format writes **both** master sectors, so an erased master sector beside an ok one only ever means a torn rotation, and mount doubts on it (§3.4a) | writing one sector and leaving the other erased (an erased sector then means either "never rotated" or "a rotation torn after its erase", and a doubt-ending rotation torn there loses the ceiling the scan raised: §3.5) |
-| D19 | The payload cap and `write_align` are geometry: recorded in the header, and a mount refuses a store whose values differ from the build's and the device's (§3.1) | leaving them to Kconfig and the driver (a smaller cap reads a sealed, intact slot as a torn tail; another `write_align` pads slots differently, and `rec_size` does not show it) |
+| D19 | The payload cap and `write_align` are geometry: recorded in the header, and a mount refuses a store whose values differ from the build's and the device's (§3.1); D21 relaxes this for a smaller cap | leaving them to Kconfig and the driver (a smaller cap reads a sealed, intact slot as a torn tail; another `write_align` pads slots differently, and `rec_size` does not show it) |
 | D20 | A slot-flag feature is written only into a store whose headers carry it. A build with the feature, on a store without it, writes as a build without it (§4.2) | refusing the mount (the store says which features it uses, and a build follows); writing the flag anyway (the headers would no longer carry every feature the store uses) |
+| D21 | A store cap **below** the build's is raised, not refused: mount rotates until both headers carry the build's cap (two rotations, one to finish a half-done raise), before it returns and before anything else is written. A larger store cap stays refused (amended 2026-11-02, after persondb met a store formatted by a build with a smaller cap) | refusing every difference (D19 as first written: safe, but a cap can only be changed by discarding the store); mounting with writes bounded to the store's cap (no use to the build that needs the larger slots); raising lazily, on the first write above the old cap (one more state to get right, and that write would have to wait for two erases) |
 
 ## 3. Master sector layout (major 5)
 
@@ -131,7 +132,7 @@ Nothing in it changes until the sector is erased again.
 | 36 | `suite` | 0 unprotected; otherwise mode and tag length, as PR #63's master byte 19 |
 | 37..39 | reserved, 0 | |
 | 40..55 | `store_uuid` | drawn at format when protected (PR #63 §3.1); 0 otherwise |
-| 56..57 | `max_payload_len` | `CONFIG_BLOB_DB_MAX_PAYLOAD_LEN` of the build that formatted the store; must equal the build's (D19) |
+| 56..57 | `max_payload_len` | `CONFIG_BLOB_DB_MAX_PAYLOAD_LEN` of the build that formatted the store, or that last raised it; must not exceed the build's (D19), and a smaller one is raised (D21) |
 | 58..59 | `write_align` | the device's write unit, which pads every slot; must equal the device's (D19) |
 | 60..63 | `hdr_crc32` | over [0, 60) |
 | 64..79 | `mac` | protected only: AES-CMAC-128(K_meta, [0, 64)) |
@@ -602,7 +603,7 @@ build.required  ⊆ store.incompat         # else -ENOTSUP: a protected build me
 store.suite    == build.suite            # else -ENOTSUP; in every ok header
 store geometry == device geometry        # else -ENOTSUP; in every ok header
 store.rec_size == build's R              # else -ENOTSUP; in every ok header
-store.max_payload_len == build's cap     # else -ENOTSUP; in every ok header (D19)
+store.max_payload_len <= build's cap     # else -ENOTSUP; in every ok header (D19); below it: raised (D21)
 store.write_align == device's            # else -ENOTSUP; in every ok header (D19)
 ```
 
@@ -1018,8 +1019,11 @@ QSPI, about 0.53 s per 64 KB erase):
       no build can drift from the format.
     - **Refusals.** A `rec_size` other than the build's is refused, and so is
       an ok other sector whose suite, geometry or `hdr_len` differs. So is a
-      `max_payload_len` other than the build's cap, smaller or larger, and a
-      `write_align` other than the device's (D19). A
+      `max_payload_len` above the build's cap, and a `write_align` other than
+      the device's (D19). A smaller `max_payload_len` is raised in both
+      headers before mount returns, in two rotations or one for a half-done
+      raise, and a raise cut between its rotations is finished by the next
+      mount (D21). A
       `write_align` above 128 is refused. Two ok sectors with equal `rot_gen` return `-EIO`.
       None of these writes anything.
     - **Binding and reserved bytes.** A record copied from an earlier

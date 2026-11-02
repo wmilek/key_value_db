@@ -373,18 +373,26 @@ static int master_accept(uint8_t slot, const struct blob_db_master_hdr *h)
 		what = "another geometry";
 	} else if (h->rec_size != st.rec_size) {
 		what = "another record size";
-	} else if (h->max_payload_len != CONFIG_BLOB_DB_MAX_PAYLOAD_LEN) {
-		what = "another CONFIG_BLOB_DB_MAX_PAYLOAD_LEN";
+	} else if (h->max_payload_len > CONFIG_BLOB_DB_MAX_PAYLOAD_LEN) {
+		/* Its slots may be longer than this build's cap, which the walk
+		 * would read as torn tails. A smaller store cap is fine, and
+		 * mount raises it (D21). */
+		what = "a larger CONFIG_BLOB_DB_MAX_PAYLOAD_LEN";
 	} else if (h->write_align != st.write_align) {
 		what = "another write alignment";
 	} else {
 		return 0;
 	}
-	LOG_ERR("master %u: the store has %s (incompat 0x%x ro_compat 0x%x "
-		"suite %u, %u B x %u buckets, R %u, max payload %u, align %u); "
-		"refusing",
-		slot, what, h->incompat, h->ro_compat, h->suite, h->peb_size,
+	LOG_ERR("master %u: the store has %s; refusing", slot, what);
+	LOG_ERR("  store: incompat 0x%x ro_compat 0x%x suite %u, %u B x %u "
+		"buckets, R %u, max payload %u, align %u",
+		h->incompat, h->ro_compat, h->suite, h->peb_size,
 		h->n_buckets, h->rec_size, h->max_payload_len, h->write_align);
+	LOG_ERR("  build: incompat 0x%x ro_compat 0x%x suite %u, %u B x %u "
+		"buckets, R %u, max payload %u, align %u",
+		BLOB_DB_BUILD_INCOMPAT, BLOB_DB_BUILD_RO_COMPAT,
+		BLOB_DB_BUILD_SUITE, st.peb_size, st.n_buckets, st.rec_size,
+		CONFIG_BLOB_DB_MAX_PAYLOAD_LEN, st.write_align);
 	return -ENOTSUP;
 }
 
@@ -1073,22 +1081,45 @@ static int mount_impl(void)
 
 	/* A half-done upgrade: one ok header has a feature bit the other
 	 * lacks. Rotations write the union (st's sets), so at most two make
-	 * both headers carry every bit (§4.2). Any rotation also ends a doubt:
-	 * it rewrites the other sector and gives the active one a fresh
-	 * record that verifies. */
+	 * both headers carry every bit (§4.2). A store cap below this build's
+	 * is raised the same way (D21): every rotation writes this build's
+	 * cap, and both sectors carry it before mount returns, so no slot
+	 * above the old cap is written while a sector a smaller build would
+	 * accept is still standing. Any rotation also ends a doubt: it
+	 * rewrites the other sector and gives the active one a fresh record
+	 * that verifies. */
 	bool rotated = false;
+	uint16_t old_cap = CONFIG_BLOB_DB_MAX_PAYLOAD_LEN;
 
-	if (active >= 0 && both_ok &&
-	    (h[0].incompat != h[1].incompat || h[0].ro_compat != h[1].ro_compat ||
-	     h[0].compat != h[1].compat)) {
+	for (uint8_t i = 0; i < 2; i++) {
+		if (c[i] == MASTER_OK) {
+			old_cap = MIN(old_cap, h[i].max_payload_len);
+		}
+	}
+
+	const bool raise_cap = old_cap < CONFIG_BLOB_DB_MAX_PAYLOAD_LEN;
+
+	const bool features_split = both_ok &&
+		(h[0].incompat != h[1].incompat ||
+		 h[0].ro_compat != h[1].ro_compat || h[0].compat != h[1].compat);
+
+	if (active >= 0 && (features_split || raise_cap)) {
 		const struct blob_db_master_hdr *old_active = &h[active];
 
-		LOG_WRN("master headers disagree on features; finishing the "
-			"upgrade");
+		if (raise_cap) {
+			LOG_WRN("raising the store's payload cap from %u to %u; "
+				"builds with the old cap will refuse it",
+				old_cap, CONFIG_BLOB_DB_MAX_PAYLOAD_LEN);
+		} else {
+			LOG_WRN("master headers disagree on features; "
+				"finishing the upgrade");
+		}
 		rc = master_commit_rotate();
 		if (rc == 0 && (old_active->incompat != st.incompat ||
 				old_active->ro_compat != st.ro_compat ||
-				old_active->compat != st.compat)) {
+				old_active->compat != st.compat ||
+				old_active->max_payload_len !=
+					CONFIG_BLOB_DB_MAX_PAYLOAD_LEN)) {
 			rc = master_commit_rotate();
 		}
 		if (rc < 0) {

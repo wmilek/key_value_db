@@ -138,9 +138,9 @@ extern "C" {
  * declares a format this build does not understand — another major version
  * (stores of majors 1-4, written before the master log, included), a feature
  * this build does not know or is configured without (a store formatted with
- * `CONFIG_BLOB_DB_LARGE_PAYLOADS`, opened by a build without it), another
- * payload cap or device geometry, or another allocator's magic — mount
- * returns `-ENOTSUP` and writes nothing;
+ * `CONFIG_BLOB_DB_LARGE_PAYLOADS`, opened by a build without it), a larger
+ * payload cap than this build's, another device geometry, or another
+ * allocator's magic — mount returns `-ENOTSUP` and writes nothing;
  * discarding it is the caller's decision, via `blob_db_format()`, which for
  * that reason does not itself require a mount. Only a
  * partition whose master sectors both read as erased is treated as virgin and
@@ -151,13 +151,20 @@ extern "C" {
  * store; with `CONFIG_BLOB_DB_AUTOFORMAT_ON_CORRUPT` (default `n`) mount does
  * that itself, erasing every blob.
  *
+ * A store formatted with a **smaller** `CONFIG_BLOB_DB_MAX_PAYLOAD_LEN` is
+ * upgraded, not refused: mount raises the store's cap to this build's,
+ * rewriting both master sectors (two erases) before it returns, and keeps
+ * every blob. From then on, builds with the old cap refuse the store. A mount
+ * interrupted during the raise is finished by the next one.
+ *
  * @retval 0       success
  * @retval -EALREADY already mounted
  * @retval -EIO    flash I/O error, partition not found, or no usable master
  *                 on a partition that is not blank (unless
  *                 `CONFIG_BLOB_DB_AUTOFORMAT_ON_CORRUPT`)
  * @retval -ENOTSUP foreign on-flash format or features, a store written with
- *                 another `CONFIG_BLOB_DB_MAX_PAYLOAD_LEN` or geometry, a
+ *                 a larger `CONFIG_BLOB_DB_MAX_PAYLOAD_LEN` or another
+ *                 geometry, a
  *                 sector larger than `CONFIG_BLOB_DB_SECTOR_BUF_SIZE`, a write
  *                 unit larger than 32 B, a payload cap the partition geometry
  *                 cannot sustain, or a root bucket holding a slot this build
