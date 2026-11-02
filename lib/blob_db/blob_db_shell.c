@@ -7,7 +7,8 @@
  * Parsing and printing only, over the public introspection API
  * (<app/lib/blob_db_inspect.h>, CONFIG_BLOB_DB_INSPECT) and
  * blob_db_maintain(). Only `maintain` with a budget writes to flash, and,
- * with CONFIG_BLOB_DB_SHELL_ADMIN, `mount` and `format`.
+ * with CONFIG_BLOB_DB_SHELL_ADMIN, `mount`, `format` and `import`. `export`
+ * and `import` live in blob_db_shell_xfer.c.
  * Every blob_db call takes the blob_db lock, so commands are safe while the
  * application uses the store; a command that reads several buckets sees
  * each as it is then, not one snapshot.
@@ -24,6 +25,8 @@
 #include <app/lib/blob_db.h>
 #include <app/lib/blob_db_inspect.h>
 #include <app/lib/blob_db_iostats.h>
+
+#include "blob_db_shell_xfer.h"
 
 /* Fullest buckets listed by `stats` when no count is given, and the most
  * it will track. */
@@ -718,6 +721,13 @@ SHELL_STATIC_SUBCMD_SET_CREATE(sub_blob_db,
 		"Hex dump of a blob's payload\n"
 		"usage: dump <id> [max_bytes]  (default 256)",
 		cmd_dump, 2, 1),
+	SHELL_CMD_ARG(export, NULL,
+		"Every live object as checksummed text lines, for a host to "
+		"collect (doc/tools/blob_db_export.md)\n"
+		"usage: export              the whole store\n"
+		"       export <id>         one object\n"
+		"       export <id> <off> <len>  data lines of a range, to resend",
+		blob_db_shell_cmd_export, 1, 3),
 	SHELL_CMD_ARG(maintain, NULL,
 		"Run erases ahead of time; WRITES: a step erases a block\n"
 		"usage: maintain [budget]  (default 0: report only)",
@@ -735,6 +745,13 @@ SHELL_STATIC_SUBCMD_SET_CREATE(sub_blob_db,
 		"blob, works unmounted, leaves it mounted\n"
 		"usage: format yes",
 		cmd_format, 1, 1),
+	SHELL_CMD_ARG(import, NULL,
+		"Restore one line of `export` output; WRITES. The store must be "
+		"freshly formatted when the H line arrives. Every id and next_id "
+		"are kept. Each line gets an A (accepted) or N (refused) reply "
+		"line. Without arguments: progress\n"
+		"usage: import %BDB1 <type> ... *<crc>",
+		blob_db_shell_cmd_import, 1, SHELL_OPT_ARG_RAW),
 #endif
 #if defined(CONFIG_BLOB_DB_IOSTATS)
 	SHELL_CMD_ARG(iostats, NULL,

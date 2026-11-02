@@ -343,6 +343,10 @@ config BLOB_DB_SHELL
 	  buckets, a per-bucket table, a slot-by-slot view of one bucket, where
 	  an id lives, and a hex dump of a blob. All of those are read-only.
 
+	  `blob_db export` writes every live object as checksummed text lines,
+	  for a host to collect from a serial console
+	  (doc/tools/blob_db_export.md). It is read-only too.
+
 	  `blob_db maintain [budget]` runs blob_db_maintain(): without a budget
 	  it only reports whether work is waiting; with one it writes, a step
 	  erasing a block. BLOB_DB_SHELL_ADMIN adds mount, unmount and format.
@@ -371,6 +375,23 @@ config BLOB_DB_SHELL_ADMIN
 	  `format` destroys every blob and needs the word `yes`. It works on a
 	  store that cannot be mounted (blob_db_format()) and leaves the store
 	  mounted.
+
+	  `import` restores a dump made by `blob_db export` into a freshly
+	  formatted store, keeping every id and the id counter
+	  (doc/tools/blob_db_export.md).
+
+config BLOB_DB_SHELL_IMPORT_BUF_SIZE
+	int "Largest object `blob_db import` restores, in bytes"
+	depends on BLOB_DB_SHELL_ADMIN
+	default 4096 if BLOB_DB_LARGE_PAYLOADS
+	default BLOB_DB_MAX_PAYLOAD_LEN
+	help
+	  `blob_db import` stages each object in a static buffer of this size
+	  and writes it with one blob_db_update(), so the restored object is
+	  written the way the original was. An object larger than the buffer
+	  is refused with -EFBIG. The host build (native_sim) sets it to
+	  BLOB_DB_MAX_OBJECT_LEN; a device build that must restore large
+	  objects needs the same, RAM permitting.
 
 config BLOB_DB_AUTOFORMAT_ON_CORRUPT
 	bool "Format when no master is usable (destroys the store)"

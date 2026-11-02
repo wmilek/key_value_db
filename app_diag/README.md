@@ -14,10 +14,12 @@ and Zephyr provide.
 | Group | Source | Needs a mount | Writes |
 |---|---|---|---|
 | `blob_db info` · `stats` · `buckets` · `bucket` · `id` · `dump` | `lib/blob_db/blob_db_shell.c` | yes | no |
-| `blob_db maintain [budget]` | same | yes | with a budget: erases |
+| `blob_db export [id [off len]]` | `lib/blob_db/blob_db_shell_xfer.c` | yes | no |
+| `blob_db maintain [budget]` | `lib/blob_db/blob_db_shell.c` | yes | with a budget: erases |
 | `blob_db iostats [reset]` | same (`CONFIG_BLOB_DB_IOSTATS`) | no | no |
 | `blob_db mount` · `unmount` | same (`CONFIG_BLOB_DB_SHELL_ADMIN`) | no | `mount` may: see below |
 | `blob_db format yes` | same (`CONFIG_BLOB_DB_SHELL_ADMIN`) | no | erases the partition; leaves it mounted |
+| `blob_db import <line>` | `blob_db_shell_xfer.c` (`CONFIG_BLOB_DB_SHELL_ADMIN`) | yes, freshly formatted | binds objects |
 | `flash read` · `write` · `erase` · … | Zephyr `CONFIG_FLASH_SHELL` | no | `write`, `erase`, `copy`, `load`, `test` |
 | `kernel …`, `device list` | Zephyr kernel and device shells | no | no |
 | `kernel reboot cold` · `warm` | Zephyr kernel shell (`CONFIG_REBOOT`) | no | no; the store sees a power cut between operations |
@@ -122,6 +124,45 @@ kvdb:~$ flash read flash-controller@80000000 0 32
 00000000: 55 42 49 23 01 00 00 00  00 00 00 00 00 00 00 02 |UBI#.... ........|
 ```
 
+## Export and import
+
+`blob_db export` prints every live object as checksummed text lines
+(`%BDB1 ...`), and `blob_db import` takes them back into a freshly formatted
+store, one line per command, keeping every id and `next_id`. The format, the
+replies and the limits are in
+[`doc/tools/blob_db_export.md`](../doc/tools/blob_db_export.md). The host side
+is `scripts/blob_db_export.py`.
+
+Each line carries its own CRC, so log output printed between or inside the
+lines does no harm: `verify` drops a damaged line and names the
+`blob_db export <id> <off> <len>` command that prints its data again.
+
+```bash
+printf 'blob_db mount\nblob_db export\n' | \
+  ./build/diag/zephyr/zephyr.exe --kvdb=storage.bin -stop_at=10 > dump.log
+python3 key_value_db/scripts/blob_db_export.py verify dump.log
+python3 key_value_db/scripts/blob_db_export.py extract dump.log -o store/
+```
+
+Restoring into a new image on the host is a pipe. `-no-rt` runs the
+simulation as fast as the host can, so a large dump does not take its
+simulated time in real time:
+
+```bash
+python3 key_value_db/scripts/blob_db_export.py commands --format dump.log | \
+  ./build/diag/zephyr/zephyr.exe --kvdb=restored.bin -no-rt -stop_at=600
+```
+
+The same works from `store/`, after editing it, or with a directory made by
+hand (a `manifest.json` as `extract` writes it). Since a dump holds objects,
+not sectors, the restoring build may differ from the one that exported:
+another geometry, the other backend, a later format.
+
+The host build stages objects of up to 128 KB
+(`CONFIG_BLOB_DB_SHELL_IMPORT_BUF_SIZE`); a device build, one slot's payload
+by default. On a device, `import` lines have to be sent one at a time, each
+after the previous reply: the shell has no flow control on its input.
+
 ## On the device (nRF5340-DK)
 
 ```bash
@@ -134,7 +175,7 @@ The shell runs on the board's console UART. The storage partition is the first
 
 ## Tests
 
-`sample.yaml` runs three scenarios on `native_sim` under twister:
+`sample.yaml` runs these scenarios on `native_sim` under twister:
 
 - `app.diag`: boots to the shell, unmounted.
 - `app.diag.mount`: mounts at boot, formatting a blank image.
@@ -143,3 +184,10 @@ The shell runs on the board's console UART. The storage partition is the first
   mount, unmount, format.
 - `app.diag.reboot`: `pytest/test_reboot.py` formats, reboots, and checks the
   app comes back unmounted and mounts the same store without formatting.
+- `app.diag.export`: `pytest/test_export.py` imports a dump made by
+  `scripts/blob_db_export.py` line by line (a damaged line, a resent one, a
+  header to a store no longer empty), exports the store, and compares every
+  object and `next_id`. One bucket holds 41 ids, more than export gathers in
+  one pass.
+- `app.diag.export.large`: the same with `CONFIG_BLOB_DB_LARGE_PAYLOADS=y`,
+  so one object is segmented.

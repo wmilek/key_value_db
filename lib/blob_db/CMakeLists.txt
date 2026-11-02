@@ -11,3 +11,5 @@ zephyr_library_sources_ifdef(CONFIG_BLOB_DB_MAINT_WORK          blob_db_maint_wo
 # Diagnostics outside the blob_db contract (<app/lib/blob_db_inspect.h>).
 zephyr_library_sources_ifdef(CONFIG_BLOB_DB_INSPECT            blob_db_inspect.c)
 zephyr_library_sources_ifdef(CONFIG_BLOB_DB_SHELL              blob_db_shell.c)
+# blob_db export / import: the store as checksummed text lines.
+zephyr_library_sources_ifdef(CONFIG_BLOB_DB_SHELL              blob_db_shell_xfer.c)
