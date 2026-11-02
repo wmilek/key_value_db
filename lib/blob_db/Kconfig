@@ -245,6 +245,18 @@ config BLOB_DB_SEGMENT_LEN
 	  bucket with no headroom, so the partition hits -ENOSPC abruptly instead
 	  of degrading.
 
+config BLOB_DB_TEST_MASTER_LOG_CAP
+	int "Test-only: record slots per master sector (0 = what fits)"
+	default 0
+	range 0 65535
+	help
+	  Caps how many records a master sector's log holds before the next
+	  update rotates into the other sector. 0 uses every slot that fits.
+	  A small cap makes a test suite rotate every few updates, so every
+	  crash and recovery case also runs across rotations
+	  (doc/proposals/2026-10-28-master-log.md §3.4). Never set it in a
+	  product: it costs an erase every few updates.
+
 config BLOB_DB_TEST_CRASH_HOOKS
 	bool "Test-only: allow a segmented write to be cut mid-sequence"
 	help

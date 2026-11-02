@@ -23,6 +23,7 @@
 #include <psa/crypto.h>
 
 #include <app/lib/blob_db.h>
+#include <app/lib/blob_db_inspect.h>
 #include <app/lib/blob_db_ubi.h>
 
 #define PARTITION_ID_UNDER_TEST PARTITION_ID(storage_partition)
@@ -259,13 +260,19 @@ ZTEST(blob_db_ubi, test_rolled_back_master_still_raises_ceiling)
 {
 	Z_TEST_SKIP_IFNDEF(CONFIG_BLOB_DB_UBI_ATOMIC_REPLACE);
 
-	/* After format the first master sits in LEB 0 and the second is
-	 * unmapped. The first alloc_id persists a ceiling 256 ahead to LEB 1,
-	 * and the allocation that reaches it persists the next to LEB 0 — so
-	 * 300 allocations leave LEB 0 newest, its previous copy awaiting
-	 * reclaim, and LEB 1's ceiling below the last id. */
+	/* After format master B (LEB 1) holds rot_gen 1 and master A (LEB 0)
+	 * rot_gen 2. Allocate until A's record log is full and the next
+	 * ceiling rotates into B: that replace leaves B's previous copy,
+	 * rot_gen 1, awaiting reclaim. Then allocate past A's last ceiling and
+	 * bind the last id, so only B's newest copy covers it. */
+	struct blob_db_inspect_info in;
 	uint64_t id = 0;
 
+	do {
+		id = blob_db_alloc_id();
+		zassert_not_equal(id, 0);
+		zassert_ok(blob_db_inspect_info_get(&in));
+	} while (in.rot_gen < 3);
 	for (int i = 0; i < 300; i++) {
 		id = blob_db_alloc_id();
 		zassert_not_equal(id, 0);
