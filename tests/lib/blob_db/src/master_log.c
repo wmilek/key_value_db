@@ -559,6 +559,58 @@ ZTEST(blob_db_master_log, test_record_from_another_rotation_fails)
 	ml_assert_blob(id, "BIND");
 }
 
+/* §3.2a, §3.5. Mount finds the log end by a binary search on "fully erased"
+ * and reads only the slots it needs. At every fill level from one record to
+ * a full log, mount adopts the reference reader's end (every slot read) and
+ * reads less than the sector it searched. */
+ZTEST(blob_db_master_log, test_mount_searches_the_log_end)
+{
+	ML_SKIP_UNLESS_RAW_PARTITION();
+
+	struct blob_db_iostats io;
+	struct blob_db_inspect_info in;
+	struct mrec_img r;
+	const uint64_t id = ml_put("SRCH");
+
+	zassert_ok(blob_db_unmount());
+
+	const uint8_t act = master_active_raw();
+	const uint16_t cap = mi_log_cap();
+
+	(void)master_newest_raw(act, &r);
+
+	const uint32_t rot_gen = ((const struct mhdr_img *)mi_sec)->rot_gen;
+
+	for (uint16_t end = 1; end <= cap; end++) {
+		mi_sector_read(act);
+		memset(mi_sec + MI_LOG_OFF, 0xff, MI_SECTOR_SZ - MI_LOG_OFF);
+		for (uint16_t i = 0; i < end; i++) {
+			r.rec_no = i;
+			r.crc32 = mrec_crc(rot_gen, &r);
+			memcpy(mi_slot(i), &r, sizeof(r));
+		}
+		mi_sector_write(act);
+		zassert_equal(mi_log_end(), end);
+
+		blob_db_iostats_reset();
+		zassert_ok(blob_db_mount(), "mount failed at end %u", end);
+		blob_db_iostats_get(&io);
+		ml_info(&in);
+		zassert_equal(in.active_master, act);
+		zassert_equal(in.master_log_used, end,
+			      "mount found end %u, the log holds %u",
+			      in.master_log_used, end);
+		zassert_equal(io.writes + io.erases, 0,
+			      "a clean mount wrote at end %u", end);
+		zassert_true(io.bytes_read < MI_SECTOR_SZ,
+			     "mount read %llu B at end %u",
+			     (unsigned long long)io.bytes_read, end);
+		ml_assert_blob(id, "SRCH");
+		zassert_ok(blob_db_unmount());
+	}
+	zassert_ok(blob_db_mount());
+}
+
 /* 3. A rotten record before the newest one is harmless: the newest stands,
  * and mount has nothing to doubt. */
 ZTEST(blob_db_master_log, test_rotten_record_mid_log_needs_no_scan)

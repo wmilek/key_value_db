@@ -354,8 +354,13 @@ static int master_accept(uint8_t slot, const struct blob_db_master_hdr *h)
 {
 	const char *what = NULL;
 
-	if (h->incompat & ~BLOB_DB_BUILD_INCOMPAT) {
+	const uint32_t missing = h->incompat & ~BLOB_DB_BUILD_INCOMPAT;
+
+	if (missing & ~BLOB_DB_LIB_INCOMPAT) {
 		what = "an incompat feature this build does not know";
+	} else if (missing & BLOB_DB_FEAT_LARGE_PAYLOADS) {
+		what = "LARGE_PAYLOADS, which this build is configured without "
+		       "(CONFIG_BLOB_DB_LARGE_PAYLOADS)";
 	} else if (h->ro_compat & ~BLOB_DB_BUILD_RO_COMPAT) {
 		/* No read-only mount yet: refused like incompat (§4.1). */
 		what = "a ro_compat feature this build does not know";
@@ -376,7 +381,8 @@ static int master_accept(uint8_t slot, const struct blob_db_master_hdr *h)
 		return 0;
 	}
 	LOG_ERR("master %u: the store has %s (incompat 0x%x ro_compat 0x%x "
-		"suite %u, %u B x %u buckets, R %u, cap %u, align %u); refusing",
+		"suite %u, %u B x %u buckets, R %u, max payload %u, align %u); "
+		"refusing",
 		slot, what, h->incompat, h->ro_compat, h->suite, h->peb_size,
 		h->n_buckets, h->rec_size, h->max_payload_len, h->write_align);
 	return -ENOTSUP;
@@ -384,8 +390,7 @@ static int master_accept(uint8_t slot, const struct blob_db_master_hdr *h)
 
 /* What a sector's record log holds (§3.5): end is one past the last slot that
  * is not fully erased, newest the newest record below it that verifies
- * (-1: none), and tail_bad whether the slot just below end fails. Reads the
- * whole sector into g_bbuf: every slot is read (D3). */
+ * (-1: none), and tail_bad whether the slot just below end fails. */
 struct master_log {
 	uint16_t end;
 	int      newest;
@@ -400,28 +405,49 @@ static bool master_rec_ok(uint32_t rot_gen, const uint8_t *slot, uint16_t i,
 	return out->rec_no == i && out->crc32 == master_rec_crc(rot_gen, out);
 }
 
+/* Read record slot i of a master sector into g_bbuf. */
+static int master_slot_read(uint8_t slot, uint16_t i)
+{
+	return blob_db_store_read(peb_offset(slot) + BLOB_DB_MASTER_LOG_OFF +
+				  (off_t)i * st.rec_size, g_bbuf, st.rec_size);
+}
+
+/* Find end by a binary search on "fully erased", which the log invariant
+ * allows (§3.2a: the written slots are a prefix, and every writer keeps it),
+ * then walk back from it to the newest record that verifies. About log2(cap)
+ * slot reads plus one per bad record at the tail, instead of the sector: on a
+ * 64 KB master, 12 reads of R bytes where reading every slot (D3 as first
+ * written) cost 64 KB and tens of ms per mount on a DK. */
 static int master_log_load(uint8_t slot, uint32_t rot_gen,
 			   struct master_log *log)
 {
-	int rc = blob_db_store_read(peb_offset(slot), g_bbuf, st.peb_size);
+	uint16_t lo = 0;
+	uint16_t hi = st.log_cap;
+	int rc;
 
-	if (rc < 0) {
-		return rc;
-	}
+	/* Slots below lo are written; slots from hi on read erased. */
+	while (lo < hi) {
+		const uint16_t mid = lo + (hi - lo) / 2;
 
-	const uint8_t *base = g_bbuf + BLOB_DB_MASTER_LOG_OFF;
-
-	log->end = 0;
-	for (uint16_t i = 0; i < st.log_cap; i++) {
-		if (!all_erased(base + (size_t)i * st.rec_size, st.rec_size)) {
-			log->end = i + 1;
+		rc = master_slot_read(slot, mid);
+		if (rc < 0) {
+			return rc;
+		}
+		if (all_erased(g_bbuf, st.rec_size)) {
+			hi = mid;
+		} else {
+			lo = mid + 1;
 		}
 	}
+	log->end = lo;
 	log->newest = -1;
 	log->tail_bad = false;
 	for (int i = (int)log->end - 1; i >= 0; i--) {
-		if (master_rec_ok(rot_gen, base + (size_t)i * st.rec_size,
-				  (uint16_t)i, &log->rec)) {
+		rc = master_slot_read(slot, (uint16_t)i);
+		if (rc < 0) {
+			return rc;
+		}
+		if (master_rec_ok(rot_gen, g_bbuf, (uint16_t)i, &log->rec)) {
 			log->newest = i;
 			break;
 		}
