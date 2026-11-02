@@ -105,22 +105,27 @@ Two lines carry most of the weight:
   read cost is independent of offset; a rising series falsifies it. (Measured:
   3187 / 3250 / 3625 / 3281 µs — flat, with `q3` below `q2`.)
 - **`partial vs whole-object write`** is the headline for why `blob_db_write`
-  exists. It prints two decimals; at the default `PART_LEN=64` expect ~`1.95x`,
-  because a 64 B partial write still pays two sector erases. The
-  `why lg pwrite` line beneath it says which: `master writes 64` — both are
-  master records, one entering the segment window and one leaving it.
+  exists. It prints two decimals. Before format major 5 a 64 B partial write
+  still paid two sector erases, one master write entering the segment window
+  and one leaving it, and the ratio was ~`1.95x`. Since major 5 those are two
+  master *records*, which erase nothing: the `why lg pwrite` line beneath it
+  shows `master rotations 0 (records 64)`, and the ratio should be far larger.
+  The re-measurement on the DK is pending (`RESULTS.md`).
 
 Since 1.1.0 there are three more kinds of line:
 
 - **`why …`** follows an `io` line whenever that phase wrote a master,
-  formatted a bucket or compacted one, and counts each. A master write or a
-  bucket format is one whole-block erase. A compaction is three on
-  flash_area and on UBI with `CONFIG_BLOB_DB_UBI_ATOMIC_REPLACE=n` (the
-  bucket, and the scratch block twice, plus two master writes), but one on
-  the default UBI build, which replaces the bucket atomically and writes no
-  masters for it. Together they account for the `er` count above them —
-  `churn`'s is 16 + 8 × 3 = 40 on flash_area and 0 + 8 × 1 = 8 on default
-  UBI. An `er` count they do not explain is worth a look.
+  formatted a bucket or compacted one, and counts each. Since 1.2.0 (format
+  major 5) it prints master *rotations* and master *records* separately. A
+  record erases nothing; a rotation or a bucket format is one whole-block
+  erase. A compaction is three on flash_area and on UBI with
+  `CONFIG_BLOB_DB_UBI_ATOMIC_REPLACE=n` (the bucket, and the scratch block
+  twice), but one on the default UBI build, which replaces the bucket
+  atomically. No compaction writes a master any more. Together they account
+  for the `er` count above them: `er = rotations + bucket formats + k ×
+  compactions`, so `churn`'s 40 on flash_area before major 5 (16 master
+  writes + 8 × 3) should now read 24. An `er` count they do not explain is
+  worth a look.
 - **`bench mount …`** times `blob_db_mount()` at four fill levels: `empty`,
   `list`, `large` and `churn`. On flash_area the `io` line below is the whole
   cost. **On UBI it is not**: attaching the UBI device scans the partition's
