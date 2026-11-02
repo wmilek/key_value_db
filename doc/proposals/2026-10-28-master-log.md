@@ -51,7 +51,7 @@ come later (§4.5a).
 | M5 | Every write programs erased bytes only | works on NOR, on flash with ECC and on UBI; no rewrite of programmed bits (§8) |
 | M6 | A store says which features it uses; a build refuses what it does not understand | `incompat` / `ro_compat` / `compat` in the header (§4) |
 | M7 | A protected build accepts only a store protected exactly as it expects | `suite` must equal the build's; the store never chooses protection (§4.3) |
-| M8 | The geometry is part of the format | `peb_size` and `n_buckets` in the header, checked at mount (§3.1) |
+| M8 | The geometry is part of the format | `peb_size`, `n_buckets`, `write_align` and the payload cap in the header, checked at mount (§3.1, D19) |
 | M9 | A few bytes of steady-state RAM, fixed at build time (P3) | the log cursor as a record index (2 B), the active sector's `rot_gen` (4 B), the header's feature sets (12 B), a failed-write flag, and the fuse word (4 B) |
 | M10 | Evidence of damage and recovery survives until a format, and no other path clears it | 32 OR-only fuses in every record (§4.5) |
 
@@ -71,11 +71,14 @@ come later (§4.5a).
 | D10 | Major 5 for the new layout; majors 1–4 are refused, never migrated | migration code for stores that exist only on development boards |
 | D11 | Fuses: a 32-bit OR-only word in every record that blob_db carries forward and never interprets, except to skip persisting a bit already set | bits cleared in place (§8); counters (more bytes than a post-mortem needs); fuses in the header (written once per erase, so a trip would need a rotation) |
 | D12 | A format clears the fuses | carrying them over (a format is the intervention that ends the store's history, P9; carrying them needs a readable old master, which an autoformat by definition lacks) |
-| D13 | The slot walk accepts the flags the **build** knows. A sealed slot whose CRC verifies but which carries a flag outside them makes its bucket refuse writes; it is never compacted | taking the accepted flags from the store's features (a lost bit would turn live slots into a "torn tail" that the next compaction drops); treating such a slot as torn (the same loss, from a single slot) |
-| D14 | Every record raises the id and nonce ceilings to the current value plus a step: `hint = max(hint, next + 1 + STEP)`. A ceiling-only record is written only when allocation reaches the ceiling and no other record has carried it forward | copying the persisted ceiling unchanged (allocation then needs a ceiling-only record every step, even right after another record was written) |
+| D13 | The slot walk accepts the flags the **build** knows. A sealed slot whose CRC verifies but which carries a flag outside them makes its bucket refuse writes; it is never compacted. Compaction also refuses when programmed bytes lie beyond one slot span past where its walk stopped | taking the accepted flags from the store's features (a lost bit would turn live slots into a "torn tail" that the next compaction drops); treating such a slot as torn (the same loss, from a single slot); refusing on any programmed byte past the stop (a page program torn out of order leaves stray bits inside the torn slot's span, and the bucket would refuse writes for good) |
+| D14 | Every record raises the id and nonce ceilings to the current value plus a step: `hint = max(hint, next + 1 + STEP)`. A ceiling-only record is written only when allocation reaches the ceiling and no other record has carried it forward. `erase_all`'s record is the one exception: it resets the id ceiling (§3.3) | copying the persisted ceiling unchanged (allocation then needs a ceiling-only record every step, even right after another record was written) |
 | D15 | `format_minor` is 0 for all of major 5; every extension is a feature bit (§3.6) | raising the minor (a rotation by an older build would write its own lower minor and erase the record of the newer one) |
 | D16 | A record's CRC covers `LE32(rot_gen)` too, in every suite, so a record verifies only under its own header | binding it in the protected MAC only (a stale unprotected record would verify) |
 | D17 | Compaction keeps no state in the master. Every mount checks the scratch seal and restores the bucket that a sealed image names (§6.1) | `COMPACTING` and `CLEAN` records around each scratch-path compaction (a rotten `COMPACTING` record hides an interrupted compaction and loses the bucket's data; two records per compaction) |
+| D18 | A format writes **both** master sectors, so an erased master sector beside an ok one only ever means a torn rotation, and mount doubts on it (§3.4a) | writing one sector and leaving the other erased (an erased sector then means either "never rotated" or "a rotation torn after its erase", and a doubt-ending rotation torn there loses the ceiling the scan raised: §3.5) |
+| D19 | The payload cap and `write_align` are geometry: recorded in the header, and a mount refuses a store whose values differ from the build's and the device's (§3.1) | leaving them to Kconfig and the driver (a smaller cap reads a sealed, intact slot as a torn tail; another `write_align` pads slots differently, and `rec_size` does not show it) |
+| D20 | A slot-flag feature is written only into a store whose headers carry it. A build with the feature, on a store without it, writes as a build without it (§4.2) | refusing the mount (the store says which features it uses, and a build follows); writing the flag anyway (the headers would no longer carry every feature the store uses) |
 
 ## 3. Master sector layout (major 5)
 
@@ -105,7 +108,8 @@ reader of any age reads the frozen prefix from the same place.
   `-ENOTSUP`, and writes nothing. `peb_size` is 32 bits, and `rot_gen` and
   `rec_no` are 32 bits. Even at one rotation per update, `rot_gen` does not
   wrap within any device's erase budget, and a writer that would wrap it
-  refuses with `-ENOSPC`. Ids and ceilings are 64 bits.
+  refuses with `-ENOSPC`. Ids and ceilings are 64 bits. `max_payload_len` and
+  `write_align` are 16 bits each, as a slot's `val_len` already is.
 
 ### 3.1 Header
 
@@ -124,7 +128,8 @@ Nothing in it changes until the sector is erased again.
 | 36 | `suite` | 0 unprotected; otherwise mode and tag length, as PR #63's master byte 19 |
 | 37..39 | reserved, 0 | |
 | 40..55 | `store_uuid` | drawn at format when protected (PR #63 §3.1); 0 otherwise |
-| 56..59 | reserved, 0 | |
+| 56..57 | `max_payload_len` | `CONFIG_BLOB_DB_MAX_PAYLOAD_LEN` of the build that formatted the store; must equal the build's (D19) |
+| 58..59 | `write_align` | the device's write unit, which pads every slot; must equal the device's (D19) |
 | 60..63 | `hdr_crc32` | over [0, 60) |
 | 64..79 | `mac` | protected only: AES-CMAC-128(K_meta, [0, 64)) |
 | 80..83 | `tail_crc32` | protected only: over [0, 80) |
@@ -139,10 +144,21 @@ anchor, not of the classification. Once fuses trip, `MAC_FAIL` records it
 
 **Every ok header must agree with the build and the device**, not only the
 active one. Each sector that classifies as ok must carry the device's
-`peb_size` and `n_buckets`, the build's `suite`, the `hdr_len` of that suite,
-and the `rec_size` the build computes for that suite and the device's
-`write_align`. Otherwise mount refuses the store with `-ENOTSUP` and writes
-nothing. The CRC and MAC sit at fixed offsets in the record (§3.2), whatever R
+`peb_size`, `n_buckets` and `write_align`, the build's `suite` and
+`max_payload_len`, the `hdr_len` of that suite, and the `rec_size` the build
+computes for that suite and the device's `write_align`. Otherwise mount
+refuses the store with `-ENOTSUP` and writes nothing.
+
+The last two are geometry for the same reason as the rest (D19). The slot
+walk ends the log at a `val_len` above the build's cap, so a build with a
+smaller cap would read a sealed, intact slot as a torn tail, and the bucket's
+next compaction would drop it and every slot after it. Every slot is padded
+to `write_align` (`slot_size_for()`), so another value walks the bucket at
+the wrong boundaries. `rec_size` does not show it, because 48 is a multiple
+of every `write_align` up to 16. Equality, not "at most", keeps both
+directions safe: a build with a larger cap would write slots the store's own
+build can no longer walk. Raising the cap is a format, as changing any other
+geometry is. The CRC and MAC sit at fixed offsets in the record (§3.2), whatever R
 is. R only adds filler, so a store whose `rec_size` differs from the build's
 was written by another build or for another device. `write_align` must be a
 power of two no larger than 128, because records start at offset 128. A
@@ -257,6 +273,17 @@ copying the ceiling instead of `next_id`. The ids a crash skips stay bounded
 by `STEP + 1`, because a record never puts the ceiling further ahead than
 that. A record whose write fails raises nothing.
 
+**`erase_all` resets the id ceiling.** `blob_db_erase_all()` empties the id
+space, so its record is the one that lowers the ceiling:
+`next_id_hint = 2 + 1 + STEP`, written directly instead of through the `max`.
+It is safe for the reason it is today. The record is written only after every
+bucket has been invalidated and the root bound again, so no id at or above 2
+is left on flash but the root's. A cut before the record lands leaves the
+older, higher ceiling, which is safe. A torn record is doubt, and the scan only
+raises the ceiling. `seq_hint` is never lowered: `erase_all` keeps the key, and
+a nonce under one key must never repeat. Every later record follows the `max`
+rule again.
+
 ### 3.4 Rotation
 
 ```
@@ -271,6 +298,30 @@ rotate(state):
 over the replaced length only, so the appends that follow keep it valid,
 exactly as slot appends after a bucket compaction do today. Rotation is
 today's A/B master write, made once per sector's worth of updates.
+
+### 3.4a Format (D18)
+
+```
+format(state):                            # blob_db_format(), the virgin format, an autoformat
+    invalidate or erase the buckets       # as today, before any master is written
+    replace(B, header(rot_gen = 1, features = the build's) ‖ record[0](state))
+    replace(A, header(rot_gen = 2, features = the build's) ‖ record[0](state))
+    active = A; cursor = 1; failed = false; fuses = 0
+```
+
+Both sectors carry a header and a record for the same state, so after a
+format no master sector is erased except inside a rotation. An erased sector
+beside an ok one is then always a rotation torn after its erase, and mount
+doubts on it (§3.5). Leaving the second sector erased, as today's format
+does, would make that state ambiguous: "never rotated yet" and "a rotation
+torn after its erase" would look the same. A doubt-ending rotation (§3.5) torn
+there would then leave a mount with no doubt and an old ceiling.
+
+A cut between the two writes leaves B ok and A erased. That is doubt, and the
+scan is cheap, because format has emptied the buckets first. A cut inside B's
+write leaves no usable master beside an erased A, which is refused with `-EIO`,
+as a torn first master is today. The cost is one sector write per format,
+whose sectors are erased anyway.
 
 ### 3.5 Mount
 
@@ -297,7 +348,7 @@ else:                no usable master                  # -EIO, write nothing; or
 cursor = end(active); state = newest(active); fuses = state.fuses   # §4.5
 doubt  = the record just below cursor does not verify
       or fell_back
-      or the other sector is neither erased nor ok
+      or the other sector is not ok                    # erased included: a torn rotation (D18)
       or the store reports damage on a master sector   # as today, for UBI
 if the scratch sector carries a valid seal:            # every mount, any backend (D17, §6.1)
     restore the bucket its image names; erase scratch
@@ -307,7 +358,7 @@ if doubt:
 if one ok sector has a feature bit the other ok sector lacks:
     rotate                                               # finish an upgrade (§4.2)
 if doubt still holds:                                    # end it, after the scan
-    if the other sector is not erased and not ok,
+    if the other sector is not ok,
        or fell_back, or the store reported damage:
         rotate                                           # rewrites the other sector
     else:
@@ -334,6 +385,17 @@ acknowledged, but bit rot in the last committed record looks the same, so
 both trigger the scan. A rotten record further back is harmless, because a
 later full-state record replaces it.
 
+**An erased other sector is doubt (D18).** Today's rule scans whenever one
+master is not ok, and the log keeps it. Doubting only on a corrupt other
+sector would lose a ceiling. Take a store whose active sector Y rots in its
+header. Mount takes the other sector X, doubts because Y is corrupt, scans,
+and ends the doubt by rotating into Y. If power is cut after Y's erase, the
+next mount finds X ok and Y erased. Without this rule nothing would make it
+doubt, and it would take X's ceiling, which is older than the ceilings Y
+carried, and issue the ids bound under them a second time. Since a format
+writes both sectors (§3.4a), an erased sector beside an ok one never arises
+in normal use. The rule costs a scan only after a torn rotation.
+
 **Ending the doubt.** A mount that doubts also ends the doubt before it
 returns, so the next mount does not scan again. Only the doubt conditions
 decide this, never the fuse word. Once fuses trip (§4.5a), a mount that finds
@@ -343,9 +405,9 @@ decide this, never the fuse word. Once fuses trip (§4.5a), a mount that finds
    `MASTER_DOUBT` in RAM.
 2. Scan the buckets and raise `next_id` in RAM. Nothing is written yet.
 3. Write once, carrying the raised ceiling (D14) and the pending fuses.
-   - If the other sector is neither erased nor ok, if mount fell back after a
-     torn rotation, or if the store reported damage on a master sector,
-     **rotate**: one erase, which rewrites the other sector.
+   - If the other sector is not ok (erased, or corrupt), if mount fell back
+     after a torn rotation, or if the store reported damage on a master
+     sector, **rotate**: one erase, which rewrites the other sector.
    - If only the last record failed to verify, **append a record**: no erase.
    - A write that mount makes anyway after the scan counts as this write when
      it ends the doubt (an upgrade's rotation).
@@ -443,9 +505,22 @@ seen the bit, while slots already use the feature. The cost is ext4's: a build
 without the feature refuses a store formatted with it, even if no slot uses
 it. Refusing is the safe direction.
 
+**A build writes only the features the store has (D20).** The other direction
+is not a refusal. A build with a slot-flag feature accepts a store formatted
+without it, because the store uses nothing the build cannot read (§4.4), but
+it writes that store as a build without the feature. It decides from the
+store's `incompat`, not from its own Kconfig. A `LARGE_PAYLOADS` build on a
+store without bit 0 writes no INDEXED or SEGMENT slot, and `blob_db_update()`
+and `blob_db_write()` beyond `CONFIG_BLOB_DB_MAX_PAYLOAD_LEN` return
+`-EINVAL`, as they do in a build without the feature. Reads are unchanged:
+such a store holds no segment. Writing the flags anyway would break the
+invariant below. A build without the feature would then mount the store, as
+its headers allow, and meet slots it cannot read (D13). The store gains the
+feature only by an upgrade. The same holds for `DELTA` (phase 3).
+
 **The invariant.** Every master sector that classifies as ok carries every
-feature bit the store has. Format meets it: the active sector carries the
-bits, and the other sector is erased. Rotation keeps it, because the new header
+feature bit the store has. Format meets it: both sectors carry the bits
+(§3.4a). Rotation keeps it, because the new header
 copies the old header's feature sets verbatim, bits the build does not know
 included. Features live only in the header; records carry none. Bits are never
 cleared, except by a format.
@@ -470,12 +545,24 @@ bucket refuses writes with `-ENOTSUP` and is never compacted. Reads of any id
 in that bucket return `-EIO`, because a newer slot for that id may lie beyond
 the one the walk cannot read. That replaces a silently stale value. Once fuses
 trip, `FOREIGN_SLOT` records it (§4.5a). Like everything else on the store, the bucket is
-kept until a format (P9). Compaction also refuses (`-EIO`) to build an
-image when the old bucket still holds programmed bytes beyond the point where
-its walk stopped. A walk that stops at a torn slot cannot be followed by
-programmed bytes, because every append that fails forces a compaction before
-the next one. So the image would otherwise drop slots the walk could not
-read.
+kept until a format (P9).
+
+**The compaction guard (D13).** Compaction drops everything past the point
+where its walk stopped, so it must not drop slots the walk could not read. One
+torn append can leave programmed bytes past that point, but only inside its
+own span. An append programs one slot, at most
+`span = slot_size_for(CONFIG_BLOB_DB_MAX_PAYLOAD_LEN)` bytes from where the
+walk stops. Within that span, it may program them in any order: a QSPI NOR
+page program (256 B) programs the whole page at once, so a cut can leave bits
+anywhere in the page, past a header torn too badly to size. Every append that
+fails forces a compaction before the next one (`confirm_cursor()`), so no
+second append lies beyond a torn one. Compaction therefore refuses (`-EIO`)
+only when a programmed byte lies at or beyond `stop + span`. Bytes inside the
+span are what a torn append leaves, and they are dropped as today. A guard
+that refused on any byte past the stop would turn one power cut inside a page
+program into a bucket that refuses writes until a format. With the cap and
+`write_align` recorded as geometry (D19) and foreign slots detected above,
+the guard is a backstop for data whose origin is unknown.
 
 ### 4.3 Protection
 
@@ -508,10 +595,13 @@ build.required  ⊆ store.incompat         # else -ENOTSUP: a protected build me
 store.suite    == build.suite            # else -ENOTSUP; in every ok header
 store geometry == device geometry        # else -ENOTSUP; in every ok header
 store.rec_size == build's R              # else -ENOTSUP; in every ok header
+store.max_payload_len == build's cap     # else -ENOTSUP; in every ok header (D19)
+store.write_align == device's            # else -ENOTSUP; in every ok header (D19)
 ```
 
 The feature sets are the union over every master sector that classifies as
-ok. Suite, geometry, `hdr_len` and `rec_size` must hold in each of them
+ok. Suite, geometry (the payload cap and `write_align` included), `hdr_len`
+and `rec_size` must hold in each of them
 (§3.1). Records carry no features, so the check runs on the headers alone, before
 any record is read. Every refusal writes nothing.
 
@@ -757,7 +847,10 @@ compacted slot   N = BE96(2⁹⁵ | ((c + offset) mod 2⁹⁵))      N[0] bit 7 
 | Crash during | Mount sees | Outcome |
 |---|---|---|
 | a record append | the last record torn (CRC fails) or still erased | the previous record stands. The update was not acknowledged, so no ceiling or feature it carried was used. Doubt, so the bucket scan raises the id ceiling as today |
-| a rotation, before the header lands | the other sector erased or corrupt; the full sector ok | the full sector's newest record stands; doubt, scan. The next update rotates again |
+| a rotation, before the header lands | the other sector erased or corrupt; the full sector ok | the full sector's newest record stands; doubt (§3.5: an erased other sector is doubt, D18), scan. The doubt-ending write rotates again |
+| a format, between its two sector writes (§3.4a) | B ok, A erased | B's record stands; doubt, a scan of buckets the format has already emptied, then a rotation into A |
+| a format, inside B's write | no usable master, A erased | `-EIO`, nothing written, as a torn first master today; `blob_db_format()` or an autoformat starts again |
+| `erase_all`'s record (§3.3) | the old record, or a torn one | the old, higher ceiling stands, or doubt and a scan; never a ceiling below an id on flash |
 | a rotation, after the header, during record[0] | the new sector's header ok, no record verifies | that sector is unusable; fall back to the other; doubt, scan |
 | the write that ends a doubt (§3.5) | a torn record, or a torn rotation | doubt again: the next mount scans and writes again. The ceiling stays safe, because the write that would have ended the doubt never landed |
 | an upgrade's first rotation | as a rotation (rows above); if it landed, one ok sector has the new bit and the other lacks it | the store does not use the feature yet. A build that knows the bit finishes the upgrade with the second rotation. One that does not know it refuses, because §4.4 takes the union of the ok headers |
@@ -813,13 +906,14 @@ QSPI, about 0.53 s per 64 KB erase):
 | a doubtful mount | a scan at every mount until the next master write | one scan, then 1 record, or 1 rotation (1 erase) when the other sector is bad; the next mount does not scan |
 | a fuse (once fuses trip, §4.5a) | — | 1 record program the first time it trips, at mount or with the next record or `blob_db_maintain()`; 0 erases, except a rotation when the sector is full |
 | flash wear on the master sectors | 1 erase per update | 1 erase per 62–1 362 updates |
+| a format | 1 master sector written | both master sectors written (D18): one more sector write, no more erases |
 
 ## 10. Code and documentation impact
 
 | Where | Change |
 |---|---|
 | `lib/blob_db/blob_db_internal.h` | major-5 header and record structs; the feature and slot-flag registry; the fuse registry |
-| `lib/blob_db/blob_db.c` | `write_master()` becomes `master_update()` and `rotate()`; mount's master classification, log search, feature check and doubt rule; features written at format, the upgrade's two rotations and finishing a half-done upgrade at mount; a sealed, intact slot with an unknown flag refuses its bucket instead of ending its log as torn, and compaction refuses to drop programmed bytes beyond its walk (D13); `persist_seg_owner()` and `persist_next_id_hint()` append records, and every record raises both ceilings (D14); compaction writes no master, and `recover_compaction()` runs on a valid scratch seal at every mount, taking the bucket from the image (D17); every record carries the fuse word forward and a format writes 0 (phase 1); later, `fuse_trip()` at each trip point, the mount and wedge appends, and pending fuses as `blob_db_maintain()` work (§4.5a) |
+| `lib/blob_db/blob_db.c` | `write_master()` becomes `master_update()` and `rotate()`; mount's master classification, log search, feature check and doubt rule; features written at format, the upgrade's two rotations and finishing a half-done upgrade at mount; every format writes both master sectors, and an erased other sector is doubt (D18); the payload cap and `write_align` written at format and checked at mount (D19); segmented writes gated on the store's `LARGE_PAYLOADS` bit, not on Kconfig (D20); a sealed, intact slot with an unknown flag refuses its bucket instead of ending its log as torn, and compaction refuses to drop programmed bytes beyond one slot span past its walk (D13); `persist_seg_owner()` and `persist_next_id_hint()` append records, every record raises both ceilings, and `erase_all`'s record resets the id ceiling (D14); compaction writes no master, and `recover_compaction()` runs on a valid scratch seal at every mount, taking the bucket from the image (D17); every record carries the fuse word forward and a format writes 0 (phase 1); later, `fuse_trip()` at each trip point, the mount and wedge appends, and pending fuses as `blob_db_maintain()` work (§4.5a) |
 | PR #63 | master MAC and tail move into the header and record layouts above; `cbase` becomes a 12-byte random base, and the compacted nonce becomes base + offset (§6); `seq_reserve()` is no longer called by compaction |
 | PR #62 | `DELTA` moves to slot flag bit 5 and is set at format |
 | `include/app/lib/blob_db_inspect.h` (public) | `struct blob_db_inspect_info`: `master_gen` becomes `rot_gen`; `format_minor` stays, always 0 (D15); it gains the three feature sets, `suite`, `rec_size`, the log's fill (records used and per sector) and the raw fuse word |
@@ -848,7 +942,10 @@ QSPI, about 0.53 s per 64 KB erase):
     `seg_owner` records anyway, allocates many ids and writes no ceiling-only
     record (iostats). Every record's ceiling is at least the one before it.
     After a cut at any point, mount's `next_id` is at most `STEP + 1` above the
-    last id handed out, and never at or below it.
+    last id handed out, and never at or below it. **`erase_all`**: a cut at
+    every byte of its record leaves the old ceiling or `2 + 1 + STEP`, never
+    another value, and after the remount no id handed out equals one still on
+    flash. `seq_hint` is unchanged by it.
 3. **The log end**: a torn last record, an erased-but-interrupted slot, and a
    rotten record in the middle give the newest committed state. **The
    invariant** (§3.2a): a record write that fails having programmed nothing
@@ -858,15 +955,23 @@ QSPI, about 0.53 s per 64 KB erase):
    suite as a reference reader, agrees with mount's full read on every store
    the suite produces. A rotten last
    record, and a corrupt other sector, make mount scan.
-3a. **Ending the doubt**: for each doubt condition (a corrupt other sector, a
-    rotten last record, a fallback after a torn rotation, UBI damage on a
-    master sector), mount scans once and writes once: a rotation or a
+3a. **Ending the doubt**: for each doubt condition (a corrupt other sector,
+    an erased other sector, a rotten last record, a fallback after a torn
+    rotation, UBI damage on a master sector), mount scans once and writes once: a rotation or a
     record, as §3.5 says. The next ten mounts do not scan (iostats). The same
     holds once fuses trip, with `MASTER_DOUBT` already set. On UBI
     with atomic replace, a workload that only rewrites existing ids still
     stops scanning after one mount. A cut at every point of the scan and of
     that write leaves the next mount scanning again, with a ceiling above
-    every id on flash.
+    every id on flash. **The torn doubt-ending rotation** (D18): rot the active
+    sector's header after ids were bound under its ceilings, mount, and cut
+    the doubt-ending rotation right after its erase. The next mount doubts on
+    the erased sector, scans, and hands out no id that is on flash.
+3c. **Format writes both sectors** (D18): after `blob_db_format()`, the
+    virgin format and an autoformat, both master sectors are ok with
+    `rot_gen` 1 and 2 and the same record[0], and the next mount does not
+    scan. A cut at every byte of the format leaves either a store that mounts
+    (with a scan when only B landed) or `-EIO` with nothing written.
 3b. **Usable sectors**: a header-only sector (a rotation torn after its
     header) above a usable one makes mount take `cursor`, `state` and `fuses`
     from the lower sector, doubt, and rotate into the header-only one. The
@@ -888,18 +993,26 @@ QSPI, about 0.53 s per 64 KB erase):
    and after its two rotations. Mount either finishes it or leaves the store
    as it was, no segmented write happens until both headers carry the bit, and
    a build without the feature refuses the store from the first rotation on.
+   **Writing only the store's features** (D20): a `LARGE_PAYLOADS` build on a
+   store formatted without the bit returns `-EINVAL` for `update()` and
+   `write()` beyond the cap, and no INDEXED or SEGMENT slot reaches flash. A
+   build without the feature then mounts the store and reads every object.
 5a. **Foreign slot** (D13): forge a sealed slot with an intact CRC and an
     unknown flag into the middle of a bucket. Writes to that bucket return
     `-ENOTSUP`, reads `-EIO`, and nothing is compacted or erased. Once fuses
     trip, `FOREIGN_SLOT` is set. A torn slot at a bucket's tail still compacts as
-    today. A compaction whose walk stops before programmed bytes refuses.
+    today, and so does a torn append whose span holds stray programmed bits
+    anywhere, out of order (a page program cut midway). A compaction whose
+    walk stops more than one slot span before programmed bytes refuses.
 5b. **Format rules** (§3.0, §3.1, §3.2, §3.6):
     - **Golden images.** The suite keeps byte images of a major-5 header and
       record, one per suite, written out by hand from §3. The build must
       parse them, and must write exactly those bytes for the same state, so
       no build can drift from the format.
     - **Refusals.** A `rec_size` other than the build's is refused, and so is
-      an ok other sector whose suite, geometry or `hdr_len` differs. A
+      an ok other sector whose suite, geometry or `hdr_len` differs. So is a
+      `max_payload_len` other than the build's cap, smaller or larger, and a
+      `write_align` other than the device's (D19). A
       `write_align` above 128 is refused. Two ok sectors with equal `rot_gen` return `-EIO`.
       None of these writes anything.
     - **Binding and reserved bytes.** A record copied from an earlier
@@ -940,7 +1053,7 @@ QSPI, about 0.53 s per 64 KB erase):
 
 | Phase | Content |
 |---|---|
-| **1** | Major 5: header, records, rotation, mount search and doubt rule; ceilings and `seg_owner` as records; compaction recovery keyed on the seal (D17); geometry; features with `LARGE_PAYLOADS`; the fuse field and its carry-forward rules (§4.5), with no trip points |
+| **1** | Major 5: header, records, rotation, mount search and doubt rule; format writing both sectors (D18); ceilings and `seg_owner` as records; compaction recovery keyed on the seal (D17); geometry, the payload cap and `write_align` included (D19); features with `LARGE_PAYLOADS`, written only into a store that has them (D20); the fuse field and its carry-forward rules (§4.5), with no trip points |
 | **2** | PR #63 rebased onto it: `suite` and `PROTECTED`, header and record MACs, the random compaction base |
 | **3** | PR #62's `DELTA` rebased onto it: slot flag bit 5, set at format |
 | **later** | Fuse trips (§4.5a), after open item 8: no format change |
