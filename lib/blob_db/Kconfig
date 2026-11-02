@@ -332,13 +332,33 @@ config BLOB_DB_SHELL
 	  an id lives, and a hex dump of a blob. All of those are read-only.
 
 	  `blob_db maintain [budget]` runs blob_db_maintain(): without a budget
-	  it only reports whether work is waiting; with one it is the one
-	  command that writes, a step erasing a block.
+	  it only reports whether work is waiting; with one it writes, a step
+	  erasing a block. BLOB_DB_SHELL_ADMIN adds mount, unmount and format.
 
 	  Every blob_db call the commands make takes the blob_db lock, so they
 	  are safe while the application uses the store, which waits out each
 	  one. A full-store scan reads every bucket sector, which takes a
 	  while on large parts, and is not a snapshot.
+
+config BLOB_DB_SHELL_ADMIN
+	bool "Shell commands to mount, unmount and format the store"
+	depends on BLOB_DB_SHELL
+	help
+	  Add `blob_db mount`, `blob_db unmount` and `blob_db format yes`.
+
+	  For a diagnostics firmware that does not mount on its own
+	  (app_diag), and for the host build that works on an image. Off by
+	  default because these commands change what the rest of the firmware
+	  sees: unmounting or formatting under an application that holds
+	  container handles leaves it working on a store that is gone.
+
+	  `mount` is not read-only. It finishes an interrupted compaction
+	  and formats a partition whose two master sectors read as erased.
+	  It writes nothing when it refuses (-ENOTSUP, -EIO).
+
+	  `format` destroys every blob and needs the word `yes`. It works on a
+	  store that cannot be mounted (blob_db_format()) and leaves the store
+	  mounted.
 
 config BLOB_DB_AUTOFORMAT_ON_CORRUPT
 	bool "Format when no master is usable (destroys the store)"
