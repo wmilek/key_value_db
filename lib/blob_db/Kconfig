@@ -193,6 +193,10 @@ config BLOB_DB_MAX_PAYLOAD_LEN
 	  (sector_size - 16) / 2 - 14 — about 2026 B on 4 KB sectors and
 	  32746 B on 64 KB sectors.
 
+	  The cap is recorded in the store. A build with a larger cap raises
+	  it at mount, keeping the store's blobs, after which builds with the
+	  old cap refuse the store; a build with a smaller cap refuses it.
+
 config BLOB_DB_LARGE_PAYLOADS
 	bool "Objects larger than one slot (segmented)"
 	help

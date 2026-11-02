@@ -167,7 +167,7 @@ struct __packed blob_db_master_hdr {
 	uint8_t  suite;           /* 36      0 = unprotected                    */
 	uint8_t  reserved0[3];    /* 37..39                                     */
 	uint8_t  store_uuid[16];  /* 40..55  0 unless protected                 */
-	uint16_t max_payload_len; /* 56..57  must equal the build's cap (D19)   */
+	uint16_t max_payload_len; /* 56..57  at most the build's cap (D19, D21) */
 	uint16_t write_align;     /* 58..59  must equal the device's (D19)      */
 	uint32_t hdr_crc32;       /* 60..63  CRC32-IEEE over [0, 60)            */
 };

@@ -372,7 +372,7 @@ ZTEST(blob_db_master_log, test_geometry_mismatch_is_refused)
 		const char *what;
 	} cases[] = {
 		{ p_peb, "peb_size" },        { p_buckets, "n_buckets" },
-		{ p_rec, "rec_size" },        { p_cap, "max_payload_len" },
+		{ p_rec, "rec_size" },        { p_cap, "a larger max_payload_len" },
 		{ p_align, "write_align" },   { p_suite, "suite" },
 		{ p_hdr_len, "hdr_len" },
 	};
@@ -446,6 +446,140 @@ ZTEST(blob_db_master_log, test_half_done_upgrade_is_finished)
 			      "master %u lacks the bit after mount", slot);
 	}
 	ml_assert_blob(id, "UPGRADE");
+}
+
+/* D21. A store cap below this build's is raised, not refused: mount rotates
+ * until both headers carry this build's cap, and only then returns, so no
+ * slot above the old cap can be written while a sector a smaller build would
+ * accept still stands. */
+static void ml_lower_cap(uint8_t slot)
+{
+	struct mhdr_img h;
+
+	master_hdr_read_raw(slot, &h);
+	h.max_payload_len = CONFIG_BLOB_DB_MAX_PAYLOAD_LEN - 1;
+	mhdr_seal(&h);
+	master_hdr_rewrite_raw(slot, &h);
+}
+
+static void ml_assert_caps_raised(void)
+{
+	struct mhdr_img h;
+
+	for (uint8_t slot = 0; slot < 2; slot++) {
+		master_hdr_read_raw(slot, &h);
+		zassert_equal(h.max_payload_len, CONFIG_BLOB_DB_MAX_PAYLOAD_LEN,
+			      "master %u still has cap %u", slot,
+			      h.max_payload_len);
+	}
+}
+
+ZTEST(blob_db_master_log, test_smaller_store_cap_is_raised)
+{
+	ML_SKIP_UNLESS_RAW_PARTITION();
+
+	struct blob_db_iostats io;
+	const uint64_t id = ml_put("RAISE");
+
+	zassert_ok(blob_db_unmount());
+	ml_lower_cap(0);
+	ml_lower_cap(1);
+
+	ml_remount(&io);
+	zassert_equal(io.master_rotations, 2,
+		      "raising both headers took %u rotations",
+		      io.master_rotations);
+	zassert_equal(io.erases, 2);
+	zassert_ok(blob_db_unmount());
+	ml_assert_caps_raised();
+
+	ml_remount(&io);
+	zassert_equal(io.writes + io.erases, 0, "the mount after a raise wrote");
+	ml_assert_blob(id, "RAISE");
+
+	/* A store cap above the build's stays refused (D19): see
+	 * test_geometry_mismatch_is_refused. */
+}
+
+/* A raise one sector already carries: one rotation when the lowered sector
+ * is the inactive one, two when it is the active one. */
+ZTEST(blob_db_master_log, test_half_raised_store_is_finished)
+{
+	ML_SKIP_UNLESS_RAW_PARTITION();
+
+	struct blob_db_iostats io;
+	const uint64_t id = ml_put("HALF");
+
+	for (int lowered_active = 0; lowered_active < 2; lowered_active++) {
+		zassert_ok(blob_db_unmount());
+
+		const uint8_t act = master_active_raw();
+
+		ml_lower_cap(lowered_active ? act : !act);
+		ml_remount(&io);
+		zassert_equal(io.master_rotations, lowered_active ? 2 : 1,
+			      "lowered %s sector: %u rotations",
+			      lowered_active ? "active" : "inactive",
+			      io.master_rotations);
+		zassert_ok(blob_db_unmount());
+		ml_assert_caps_raised();
+		zassert_ok(blob_db_mount());
+		ml_assert_blob(id, "HALF");
+	}
+}
+
+/* A raise cut between its two rotations: the second, which rewrites the old
+ * active sector, fails after its erase; the first never touches that sector.
+ * Mount reports the failure; the next mount finishes, and nothing is lost. */
+ZTEST(blob_db_master_log, test_raise_cut_between_rotations)
+{
+	ML_SKIP_UNLESS_RAW_PARTITION();
+
+	const struct flash_area *fa;
+	uint64_t last = 0;
+	const uint64_t id = ml_put("CUT");
+
+	for (int i = 0; i < 3; i++) {
+		last = blob_db_alloc_id();
+	}
+	zassert_ok(blob_db_unmount());
+
+	const uint8_t act = master_active_raw();
+
+	ml_lower_cap(0);
+	ml_lower_cap(1);
+
+	zassert_ok(flash_area_open(MI_PARTITION_ID, &fa));
+
+	const struct device *dev = fa->fa_dev;
+	const off_t sector = fa->fa_off + (off_t)act * MI_SECTOR_SZ;
+
+	flash_area_close(fa);
+
+	memset(&ml_fail, 0, sizeof(ml_fail));
+	ml_fail.lo = sector;
+	ml_fail.hi = sector + MI_SECTOR_SZ;
+	ml_fail.armed = true;
+	flash_simulator_set_callbacks(dev, &ml_cb);
+	zassert_not_equal(blob_db_mount(), 0,
+			  "mount succeeded with its second rotation failing");
+	flash_simulator_set_callbacks(dev, NULL);
+	zassert_true(ml_fail.fired, "the second rotation was not attempted");
+	blob_db_unmount();
+
+	/* What the cut leaves: the sector the first rotation wrote carries the
+	 * raised cap, and no ok sector carries the old one. */
+	struct mhdr_img h;
+
+	master_hdr_read_raw(!act, &h);
+	zassert_equal(h.max_payload_len, CONFIG_BLOB_DB_MAX_PAYLOAD_LEN);
+
+	zassert_ok(blob_db_mount());
+	zassert_ok(blob_db_unmount());
+	ml_assert_caps_raised();
+	zassert_ok(blob_db_mount());
+	ml_assert_blob(id, "CUT");
+	zassert_true(blob_db_alloc_id() > last, "an id was issued twice");
 }
 
 /* 10. The fuse word passes through every record — appends, rotations, the
