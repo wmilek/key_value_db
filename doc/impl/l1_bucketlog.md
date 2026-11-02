@@ -255,6 +255,18 @@ bucket until compaction.) Readers verify the CRC of the one slot they actually
 want, and fall back to the newest intact slot below it — so the visible value is
 always a committed one.
 
+**A foreign slot is not the end of the log.** A slot that is sealed, has a
+`val_len` this build can size, fits the sector and passes its CRC, but carries a
+flag outside `BLOB_DB_SLOT_F_KNOWN`, was written by a build with more slot
+flags. The walk stops there, because it cannot know what the slot means, but it
+reports the slot as foreign, not as a torn tail. The bucket then answers no
+lookup (`-EIO`), since a slot past the stop may supersede the one a lookup would
+find, and takes no write (`-ENOTSUP`). It is never compacted, so the slot
+survives for the build that can read it. If the root's bucket is foreign,
+mount refuses with `-ENOTSUP` rather than bind an empty root over it. The CRC
+check streams the slot in 64 B reads and runs only where a walk stops at a
+sealed slot with an unknown flag.
+
 ### 3.5 Large objects — segments and an index record
 
 With `CONFIG_BLOB_DB_LARGE_PAYLOADS`, a payload too big for one slot is stored
@@ -678,6 +690,16 @@ like any rotten slot (§3.4). One torn inside its header ends the log on
 programmed bytes, and the next append to that bucket would be programmed over
 them and fail its own CRC. So every writer treats such a bucket as full and
 compacts it first (`confirm_cursor()`).
+
+**What compaction may drop.** Compaction keeps what its walk reaches and drops
+the rest, so it first checks that the rest is only what a torn append leaves.
+One append programs one slot, at most `slot_size_for(MAX_PAYLOAD_LEN)` bytes
+from where the walk stopped. Within that span its bytes may be programmed in any
+order: a NOR page program cut midway can leave bits anywhere in the page, beyond
+a header torn too badly to size. A programmed byte further out is data the walk
+could not reach (a build with a larger payload cap, or a stride the walk lost),
+so compaction refuses with `-EIO` and drops nothing. A foreign slot at the stop
+refuses it with `-ENOTSUP` (§3.4).
 
 ## 7. Kconfig
 

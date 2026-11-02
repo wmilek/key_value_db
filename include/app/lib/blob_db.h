@@ -83,6 +83,25 @@ extern "C" {
  * needs several calls to see a consistent store (a container mutation, say)
  * still serializes those itself.
  *
+ * @section blob_db_foreign Slots this build cannot read
+ *
+ * A build that knows more slot flags than this one can write a slot this
+ * build cannot interpret: whole and intact, but carrying a flag it does not
+ * know. Such a slot is data, and slots after it may replace ones before it,
+ * so the bucket that holds it gives no answer that could be stale and takes
+ * no write that could lose it:
+ * - `get()`, `size()` and `read()` of any id in that bucket return `-EIO`,
+ *   and `exists()` returns `false`.
+ * - `update()`, `write()` and `delete()` return `-ENOTSUP`, and nothing in
+ *   the bucket is written, erased or compacted.
+ * - `iterate()` returns `-EIO` when it reaches the bucket, before calling
+ *   back for any of its slots; `count()` counts the blobs before the slot.
+ * - If the root's bucket holds one, `blob_db_mount()` returns `-ENOTSUP`.
+ *
+ * Every other bucket works as usual. The bucket stays as it is until
+ * `blob_db_format()` discards the store; the build that wrote it reads it
+ * normally.
+ *
  * See `doc/layers/l1_blob_db.md` for the on-flash format, algorithms, and crash
  * recovery details.
  */
@@ -181,7 +200,8 @@ uint64_t blob_db_alloc_id(void);
  * @retval -ENOMEM  @p out_sz is smaller than the stored payload
  * @retval -EINVAL  bad arguments
  * @retval -ENODEV  not mounted
- * @retval -EIO     flash I/O error
+ * @retval -EIO     flash I/O error, or the id's bucket holds a slot this build
+ *                  cannot read (see @ref blob_db_foreign)
  */
 int blob_db_get(uint64_t id, void *out, size_t out_sz, size_t *out_len);
 
@@ -213,8 +233,11 @@ int blob_db_get(uint64_t id, void *out, size_t out_sz, size_t *out_len);
  * @retval 0        success
  * @retval -EINVAL  bad arguments, or id was never allocated
  * @retval -ENOSPC  partition is full
+ * @retval -ENOTSUP the id's bucket holds a slot this build cannot read, so it
+ *                  takes no writes (see @ref blob_db_foreign)
  * @retval -ENODEV  not mounted
- * @retval -EIO     flash I/O error
+ * @retval -EIO     flash I/O error, or the bucket holds programmed bytes past
+ *                  the end of its log that compaction would have to drop
  */
 int blob_db_update(uint64_t id, const void *payload, size_t len);
 
@@ -233,7 +256,8 @@ int blob_db_update(uint64_t id, const void *payload, size_t len);
  * @retval -ENOENT  id was never assigned, or has been deleted
  * @retval -EINVAL  bad arguments
  * @retval -ENODEV  not mounted
- * @retval -EIO     flash I/O error
+ * @retval -EIO     flash I/O error, or the id's bucket holds a slot this build
+ *                  cannot read (see @ref blob_db_foreign)
  */
 int blob_db_size(uint64_t id, size_t *out_size);
 
@@ -261,7 +285,9 @@ int blob_db_size(uint64_t id, size_t *out_size);
  * @retval -ENOENT  id was never assigned, or has been deleted
  * @retval -EINVAL  bad arguments
  * @retval -ENODEV  not mounted
- * @retval -EIO     flash I/O error, or a segment is missing or mislabelled
+ * @retval -EIO     flash I/O error, a segment is missing or mislabelled, or a
+ *                  bucket the payload lives in holds a slot this build cannot
+ *                  read (see @ref blob_db_foreign)
  */
 int blob_db_read(uint64_t id, size_t offset, void *out, size_t len,
 		 size_t *out_read);
@@ -302,9 +328,12 @@ int blob_db_read(uint64_t id, size_t offset, void *out, size_t len,
  * @retval -EFBIG   would exceed `CONFIG_BLOB_DB_MAX_OBJECT_LEN`, or would grow
  *                  an inline payload past a single slot (see above)
  * @retval -ENOSPC  no room to commit the change
+ * @retval -ENOTSUP a bucket the write touches holds a slot this build cannot
+ *                  read (see @ref blob_db_foreign)
  * @retval -EINVAL  bad arguments
  * @retval -ENODEV  not mounted
- * @retval -EIO     flash I/O error
+ * @retval -EIO     flash I/O error, or the bucket holds programmed bytes past
+ *                  the end of its log that compaction would have to drop
  */
 int blob_db_write(uint64_t id, size_t offset, const void *buf, size_t len);
 
@@ -321,8 +350,11 @@ int blob_db_write(uint64_t id, size_t offset, const void *buf, size_t len);
  * @retval 0        success
  * @retval -ENOENT  id was never assigned, or has already been deleted
  * @retval -ENOSPC  partition is full (could not write the tombstone)
+ * @retval -ENOTSUP the id's bucket holds a slot this build cannot read (see
+ *                  @ref blob_db_foreign)
  * @retval -ENODEV  not mounted
- * @retval -EIO     flash I/O error
+ * @retval -EIO     flash I/O error, or the bucket holds programmed bytes past
+ *                  the end of its log that compaction would have to drop
  */
 int blob_db_delete(uint64_t id);
 
@@ -330,7 +362,8 @@ int blob_db_delete(uint64_t id);
  * @brief Predicate: does this id currently identify a live blob?
  *
  * @param id        id to test
- * @return          true iff `get(id)` would succeed
+ * @return          true iff `get(id)` would succeed, so false also for an id
+ *                  whose bucket holds a slot this build cannot read
  */
 bool blob_db_exists(uint64_t id);
 
@@ -339,6 +372,10 @@ bool blob_db_exists(uint64_t id);
  *
  * O(n²) in entry count — intended for diagnostics / fsck, not a hot
  * path. See `doc/layers/l1_blob_db.md` §11 for cost details.
+ *
+ * It has no error to return. A bucket that cannot be read counts nothing, and
+ * one that holds a slot this build cannot read (see @ref blob_db_foreign)
+ * counts the blobs before that slot. `blob_db_iterate()` reports both.
  *
  * @return number of live (non-tombstoned) blobs
  */
@@ -372,7 +409,9 @@ typedef int (*blob_db_iter_cb_t)(uint64_t id,
  * @retval 0        full walk completed
  * @retval other    value the callback returned to abort early
  * @retval -ENODEV  not mounted
- * @retval -EIO     flash I/O error
+ * @retval -EIO     flash I/O error, or a bucket holds a slot this build cannot
+ *                  read (see @ref blob_db_foreign); checked before any callback
+ *                  for that bucket
  */
 int blob_db_iterate(blob_db_iter_cb_t cb, void *user);
 

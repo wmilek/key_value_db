@@ -84,7 +84,9 @@
 
 /* Every flag bit this version understands. A slot carrying a bit outside this
  * mask was written by software we do not understand, and its payload must not
- * be handed out as data — see slot_view_at().
+ * be handed out as data. Nor may it be dropped: a whole one closes its bucket
+ * to reads and writes, and compaction leaves it alone — see
+ * slot_foreign_head().
  *
  * This is defense in depth, not the primary guard: introducing a slot flag
  * changes what a payload *means*, so it is a MAJOR format change and mount

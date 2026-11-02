@@ -61,6 +61,10 @@ struct bucket_scan {
 	bool             tail_torn;     /* the walk stopped at a programmed
 					 * header it could not trust: a torn
 					 * slot sits at write_cursor          */
+	bool             foreign;       /* the walk stopped at an intact slot
+					 * written by a build that knows a flag
+					 * this one does not: see
+					 * slot_foreign_head()                */
 };
 
 static int read_bucket_hdr(uint16_t bid, bool *valid);
@@ -792,6 +796,15 @@ static int mount_impl(void)
 
 			rc = find_live_slot(root_bid, BLOB_DB_ROOT_ID, &sc,
 					    g_bbuf);
+			if (rc == -ENOTSUP) {
+				/* Binding an empty root would reformat the
+				 * bucket and erase the slot this build cannot
+				 * read; and without the root the store has no
+				 * entry point. */
+				LOG_ERR("root bucket %u holds a slot with a flag "
+					"this build does not know; refusing",
+					root_bid);
+			}
 			if (rc < 0 && rc != -ENOENT) {
 				goto err_close;
 			}
@@ -942,9 +955,11 @@ static bool slot_walk_at(const uint8_t *buf, off_t off, struct slot_view *out,
 		return false;
 	}
 	/* Written by a version we do not understand: its payload does not mean
-	 * what we would take it to mean, so it is not data. Mount should have
-	 * refused the store already (a new slot flag is a MAJOR change); this
-	 * is the backstop if that discipline ever slips. */
+	 * what we would take it to mean, so the walk cannot go on. Where it is
+	 * whole, it is data all the same, and the bucket is closed rather than
+	 * truncated: see slot_foreign_head(). Mount should have refused such a
+	 * store already (a new slot flag is a MAJOR change); this is the
+	 * backstop if that discipline ever slips. */
 	if (shdr->flags & ~(uint8_t)BLOB_DB_SLOT_F_KNOWN) {
 		return false;
 	}
@@ -971,6 +986,63 @@ static bool slot_walk_at(const uint8_t *buf, off_t off, struct slot_view *out,
 	out->val_len    = shdr->val_len;
 	out->total_size = ssz;
 	return true;
+}
+
+/* Whether a slot header at @p off is one a build with more slot flags than
+ * this one wrote: sealed, a flag outside BLOB_DB_SLOT_F_KNOWN, and a length
+ * this build could size and that fits the sector. Its CRC still has to
+ * verify (slot_foreign_at(), slot_crc_ok_on_flash()) before the slot counts
+ * as foreign rather than torn.
+ *
+ * A foreign slot is not the end of the log. It is data this build cannot
+ * read, and slots after it may supersede ones before it, so its bucket can
+ * answer no lookup and take no write: reads return -EIO, writes -ENOTSUP,
+ * and compaction, which would drop it and everything after it, refuses
+ * (doc/proposals/2026-10-28-master-log.md D13). The bucket is kept as it is
+ * until a format. */
+static bool slot_foreign_head(const struct blob_db_slot_hdr *hdr, off_t off)
+{
+	return hdr->flags != 0xff && (hdr->flags & BLOB_DB_SLOT_F_SEALED) &&
+	       (hdr->flags & ~(uint8_t)BLOB_DB_SLOT_F_KNOWN) &&
+	       hdr->val_len <= CONFIG_BLOB_DB_MAX_PAYLOAD_LEN &&
+	       off + (off_t)slot_size_for(hdr->val_len) <= (off_t)st.peb_size;
+}
+
+/* Whether the slot at buf[off] of a resident bucket image, where a walk
+ * stopped, is foreign: see slot_foreign_head(). */
+static bool slot_foreign_at(const uint8_t *buf, off_t off)
+{
+	if (off + BLOB_DB_SLOT_OVERHEAD > (off_t)st.peb_size) {
+		return false;
+	}
+
+	const struct blob_db_slot_hdr *shdr =
+		(const struct blob_db_slot_hdr *)(buf + off);
+
+	if (!slot_foreign_head(shdr, off)) {
+		return false;
+	}
+
+	uint64_t id;
+	uint16_t stored;
+	const uint8_t *payload = buf + off + sizeof(*shdr) + sizeof(id);
+
+	memcpy(&id, buf + off + sizeof(*shdr), sizeof(id));
+	memcpy(&stored, payload + shdr->val_len, sizeof(stored));
+	return slot_crc16(shdr, id, payload, shdr->val_len) == stored;
+}
+
+/* Whether the log of a resident bucket image ends at a foreign slot. */
+static bool bucket_image_ends_foreign(const uint8_t *buf)
+{
+	off_t off = BLOB_DB_BUCKET_DATA_OFF;
+	struct slot_view sv;
+	bool intact;
+
+	while (slot_walk_at(buf, off, &sv, &intact)) {
+		off += sv.total_size;
+	}
+	return slot_foreign_at(buf, off);
 }
 
 /* An intact slot at buf[off]; false at the end of the log or a rotten slot.
@@ -1063,6 +1135,41 @@ static int read_bucket_hdr(uint16_t bid, bool *valid)
 	return 0;
 }
 
+/* The CRC check of slot_verify(), streamed in small reads: for a slot the
+ * walk stopped at, whose payload is not staged anywhere. Runs only where a
+ * walk stops at a sealed slot with an unknown flag, so its cost is off every
+ * ordinary path. */
+static int slot_crc_ok_on_flash(uint16_t bid, off_t off,
+				const struct slot_head *sh, bool *ok)
+{
+	uint8_t chunk[64];
+	off_t at = bucket_offset(bid) + off + (off_t)sizeof(*sh);
+	size_t left = sh->hdr.val_len;
+	uint16_t c = crc16_ccitt(0xffff, (const uint8_t *)&sh->hdr,
+				 sizeof(sh->hdr));
+	uint16_t stored;
+	int rc;
+
+	c = crc16_ccitt(c, (const uint8_t *)&sh->id, sizeof(sh->id));
+	while (left > 0) {
+		const size_t n = MIN(left, sizeof(chunk));
+
+		rc = blob_db_store_read(at, chunk, n);
+		if (rc < 0) {
+			return rc;
+		}
+		c = crc16_ccitt(c, chunk, n);
+		at += (off_t)n;
+		left -= n;
+	}
+	rc = blob_db_store_read(at, &stored, sizeof(stored));
+	if (rc < 0) {
+		return rc;
+	}
+	*ok = c == stored;
+	return 0;
+}
+
 /* Walk bucket `bid` by slot header, recording the append cursor and the LAST
  * slot whose id is `target_id` and which starts below `limit`.
  *
@@ -1075,7 +1182,9 @@ static int read_bucket_hdr(uint16_t bid, bool *valid)
  *
  * The log still ends at the first header that cannot be trusted to size its
  * own slot — erased, unsealed, carrying unknown flags, or an implausible
- * val_len — because there is no safe stride past it.
+ * val_len — because there is no safe stride past it. Where the slot with
+ * unknown flags is whole, out->foreign says so, and the bucket answers and
+ * takes nothing (slot_foreign_head()).
  */
 static int scan_bucket_for(uint16_t bid, uint64_t target_id, off_t limit,
 			   struct bucket_scan *out)
@@ -1086,6 +1195,7 @@ static int scan_bucket_for(uint16_t bid, uint64_t target_id, off_t limit,
 	out->target_off = -1;
 	out->from_index = false;
 	out->tail_torn = false;
+	out->foreign = false;
 
 	for (;;) {
 		if (cursor + (off_t)BLOB_DB_SLOT_OVERHEAD > (off_t)st.peb_size) {
@@ -1102,9 +1212,19 @@ static int scan_bucket_for(uint16_t bid, uint64_t target_id, off_t limit,
 		    !(sh.hdr.flags & BLOB_DB_SLOT_F_SEALED) ||
 		    (sh.hdr.flags & ~(uint8_t)BLOB_DB_SLOT_F_KNOWN) ||
 		    sh.hdr.val_len > CONFIG_BLOB_DB_MAX_PAYLOAD_LEN) {
+			if (slot_foreign_head(&sh.hdr, cursor)) {
+				bool ok;
+
+				rc = slot_crc_ok_on_flash(bid, cursor, &sh, &ok);
+				if (rc < 0) {
+					return rc;
+				}
+				out->foreign = ok;
+			}
 			/* A slot is programmed from its first byte on, so a
-			 * programmed flags byte here means a torn append. */
-			out->tail_torn = sh.hdr.flags != 0xff;
+			 * programmed flags byte here means a torn append, unless
+			 * the slot is whole and only its flags are unknown. */
+			out->tail_torn = !out->foreign && sh.hdr.flags != 0xff;
 			break;
 		}
 
@@ -1172,6 +1292,11 @@ static int walk_live_slot(uint16_t bid, uint64_t id, struct bucket_scan *sc,
 		if (rc < 0) {
 			return rc;
 		}
+		if (sc->foreign) {
+			/* A newer slot for this id may lie past the one the walk
+			 * cannot read: no answer from here is safe to give. */
+			return -ENOTSUP;
+		}
 		if (sc->target_off < 0) {
 			if (learn && limit == (off_t)st.peb_size) {
 				blob_db_sidx_learn(bid, id, -1,
@@ -1212,12 +1337,13 @@ static int bucket_cursor(uint16_t bid, uint64_t id, struct bucket_scan *sc)
 		sc->target_off = -1;
 		sc->from_index = true;
 		sc->tail_torn = false;
+		sc->foreign = false;
 		return 0;
 	}
 
 	int rc = scan_bucket_for(bid, id, (off_t)st.peb_size, sc);
 
-	if (rc == 0) {
+	if (rc == 0 && !sc->foreign) {
 		blob_db_sidx_learn(bid, id, -1, (uint32_t)sc->write_cursor);
 	}
 	return rc;
@@ -1249,6 +1375,12 @@ static void cursor_past_torn_tail(uint16_t bid, struct bucket_scan *sc)
 static int confirm_cursor(uint16_t bid, uint64_t id, struct bucket_scan *sc)
 {
 	if (!sc->from_index) {
+		if (sc->foreign) {
+			LOG_WRN("bucket %u: a slot at %ld carries a flag this "
+				"build does not know; refusing to write the bucket",
+				bid, (long)sc->write_cursor);
+			return -ENOTSUP;
+		}
 		if (sc->tail_torn) {
 			sc->tail_torn = false;
 			cursor_past_torn_tail(bid, sc);
@@ -1280,6 +1412,9 @@ static int confirm_cursor(uint16_t bid, uint64_t id, struct bucket_scan *sc)
 						     (off_t)st.peb_size, &walk);
 				if (rc < 0) {
 					return rc;
+				}
+				if (walk.foreign) {
+					return -ENOTSUP;
 				}
 				sc->write_cursor = walk.write_cursor;
 				if (walk.tail_torn) {
@@ -1370,6 +1505,7 @@ static int find_indexed_slot(uint16_t bid, uint64_t id,
 	sc->target = sh;
 	sc->from_index = true;
 	sc->tail_torn = false;
+	sc->foreign = false;
 
 	rc = slot_verify(bid, sc, dst);
 	if (rc == -EBADMSG) {
@@ -1530,10 +1666,11 @@ static int append_slot2(uint16_t bid, off_t write_cursor, uint64_t id,
 
 /* Build a compacted image of bucket `bid` in new_buf using old_buf as the
  * source. Returns the number of bytes written into new_buf (≥ 16 for the
- * bucket header). Skipped entries: tombstones, rotten slots, and any slot
- * whose id has a later intact occurrence in the same bucket. */
+ * bucket header), and in *stop the offset in old_buf where the walk ended.
+ * Skipped entries: tombstones, rotten slots, and any slot whose id has a
+ * later intact occurrence in the same bucket. */
 static size_t build_compacted_image(const uint8_t *old_buf, uint8_t *new_buf,
-				    uint16_t bid)
+				    uint16_t bid, off_t *stop)
 {
 	const struct blob_db_bucket_hdr *old_bhdr =
 		(const struct blob_db_bucket_hdr *)old_buf;
@@ -1568,7 +1705,42 @@ static size_t build_compacted_image(const uint8_t *old_buf, uint8_t *new_buf,
 		cursor += sv.total_size;
 	}
 
+	*stop = cursor;
 	return (size_t)new_cursor;
+}
+
+/* Whether compaction may drop everything in old_buf from @p stop, where its
+ * walk ended, to the end of the sector. It drops what it cannot walk, so it
+ * must know that is nothing but erased flash and the remains of one torn
+ * append.
+ *
+ * A foreign slot (slot_foreign_at()) is data: -ENOTSUP, and the bucket stays
+ * as it is. Otherwise one append programs one slot, so a power cut leaves
+ * programmed bytes at most one slot span past the stop, and in any order
+ * within it: a NOR page program cut midway can leave bits anywhere in the
+ * page, beyond a header torn too badly to size. A programmed byte further
+ * out is data the walk could not reach, from a build with another payload cap
+ * or a stride the walk lost: -EIO, and nothing is dropped. */
+static int compaction_may_drop_tail(uint16_t bid, const uint8_t *old_buf,
+				    off_t stop)
+{
+	if (slot_foreign_at(old_buf, stop)) {
+		LOG_ERR("compact bid=%u: a slot at %ld carries a flag this build "
+			"does not know; not compacting", bid, (long)stop);
+		return -ENOTSUP;
+	}
+
+	const off_t span = (off_t)slot_size_for(CONFIG_BLOB_DB_MAX_PAYLOAD_LEN);
+
+	for (off_t i = stop + span; i < (off_t)st.peb_size; i++) {
+		if (old_buf[i] != 0xff) {
+			LOG_ERR("compact bid=%u: programmed bytes at %ld, past "
+				"where the log ends (%ld); not compacting",
+				bid, (long)i, (long)stop);
+			return -EIO;
+		}
+	}
+	return 0;
 }
 
 /* Byte offset of the scratch seal: the tail of the scratch sector, rounded
@@ -1744,7 +1916,15 @@ static int compact_bucket(uint16_t bid)
 
 	g_bbuf_new_busy = true;
 
-	const size_t new_len = build_compacted_image(g_bbuf, g_bbuf_new, bid);
+	off_t stop;
+	const size_t new_len = build_compacted_image(g_bbuf, g_bbuf_new, bid,
+						     &stop);
+
+	rc = compaction_may_drop_tail(bid, g_bbuf, stop);
+	if (rc < 0) {
+		g_bbuf_new_busy = false;
+		return rc;
+	}
 
 	LOG_INF("compact bid=%u: new bucket has %zu B (was up to %zu B)",
 		bid, new_len, st.peb_size);
@@ -3297,6 +3477,9 @@ static size_t count_impl(void)
 		if (!bucket_hdr_valid(g_bbuf, bid)) {
 			continue;
 		}
+		/* count() has no error to return. A bucket holding a foreign
+		 * slot counts the objects before it, as a bucket it cannot read
+		 * counts none (see blob_db_count()). */
 		(void)for_each_live_slot(g_bbuf, count_visitor, &total);
 	}
 	return total;
@@ -3331,6 +3514,14 @@ static int iterate_impl(blob_db_iter_cb_t cb, void *user)
 		}
 		if (!bucket_hdr_valid(g_bbuf, bid)) {
 			continue;
+		}
+
+		/* Checked before any callback: the slots before a foreign
+		 * one may be superseded by slots past it. */
+		if (bucket_image_ends_foreign(g_bbuf)) {
+			LOG_ERR("iterate: bucket %u holds a slot with a flag this "
+				"build does not know", bid);
+			return -EIO;
 		}
 
 		int rc = for_each_live_slot(g_bbuf, iterate_visitor, &t);
@@ -4055,10 +4246,20 @@ uint64_t blob_db_alloc_id(void)
 	return id;
 }
 
+/* Inside the library, -ENOTSUP from a lookup means the bucket holds a
+ * foreign slot (slot_foreign_head()). A writer returns it as it is: the
+ * bucket refuses writes. A reader cannot give an answer either, and to it
+ * that is an I/O error, as the contract has always said for data it cannot
+ * read. No read path returns -ENOTSUP for anything else. */
+static inline int read_rc(int rc)
+{
+	return rc == -ENOTSUP ? -EIO : rc;
+}
+
 int blob_db_get(uint64_t id, void *out, size_t out_sz, size_t *out_len)
 {
 	blob_db_lock();
-	const int rc = get_impl(id, out, out_sz, out_len);
+	const int rc = read_rc(get_impl(id, out, out_sz, out_len));
 
 	blob_db_unlock();
 	return rc;
@@ -4076,7 +4277,7 @@ int blob_db_update(uint64_t id, const void *payload, size_t len)
 int blob_db_size(uint64_t id, size_t *out_size)
 {
 	blob_db_lock();
-	const int rc = size_impl(id, out_size);
+	const int rc = read_rc(size_impl(id, out_size));
 
 	blob_db_unlock();
 	return rc;
@@ -4086,7 +4287,7 @@ int blob_db_read(uint64_t id, size_t offset, void *out, size_t len,
 		 size_t *out_read)
 {
 	blob_db_lock();
-	const int rc = read_impl(id, offset, out, len, out_read);
+	const int rc = read_rc(read_impl(id, offset, out, len, out_read));
 
 	blob_db_unlock();
 	return rc;
