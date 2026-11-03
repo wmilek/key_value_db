@@ -14,6 +14,7 @@
  */
 
 #include <errno.h>
+#include <stddef.h>
 #include <string.h>
 
 #include <zephyr/kernel.h>
@@ -47,11 +48,17 @@ BUILD_ASSERT(sizeof(struct rr_entry) == 16, "rr_entry layout drift");
 BUILD_ASSERT(RR_IMAGE_MAX <= CONFIG_BLOB_DB_MAX_PAYLOAD_LEN,
 	     "ROOTREG_MAX_ROOTS image exceeds BLOB_DB_MAX_PAYLOAD_LEN");
 
-/* RAM image of the registry. */
+/* RAM image of the registry. Both members are packed, so there is no padding:
+ * its first 8 + 16 * count bytes are the on-flash image, and rr_load() and
+ * rr_store() hand it to blob_db directly instead of copying through a buffer.
+ */
 struct rr_image {
 	struct rr_hdr   hdr;
 	struct rr_entry e[CONFIG_ROOTREG_MAX_ROOTS];
 };
+BUILD_ASSERT(sizeof(struct rr_image) == RR_IMAGE_MAX &&
+	     offsetof(struct rr_image, e) == sizeof(struct rr_hdr),
+	     "rr_image no longer matches the on-flash image");
 
 /* Read + validate the registry image from id = 1.
  *
@@ -61,9 +68,8 @@ struct rr_image {
  */
 static int rr_load(struct rr_image *img)
 {
-	uint8_t buf[RR_IMAGE_MAX];
 	size_t got;
-	int rc = blob_db_get(BLOB_DB_ROOT_ID, buf, sizeof(buf), &got);
+	int rc = blob_db_get(BLOB_DB_ROOT_ID, img, sizeof(*img), &got);
 
 	if (rc < 0) {
 		return rc;
@@ -71,8 +77,6 @@ static int rr_load(struct rr_image *img)
 	if (got < sizeof(struct rr_hdr)) {
 		return -ENOTSUP;   /* empty (not bootstrapped) or truncated */
 	}
-
-	memcpy(&img->hdr, buf, sizeof(img->hdr));
 	if (memcmp(img->hdr.magic, RR_MAGIC, 4) != 0 ||
 	    img->hdr.version != RR_VERSION) {
 		return -ENOTSUP;   /* foreign format — refuse to touch */
@@ -84,23 +88,14 @@ static int rr_load(struct rr_image *img)
 			img->hdr.count, got);
 		return -EIO;
 	}
-	memcpy(img->e, buf + sizeof(struct rr_hdr),
-	       img->hdr.count * sizeof(struct rr_entry));
 	return 0;
 }
 
-/* Serialize + commit the image with ONE atomic update of id = 1. */
+/* Commit the image with ONE atomic update of id = 1. */
 static int rr_store(const struct rr_image *img)
 {
-	uint8_t buf[RR_IMAGE_MAX];
-	const size_t len = sizeof(struct rr_hdr) +
-			   img->hdr.count * sizeof(struct rr_entry);
-
-	memcpy(buf, &img->hdr, sizeof(img->hdr));
-	memcpy(buf + sizeof(struct rr_hdr), img->e,
-	       img->hdr.count * sizeof(struct rr_entry));
-
-	return blob_db_update(BLOB_DB_ROOT_ID, buf, len);
+	return blob_db_update(BLOB_DB_ROOT_ID, img, sizeof(struct rr_hdr) +
+			      img->hdr.count * sizeof(struct rr_entry));
 }
 
 static int rr_find(const struct rr_image *img, uint64_t key)
@@ -181,25 +176,23 @@ int rootreg_get(uint64_t key, uint64_t *root_id)
 
 int rootreg_get_or_create(uint64_t key, uint64_t *root_id)
 {
-	if (key == 0 || !root_id) {
-		return -EINVAL;
-	}
+	/* The common case is a key that exists: answer it the way get does,
+	 * which also validates the arguments. The registered root may be
+	 * allocated-but-unbound (creation was interrupted before the caller's
+	 * bind) — still the same id, returned again; the caller lazily binds
+	 * it (§7). Only a missing key goes on to create, and that path reads
+	 * the registry a second time, once per new root. */
+	int rc = rootreg_get(key, root_id);
 
-	struct rr_image img;
-	int rc = rr_load(&img);
-
-	if (rc < 0) {
+	if (rc != -ENOENT) {
 		return rc;
 	}
 
-	int idx = rr_find(&img, key);
+	struct rr_image img;
 
-	if (idx >= 0) {
-		/* The registered root may be allocated-but-unbound (creation
-		 * was interrupted before the caller's bind) — still the same
-		 * id, returned again; the caller lazily binds it (§7). */
-		*root_id = img.e[idx].root_id;
-		return 0;
+	rc = rr_load(&img);
+	if (rc < 0) {
+		return rc;
 	}
 	if (img.hdr.count >= CONFIG_ROOTREG_MAX_ROOTS) {
 		return -ENOSPC;
