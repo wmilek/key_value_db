@@ -41,6 +41,16 @@
 
 LOG_MODULE_REGISTER(persondb, CONFIG_APP_CBOR_PERSONDB_LOG_LEVEL);
 
+/* The Map provider, bound at compile time. Both tables are kvhash maps, so
+ * there is nothing to choose at run time, and a pointer the compiler can see
+ * through lets LTO turn every call into a direct one. That also lets it drop
+ * the table and whichever ops this image never calls: kvhash_next and
+ * kvhash_count in the bench frontend. Storing the address anywhere, even in a
+ * field nothing reads, keeps the whole table and all eight ops in the image
+ * (app_footprint/RESULTS.md §6). Swapping the provider is still this one line.
+ */
+static const struct map_ops *const pdb_ops = &kvhash_map_ops;
+
 #define PADB_MAGIC        0x50414442u /* 'PADB' */
 /* Instance 0: this application is one database, and a database is one
  * structure with one root (P5) -- so it takes one registry entry, and that
@@ -79,7 +89,6 @@ struct persondb {
 	struct superblock     sb;
 	uint64_t              people_root;   /* resolved from sb at open */
 	uint64_t              cred_root;
-	const struct map_ops *ops;
 	struct persondb_stat  st;
 };
 
@@ -102,7 +111,7 @@ static int map_get(struct persondb *db, uint64_t root, const char *key,
 		   void *out, size_t out_sz, size_t *out_len)
 {
 	db->st.map_gets++;
-	return db->ops->get(root, key, strlen(key), out, out_sz, out_len);
+	return pdb_ops->get(root, key, strlen(key), out, out_sz, out_len);
 }
 
 static int map_set(struct persondb *db, uint64_t root, const char *key,
@@ -111,7 +120,7 @@ static int map_set(struct persondb *db, uint64_t root, const char *key,
 	int rc;
 
 	db->st.map_sets++;
-	rc = db->ops->set(root, key, strlen(key), val, len);
+	rc = pdb_ops->set(root, key, strlen(key), val, len);
 	if (rc == -ENOSPC) {
 		/* Two different walls arrive here as the same errno, and the
 		 * application cannot tell them apart:
@@ -139,7 +148,7 @@ static int map_set(struct persondb *db, uint64_t root, const char *key,
 static int map_del(struct persondb *db, uint64_t root, const char *key)
 {
 	db->st.map_dels++;
-	return db->ops->del(root, key, strlen(key));
+	return pdb_ops->del(root, key, strlen(key));
 }
 
 static int cred_put(struct persondb *db, const char *card, uint32_t person_id)
@@ -319,7 +328,7 @@ static int create_store(struct persondb *db, uint32_t n_persons)
 		return -EIO;
 	}
 
-	int rc = db->ops->create(db->people_root, &people_cfg);
+	int rc = pdb_ops->create(db->people_root, &people_cfg);
 
 	if (rc != 0) {
 		return rc;
@@ -330,7 +339,7 @@ static int create_store(struct persondb *db, uint32_t n_persons)
 		return -EIO;
 	}
 
-	rc = db->ops->create(db->cred_root, &cred_cfg);
+	rc = pdb_ops->create(db->cred_root, &cred_cfg);
 	if (rc != 0) {
 		return rc;
 	}
@@ -349,8 +358,8 @@ static int create_store(struct persondb *db, uint32_t n_persons)
 
 	struct map_info people_info, cred_info;
 
-	if (db->ops->stat && db->ops->stat(db->people_root, &people_info) == 0 &&
-	    db->ops->stat(db->cred_root, &cred_info) == 0) {
+	if (pdb_ops->stat && pdb_ops->stat(db->people_root, &people_info) == 0 &&
+	    pdb_ops->stat(db->cred_root, &cred_info) == 0) {
 		LOG_INF("created store for %u persons: people map depth %u, "
 			"%u buckets; credential map depth %u, %u buckets",
 			n_persons, people_info.depth, people_info.buckets,
@@ -460,7 +469,7 @@ static int tables_drop(struct persondb *db, const bool drop[SB_TABLES_MAX])
 			continue;
 		}
 
-		int rc = db->ops->destroy(t->root);
+		int rc = pdb_ops->destroy(t->root);
 
 		if (rc != 0 && rc != -ENOENT) {
 			LOG_ERR("dropping table %u: %d", t->id, rc);
@@ -507,8 +516,8 @@ static int attach_store(struct persondb *db, const uint8_t *buf, size_t len)
 	 * lookup would answer "not found" and every write fail. */
 	struct map_info info;
 
-	if (db->ops->stat(db->people_root, &info) == -ENOENT ||
-	    db->ops->stat(db->cred_root, &info) == -ENOENT) {
+	if (pdb_ops->stat(db->people_root, &info) == -ENOENT ||
+	    pdb_ops->stat(db->cred_root, &info) == -ENOENT) {
 		LOG_ERR("store was being destroyed; persondb_destroy() "
 			"finishes it");
 		return -EINPROGRESS;
@@ -547,7 +556,6 @@ int persondb_open(struct persondb **out, uint32_t n_persons)
 	}
 
 	memset(&db->st, 0, sizeof(db->st));
-	db->ops = &kvhash_map_ops;
 
 	/* This module owns the storage stack end to end, so nothing above it
 	 * ever names blob_db or rootreg (DESIGN.md F12, checked by A7). */
@@ -669,7 +677,7 @@ static int tables_destroy(struct persondb *db)
 				(unsigned long long)t->root);
 			return -EIO;
 		}
-		rc = db->ops->stat(t->root, &info);
+		rc = pdb_ops->stat(t->root, &info);
 		if (rc != 0 && rc != -ENOENT) {
 			LOG_ERR("table %u is not a map this build can "
 				"destroy: %d", t->id, rc);
@@ -685,7 +693,7 @@ static int tables_destroy(struct persondb *db)
 				continue;
 			}
 
-			int rc = db->ops->destroy(t->root);
+			int rc = pdb_ops->destroy(t->root);
 
 			if (rc != 0 && rc != -ENOENT) {
 				LOG_ERR("destroying table %u: %d", t->id, rc);
@@ -715,7 +723,6 @@ int persondb_destroy(struct persondb **out)
 		*out = NULL;
 	}
 	db->open = false;
-	db->ops = &kvhash_map_ops;
 
 	rc = blob_db_mount();
 	if (rc != 0 && rc != -EALREADY) {
@@ -968,7 +975,7 @@ int persondb_person_next(struct persondb *db, const uint32_t *after,
 	 * search, which is what the stat block's map traffic means. */
 	db->st.map_gets++;
 
-	int rc = db->ops->next(db->people_root, after ? cursor : NULL,
+	int rc = pdb_ops->next(db->people_root, after ? cursor : NULL,
 			       after ? strlen(cursor) : 0, key, sizeof(key),
 			       &klen, buf, sizeof(buf), &vlen);
 
@@ -988,7 +995,7 @@ int persondb_person_next(struct persondb *db, const uint32_t *after,
 int persondb_person_count(struct persondb *db, uint32_t *n)
 {
 	size_t count = 0;
-	int rc = db->ops->count(db->people_root, &count);
+	int rc = pdb_ops->count(db->people_root, &count);
 
 	if (rc == 0) {
 		*n = (uint32_t)count;
@@ -1148,7 +1155,7 @@ int persondb_card_owner(struct persondb *db, const char *card,
 int persondb_card_count(struct persondb *db, uint32_t *n)
 {
 	size_t count = 0;
-	int rc = db->ops->count(db->cred_root, &count);
+	int rc = pdb_ops->count(db->cred_root, &count);
 
 	if (rc == 0) {
 		*n = (uint32_t)count;
@@ -1449,11 +1456,11 @@ int persondb_stat(struct persondb *db, struct persondb_stat *out)
 	 * already had to persist in order to work. */
 	struct map_info info;
 
-	if (db->ops->stat && db->ops->stat(db->people_root, &info) == 0) {
+	if (pdb_ops->stat && pdb_ops->stat(db->people_root, &info) == 0) {
 		out->people_depth = info.depth;
 		out->people_buckets = info.buckets;
 	}
-	if (db->ops->stat && db->ops->stat(db->cred_root, &info) == 0) {
+	if (pdb_ops->stat && pdb_ops->stat(db->cred_root, &info) == 0) {
 		out->cred_depth = info.depth;
 		out->cred_buckets = info.buckets;
 	}
