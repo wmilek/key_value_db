@@ -394,7 +394,7 @@ inequality itself against the real geometry. The app carried a `BUILD_ASSERT`
 and a mount-time check of its own; both are now deleted, because the layer that
 owns the constants answers the question (see B9).
 
-### B6 — 128 KB of `.bss` for sector buffers (major, **`measured`** — still open)
+### B6 — 128 KB of `.bss` for sector buffers (major, **`measured`** — partly fixed: one sector buffer left)
 
 `g_bbuf` and `g_bbuf_new` are each `CONFIG_BLOB_DB_SECTOR_BUF_SIZE` — 64 KB on
 the DK, so **128 KB, a quarter of the nRF5340's 512 KB RAM**, permanently
@@ -435,6 +435,17 @@ Reading by slot header removed the *reason* the read path needed a resident
 sector; retiring the buffers themselves needs the compaction path to stream
 too. That is the remaining work, and it is still worth more RAM than everything
 else in this register combined.
+
+**`g_bbuf_new` is gone.** Compaction now rewrites the bucket image in place in
+`g_bbuf`. Each live slot moves down over bytes the walk has already passed, and
+the "is it superseded?" test only looks ahead of the walk, so the old image
+never needs a second copy. Slot staging, the other job `g_bbuf_new` had, moved
+to a buffer sized to the largest slot, `MAX_PAYLOAD_LEN + 14` B rounded up to
+32. For this app (64 KB sectors, 16 KB cap) the two buffers come to
+65 536 + 16 416 = **81 952 B instead of 131 072, −49 120 B**. Those are symbol
+sizes from a `native_sim` build of this app. The DK's total RAM has not been
+re-measured. One sector buffer stays: `count`, `iterate` and compaction still
+need a resident sector, because their latest-wins check is O(n²) in slots.
 
 ### B7 — First write to a fresh bucket stalls ~1.1 s (moderate, `read`)
 

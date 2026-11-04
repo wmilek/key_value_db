@@ -401,8 +401,9 @@ config BLOB_DB_SECTOR_BUF_SIZE
 	default 4096
 	range 256 65536
 	help
-	  Upper bound on the flash sector size blob_db supports. Two buffers
-	  of this size live in .bss (guarded by the blob_db lock); mount refuses
+	  Upper bound on the flash sector size blob_db supports. One buffer
+	  of this size lives in .bss (guarded by the blob_db lock), next to a
+	  slot staging buffer of about BLOB_DB_MAX_PAYLOAD_LEN; mount refuses
 	  a partition whose sector is larger than this. Set to at least the
 	  target flash's largest sector — e.g. 65536 for the mx25r64 QSPI
 	  NOR on the nRF5340-DK.

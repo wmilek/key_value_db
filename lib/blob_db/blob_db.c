@@ -91,8 +91,8 @@ static inline void idx_invalidate(void);
 #endif
 
 /* Upper bound on the sector size we can hold in RAM. mount refuses larger
- * partitions. Two full-sector buffers live in .bss (below); every public call
- * holds g_lock for its whole duration, so sharing them across calls is safe. */
+ * partitions. One full-sector buffer lives in .bss (below); every public call
+ * holds g_lock for its whole duration, so sharing it across calls is safe. */
 #define BLOB_DB_SECTOR_BUF_MAX CONFIG_BLOB_DB_SECTOR_BUF_SIZE
 
 /* Largest write unit blob_db stages for: slots and master records are padded
@@ -103,21 +103,29 @@ static inline void idx_invalidate(void);
 #define BLOB_DB_MASTER_REC_MAX                                                 \
 	ROUND_UP(sizeof(struct blob_db_master_rec), BLOB_DB_MAX_WRITE_ALIGN)
 
-/* Sector-sized scratch buffers. g_bbuf is used by every read-a-bucket op
- * (mount, get, update, delete, exists, count, iterate) and by compaction
- * as the "old" image; g_bbuf_new is used by compaction as the "new" image.
+/* The one sector-sized scratch buffer. Every read-a-bucket op (mount, get,
+ * update, delete, exists, count, iterate) reads into it, and compaction
+ * rewrites the bucket image inside it in place (build_compacted_image()).
  *
  * Every buffer handed to the store is word-aligned: nrf_qspi_nor DMAs only
  * from aligned RAM and otherwise copies through a 4-byte stack buffer
  * (CONFIG_NORDIC_QSPI_NOR_STACK_WRITE_BUFFER_SIZE), one program per word.
- * On the nRF5340-DK an unaligned g_bbuf_new made writes 4.3x slower. */
+ * On the nRF5340-DK an unaligned staging buffer made writes 4.3x slower. */
 static uint8_t __aligned(4) g_bbuf[BLOB_DB_SECTOR_BUF_MAX];
-static uint8_t __aligned(4) g_bbuf_new[BLOB_DB_SECTOR_BUF_MAX];
 
-/* Set while compaction owns g_bbuf_new, so append_slot() — which also stages
- * there — can assert the two never overlap. Debug builds only; release
- * compiles the assert away and this stays a dead store. */
-static bool g_bbuf_new_busy;
+/* Largest slot append_slot2() can stage: the biggest payload, its overhead,
+ * padded to the largest write unit open accepts. Every write_align open
+ * accepts is a power of two no larger than BLOB_DB_MAX_WRITE_ALIGN, so
+ * slot_size_for() never rounds past this. */
+#define BLOB_DB_SLOT_BUF_MAX                                                   \
+	ROUND_UP(BLOB_DB_SLOT_OVERHEAD + CONFIG_BLOB_DB_MAX_PAYLOAD_LEN,       \
+		 BLOB_DB_MAX_WRITE_ALIGN)
+
+/* Where append_slot2() assembles a slot before its single write. Its own
+ * buffer, not g_bbuf: a partial blob_db_write() hands it a payload that lives
+ * in g_bbuf. Mount refuses a payload cap above half a sector, so this is at
+ * most half the size of g_bbuf. */
+static uint8_t __aligned(4) g_slot_buf[BLOB_DB_SLOT_BUF_MAX];
 
 /* Serializes every public call (contract §5). Recursive, so a public call
  * made from inside another — an iterate callback, or the library calling its
@@ -1953,22 +1961,28 @@ static int append_slot2(uint16_t bid, off_t write_cursor, uint64_t id,
 			uint8_t extra_flags, const void *hdr, uint16_t hdr_len,
 			const void *payload, uint16_t val_len)
 {
-	/* Staged in the compaction scratch buffer rather than on the stack:
-	 * at CONFIG_BLOB_DB_MAX_PAYLOAD_LEN=4096 a stack frame here was ~4.1 KB,
-	 * over the 4 KB bound contract R7 sets. g_bbuf_new is sector-sized and
-	 * a slot is smaller than a sector by construction, so it always fits.
-	 *
-	 * Safe because compaction always *completes* before its caller appends
-	 * — blob_db_update()/blob_db_delete() call compact_bucket() and only
-	 * then append_slot(), never the other way round. The assert pins that. */
-	__ASSERT(!g_bbuf_new_busy, "append_slot re-entered compaction scratch");
+	/* Staged in g_slot_buf rather than on the stack: at
+	 * CONFIG_BLOB_DB_MAX_PAYLOAD_LEN=4096 a stack frame here was ~4.1 KB,
+	 * over the 4 KB bound contract R7 sets. The buffer holds the largest
+	 * slot the cap allows; the walk rejects anything longer as rot, so no
+	 * caller has a reason to append one. */
+	if (val_len > CONFIG_BLOB_DB_MAX_PAYLOAD_LEN || hdr_len > val_len) {
+		__ASSERT(false, "append_slot: val_len %u hdr_len %u over the cap",
+			 val_len, hdr_len);
+		return -EINVAL;
+	}
+	if (st.write_align > BLOB_DB_MAX_WRITE_ALIGN) {
+		LOG_ERR("write_align %zu exceeds BLOB_DB_MAX_WRITE_ALIGN=%u",
+			st.write_align, BLOB_DB_MAX_WRITE_ALIGN);
+		return -ENOTSUP;
+	}
 
 	/* Every mutation in the library funnels through here, so this one line
 	 * is the whole invalidation story for the index cache: an append can
 	 * change what an id's index record says, and no read appends. */
 	IDX_INVALIDATE();
 
-	uint8_t *buf = g_bbuf_new;
+	uint8_t *buf = g_slot_buf;
 
 	struct blob_db_slot_hdr *shdr = (struct blob_db_slot_hdr *)buf;
 
@@ -2000,11 +2014,6 @@ static int append_slot2(uint16_t bid, off_t write_cursor, uint64_t id,
 	if (total > base) {
 		memset(buf + base, 0xff, total - base);
 	}
-	if (st.write_align > BLOB_DB_MAX_WRITE_ALIGN) {
-		LOG_ERR("write_align %zu exceeds BLOB_DB_MAX_WRITE_ALIGN=%u",
-			st.write_align, BLOB_DB_MAX_WRITE_ALIGN);
-		return -ENOTSUP;
-	}
 
 	int rc = blob_db_store_write(bucket_offset(bid) + write_cursor,
 				     buf, total);
@@ -2025,25 +2034,29 @@ static int append_slot2(uint16_t bid, off_t write_cursor, uint64_t id,
 
 /* Per-bucket compaction & crash recovery (stage 5) ---------------------- */
 
-/* Build a compacted image of bucket `bid` in new_buf using old_buf as the
- * source. Returns the number of bytes written into new_buf (≥ 16 for the
- * bucket header), and in *stop the offset in old_buf where the walk ended.
- * Skipped entries: tombstones, rotten slots, and any slot whose id has a
- * later intact occurrence in the same bucket. */
-static size_t build_compacted_image(const uint8_t *old_buf, uint8_t *new_buf,
-				    uint16_t bid, off_t *stop)
+/* Compact bucket `bid` in place: rewrite the image in buf so it holds only
+ * what survives, packed from the start of the data area. Returns the
+ * compacted image's length (≥ 16 for the bucket header), and in *stop the
+ * offset where the walk of the old image ended. Skipped entries: tombstones,
+ * rotten slots, and any slot whose id has a later intact occurrence in the
+ * same bucket.
+ *
+ * One buffer is enough because the walk never reads what it has written:
+ *  - a kept slot moves to new_cursor ≤ cursor, so it lands on bytes the walk
+ *    has already passed (memmove, since the two can overlap);
+ *  - slot_superseded() looks only at slots *after* the one being judged,
+ *    which start at or past cursor + total_size, beyond anything written;
+ *  - everything from *stop on is left untouched, so the caller's tail check
+ *    reads the old bytes.
+ * The old image is gone from RAM afterwards, but it is still on flash: the
+ * caller commits through the scratch sector or an atomic replace, and on any
+ * error before that the bucket is unchanged and buf is just scratch. */
+static size_t build_compacted_image(uint8_t *buf, uint16_t bid, off_t *stop)
 {
-	const struct blob_db_bucket_hdr *old_bhdr =
-		(const struct blob_db_bucket_hdr *)old_buf;
+	struct blob_db_bucket_hdr *bhdr = (struct blob_db_bucket_hdr *)buf;
 
-	struct blob_db_bucket_hdr *new_bhdr =
-		(struct blob_db_bucket_hdr *)new_buf;
-
-	memcpy(new_bhdr->magic, BUCKET_MAGIC, 4);
-	new_bhdr->bucket_id = bid;
-	new_bhdr->reserved  = 0;
-	new_bhdr->gen       = old_bhdr->gen + 1;
-	new_bhdr->hdr_crc32 = hdr_crc32(new_bhdr, sizeof(*new_bhdr));
+	/* The header is rewritten in place, so take the old generation first. */
+	const uint32_t old_gen = bhdr->gen;
 
 	off_t new_cursor = BLOB_DB_BUCKET_DATA_OFF;
 	off_t cursor     = BLOB_DB_BUCKET_DATA_OFF;
@@ -2052,19 +2065,27 @@ static size_t build_compacted_image(const uint8_t *old_buf, uint8_t *new_buf,
 		struct slot_view sv;
 		bool intact;
 
-		if (!slot_walk_at(old_buf, cursor, &sv, &intact)) {
+		if (!slot_walk_at(buf, cursor, &sv, &intact)) {
 			break;
 		}
 
 		if (intact && !(sv.flags & BLOB_DB_SLOT_F_TOMBSTONE) &&
-		    !slot_superseded(old_buf, cursor, &sv)) {
-			memcpy(new_buf + new_cursor,
-			       old_buf + cursor, sv.total_size);
+		    !slot_superseded(buf, cursor, &sv)) {
+			if (new_cursor != cursor) {
+				memmove(buf + new_cursor, buf + cursor,
+					sv.total_size);
+			}
 			new_cursor += sv.total_size;
 		}
 
 		cursor += sv.total_size;
 	}
+
+	memcpy(bhdr->magic, BUCKET_MAGIC, 4);
+	bhdr->bucket_id = bid;
+	bhdr->reserved  = 0;
+	bhdr->gen       = old_gen + 1;
+	bhdr->hdr_crc32 = hdr_crc32(bhdr, sizeof(*bhdr));
 
 	*stop = cursor;
 	return (size_t)new_cursor;
@@ -2254,15 +2275,12 @@ static int compact_bucket(uint16_t bid)
 		return -EINVAL;
 	}
 
-	g_bbuf_new_busy = true;
-
 	off_t stop;
-	const size_t new_len = build_compacted_image(g_bbuf, g_bbuf_new, bid,
-						     &stop);
+	const size_t new_len = build_compacted_image(g_bbuf, bid, &stop);
 
+	/* Reads only from stop on, which the in-place rewrite left alone. */
 	rc = compaction_may_drop_tail(bid, g_bbuf, stop);
 	if (rc < 0) {
-		g_bbuf_new_busy = false;
 		return rc;
 	}
 
@@ -2271,7 +2289,7 @@ static int compact_bucket(uint16_t bid)
 	IO_CAUSE(compactions);
 	IO_CAUSE_BYTES(bytes_compacted, new_len);
 
-	rc = compact_commit(bid, g_bbuf_new, new_len);
+	rc = compact_commit(bid, g_bbuf, new_len);
 
 	/* Every slot moved. The image is still in RAM, so re-index it from
 	 * there rather than leave the bucket's lookups to walk. */
@@ -2283,7 +2301,7 @@ static int compact_bucket(uint16_t bid)
 
 		blob_db_sidx_begin(bid, (uint32_t)off);
 		while (off < (off_t)new_len &&
-		       slot_view_at(g_bbuf_new, off, &sv)) {
+		       slot_view_at(g_bbuf, off, &sv)) {
 			const bool tomb =
 				(sv.flags & BLOB_DB_SLOT_F_TOMBSTONE) != 0;
 
@@ -2296,7 +2314,6 @@ static int compact_bucket(uint16_t bid)
 		}
 	}
 
-	g_bbuf_new_busy = false;
 	return rc;
 }
 
