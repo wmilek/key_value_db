@@ -1,6 +1,6 @@
 # Design change proposal — kvdb tools: one shell, on the device and on images
 
-Status: **proposal**, step 1 and part of step 2 landed (`app_diag/`, `blob_db mount` · `unmount` · `format`) · 2026-11-02
+Status: **proposal**, step 1 and part of step 2 landed (`app_diag/`, `blob_db mount` · `unmount` · `format`, `blob_db export` · `import`) · 2026-11-02
 · Builds on: `lib/blob_db/blob_db_shell.c`, `include/app/lib/blob_db_inspect.h`,
   the store seam `lib/blob_db/blob_db_store.h`
 · Governed by `doc/principles.md`
@@ -52,6 +52,7 @@ Planned groups, by layer (none beyond `blob_db`, `flash`, `kernel` and
 ```
 blob_db  info · stats · buckets · bucket · id · dump · maintain · iostats    exists
          mount · unmount · format yes                                        exists (SHELL_ADMIN)
+         export · import (logical dump, doc/tools/blob_db_export.md)         exists (import: SHELL_ADMIN)
          ls · get · verify                                                   later
 ubi      info · peb · ec-hist (wear)                                         L0
 rootreg  ls · get · set · rm                                                 L1½
@@ -129,6 +130,11 @@ Fault injection reuses `tests/support/flash_fault`.
   must be reproducible: the same manifest gives the same bytes.
 - **Getting an image off a device:** a debug-probe read of the partition
   range. Streaming it over the shell is the slow fallback.
+- **Getting the content off a device:** `blob_db export` prints the live
+  objects as checksummed lines, and `blob_db import` restores them into a
+  fresh store with every id and `next_id`
+  ([format](../tools/blob_db_export.md)). That is logical, not an image: it
+  crosses geometries and format versions, and keeps no layout.
 - **diff:** compares two images at the logical level: ids, keys and paths
   added, changed or removed, not bytes. Run against the replay bench in
   `kvdb-workloads`, it shows what a workload did to the store.
@@ -138,7 +144,7 @@ Fault injection reuses `tests/support/flash_fault`.
 | Step | Content | New commands |
 |---|---|---|
 | **1** (landed) | `app_diag/`: shell only, existing groups (`blob_db`, `blob_db iostats`, `flash`, `kernel`, `device`); no mount unless `CONFIG_APP_DIAG_MOUNT_AT_BOOT=y`; nRF5340-DK build plus a `native_sim` build whose store flash is a partition image (`--kvdb=<file>`); twister runs both variants | none |
-| 2 | `blob_db mount` / `unmount` / `format yes` behind `CONFIG_BLOB_DB_SHELL_ADMIN` (**landed**); read-only groups for `rootreg`, `kvdb`, `blobfs` | yes |
+| 2 | `blob_db mount` / `unmount` / `format yes` behind `CONFIG_BLOB_DB_SHELL_ADMIN` (**landed**); `blob_db export` / `import` and `scripts/blob_db_export.py` (**landed**, import on native_sim); read-only groups for `rootreg`, `kvdb`, `blobfs` | yes |
 | 3 | Copy-on-write store under the seam, so a mount on an image writes nothing unless committed; `west kvdb` wrapper (build per profile, run on an image, batch input, machine-readable output) | wrapper only |
 | 4 | fsck L0/L1, then container walkers and reachability | `fsck` |
 | 5 | `danger` group behind a Kconfig option and `unlock`; fault injection | `danger` |

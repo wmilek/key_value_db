@@ -45,3 +45,27 @@ tests:
     platform_allow:
       - native_sim
     harness: pytest
+    harness_config:
+      pytest_root:
+        - "pytest/test_reboot.py"
+
+  # A dump made on the host is imported line by line into a fresh store and
+  # exported again: every object comes back at its own id, with next_id.
+  app.diag.export:
+    platform_allow:
+      - native_sim
+    harness: pytest
+    harness_config:
+      pytest_root:
+        - "pytest/test_export.py"
+
+  # The same with large payloads: one object is segmented.
+  app.diag.export.large:
+    platform_allow:
+      - native_sim
+    extra_configs:
+      - CONFIG_BLOB_DB_LARGE_PAYLOADS=y
+    harness: pytest
+    harness_config:
+      pytest_root:
+        - "pytest/test_export.py"
