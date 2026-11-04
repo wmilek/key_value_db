@@ -290,3 +290,35 @@ Already off in the shipped build, so nothing to gain: `UBI_VERIFY_ON_READ`,
 What is left in PSA Crypto (10.3 KB) is mostly its core, `psa_crypto.c` at 4.5 KB,
 then AES 1.4, the MAC layer 1.0, SHA-256 0.9 and CMAC 0.8. No Kconfig setting
 reaches the core.
+
+## 6. How persondb binds its Map provider
+
+persondb used to keep the provider in its handle (`db->ops = &kvhash_map_ops`)
+and call through it. Because the table's address was stored in RAM, the
+linker had to keep the whole table, and every function it points to, in
+every build. In the bench frontend that means `kvhash_next` and
+`kvhash_count`, which only the shell and the TUI call. persondb now binds the
+provider at compile time (`static const struct map_ops *const pdb_ops`), and
+the address is never stored.
+
+Measured on key_value_db `09b6803f1a65` (plus this change), Zephyr
+`ec98918869ca`, SDK 1.0.1, nRF5340-DK. The §4 and §5 rows above were taken at
+an older key_value_db, so the shipped image here is larger.
+
+| Build | Before | After | Δ |
+|---|--:|--:|--:|
+| shipped, no LTO | 112 652 | 112 652 | 0 |
+| §5 trimmed, no LTO | 78 200 | 78 184 | -16 |
+| §5 trimmed + `CONFIG_LTO=y` | 70 504 | **69 224** | **-1 280** |
+| shell frontend, no LTO | 174 172 | 174 124 | -48 |
+
+- **With LTO** every `pdb_ops->...` call becomes a direct call. `kvhash_map_ops`
+  disappears, and with it `kvhash_next`, `kvhash_count` and the helpers only
+  they use.
+- **Without LTO** nothing changes. `persondb.c` cannot see into a table that
+  `kvhash.c` defines, so the table and all eight ops stay.
+- **The shell frontend** calls `next` and `count`, so they stay.
+- **Storing the address anywhere**, even in a field nothing reads, brings the
+  whole table back. A test build at the §5 tree that kept only the
+  `db->ops = &kvhash_map_ops` store, with no call reading it, was 1 216 B larger
+  under LTO than one without the store.
