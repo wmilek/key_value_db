@@ -146,8 +146,9 @@ split (spec §2, id lifecycle) dissolves it:
 
 ```
 get_or_create(key):
-    read registry (1 flash read)
+    get(key) (1 flash read)
     if key present: return its root_id
+    read registry again (1 flash read)       only when creating
     id = blob_db_alloc_id()                  RAM only — nothing on flash
     blob_db_update(1, registry + (key,id))   COMMIT — entry durable
     return id                                caller now binds/populates the root
