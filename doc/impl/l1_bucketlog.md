@@ -454,7 +454,7 @@ bid = id % N
 ensure bucket formatted (header write on first use)
 if write_cursor[bid] + slot_size(len) > sector_end:
     compact_bucket(bid); if still no room: return -ENOSPC
-build slot in stack buffer; flash_area_write at write cursor
+build slot in the slot staging buffer; write it at the write cursor
 ```
 
 On rebind the previous slot for the id becomes garbage until compaction.
@@ -566,8 +566,11 @@ Verify presence (1 read); append a TOMBSTONE slot (`val_len = 0`).
 
 ### 5.6 `compact_bucket(bid)`
 
-Build the compacted image (live slots only) in RAM, check that what it drops
-past the end of its walk is only what one torn append can leave (§6.2), then:
+Read the bucket into the sector buffer and compact it there, in place: each
+live slot moves down over the bytes the walk has already passed, so one
+sector-sized buffer holds both the old image (ahead of the walk) and the new
+one (behind it). Check that what it drops past the end of its walk is only
+what one torn append can leave (§6.2), then:
 
 ```
 erase scratch; write new image to scratch; seal it   ── enters the window
@@ -925,10 +928,12 @@ draft implementation and will be reworked against the final API; the
    keeps **no** `write_cursor[N]` array; each write re-walks the target
    bucket (`walk_bucket`) to find the append cursor (+1 read on
    `update`/`delete`), honoring contract R1 (O(1) steady-state RAM).
-3. **Sector-size portability.** *(Resolved.)* The sector buffers are sized by
-   `BLOB_DB_SECTOR_BUF_SIZE` and mount refuses a partition whose sector is
-   larger. Slot staging moved off the stack into the compaction scratch, so
-   the payload cap no longer drives stack depth (contract R7). The cap itself
+3. **Sector-size portability.** *(Resolved.)* The one sector buffer is sized
+   by `BLOB_DB_SECTOR_BUF_SIZE` and mount refuses a partition whose sector is
+   larger. Compaction works in place in that buffer (§5.6), so there is no
+   second sector image. Slot staging moved off the stack into its own
+   `.bss` buffer of `MAX_PAYLOAD_LEN + 14` B rounded up to 32, so the payload
+   cap no longer drives stack depth (contract R7). The cap itself
    is checked against the geometry at mount: a bucket is an append-only log,
    so a rebind needs two slots to coexist, bounding the payload at
    `(sector − 16) / 2 − 14` — about 2026 B on 4 KB sectors, 32 746 B on 64 KB.
