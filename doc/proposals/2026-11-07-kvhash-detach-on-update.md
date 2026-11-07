@@ -153,7 +153,9 @@ Why reads grow:
 An insert-only workload (2,000 inserts into two maps, then lookups) replays
 identically, counter for counter: no update, no detach. With unchanged re-sets of
 its ~7 B values repeated, detaching every update (`DETACH_MIN_LEN = 0`) saves
-15–25 % of bytes written and no erases, and costs 1.5–2× the reads. That is the
+13–17 % of bytes written and 13–16 % of erases, but costs 1.2–2× the reads. The
+modelled time is 4–20 % worse on the re-set phases and 41–67 % worse on the
+lookup phases (UBI, 4 KiB erase, a 2,048-entry slot index that is full). That is the
 case `DETACH_MIN_LEN` exists for. At the 16 B default those values stay inline:
 the repeats then match today's counters exactly, and a variant that deletes and
 re-inserts the population comes within 0.3 % (one longer record detaches). The
