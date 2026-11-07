@@ -294,6 +294,16 @@ def derive_geometry(expected_entries, typical_entry_bytes, max_entry_bytes,
     # the device built 256. The check has to be the code's twin or it is
     # checking something else.
     buckets = max(buckets, ONE_LEVEL_MAX_BUCKETS)
+    # ...and never more entries per leaf than a payload holds at the
+    # one-level fill target, sized by the largest entry (typical + entry
+    # header when no maximum is declared). The floor above is a fixed byte
+    # count, so on a small payload it alone builds leaves that overflow.
+    # Mirrors the block after it in kvhash.c derive_geometry().
+    ent = max_entry_bytes or (typical_entry_bytes + 4 if typical_entry_bytes
+                              else 0)
+    if ent:
+        per = max(1, safe_bucket // ent)
+        buckets = max(buckets, -(-expected_entries // per))
     m = int(buckets ** 0.5)
     while m * m < buckets:
         m += 1

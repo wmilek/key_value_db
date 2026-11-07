@@ -82,7 +82,14 @@ The derivation, in order:
 3. **Otherwise two levels**, sized at about one entry per bucket but floored so
    that a bucket is worth its own blob: `MIN_BUCKET_BYTES` (4096) of expected
    content per bucket. Below that floor the per-blob overhead — an i-node, a
-   directory slot, a read — costs more than the shorter scan saves. The two
+   directory slot, a read — costs more than the shorter scan saves. The floor
+   is a fixed byte count, so it is capped from the other side by the payload:
+   never more entries per bucket than fit under the near-full threshold at
+   `max_entry_bytes` (or `typical_entry_bytes` plus the entry header when no
+   maximum is declared), the same load step 2 caps a flat bucket at. Without
+   that cap a payload under about 4 KB (a 4 KB erase block) gets buckets whose
+   expected content alone exceeds the payload, and sets start failing with
+   `-ENOSPC` well before the declared population. The two
    levels are made equal (`n = ceil(sqrt(buckets))`), which minimises the
    metadata a lookup touches for a given bucket count.
 4. **A declaration that cannot be honoured is refused**, not quietly built
