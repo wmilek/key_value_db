@@ -20,6 +20,7 @@ target_sources(app PRIVATE src/torn_append.c)
 target_sources(app PRIVATE src/foreign_slot.c)
 # The major-5 master: header, record log, rotation, mount's doubt rules.
 target_sources(app PRIVATE src/master_log.c)
+target_sources(app PRIVATE src/slot_index_clock.c)
 # The UBI backend's own behaviour: refusing a substrate it cannot read, and the
 # application hooks of <app/lib/blob_db_ubi.h>.
 target_sources_ifdef(CONFIG_BLOB_DB_BACKEND_UBI app PRIVATE src/ubi.c)

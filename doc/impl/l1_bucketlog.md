@@ -532,11 +532,37 @@ error no check could catch, naming an *older* slot of an id, cannot arise:
 
 So a crash, a torn write or bit-rot costs a walk, never a wrong answer, and the
 index has no on-flash state and no format impact. When the table is full,
-further ids are not indexed and their lookups walk. Nothing is evicted.
+further ids are not indexed and their lookups walk. Nothing is evicted, unless
+the table is a cache (below).
 `CONFIG_BLOB_DB_SLOT_INDEX_VERIFY` makes every indexed answer also walk and
 assert agreement. The `.slot_index` test scenarios run the blob_db, containers,
 kvdb and blobfs suites that way, on both backends, with large payloads, and
 with a 64-cell table.
+
+**As a cache (`CONFIG_BLOB_DB_SLOT_INDEX_CLOCK`).** Sized for every live id,
+the table can need hundreds of KB. Without eviction it fills with whatever comes
+first, and stays that way. Every append makes an entry, and a compaction
+re-learns all of a bucket's survivors in on-flash order. So ids that are written
+and never read (log records, say) can hold the room that the ids read on every
+operation need. With the option the table is a cache of what is looked up:
+
+- an entry is made only when a walk finds an id (`learn`);
+- an append, or a compaction's re-index, only refreshes an entry already
+  present (`blob_db_sidx_rebuild_begin/_end` keep the bucket's entries and drop
+  those whose id did not survive);
+- a full table evicts by CLOCK: a reference bit per cell, set on each hit, and
+  a hand that clears set bits and evicts the first cell it finds clear. A new
+  entry starts with its bit set, so it survives the hand's next pass.
+
+Eviction only removes entries, so the rules above still hold. RAM is 2 bits per
+cell more. On a recorded rewrite-heavy soak (one two-level map, 1.96 M gets,
+UBI on 64 KiB blocks, about 12 k live ids), 128 cells (1.5 KB) read 20.7 M
+times, against 19.1 M for a 32 768-cell table (384 KB) holding everything and
+100.3 M for a 4 096-cell one without eviction. The hot set was a few hundred
+ids: the map's directories and buckets. The `.slot_index.clock` scenarios run
+the blob_db and containers suites on a 16-cell cache with every answer
+cross-checked. `src/slot_index_clock.c` checks that hot ids stay indexed
+through cold traffic and compactions.
 
 **Effect** (`app_cbor_persondb`, 8 000 persons, DK flash model, flash time only):
 

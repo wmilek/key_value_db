@@ -2299,7 +2299,7 @@ static int compact_bucket(uint16_t bid)
 		off_t off = BLOB_DB_BUCKET_DATA_OFF;
 		struct slot_view sv;
 
-		blob_db_sidx_begin(bid, (uint32_t)off);
+		blob_db_sidx_rebuild_begin(bid, (uint32_t)off);
 		while (off < (off_t)new_len &&
 		       slot_view_at(g_bbuf, off, &sv)) {
 			const bool tomb =
@@ -2311,6 +2311,8 @@ static int compact_bucket(uint16_t bid)
 		}
 		if (off != (off_t)new_len) {
 			blob_db_sidx_forget(bid);
+		} else {
+			blob_db_sidx_rebuild_end(bid);
 		}
 	}
 

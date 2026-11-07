@@ -34,6 +34,29 @@ static uint64_t g_ids[CAP];
 static uint32_t g_offs[CAP];
 static uint32_t g_used;
 
+#if defined(CONFIG_BLOB_DB_SLOT_INDEX_CLOCK)
+/*
+ * CLOCK replacement. The table is a cache of the ids that are looked up:
+ * an entry is created when a walk finds an id (learn), and an append or a
+ * compaction only refreshes an entry already present. When the table is full,
+ * a hand sweeps the cells: a cell whose reference bit is set (looked up since
+ * the hand last passed) has it cleared and is skipped, the first one without
+ * is evicted. Hot ids are touched more often than the hand comes round, so
+ * they stay; ids written and never read never get in.
+ *
+ * Evicting is always safe: the index is a hint, and an id with no entry is
+ * walked, exactly as on a miss. The bits travel with their cells when a
+ * deletion shifts a probe run back (remove_at).
+ */
+static uint8_t g_ref[CAP / 8];
+static uint8_t g_seen[CAP / 8];  /* compaction refresh: survivors seen */
+static uint32_t g_hand;
+#define BIT_GET(a, i)  (((a)[(i) >> 3] >> ((i) & 7)) & 1u)
+#define BIT_SET(a, i)  ((a)[(i) >> 3] |= (uint8_t)(1u << ((i) & 7)))
+#define BIT_CLR(a, i)  ((a)[(i) >> 3] &= (uint8_t)~(1u << ((i) & 7)))
+#define BIT_PUT(a, i, v) do { if (v) { BIT_SET(a, i); } else { BIT_CLR(a, i); } } while (0)
+#endif
+
 /* 0 = unknown. A real cursor is at least the bucket header's length. */
 static uint32_t g_cursor[MAX_BKT];
 /* Entries per bucket, so forgetting a bucket with none costs nothing -- mount
@@ -88,11 +111,50 @@ static void remove_at(uint32_t i)
 		if (!stays) {
 			g_ids[i] = g_ids[j];
 			g_offs[i] = g_offs[j];
+#if defined(CONFIG_BLOB_DB_SLOT_INDEX_CLOCK)
+			BIT_PUT(g_ref, i, BIT_GET(g_ref, j));
+			BIT_PUT(g_seen, i, BIT_GET(g_seen, j));
+#endif
 			g_ids[j] = 0;
 			i = j;
 		}
 	}
 }
+
+#if defined(CONFIG_BLOB_DB_SLOT_INDEX_CLOCK)
+/* Free one cell: sweep from the hand, giving each referenced cell a second
+ * chance. Ends within two turns: every cell passed has its bit cleared. */
+static void evict_one(void)
+{
+	for (;;) {
+		uint32_t i = g_hand;
+
+		if (g_ids[i] != 0) {
+			if (!BIT_GET(g_ref, i)) {
+				/* remove_at may pull a later cell into i; the hand
+				 * stays, so that cell is the next one examined. */
+				remove_at(i);
+				return;
+			}
+			BIT_CLR(g_ref, i);
+		}
+		g_hand = (g_hand + 1) & (CAP - 1);
+	}
+}
+
+/* Refresh @p id's entry if the table holds one; never create one. */
+static bool refresh(uint64_t id, uint32_t off)
+{
+	int32_t i = find(id);
+
+	if (i < 0) {
+		return false;
+	}
+	g_offs[i] = off;
+	BIT_SET(g_seen, (uint32_t)i);
+	return true;
+}
+#endif
 
 static void put(uint64_t id, uint32_t off)
 {
@@ -108,12 +170,24 @@ static void put(uint64_t id, uint32_t off)
 		}
 	}
 	if (g_used >= MAX_FILL) {
+#if defined(CONFIG_BLOB_DB_SLOT_INDEX_CLOCK)
+		evict_one();
+		put(id, off);   /* the eviction may have moved this id's cell */
+		return;
+#else
 		return;   /* full: this id is looked up by walking */
+#endif
 	}
 	g_ids[i] = id;
 	g_offs[i] = off;
 	g_used++;
 	g_bcnt[bucket_of(id)]++;
+#if defined(CONFIG_BLOB_DB_SLOT_INDEX_CLOCK)
+	/* One pass of protection: a new entry may land just ahead of the
+	 * hand, and should get one more lookup before it can go. */
+	BIT_SET(g_ref, i);
+	BIT_SET(g_seen, i);
+#endif
 }
 
 static void drop(uint64_t id)
@@ -133,6 +207,11 @@ static inline bool on(uint16_t bid)
 void blob_db_sidx_reset(uint16_t n_buckets)
 {
 	memset(g_ids, 0, sizeof(g_ids));
+#if defined(CONFIG_BLOB_DB_SLOT_INDEX_CLOCK)
+	memset(g_ref, 0, sizeof(g_ref));
+	memset(g_seen, 0, sizeof(g_seen));
+	g_hand = 0;
+#endif
 	memset(g_cursor, 0, sizeof(g_cursor));
 	memset(g_bcnt, 0, sizeof(g_bcnt));
 	g_used = 0;
@@ -196,8 +275,51 @@ void blob_db_sidx_note(uint16_t bid, uint64_t id, uint32_t off,
 	if (tombstone) {
 		drop(id);
 	} else {
+#if defined(CONFIG_BLOB_DB_SLOT_INDEX_CLOCK)
+		(void)refresh(id, off);   /* an append does not earn a cell */
+#else
 		put(id, off);
+#endif
 	}
+}
+
+void blob_db_sidx_rebuild_begin(uint16_t bid, uint32_t data_off)
+{
+#if defined(CONFIG_BLOB_DB_SLOT_INDEX_CLOCK)
+	if (!on(bid)) {
+		return;
+	}
+	/* Keep the bucket's entries: the notes that follow refresh the ones
+	 * whose ids survived, and rebuild_end drops the rest. Nothing reads
+	 * the index in between. */
+	for (uint32_t i = 0; i < CAP; i++) {
+		if (g_ids[i] != 0 && bucket_of(g_ids[i]) == bid) {
+			BIT_CLR(g_seen, i);
+		}
+	}
+	g_cursor[bid] = data_off;
+#else
+	blob_db_sidx_begin(bid, data_off);
+#endif
+}
+
+void blob_db_sidx_rebuild_end(uint16_t bid)
+{
+#if defined(CONFIG_BLOB_DB_SLOT_INDEX_CLOCK)
+	if (!on(bid) || g_cursor[bid] == 0) {
+		return;
+	}
+	for (uint32_t i = 0; i < CAP && g_bcnt[bid] != 0;) {
+		if (g_ids[i] != 0 && bucket_of(g_ids[i]) == bid &&
+		    !BIT_GET(g_seen, i)) {
+			remove_at(i);   /* its id did not survive the compaction */
+		} else {
+			i++;
+		}
+	}
+#else
+	ARG_UNUSED(bid);
+#endif
 }
 
 void blob_db_sidx_learn(uint16_t bid, uint64_t id, int64_t off,
@@ -233,6 +355,9 @@ bool blob_db_sidx_lookup(uint16_t bid, uint64_t id, uint32_t *off,
 	}
 	*off = g_offs[i];
 	*cursor = g_cursor[bid];
+#if defined(CONFIG_BLOB_DB_SLOT_INDEX_CLOCK)
+	BIT_SET(g_ref, (uint32_t)i);
+#endif
 	return true;
 }
 
