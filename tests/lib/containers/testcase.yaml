@@ -12,3 +12,14 @@ tests:
       - CONFIG_BLOB_DB_SLOT_INDEX_MAX_BUCKETS=2048
       - CONFIG_BLOB_DB_SLOT_INDEX_VERIFY=y
       - CONFIG_ASSERT=y
+  # The slot index as a 16-entry CLOCK cache under the containers: kvhash's
+  # directories, buckets and spilled parts compete for it and are evicted all
+  # the time, with every indexed answer cross-checked against the walk.
+  lib.containers.slot_index.clock:
+    extra_configs:
+      - CONFIG_BLOB_DB_SLOT_INDEX=y
+      - CONFIG_BLOB_DB_SLOT_INDEX_MAX_BUCKETS=2048
+      - CONFIG_BLOB_DB_SLOT_INDEX_ENTRIES=16
+      - CONFIG_BLOB_DB_SLOT_INDEX_CLOCK=y
+      - CONFIG_BLOB_DB_SLOT_INDEX_VERIFY=y
+      - CONFIG_ASSERT=y
