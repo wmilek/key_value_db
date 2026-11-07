@@ -1251,6 +1251,60 @@ ZTEST(kvhash_layout, test_large_population_builds_a_second_level)
 }
 
 /*
+ * A two-level map sizes its leaves against the payload, not only against the
+ * MIN_BUCKET_BYTES floor: the declared population at its declared largest
+ * entry must fit the leaves at the near-full threshold. The floor is a fixed
+ * byte count, so on its own it builds the same 256 leaves under any payload,
+ * and on a small payload (a small erase block) their expected content is more
+ * than a payload holds: sets fail with -ENOSPC long before the declared
+ * population is reached.
+ *
+ * The population is chosen from the payload so the test means the same under
+ * any CONFIG_BLOB_DB_MAX_PAYLOAD_LEN: 300 near-full buckets' worth, which is
+ * past one level (255) and past what 256 leaves hold at that load.
+ */
+ZTEST(kvhash_layout, test_two_level_leaves_fit_the_payload)
+{
+	const size_t maxent = 40;
+	const size_t per = MAX((size_t)CONFIG_BLOB_DB_MAX_PAYLOAD_LEN * 60u / 100u /
+			       maxent, 1u);
+	const size_t entries = 300u * per;
+	size_t baseline = blob_db_count();
+	struct map_config cfg = {
+		.expected_entries = entries,
+		.typical_entry_bytes = 20,
+		.max_entry_bytes = maxent,
+	};
+	struct map_info info = { 0 };
+	uint64_t root = blob_db_alloc_id();
+	char key[8], val[14];
+	size_t count = 0;
+
+	zassert_not_equal(root, 0);
+	zassert_ok(kvhash_map_ops.create(root, &cfg));
+	zassert_ok(kvhash_map_ops.stat(root, &info));
+	zassert_equal(info.depth, 2, "%zu entries should need two levels", entries);
+	zassert_true((size_t)info.buckets * per >= entries,
+		     "%u leaves of %zu entries cannot hold the %zu declared",
+		     info.buckets, per, entries);
+
+	/* And the declared population, at its typical size, goes in. */
+	memset(val, 'v', sizeof(val));
+	for (size_t i = 0; i < entries; i++) {
+		snprintf(key, sizeof(key), "k%05zu", i);
+		zassert_ok(kvhash_map_ops.set(root, key, strlen(key), val,
+					      sizeof(val)),
+			   "set %s of %zu", key, entries);
+	}
+	zassert_ok(kvhash_map_ops.count(root, &count));
+	zassert_equal(count, entries, "count %zu after %zu sets", count, entries);
+
+	zassert_ok(kvhash_map_ops.destroy(root));
+	zassert_equal(blob_db_count(), baseline,
+		      "destroy left %zu blob(s) behind", blob_db_count() - baseline);
+}
+
+/*
  * A bucket is one blob payload. Overflowing it is -ENOSPC, and — the part
  * that matters — the failed insert must leave the bucket exactly as it was.
  *

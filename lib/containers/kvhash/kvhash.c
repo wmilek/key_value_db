@@ -731,6 +731,31 @@ static int derive_geometry(const struct map_config *cfg,
 		buckets = ONE_LEVEL_MAX_BUCKETS;
 	}
 
+	/* ...but never more entries per leaf than a payload holds at the fill
+	 * the one-level path aims for. The floor above counts bytes against a
+	 * fixed MIN_BUCKET_BYTES, not against MAX_PAYLOAD: on a small erase
+	 * block a leaf it sizes can outgrow the payload, and every set into it
+	 * then fails with -ENOSPC. Sized against the largest entry, as the
+	 * one-level load is, so the margin also absorbs uneven hashing. */
+	{
+		size_t ent = maxent != 0 ? maxent :
+			     (typical != 0 ? typical + ENTRY_HDR_LEN : 0);
+
+		if (ent != 0) {
+			size_t per = ((size_t)MAX_PAYLOAD * BUCKET_FILL_PCT /
+				      100u) / ent;
+
+			if (per == 0) {
+				per = 1;
+			}
+			size_t need = (entries + per - 1) / per;
+
+			if (need > buckets) {
+				buckets = need;
+			}
+		}
+	}
+
 	/* Square fan-out minimises the metadata a lookup touches. */
 	size_t side = 1;
 
