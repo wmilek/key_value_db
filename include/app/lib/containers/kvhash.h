@@ -38,6 +38,30 @@ extern const struct map_ops kvhash_map_ops;
  */
 void kvhash_set_inline_max(size_t key_max, size_t val_max);
 
+/**
+ * @brief Turn detach-on-update on or off for writes from now on (draft).
+ *
+ * When on, the first set that replaces an existing key's value moves the
+ * value into a blob of its own, and every later set of that key rewrites only
+ * that blob. Inserts are placed by the inline thresholds as before. Maps
+ * created while it is on are kvhash v4; only those ever hold detached values.
+ * Like the thresholds, a write policy: turning it off never makes stored data
+ * unreadable, and a detached value is placed by the thresholds again on its
+ * key's next set.
+ *
+ * Initialised from CONFIG_BLOB_CONTAINER_KVHASH_DETACH_ON_UPDATE.
+ */
+void kvhash_set_detach_on_update(bool on);
+
+/**
+ * @brief Shortest value an update detaches (draft).
+ *
+ * An update whose new value is shorter than @p min_len stays inline; a value
+ * already detached stays detached. Initialised from
+ * CONFIG_BLOB_CONTAINER_KVHASH_DETACH_MIN_LEN (0 when that is not built).
+ */
+void kvhash_set_detach_min_len(size_t min_len);
+
 #if defined(CONFIG_BLOB_CONTAINER_KVHASH_TEST_HOOKS)
 /**
  * @brief AND-mask applied to every key fingerprint (default all ones).

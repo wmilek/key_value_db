@@ -36,6 +36,15 @@ which never spills. Maps created as v2 are still served, but never spilled, so
 v2 firmware can keep parsing them. Full design:
 `doc/proposals/2026-10-09-kvhash-spill.md`.
 
+**Detaching (v4, draft).** With `CONFIG_BLOB_CONTAINER_KVHASH_DETACH_ON_UPDATE`
+(or `kvhash_set_detach_on_update()`), the first `set` that replaces a key's
+value moves the value into a blob of its own, and every later `set` of that key
+is one write of that blob. The entry is `VS=1` with a length of 0: a detached
+value's length is its blob's, so a length change does not touch the bucket.
+Inserts are placed by the thresholds as before. Only maps created with the
+policy on are v4 and may hold detached entries. Design and measurements:
+`doc/proposals/2026-11-07-kvhash-detach-on-update.md`.
+
 At `depth 1` each `child_id` is a bucket. At `depth 2` each is a sub-directory —
 itself a well-formed `depth 1` directory, so one loader serves both levels — and
 the buckets hang off those. The geometry is fixed at create and never changes.
