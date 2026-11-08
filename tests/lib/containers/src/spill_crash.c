@@ -38,6 +38,14 @@
 
 static const struct map_ops *ops = &kvhash_map_ops;
 
+/* What every other suite runs under. */
+#define DETACH_DEFAULT IS_ENABLED(CONFIG_BLOB_CONTAINER_KVHASH_DETACH_ON_UPDATE)
+#if defined(CONFIG_BLOB_CONTAINER_KVHASH_DETACH_MIN_LEN)
+#define DETACH_MIN_DEFAULT CONFIG_BLOB_CONTAINER_KVHASH_DETACH_MIN_LEN
+#else
+#define DETACH_MIN_DEFAULT 0
+#endif
+
 static const char key[] = "crash-key-long-enough-to-spill-0001";
 #define KL (sizeof(key) - 1)
 
@@ -53,6 +61,12 @@ struct scenario {
 	size_t op_k, op_v;        /* thresholds in force for the operation */
 	size_t new_vlen;
 	size_t max_leak;          /* unreferenced blobs a cut may leave (§5) */
+	/* Detach-on-update (v4). The map is created with detaching on; the
+	 * old state is first written as an insert, then -- with pre_detached --
+	 * set once more so its value is detached before the operation. */
+	bool detach;
+	bool pre_detached;
+	bool op_detach;           /* detaching in force for the operation */
 };
 
 static const struct scenario scenarios[] = {
@@ -72,6 +86,16 @@ static const struct scenario scenarios[] = {
 	  OP_DEL, 0, 0, 0, 2 /* old key, old value */ },
 	{ "delete spilled entry, alone", false, true, 0, 0, 32,
 	  OP_DEL, 0, 0, 0, 2 },
+	{ "inline value becomes detached", true, true, NEVER, NEVER, 24,
+	  OP_SET, NEVER, NEVER, 32, 1 /* new value */, true, false, true },
+	{ "rewrite detached value, same length", true, true, NEVER, NEVER, 32,
+	  OP_SET, NEVER, NEVER, 32, 0 /* one in-place update */, true, true, true },
+	{ "rewrite detached value, new length", true, true, NEVER, NEVER, 32,
+	  OP_SET, NEVER, NEVER, 48, 0 /* one in-place update */, true, true, true },
+	{ "detached value back inline", true, true, NEVER, NEVER, 32,
+	  OP_SET, NEVER, NEVER, 48, 1 /* old value */, true, true, false },
+	{ "delete detached entry", true, true, NEVER, NEVER, 32,
+	  OP_DEL, NEVER, NEVER, 0, 1 /* old value */, true, true, true },
 };
 
 static void crash_before(void *fixture)
@@ -80,6 +104,7 @@ static void crash_before(void *fixture)
 	blob_db_unmount();
 	zassert_ok(blob_db_mount());
 	kvhash_set_inline_max(NEVER, NEVER);
+	kvhash_set_detach_on_update(false);
 	kvhash_test_cut_after = -1;
 	kvhash_test_cut_fired = false;
 }
@@ -88,6 +113,8 @@ static void crash_after(void *fixture)
 {
 	ARG_UNUSED(fixture);
 	kvhash_set_inline_max(NEVER, NEVER);
+	kvhash_set_detach_on_update(DETACH_DEFAULT);
+	kvhash_set_detach_min_len(DETACH_MIN_DEFAULT);
 	kvhash_test_cut_after = -1;
 	kvhash_test_cut_fired = false;
 	blob_db_unmount();
@@ -194,6 +221,8 @@ static int run_op(const struct scenario *s, uint64_t root)
 	uint8_t v[VBUF];
 
 	kvhash_set_inline_max(s->op_k, s->op_v);
+	kvhash_set_detach_on_update(s->op_detach);
+	kvhash_set_detach_min_len(0);
 	if (s->op == OP_DEL) {
 		return ops->del(root, key, KL);
 	}
@@ -225,6 +254,8 @@ static void sweep(const struct scenario *s)
 		uint64_t root = blob_db_alloc_id();
 
 		zassert_not_equal(root, 0);
+		kvhash_set_detach_on_update(s->detach);
+		kvhash_set_detach_min_len(0);
 		zassert_ok(ops->create(root, &cfg));
 		if (s->neighbours) {
 			put_neighbours(root);
@@ -233,6 +264,10 @@ static void sweep(const struct scenario *s)
 			uint8_t v[VBUF];
 
 			kvhash_set_inline_max(s->pre_k, s->pre_v);
+			if (s->pre_detached) {
+				value(v, 5, 0x77); /* an insert; the next set detaches */
+				zassert_ok(ops->set(root, key, KL, v, 5));
+			}
 			value(v, s->pre_vlen, 0xA0);
 			zassert_ok(ops->set(root, key, KL, v, s->pre_vlen));
 		}
@@ -245,6 +280,7 @@ static void sweep(const struct scenario *s)
 		kvhash_test_cut_after = -1;
 		kvhash_test_cut_fired = false;
 		kvhash_set_inline_max(NEVER, NEVER); /* the next boot's policy */
+		kvhash_set_detach_on_update(false);
 		zassert_ok(blob_db_unmount());
 		zassert_ok(blob_db_mount());
 

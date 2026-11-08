@@ -21,6 +21,8 @@
  *     true length, wherever the bytes live. A spilled key or value is a blob
  *     holding exactly those bytes. (v3; a v2 bucket is the same with both
  *     bits always clear — see "Spilling" below.)
+ *     v4 adds one encoding: VS=1 with a length of 0 is a *detached* value,
+ *     whose true length is its blob's length (see "Detaching" below).
  *
  * At depth 1 the root IS the directory: n is the bucket count and each child
  * is a bucket blob, created lazily (id 0 means "empty"). At depth 2 the root's
@@ -49,6 +51,20 @@
  * earlier value stays readable; it moves to the current placement only when
  * its key is next set. See doc/proposals/2026-10-09-kvhash-spill.md.
  *
+ * Detaching (v4, DRAFT). With detach_on_update on, the first set that
+ * replaces a key's value moves the value out of the bucket into a blob of its
+ * own, and every later set of that key rewrites only that blob. A key that is
+ * written once — the common case for an insert-only map — stays inline and
+ * costs exactly what it did before; a key that is rewritten stops dragging its
+ * whole bucket along on each rewrite. The detached entry records no length
+ * (VS=1, length 0): the length lives with the bytes, so a set that changes the
+ * length is still one blob write. VS=1 with length 0 is never written by v3
+ * code (a spilled value is longer than a threshold >= 0), so the encoding is
+ * new; it is only written under a v4 directory, which v3 firmware refuses.
+ * Detachment is a write policy like the thresholds: turning it off makes the
+ * next set of a detached key place the value by the thresholds again. See
+ * doc/proposals/2026-11-07-kvhash-detach-on-update.md.
+ *
  * The flag bits are free in every v2 bucket because blob_db refuses at mount
  * any payload cap above ~32 KB (BUILD_ASSERTed below), so no inline length
  * reaches 0x8000. v2 maps stay readable and writable by this code but are
@@ -74,7 +90,9 @@ LOG_MODULE_REGISTER(kvhash, CONFIG_BLOB_CONTAINER_KVHASH_LOG_LEVEL);
 
 #define KVHASH_DIR_MAGIC   0x4b564841u /* 'KVHA' */
 #define KVHASH_DIR_DYING   0x4b564844u /* 'KVHD' — destroy committed, release pending */
-#define KVHASH_VERSION     3   /* what create writes: entries may spill */
+#define KVHASH_VERSION     4   /* newest served: values may be detached */
+#define KVHASH_VERSION_SPILL  3 /* what create writes without detaching */
+#define KVHASH_VERSION_DETACH 4 /* what create writes with detach_on_update */
 #define KVHASH_VERSION_MIN 2   /* oldest still served: never spilled */
 
 #define MAX_PAYLOAD        CONFIG_BLOB_DB_MAX_PAYLOAD_LEN
@@ -104,6 +122,12 @@ BUILD_ASSERT(MAX_PAYLOAD <= ENT_LEN_MASK,
 /* Write policy (see "Spilling"). Read by kvhash_set only. */
 static size_t key_inline_max = CONFIG_BLOB_CONTAINER_KVHASH_KEY_INLINE_MAX;
 static size_t val_inline_max = CONFIG_BLOB_CONTAINER_KVHASH_VAL_INLINE_MAX;
+static bool detach_on_update = IS_ENABLED(CONFIG_BLOB_CONTAINER_KVHASH_DETACH_ON_UPDATE);
+#if defined(CONFIG_BLOB_CONTAINER_KVHASH_DETACH_MIN_LEN)
+static size_t detach_min_len = CONFIG_BLOB_CONTAINER_KVHASH_DETACH_MIN_LEN;
+#else
+static size_t detach_min_len;
+#endif
 
 #if defined(CONFIG_BLOB_CONTAINER_KVHASH_TEST_HOOKS)
 uint32_t kvhash_test_fp_mask = 0xffffffffu;
@@ -158,6 +182,16 @@ void kvhash_set_inline_max(size_t key_max, size_t val_max)
 {
 	key_inline_max = MIN(key_max, (size_t)ENT_LEN_MASK);
 	val_inline_max = MIN(val_max, (size_t)ENT_LEN_MASK);
+}
+
+void kvhash_set_detach_on_update(bool on)
+{
+	detach_on_update = on;
+}
+
+void kvhash_set_detach_min_len(size_t min_len)
+{
+	detach_min_len = min_len;
 }
 
 /* Reused across calls (single-threaded contract). One holds the directory
@@ -284,7 +318,9 @@ static void dir_format(uint8_t *buf, uint16_t n, uint8_t depth)
 	memset(buf, 0, dir_len(n));
 	memcpy(&buf[0], &magic, sizeof(magic));
 	put_u16(&buf[4], n);
-	buf[6] = KVHASH_VERSION;
+	/* Only a map that may hold detached values says v4, so a map built
+	 * with detaching off stays readable by v3 firmware. */
+	buf[6] = detach_on_update ? KVHASH_VERSION_DETACH : KVHASH_VERSION_SPILL;
 	buf[7] = depth;
 }
 
@@ -408,6 +444,7 @@ struct ent {
 	size_t kl, vl;    /* true key and value lengths */
 	bool kspill;      /* key part is [u32 fp][u64 id] */
 	bool vspill;      /* value part is [u64 id] */
+	bool vdetached;   /* vspill with no recorded length: the blob's is it (v4) */
 	size_t kpos;      /* offset of the key part in the bucket */
 	size_t vpos;      /* offset of the value part in the bucket */
 };
@@ -434,6 +471,7 @@ static bool bkt_entry(const uint8_t *buf, size_t used, size_t off, struct ent *e
 	e->vspill = (vf & ENT_SPILL) != 0;
 	e->kl = kf & ENT_LEN_MASK;
 	e->vl = vf & ENT_LEN_MASK;
+	e->vdetached = e->vspill && e->vl == 0;
 	e->kpos = off + ENTRY_HDR_LEN;
 	e->vpos = e->kpos + (e->kspill ? KEY_REF_LEN : e->kl);
 	e->len = ENTRY_HDR_LEN + (e->kspill ? KEY_REF_LEN : e->kl) +
@@ -882,6 +920,36 @@ static int kvhash_stat(uint64_t root, struct map_info *out)
 }
 
 /*
+ * A detached value: the blob is the whole truth, length included. On -ENOMEM
+ * the length still has to reach the caller, and blob_db_get only reports it
+ * for a segmented object, so ask for it.
+ */
+static int detached_value(uint64_t vid, void *out, size_t out_sz,
+			  size_t *out_len)
+{
+	size_t got = 0;
+	int rc;
+
+	if (vid == 0) {
+		return -EIO;
+	}
+	rc = blob_db_get(vid, out, out_sz, &got);
+	if (rc == -ENOMEM) {
+		if (out_len && blob_db_size(vid, &got) == 0) {
+			*out_len = got;
+		}
+		return -ENOMEM;
+	}
+	if (rc != 0) {
+		return rc == -ENOENT ? -EIO : rc;
+	}
+	if (out_len) {
+		*out_len = got;
+	}
+	return 0;
+}
+
+/*
  * Copy an entry's value out, wherever it lives. @out_len gets the true length
  * even on -ENOMEM. A spilled value whose blob disagrees with the entry's
  * length is a damaged map: -EIO.
@@ -889,6 +957,9 @@ static int kvhash_stat(uint64_t root, struct map_info *out)
 static int ent_value(const uint8_t *buf, const struct ent *e,
 		     void *out, size_t out_sz, size_t *out_len)
 {
+	if (e->vdetached) {
+		return detached_value(ent_val_id(buf, e), out, out_sz, out_len);
+	}
 	if (out_len) {
 		*out_len = e->vl;
 	}
@@ -966,11 +1037,18 @@ static int kvhash_get(uint64_t root, const void *key, size_t klen,
  *
  *   spilled value, same placement, same length:
  *       blob_db_update(val_id)                the whole mutation
+ *   detached value, same key placement, detaching on (any length):
+ *       blob_db_update(val_id)                the whole mutation
  *   otherwise:
  *       1. bind fresh blobs for any spilled part   unreferenced so far
  *       2. rewrite the bucket                      COMMIT
  *          (+ publish a fresh bucket, as before)
  *       3. delete the old entry's blobs the new one does not reuse
+ *
+ * With detaching on, a set that replaces an existing value builds the new
+ * entry detached (the first update of an inline value pays the bucket rewrite
+ * once; every later one is the one-blob path above). An insert is placed by
+ * the thresholds alone.
  *
  * A spilled key that stays spilled keeps its blob: the bytes are the same.
  * A crash before the commit leaves the old entry and, at worst, fresh blobs
@@ -1000,9 +1078,11 @@ static int kvhash_set(uint64_t root, const void *key, size_t klen,
 
 	/* The leaf directory's version decides whether spilling is allowed:
 	 * a v2 map must stay parseable by v2 firmware. */
-	bool can_spill = dir_buf[6] >= 3;
+	bool can_spill = dir_buf[6] >= KVHASH_VERSION_SPILL;
+	bool can_detach = detach_on_update && dir_buf[6] >= KVHASH_VERSION_DETACH;
 	bool kspill = can_spill && klen > key_inline_max;
 	bool vspill = can_spill && vlen > val_inline_max;
+	bool vdetach = false; /* decided once the old entry is known */
 
 	if (kspill && klen > MAX_PAYLOAD) {
 		return -ENOSPC; /* a spilled key is one slot, so a lookup can hold it */
@@ -1031,8 +1111,17 @@ static int kvhash_set(uint64_t root, const void *key, size_t klen,
 			old_kid = ent_key_id(bkt_buf, &old);
 			old_vid = ent_val_id(bkt_buf, &old);
 
-			if (old.kspill == kspill && old.vspill && vspill &&
-			    old.vl == vlen) {
+			/* An update: with detaching on, the value leaves the
+			 * bucket now and stays out on every later set. A short
+			 * value stays inline: rewriting it costs little more
+			 * than its 8 B reference, and a detached one costs a
+			 * blob read on every get. */
+			vdetach = can_detach &&
+				  (old.vdetached || vlen >= detach_min_len);
+
+			if (old.kspill == kspill && old.vspill &&
+			    ((old.vdetached && vdetach) ||
+			     (!old.vdetached && vspill && old.vl == vlen))) {
 				if (old_vid == 0) {
 					return -EIO;
 				}
@@ -1060,8 +1149,9 @@ static int kvhash_set(uint64_t root, const void *key, size_t klen,
 		}
 	}
 
+	bool vref = vspill || vdetach;   /* the value part is a blob id */
 	size_t need = ENTRY_HDR_LEN + (kspill ? KEY_REF_LEN : klen) +
-		      (vspill ? VAL_REF_LEN : vlen);
+		      (vref ? VAL_REF_LEN : vlen);
 
 	if (used + need > sizeof(bkt_buf)) {
 		return -ENOSPC;
@@ -1083,7 +1173,7 @@ static int kvhash_set(uint64_t root, const void *key, size_t klen,
 		}
 		fresh_kid = true;
 	}
-	if (vspill) {
+	if (vref) {
 		vid = blob_db_alloc_id();
 		if (vid == 0) {
 			rc = -EIO;
@@ -1098,7 +1188,9 @@ static int kvhash_set(uint64_t root, const void *key, size_t klen,
 
 	/* 2. Append the new entry and commit the bucket. */
 	put_u16(&bkt_buf[used], (uint16_t)(klen | (kspill ? ENT_SPILL : 0)));
-	put_u16(&bkt_buf[used + 2], (uint16_t)(vlen | (vspill ? ENT_SPILL : 0)));
+	/* A detached value records no length: the blob carries it. */
+	put_u16(&bkt_buf[used + 2],
+		(uint16_t)(vdetach ? ENT_SPILL : (vlen | (vspill ? ENT_SPILL : 0))));
 
 	size_t pos = used + ENTRY_HDR_LEN;
 
@@ -1110,7 +1202,7 @@ static int kvhash_set(uint64_t root, const void *key, size_t klen,
 		memcpy(&bkt_buf[pos], key, klen);
 		pos += klen;
 	}
-	if (vspill) {
+	if (vref) {
 		put_u64(&bkt_buf[pos], vid);
 	} else if (vlen) {
 		memcpy(&bkt_buf[pos], val, vlen);
@@ -1413,10 +1505,19 @@ static int kvhash_next(uint64_t root, const void *key, size_t klen,
 	if (kout_len) {
 		*kout_len = e.kl;
 	}
-	if (vout_len) {
-		*vout_len = e.vl;
+	size_t vl = e.vl;
+
+	if (e.vdetached) {
+		/* The length is the blob's: one more read to report it. */
+		rc = blob_db_size(ent_val_id(bkt_buf, &e), &vl);
+		if (rc != 0) {
+			return rc == -ENOENT ? -EIO : rc;
+		}
 	}
-	if (e.kl > kout_sz || e.vl > vout_sz) {
+	if (vout_len) {
+		*vout_len = vl;
+	}
+	if (e.kl > kout_sz || vl > vout_sz) {
 		return -ENOMEM;
 	}
 

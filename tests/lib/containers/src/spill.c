@@ -37,6 +37,9 @@ static void spill_before(void *fixture)
 	zassert_ok(blob_db_mount());
 	zassert_ok(blob_db_format());
 	kvhash_set_inline_max(NEVER, NEVER);
+	/* These tests pin placement by the thresholds alone; detach-on-update
+	 * would move a value on its first rewrite (kvhash_detach covers it). */
+	kvhash_set_detach_on_update(false);
 	kvhash_test_fp_mask = 0xffffffffu;
 }
 
@@ -44,6 +47,7 @@ static void spill_after(void *fixture)
 {
 	ARG_UNUSED(fixture);
 	kvhash_set_inline_max(NEVER, NEVER);
+	kvhash_set_detach_on_update(IS_ENABLED(CONFIG_BLOB_CONTAINER_KVHASH_DETACH_ON_UPDATE));
 	kvhash_test_fp_mask = 0xffffffffu;
 	blob_db_unmount();
 }

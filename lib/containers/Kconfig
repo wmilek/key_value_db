@@ -125,6 +125,37 @@ config BLOB_CONTAINER_KVHASH_VAL_INLINE_MAX
 
 	  The default, 32767, never spills.
 
+config BLOB_CONTAINER_KVHASH_DETACH_ON_UPDATE
+	bool "Detach a value from its bucket once its key is updated (draft)"
+	help
+	  The first set that replaces an existing key's value moves the value
+	  into a blob of its own; the bucket keeps an 8 B reference. Every
+	  later set of that key rewrites only the value blob, whatever its
+	  length, instead of the whole bucket. A key that is only ever
+	  inserted stays inline, so insert-only maps are unaffected.
+
+	  Costs one more blob read per get of a detached value, and one blob
+	  per detached key. Maps created with this on are kvhash v4, which
+	  firmware without it refuses; existing v2/v3 maps are served as
+	  before and never detached. A write policy like the inline
+	  thresholds: turning it off (or kvhash_set_detach_on_update(false))
+	  makes the next set of a detached key place its value by the
+	  thresholds again.
+
+	  Draft: see doc/proposals/2026-11-07-kvhash-detach-on-update.md.
+
+config BLOB_CONTAINER_KVHASH_DETACH_MIN_LEN
+	int "Shortest value detached on update"
+	depends on BLOB_CONTAINER_KVHASH_DETACH_ON_UPDATE
+	default 16
+	range 0 32767
+	help
+	  An update whose new value is shorter than this keeps the value
+	  inline. Detaching pays when the bucket a rewrite drags along is
+	  large next to the value; for a value of a few bytes the 8 B
+	  reference and the extra blob read per get cost more than they
+	  save. A value already detached stays detached whatever its length.
+
 config BLOB_CONTAINER_KVHASH_TEST_HOOKS
 	bool "Test hooks (fingerprint collisions, power cuts)"
 	help
