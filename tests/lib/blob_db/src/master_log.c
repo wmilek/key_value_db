@@ -28,10 +28,16 @@
 	Z_TEST_SKIP_IFNDEF(CONFIG_BLOB_DB_BACKEND_FLASH_AREA)
 
 #if defined(CONFIG_BLOB_DB_LARGE_PAYLOADS)
-#define ML_BUILD_INCOMPAT  0x1u
+#define ML_INCOMPAT_LP     0x1u
 #else
-#define ML_BUILD_INCOMPAT  0x0u
+#define ML_INCOMPAT_LP     0x0u
 #endif
+#if defined(CONFIG_BLOB_DB_DELTA)
+#define ML_INCOMPAT_DELTA  0x4u
+#else
+#define ML_INCOMPAT_DELTA  0x0u
+#endif
+#define ML_BUILD_INCOMPAT  (ML_INCOMPAT_LP | ML_INCOMPAT_DELTA)
 
 static uint8_t ml_save[2][MI_SECTOR_SZ];
 
@@ -359,6 +365,9 @@ static void p_suite(struct mhdr_img *h) { h->suite = 1; }
 static void p_hdr_len(struct mhdr_img *h) { h->hdr_len = 84; }
 static void p_incompat(struct mhdr_img *h) { h->incompat |= 0x80; }
 static void p_ro_compat(struct mhdr_img *h) { h->ro_compat |= 0x1; }
+#if !defined(CONFIG_BLOB_DB_DELTA)
+static void p_delta(struct mhdr_img *h) { h->incompat |= 0x4; }
+#endif
 
 /* 5b, D19. Each geometry value in a header must match the build and the
  * device, in every ok header, the older one included; otherwise mount
@@ -402,6 +411,22 @@ ZTEST(blob_db_master_log, test_unknown_feature_bits_are_refused)
 	}
 	zassert_ok(blob_db_mount());
 }
+
+#if !defined(CONFIG_BLOB_DB_DELTA)
+/* §4.2. A build without DELTA refuses a store formatted with it, from either
+ * ok sector, before any slot is read: delta slots are not values to it. */
+ZTEST(blob_db_master_log, test_delta_store_is_refused_without_delta)
+{
+	ML_SKIP_UNLESS_RAW_PARTITION();
+
+	zassert_ok(blob_db_unmount());
+	ml_save_masters();
+	for (uint8_t slot = 0; slot < 2; slot++) {
+		ml_expect_refused(slot, p_delta, -ENOTSUP, "DELTA");
+	}
+	zassert_ok(blob_db_mount());
+}
+#endif
 
 /* §3.1. Two ok sectors at the same rot_gen cannot be ordered: -EIO, nothing
  * written. */
@@ -919,5 +944,63 @@ ZTEST(blob_db_master_log, test_large_write_needs_the_store_feature)
 		      "a segmented write into a store without the feature");
 	zassert_ok(blob_db_update(id, big, sizeof(big) - 1),
 		   "a single-slot write was refused");
+}
+#endif
+
+#if defined(CONFIG_BLOB_DB_DELTA) && defined(CONFIG_BLOB_DB_IOSTATS)
+static void ml_assert_blob_bytes(uint64_t id, const uint8_t *want, size_t len)
+{
+	static uint8_t buf[256];
+	size_t got;
+
+	zassert_true(len <= sizeof(buf));
+	zassert_ok(blob_db_get(id, buf, sizeof(buf), &got));
+	zassert_equal(got, len);
+	zassert_mem_equal(buf, want, len);
+}
+
+/* D20 for DELTA. A delta build, on a store formatted without the feature,
+ * writes it as a build without deltas would: full slots only, and the
+ * feature bit stays off through rotations, so a build without deltas can
+ * still mount it. */
+ZTEST(blob_db_master_log, test_delta_needs_the_store_feature)
+{
+	ML_SKIP_UNLESS_RAW_PARTITION();
+
+	static uint8_t v[200];
+	struct mhdr_img h;
+
+	zassert_ok(blob_db_unmount());
+	for (uint8_t slot = 0; slot < 2; slot++) {
+		master_hdr_read_raw(slot, &h);
+		h.incompat &= ~0x4u;
+		mhdr_seal(&h);
+		master_hdr_rewrite_raw(slot, &h);
+	}
+	zassert_ok(blob_db_mount());
+
+	const uint64_t id = blob_db_alloc_id();
+	struct blob_db_iostats a, b;
+
+	memset(v, 0x3c, sizeof(v));
+	zassert_ok(blob_db_update(id, v, sizeof(v)));
+	blob_db_iostats_get(&a);
+	for (int i = 0; i < 40; i++) {
+		v[i % sizeof(v)] ^= 0x5a;
+		zassert_ok(blob_db_update(id, v, sizeof(v)));
+	}
+	blob_db_iostats_get(&b);
+	zassert_equal(b.delta_slots, a.delta_slots,
+		      "a delta was written into a store without the feature");
+	ml_assert_blob_bytes(id, v, sizeof(v));
+
+	zassert_ok(blob_db_unmount());
+	for (uint8_t slot = 0; slot < 2; slot++) {
+		master_hdr_read_raw(slot, &h);
+		zassert_equal(h.incompat & 0x4u, 0,
+			      "master %u gained DELTA after the fact", slot);
+	}
+	zassert_ok(blob_db_mount());
+	ml_assert_blob_bytes(id, v, sizeof(v));
 }
 #endif

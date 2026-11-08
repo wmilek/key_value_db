@@ -225,9 +225,11 @@ sector beside an ok one as doubt (§5.1).
 
 **Features** (§4 of the proposal). `incompat`, `ro_compat` and `compat` replace
 the old major per feature combination. A slot-flag feature is set at format:
-`LARGE_PAYLOADS` owns slot flags `INDEXED` and `SEGMENT`. A build writes those
-flags only into a store whose headers carry the bit, so a build without the
-feature may mount a store formatted without it. A build refuses a store with an
+`LARGE_PAYLOADS` (bit 0) owns slot flags `INDEXED` and `SEGMENT`, `DELTA`
+(bit 2) owns slot flag `DELTA` (§3.6), and slot flag bit 4 is reserved for
+`PROTECTED`'s `COMPACTED`. A build writes a feature's flags only into a store
+whose headers carry the bit, so a build without the feature may mount a store
+formatted without it. A build refuses a store with an
 `incompat` or `ro_compat` bit it does not know, in any ok header.
 
 **Mount classifies each master header:**
@@ -288,7 +290,9 @@ Variable length, write-block aligned (`W = flash_area_align()`):
 
 ```
 struct blob_slot_hdr {           /* 4 B, __packed */
-    uint8_t  flags;              /* bit0 SEALED | bit1 TOMBSTONE */
+    uint8_t  flags;              /* bit0 SEALED | bit1 TOMBSTONE, plus the
+                                    feature flags: bit2 INDEXED, bit3 SEGMENT,
+                                    bit4 reserved (COMPACTED), bit5 DELTA */
     uint8_t  reserved;
     uint16_t val_len;            /* 0..MAX_PAYLOAD_LEN, LE */
 };
@@ -315,8 +319,9 @@ always a committed one.
 
 **A foreign slot is not the end of the log.** A slot that is sealed, has a
 `val_len` this build can size, fits the sector and passes its CRC, but carries a
-flag outside `BLOB_DB_SLOT_F_KNOWN`, was written by a build with more slot
-flags. The walk stops there, because it cannot know what the slot means, but it
+flag outside `BLOB_DB_SLOT_F_KNOWN`, or a combination the format leaves
+undefined (`DELTA` with `TOMBSTONE`, `INDEXED` or `SEGMENT`), was written by a
+build with more slot flags. The walk stops there, because it cannot know what the slot means, but it
 reports the slot as foreign, not as a torn tail. The bucket then answers no
 lookup (`-EIO`), since a slot past the stop may supersede the one a lookup would
 find, and takes no write (`-ENOTSUP`). It is never compacted, so the slot
@@ -364,6 +369,37 @@ arbitrary, and `bucket = id mod N`, so when the bucket a fresh id lands in has
 no room the writer simply allocates another id and lands elsewhere. A
 user-visible id cannot do this — its bucket is fixed — but segments are never
 user-visible.
+
+### 3.6 Delta slots
+
+With `CONFIG_BLOB_DB_DELTA`, on a store formatted with the `incompat` feature
+`DELTA`, an update that changes one contiguous range of a value may be stored
+as a **delta slot**: flags `SEALED|DELTA`, at the object's own id, holding the
+change from an older slot of that id in the same bucket.
+
+```
+delta slot   flags = SEALED|DELTA, at the object's id
+  payload:   kind[1] = 0, prev_off[2], pre[2], suf[2], then the changed bytes
+             (all little-endian; struct blob_db_delta_hdr, 7 B)
+```
+
+- `prev_off` is the bucket offset of the older slot: a full slot or another
+  delta, never a tombstone, an index or a segment slot. It is 16 bits, so a
+  store with deltas has buckets of at most 64 KiB.
+- The value is the first `pre` bytes of the older value, the changed bytes,
+  then the older value's last `suf` bytes. `pre + suf` is at most the older
+  value's length.
+- `kind` 0 is the only encoding. Another would come with its own `incompat`
+  feature, so it costs no slot flag; a reader refuses any other kind.
+- A reader follows at most 32 deltas (`BLOB_DB_DELTA_CHAIN_MAX`) to reach a
+  full slot. That bound is part of the format; `CONFIG_BLOB_DB_DELTA_MAX_CHAIN`
+  only bounds what a build writes.
+- `DELTA` combines with no other feature flag, nor with `TOMBSTONE`: such a
+  slot is foreign (§3.4).
+
+Compaction writes the value a live chain describes as one full slot, so no
+delta survives a compaction. A chain that does not resolve is not dropped:
+compaction refuses the bucket instead, as it does any slot it cannot read.
 
 ## 4. Slot semantics — latest wins
 

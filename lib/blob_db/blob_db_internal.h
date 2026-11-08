@@ -55,7 +55,7 @@
  * after a crash. Every record raises the ceiling to this many ids past the
  * next one (D14), so alloc_id needs a record of its own only when no other
  * record has carried the ceiling forward within the step. */
-#define BLOB_DB_ID_HINT_STEP      256
+#define BLOB_DB_ID_HINT_STEP      CONFIG_BLOB_DB_ID_HINT_STEP
 
 /* Slot flags. After erase the flags byte is 0xff, which trivially fails
  * the "is sealed" check. A slot is considered valid when it has the
@@ -69,6 +69,12 @@
  * they belong to the incompat feature BLOB_DB_FEAT_LARGE_PAYLOADS below. */
 #define BLOB_DB_SLOT_F_INDEXED    (1u << 2)
 #define BLOB_DB_SLOT_F_SEGMENT    (1u << 3)
+/* Bit 4 is reserved for PROTECTED's COMPACTED (PR #63); see the registry
+ * below. */
+/* DELTA marks a slot whose payload is the change from an older slot of the
+ * same id in the same bucket (incompat feature BLOB_DB_FEAT_DELTA), laid out
+ * as struct blob_db_delta_hdr followed by the changed bytes. */
+#define BLOB_DB_SLOT_F_DELTA      (1u << 5)
 
 /* Every flag bit this version understands. A slot carrying a bit outside this
  * mask was written by software we do not understand, and its payload must not
@@ -81,7 +87,11 @@
  * store whose features this build does not know before any slot is read. The
  * mask covers the case where that discipline is broken.
  */
-#ifdef CONFIG_BLOB_DB_LARGE_PAYLOADS
+#if defined(CONFIG_BLOB_DB_DELTA)
+#define BLOB_DB_SLOT_F_KNOWN                                                   \
+	(BLOB_DB_SLOT_F_SEALED | BLOB_DB_SLOT_F_TOMBSTONE |                    \
+	 BLOB_DB_SLOT_F_INDEXED | BLOB_DB_SLOT_F_SEGMENT | BLOB_DB_SLOT_F_DELTA)
+#elif defined(CONFIG_BLOB_DB_LARGE_PAYLOADS)
 #define BLOB_DB_SLOT_F_KNOWN                                                   \
 	(BLOB_DB_SLOT_F_SEALED | BLOB_DB_SLOT_F_TOMBSTONE |                    \
 	 BLOB_DB_SLOT_F_INDEXED | BLOB_DB_SLOT_F_SEGMENT)
@@ -90,30 +100,89 @@
 	(BLOB_DB_SLOT_F_SEALED | BLOB_DB_SLOT_F_TOMBSTONE)
 #endif
 
+/* Whether a slot's flags byte says something this build cannot read: a bit
+ * outside BLOB_DB_SLOT_F_KNOWN, or a combination the format leaves undefined.
+ * DELTA combines with none of TOMBSTONE, INDEXED and SEGMENT; those
+ * combinations stay free for a later feature, so a slot carrying one is
+ * foreign like an unknown bit, never data and never rot. */
+#define BLOB_DB_SLOT_FLAGS_UNKNOWN(f)                                          \
+	((((f) & ~(uint8_t)BLOB_DB_SLOT_F_KNOWN) != 0) ||                      \
+	 (((f) & BLOB_DB_SLOT_F_DELTA) &&                                      \
+	  ((f) & (BLOB_DB_SLOT_F_TOMBSTONE | BLOB_DB_SLOT_F_INDEXED |          \
+		  BLOB_DB_SLOT_F_SEGMENT))))
+
 /* Format features (§4 of the master-log proposal). One registry owns every
  * bit, so two features cannot claim the same slot flag. A slot-flag feature
  * is set at format (D7), and a build writes its flags only into a store whose
  * headers carry it (D20). */
 #define BLOB_DB_FEAT_LARGE_PAYLOADS  (1u << 0)   /* incompat; INDEXED, SEGMENT */
-/* bit 1: PROTECTED (phase 2, PR #63); bit 2: DELTA (phase 3, PR #62) */
+/* bit 1: PROTECTED (phase 2, PR #63), owns slot flag bit 4 COMPACTED */
+#define BLOB_DB_FEAT_DELTA           (1u << 2)   /* incompat; DELTA */
 
+#define BLOB_DB_SLOT_F_BASE                                                    \
+	(BLOB_DB_SLOT_F_SEALED | BLOB_DB_SLOT_F_TOMBSTONE)
+#define BLOB_DB_SLOT_F_PROTECTED_RESERVED  (1u << 4)
 #define BLOB_DB_FEAT_FLAGS_LARGE_PAYLOADS                                      \
 	(BLOB_DB_SLOT_F_INDEXED | BLOB_DB_SLOT_F_SEGMENT)
-BUILD_ASSERT((BLOB_DB_FEAT_FLAGS_LARGE_PAYLOADS &
-	      (BLOB_DB_SLOT_F_SEALED | BLOB_DB_SLOT_F_TOMBSTONE)) == 0,
+#define BLOB_DB_FEAT_FLAGS_DELTA  BLOB_DB_SLOT_F_DELTA
+BUILD_ASSERT((BLOB_DB_FEAT_FLAGS_LARGE_PAYLOADS & BLOB_DB_SLOT_F_BASE) == 0,
 	     "a feature's slot flags must not overlap the base flags");
+BUILD_ASSERT((BLOB_DB_FEAT_FLAGS_DELTA &
+	      (BLOB_DB_SLOT_F_BASE | BLOB_DB_FEAT_FLAGS_LARGE_PAYLOADS |
+	       BLOB_DB_SLOT_F_PROTECTED_RESERVED)) == 0,
+	     "two features own the same slot flag");
 
 /* The incompat features this library implements, whether or not a build is
  * configured with them: a store carrying one of them needs a differently
  * configured build, not a newer one. */
-#define BLOB_DB_LIB_INCOMPAT      BLOB_DB_FEAT_LARGE_PAYLOADS
+#define BLOB_DB_LIB_INCOMPAT                                                   \
+	(BLOB_DB_FEAT_LARGE_PAYLOADS | BLOB_DB_FEAT_DELTA)
 
 /* What this build knows, writes at format, and requires of a store. */
 #ifdef CONFIG_BLOB_DB_LARGE_PAYLOADS
-#define BLOB_DB_BUILD_INCOMPAT    BLOB_DB_FEAT_LARGE_PAYLOADS
+#define BLOB_DB_BUILD_INCOMPAT_LP BLOB_DB_FEAT_LARGE_PAYLOADS
 #else
-#define BLOB_DB_BUILD_INCOMPAT    0u
+#define BLOB_DB_BUILD_INCOMPAT_LP 0u
 #endif
+#ifdef CONFIG_BLOB_DB_DELTA
+#define BLOB_DB_BUILD_INCOMPAT_DELTA BLOB_DB_FEAT_DELTA
+#else
+#define BLOB_DB_BUILD_INCOMPAT_DELTA 0u
+#endif
+#define BLOB_DB_BUILD_INCOMPAT                                                 \
+	(BLOB_DB_BUILD_INCOMPAT_LP | BLOB_DB_BUILD_INCOMPAT_DELTA)
+
+/* The payload of a DELTA slot (feature DELTA): this header, then the changed
+ * bytes. Every field is little-endian.
+ *
+ * kind      0 = one changed range; any other value is refused. A new
+ *           encoding is a new kind under a new incompat feature, so it costs
+ *           no slot flag.
+ * prev_off  offset in the bucket of the older slot of the same id this delta
+ *           applies to: a full slot or another DELTA, never a tombstone.
+ *           Bucket offsets fit 16 bits (see BLOB_DB_DELTA_MAX_BUCKET).
+ * pre, suf  bytes kept from the start and from the end of the older value.
+ *
+ * The value is pre bytes of the older value, the changed bytes, then its last
+ * suf bytes: pre + suf <= the older value's length, and the new length is
+ * pre + suf + (val_len - sizeof(struct blob_db_delta_hdr)). */
+struct __packed blob_db_delta_hdr {
+	uint8_t  kind;
+	uint16_t prev_off;
+	uint16_t pre;
+	uint16_t suf;
+};
+BUILD_ASSERT(sizeof(struct blob_db_delta_hdr) == 7, "delta header drift");
+#define BLOB_DB_DELTA_KIND_RANGE  0u
+
+/* A reader follows at most this many DELTA slots to reach a full one. Part
+ * of the format, not a build option: CONFIG_BLOB_DB_DELTA_MAX_CHAIN only
+ * bounds what a build writes, so a build with a lower value still reads a
+ * chain another build wrote. */
+#define BLOB_DB_DELTA_CHAIN_MAX   32u
+
+/* prev_off is 16 bits, so a store with deltas has buckets of at most 64 KiB. */
+#define BLOB_DB_DELTA_MAX_BUCKET  65536u
 #define BLOB_DB_BUILD_RO_COMPAT   0u
 #define BLOB_DB_BUILD_REQUIRED    0u   /* phase 2: PROTECTED */
 #define BLOB_DB_BUILD_SUITE       0u
