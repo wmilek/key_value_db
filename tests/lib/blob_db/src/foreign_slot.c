@@ -35,6 +35,12 @@
 /* A slot flag no build assigns yet: bit 6 is free in the registry of the
  * master-log proposal (§4.2), so every build here reads it as unknown. */
 #define FS_FLAG_UNKNOWN  0x40
+/* Flags whose combination the format leaves undefined (DELTA with any of
+ * TOMBSTONE, INDEXED, SEGMENT): foreign to every build, delta or not. */
+#define FS_TOMBSTONE     0x02
+#define FS_INDEXED       0x04
+#define FS_SEGMENT       0x08
+#define FS_DELTA         0x20
 
 #define FS_SKIP_UNLESS_RAW_PARTITION() \
 	Z_TEST_SKIP_IFNDEF(CONFIG_BLOB_DB_BACKEND_FLASH_AREA)
@@ -110,13 +116,13 @@ static off_t fs_cursor(uint16_t bid)
 
 /* Append, by hand, the slot a newer build would write: whole and intact, with
  * a flag this build does not know. */
-static void forge_foreign_slot(uint16_t bid, uint64_t id, const char *val)
+static void forge_slot(uint16_t bid, uint64_t id, uint8_t flags, const char *val)
 {
 	static uint8_t slot[64];
 	const uint16_t len = (uint16_t)strlen(val);
 	const size_t ssz = fs_slot_size(len);
 	struct fs_slot_head h = {
-		.flags = FS_SEALED | FS_FLAG_UNKNOWN,
+		.flags = flags,
 		.val_len = len,
 		.id = id,
 	};
@@ -133,6 +139,11 @@ static void forge_foreign_slot(uint16_t bid, uint64_t id, const char *val)
 	memcpy(slot + sizeof(h) + len, &crc, sizeof(crc));
 
 	fs_write(fs_bucket_off(bid) + fs_cursor(bid), slot, ssz);
+}
+
+static void forge_foreign_slot(uint16_t bid, uint64_t id, const char *val)
+{
+	forge_slot(bid, id, FS_SEALED | FS_FLAG_UNKNOWN, val);
 }
 
 /* What a power cut leaves when it tears a slot inside its header: a sealed
@@ -237,6 +248,43 @@ ZTEST(blob_db_foreign, test_foreign_slot_closes_its_bucket)
 		fs_read_bucket(bid, fs_after);
 		zassert_mem_equal(fs_after, fs_before, FS_SECTOR_SZ,
 				  "pass %d: the bucket was written", pass);
+	}
+}
+
+/* DELTA combined with TOMBSTONE, INDEXED or SEGMENT means nothing yet. A
+ * whole slot carrying such a combination is foreign, as an unknown bit is:
+ * not served, not written over, not dropped. */
+ZTEST(blob_db_foreign, test_undefined_delta_combinations_are_foreign)
+{
+	FS_SKIP_UNLESS_RAW_PARTITION();
+
+	static const uint8_t combos[] = {
+		FS_SEALED | FS_DELTA | FS_TOMBSTONE,
+		FS_SEALED | FS_DELTA | FS_INDEXED,
+		FS_SEALED | FS_DELTA | FS_SEGMENT,
+	};
+
+	for (size_t k = 0; k < ARRAY_SIZE(combos); k++) {
+		const uint64_t id = fs_put("OLD");
+		const uint16_t bid = (uint16_t)(id % FS_N_BUCKETS);
+		uint8_t buf[16];
+		size_t got;
+
+		zassert_ok(blob_db_unmount());
+		forge_slot(bid, id, combos[k], "0123456789");
+		fs_read_bucket(bid, fs_before);
+		zassert_ok(blob_db_mount());
+
+		zassert_equal(blob_db_get(id, buf, sizeof(buf), &got), -EIO,
+			      "flags 0x%02x: served the older value", combos[k]);
+		zassert_equal(blob_db_update(id, "X", 1), -ENOTSUP,
+			      "flags 0x%02x: wrote into the bucket", combos[k]);
+
+		zassert_ok(blob_db_unmount());
+		fs_read_bucket(bid, fs_after);
+		zassert_mem_equal(fs_after, fs_before, FS_SECTOR_SZ,
+				  "flags 0x%02x: the bucket was written", combos[k]);
+		zassert_ok(blob_db_mount());
 	}
 }
 

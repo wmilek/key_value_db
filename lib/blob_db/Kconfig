@@ -461,13 +461,22 @@ config BLOB_DB_DELTA
 	  leading and trailing bytes are kept, and the bytes in between --
 	  instead of the whole value. Reads follow the chain back to a full
 	  slot; compaction writes the materialized value as a full slot.
-	  On-flash format change.
+
+	  On-flash format: the incompat feature DELTA (bit 2), slot flag
+	  bit 5. A format by this build sets the feature, and a build without
+	  this option refuses such a store at mount. On a store formatted
+	  without the feature this build writes no delta (D20), so builds
+	  without deltas can keep using it.
 
 config BLOB_DB_DELTA_MAX_CHAIN
 	int "Longest chain of deltas before a full rewrite"
 	depends on BLOB_DB_DELTA
 	default 8
 	range 1 32
+	help
+	  Bounds what this build writes only. Every build reads chains of up
+	  to 32 deltas (BLOB_DB_DELTA_CHAIN_MAX, part of the format), so
+	  lowering this value never makes a stored chain unreadable.
 
 config BLOB_DB_DELTA_REBASE_AGE
 	int "A get rewrites a delta in full once this many bytes followed it in its bucket (0 = never)"

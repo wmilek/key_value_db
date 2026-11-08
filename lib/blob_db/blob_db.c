@@ -375,6 +375,9 @@ static int master_accept(uint8_t slot, const struct blob_db_master_hdr *h)
 	} else if (missing & BLOB_DB_FEAT_LARGE_PAYLOADS) {
 		what = "LARGE_PAYLOADS, which this build is configured without "
 		       "(CONFIG_BLOB_DB_LARGE_PAYLOADS)";
+	} else if (missing & BLOB_DB_FEAT_DELTA) {
+		what = "DELTA, which this build is configured without "
+		       "(CONFIG_BLOB_DB_DELTA)";
 	} else if (h->ro_compat & ~BLOB_DB_BUILD_RO_COMPAT) {
 		/* No read-only mount yet: refused like incompat (§4.1). */
 		what = "a ro_compat feature this build does not know";
@@ -730,7 +733,7 @@ static int scan_bucket(uint16_t bid, uint64_t *max_id_inout)
 		 * this scan carries on for the id ceiling's sake. The two then
 		 * disagree on where the log ends, so leave the bucket to the
 		 * walk rather than index a cursor the walk would not find. */
-		if (shdr.flags & ~(uint8_t)BLOB_DB_SLOT_F_KNOWN) {
+		if (BLOB_DB_SLOT_FLAGS_UNKNOWN(shdr.flags)) {
 			blob_db_sidx_forget(bid);
 		}
 		const size_t base_sz = sizeof(shdr) + sizeof(uint64_t) +
@@ -1338,7 +1341,7 @@ static bool slot_walk_at(const uint8_t *buf, off_t off, struct slot_view *out,
 	 * truncated: see slot_foreign_head(). Mount should have refused such a
 	 * store already (a new slot flag is a MAJOR change); this is the
 	 * backstop if that discipline ever slips. */
-	if (shdr->flags & ~(uint8_t)BLOB_DB_SLOT_F_KNOWN) {
+	if (BLOB_DB_SLOT_FLAGS_UNKNOWN(shdr->flags)) {
 		return false;
 	}
 	if (shdr->val_len > CONFIG_BLOB_DB_MAX_PAYLOAD_LEN) {
@@ -1381,7 +1384,7 @@ static bool slot_walk_at(const uint8_t *buf, off_t off, struct slot_view *out,
 static bool slot_foreign_head(const struct blob_db_slot_hdr *hdr, off_t off)
 {
 	return hdr->flags != 0xff && (hdr->flags & BLOB_DB_SLOT_F_SEALED) &&
-	       (hdr->flags & ~(uint8_t)BLOB_DB_SLOT_F_KNOWN) &&
+	       BLOB_DB_SLOT_FLAGS_UNKNOWN(hdr->flags) &&
 	       hdr->val_len <= CONFIG_BLOB_DB_MAX_PAYLOAD_LEN &&
 	       off + (off_t)slot_size_for(hdr->val_len) <= (off_t)st.peb_size;
 }
@@ -1615,7 +1618,7 @@ static int scan_bucket_for(uint16_t bid, uint64_t target_id, off_t limit,
 #endif
 		if (sh.hdr.flags == 0xff ||
 		    !(sh.hdr.flags & BLOB_DB_SLOT_F_SEALED) ||
-		    (sh.hdr.flags & ~(uint8_t)BLOB_DB_SLOT_F_KNOWN) ||
+		    BLOB_DB_SLOT_FLAGS_UNKNOWN(sh.hdr.flags) ||
 		    sh.hdr.val_len > CONFIG_BLOB_DB_MAX_PAYLOAD_LEN) {
 			if (slot_foreign_head(&sh.hdr, cursor)) {
 				bool ok;
@@ -1907,7 +1910,7 @@ static int slot_fetch(uint16_t bid, uint64_t id, uint32_t off, uint32_t limit,
 	memcpy(sh, g_win, sizeof(*sh));
 	if (sh->id != id || sh->hdr.flags == 0xff ||
 	    !(sh->hdr.flags & BLOB_DB_SLOT_F_SEALED) ||
-	    (sh->hdr.flags & ~(uint8_t)BLOB_DB_SLOT_F_KNOWN) ||
+	    BLOB_DB_SLOT_FLAGS_UNKNOWN(sh->hdr.flags) ||
 	    sh->hdr.val_len > CONFIG_BLOB_DB_MAX_PAYLOAD_LEN ||
 	    off + slot_size_for(sh->hdr.val_len) > limit) {
 		return -EAGAIN;
@@ -1974,7 +1977,7 @@ static int find_indexed_slot(uint16_t bid, uint64_t id,
 	}
 	if (sh.id != id || sh.hdr.flags == 0xff ||
 	    !(sh.hdr.flags & BLOB_DB_SLOT_F_SEALED) ||
-	    (sh.hdr.flags & ~(uint8_t)BLOB_DB_SLOT_F_KNOWN) ||
+	    BLOB_DB_SLOT_FLAGS_UNKNOWN(sh.hdr.flags) ||
 	    sh.hdr.val_len > CONFIG_BLOB_DB_MAX_PAYLOAD_LEN ||
 	    off + slot_size_for(sh.hdr.val_len) > cursor) {
 		goto stale;
@@ -2034,9 +2037,8 @@ static off_t g_found_base_off;
 static uint16_t g_found_base_len;
 static uint8_t __aligned(4) g_delta_tmp[CONFIG_BLOB_DB_MAX_PAYLOAD_LEN + 16];
 
-/* Delta payload: [u16 prev_off][varint pre][varint suf][changed bytes]. The
- * value's length is pre + suf + changed; the chain's depth is counted, not
- * stored. */
+/* A parsed delta payload (struct blob_db_delta_hdr and the changed bytes).
+ * The chain's depth is counted, not stored. */
 struct delta {
 	uint16_t prev_off;
 	uint16_t pre, suf;
@@ -2044,63 +2046,48 @@ struct delta {
 	uint16_t mid_len;
 };
 
-static size_t varint_put(uint8_t *p, uint32_t v)
-{
-	size_t n = 0;
+BUILD_ASSERT(CONFIG_BLOB_DB_DELTA_MAX_CHAIN <= BLOB_DB_DELTA_CHAIN_MAX,
+	     "a build may not write chains longer than any reader follows");
+BUILD_ASSERT(BLOB_DB_SECTOR_BUF_MAX <= BLOB_DB_DELTA_MAX_BUCKET,
+	     "delta prev_off is 16 bits: buckets of at most 64 KiB");
 
-	while (v >= 0x80) {
-		p[n++] = (uint8_t)(v | 0x80);
-		v >>= 7;
-	}
-	p[n++] = (uint8_t)v;
-	return n;
+#define DELTA_HDR_LEN sizeof(struct blob_db_delta_hdr)
+
+/* D20: a build writes DELTA slots only into a store formatted with the
+ * feature. Into any other it writes as a build without deltas, so a build
+ * that cannot read them may keep mounting it. */
+static inline bool delta_enabled(void)
+{
+	return (st.incompat & BLOB_DB_FEAT_DELTA) != 0;
 }
 
-static int varint_get(const uint8_t *p, size_t len, size_t *at, uint16_t *out)
+/* Flags an older slot may carry for a delta to apply to it: a full value or
+ * another delta, never a tombstone, a segment table or a segment. */
+static inline bool delta_base_ok(uint8_t flags)
 {
-	uint32_t v = 0;
-
-	for (int shift = 0; shift <= 14; shift += 7) {
-		if (*at >= len) {
-			return -EIO;
-		}
-		const uint8_t b = p[(*at)++];
-
-		v |= (uint32_t)(b & 0x7f) << shift;
-		if (!(b & 0x80)) {
-			if (v > 0xffff) {
-				return -EIO;
-			}
-			*out = (uint16_t)v;
-			return 0;
-		}
-	}
-	return -EIO;
+	return !(flags & (BLOB_DB_SLOT_F_TOMBSTONE | BLOB_DB_SLOT_F_INDEXED |
+			  BLOB_DB_SLOT_F_SEGMENT));
 }
 
-static size_t delta_hdr_put(uint8_t *p, uint16_t prev_off, uint16_t pre, uint16_t suf)
+static void delta_hdr_put(uint8_t *p, uint16_t prev_off, uint16_t pre, uint16_t suf)
 {
-	sys_put_le16(prev_off, p);
-	size_t n = 2;
-
-	n += varint_put(p + n, pre);
-	n += varint_put(p + n, suf);
-	return n;
+	p[offsetof(struct blob_db_delta_hdr, kind)] = BLOB_DB_DELTA_KIND_RANGE;
+	sys_put_le16(prev_off, p + offsetof(struct blob_db_delta_hdr, prev_off));
+	sys_put_le16(pre, p + offsetof(struct blob_db_delta_hdr, pre));
+	sys_put_le16(suf, p + offsetof(struct blob_db_delta_hdr, suf));
 }
 
 static int delta_parse(const uint8_t *p, uint16_t len, struct delta *d)
 {
-	size_t at = 2;
-
-	if (len < 4) {
+	if (len < DELTA_HDR_LEN ||
+	    p[offsetof(struct blob_db_delta_hdr, kind)] != BLOB_DB_DELTA_KIND_RANGE) {
 		return -EIO;
 	}
-	d->prev_off = sys_get_le16(p);
-	if (varint_get(p, len, &at, &d->pre) || varint_get(p, len, &at, &d->suf)) {
-		return -EIO;
-	}
-	d->mid = p + at;
-	d->mid_len = (uint16_t)(len - at);
+	d->prev_off = sys_get_le16(p + offsetof(struct blob_db_delta_hdr, prev_off));
+	d->pre = sys_get_le16(p + offsetof(struct blob_db_delta_hdr, pre));
+	d->suf = sys_get_le16(p + offsetof(struct blob_db_delta_hdr, suf));
+	d->mid = p + DELTA_HDR_LEN;
+	d->mid_len = (uint16_t)(len - DELTA_HDR_LEN);
 	return 0;
 }
 
@@ -2133,7 +2120,7 @@ static int slot_fetch(uint16_t bid, uint64_t id, uint32_t off, uint32_t limit,
 		return rc;
 	}
 	if (sh->id != id || !(sh->hdr.flags & BLOB_DB_SLOT_F_SEALED) ||
-	    (sh->hdr.flags & ~(uint8_t)BLOB_DB_SLOT_F_KNOWN) ||
+	    BLOB_DB_SLOT_FLAGS_UNKNOWN(sh->hdr.flags) ||
 	    sh->hdr.val_len > CONFIG_BLOB_DB_MAX_PAYLOAD_LEN ||
 	    off + slot_size_for(sh->hdr.val_len) > limit) {
 		return -EAGAIN;
@@ -2159,7 +2146,7 @@ static int slot_fetch(uint16_t bid, uint64_t id, uint32_t off, uint32_t limit,
 static int delta_materialize(uint16_t bid, uint64_t id, struct bucket_scan *sc,
 			     uint8_t *dst)
 {
-	struct { uint16_t at; uint16_t len; } link[CONFIG_BLOB_DB_DELTA_MAX_CHAIN + 1];
+	struct { uint16_t at; uint16_t len; } link[BLOB_DB_DELTA_CHAIN_MAX + 1];
 	uint8_t *cache = g_cbuf;
 	size_t used;
 	int n = 0;
@@ -2177,7 +2164,7 @@ static int delta_materialize(uint16_t bid, uint64_t id, struct bucket_scan *sc,
 	used = plen;
 
 	for (;;) {
-		if (d.prev_off >= at || n > CONFIG_BLOB_DB_DELTA_MAX_CHAIN) {
+		if (d.prev_off >= at || n > BLOB_DB_DELTA_CHAIN_MAX) {
 			return -EIO;
 		}
 		at = d.prev_off;
@@ -2192,7 +2179,7 @@ static int delta_materialize(uint16_t bid, uint64_t id, struct bucket_scan *sc,
 		if (rc < 0) {
 			return rc;
 		}
-		if (sh.hdr.flags & BLOB_DB_SLOT_F_TOMBSTONE) {
+		if (!delta_base_ok(sh.hdr.flags)) {
 			return -EIO;
 		}
 		if (!(sh.hdr.flags & BLOB_DB_SLOT_F_DELTA)) {
@@ -2227,15 +2214,21 @@ static int delta_materialize(uint16_t bid, uint64_t id, struct bucket_scan *sc,
  * @p off into @p out. */
 static int delta_materialize_ram(const uint8_t *buf, off_t off, uint8_t *out, uint16_t *len)
 {
-	uint32_t chain[CONFIG_BLOB_DB_DELTA_MAX_CHAIN + 1];
+	uint32_t chain[BLOB_DB_DELTA_CHAIN_MAX + 1];
 	int n = 0;
 	struct slot_view sv;
 	off_t at = off;
 	struct delta d;
+	uint64_t id = 0;
 
 	for (;;) {
-		if (n > CONFIG_BLOB_DB_DELTA_MAX_CHAIN || !slot_view_at(buf, at, &sv)) {
+		if (n > BLOB_DB_DELTA_CHAIN_MAX || !slot_view_at(buf, at, &sv)) {
 			return -EIO;
+		}
+		if (n == 0) {
+			id = sv.id;
+		} else if (sv.id != id || !delta_base_ok(sv.flags)) {
+			return -EIO;   /* every link is an older slot of the same id */
 		}
 		chain[n++] = (uint32_t)at;
 		const uint8_t *p = buf + at + sizeof(struct blob_db_slot_hdr) + sizeof(uint64_t);
@@ -2414,7 +2407,10 @@ static int append_slot2(uint16_t bid, off_t write_cursor, uint64_t id,
 /* src is the image to walk; it is buf itself (in place) unless delta slots
  * are on, where a chain is materialized from the untouched copy in src: a
  * full value can be longer than the delta it replaces, and a chain's base
- * sits behind it, where the in-place rewrite has already written. */
+ * sits behind it, where the in-place rewrite has already written.
+ *
+ * Returns the new image's length, or 0 when a live delta does not resolve:
+ * the caller then leaves the bucket alone. */
 static size_t build_compacted_image(const uint8_t *src, uint8_t *buf,
 				    uint16_t bid, off_t *stop)
 {
@@ -2467,9 +2463,14 @@ static size_t build_compacted_image(const uint8_t *src, uint8_t *buf,
 					}
 					new_cursor += total;
 				} else {
+					/* Never drop what cannot be read: the
+					 * older links were superseded above, so
+					 * the value would be gone. The bucket
+					 * stays as it is (D13). */
 					LOG_ERR("compact bid=%u: delta chain of id %llu "
-						"broken; dropped", bid,
+						"does not resolve; not compacting", bid,
 						(unsigned long long)sv.id);
+					return 0;
 				}
 				cursor += sv.total_size;
 				continue;
@@ -2687,6 +2688,10 @@ static int compact_bucket(uint16_t bid)
 	const uint8_t *src = g_bbuf;
 #endif
 	const size_t new_len = build_compacted_image(src, g_bbuf, bid, &stop);
+
+	if (new_len == 0) {
+		return -EIO;
+	}
 
 	/* Reads only from stop on, which the in-place rewrite left alone. */
 	rc = compaction_may_drop_tail(bid, src, stop);
@@ -3347,7 +3352,7 @@ static int seg_sweep(uint64_t owner)
 			}
 			if (sh.hdr.flags == 0xff ||
 			    !(sh.hdr.flags & BLOB_DB_SLOT_F_SEALED) ||
-			    (sh.hdr.flags & ~(uint8_t)BLOB_DB_SLOT_F_KNOWN) ||
+			    BLOB_DB_SLOT_FLAGS_UNKNOWN(sh.hdr.flags) ||
 			    sh.hdr.val_len > CONFIG_BLOB_DB_MAX_PAYLOAD_LEN) {
 				break;
 			}
@@ -3935,7 +3940,8 @@ static int update_impl(uint64_t id, const void *payload, size_t len)
 			return -EINVAL;   /* an internal id — see §6.6 */
 		}
 #if defined(CONFIG_BLOB_DB_DELTA)
-		delta_ok = rc == 0 && len <= CONFIG_BLOB_DB_MAX_PAYLOAD_LEN &&
+		delta_ok = rc == 0 && delta_enabled() &&
+			len <= CONFIG_BLOB_DB_MAX_PAYLOAD_LEN &&
 			!(sc.target.hdr.flags & BLOB_DB_SLOT_F_INDEXED);
 #if defined(CONFIG_BLOB_DB_DELTA_BASE)
 		/* Against the full slot at the bottom: never more than one
@@ -4014,9 +4020,11 @@ static int update_impl(uint64_t id, const void *payload, size_t len)
 			suf++;
 		}
 		const uint16_t mid = (uint16_t)(len - pre - suf);
-		uint8_t hdr[8];
-		const size_t hlen = delta_hdr_put(hdr, (uint16_t)old_off, pre, suf);
+		uint8_t hdr[DELTA_HDR_LEN];
+		const size_t hlen = DELTA_HDR_LEN;
 		const size_t dsz = hlen + mid;
+
+		delta_hdr_put(hdr, (uint16_t)old_off, pre, suf);
 #if defined(CONFIG_BLOB_DB_DELTA_BASE)
 		const bool pays = dsz * 100 < (size_t)CONFIG_BLOB_DB_DELTA_BASE_PCT * len;
 #else
