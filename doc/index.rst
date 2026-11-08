@@ -46,6 +46,12 @@ instructions live in the repository ``README.md``.
 
 .. toctree::
    :maxdepth: 1
+   :caption: Tools
+
+   tools/blob_db_export
+
+.. toctree::
+   :maxdepth: 1
    :caption: Design — proposals
 
    proposals/2026-08-09-large-payloads
