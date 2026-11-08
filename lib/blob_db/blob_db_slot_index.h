@@ -56,6 +56,14 @@ void blob_db_sidx_begin(uint16_t bid, uint32_t data_off);
 void blob_db_sidx_note(uint16_t bid, uint64_t id, uint32_t off,
 		       uint32_t size, bool tombstone);
 
+/** Compaction rewrote bucket @p bid from an image in RAM; the notes that
+ *  follow, until blob_db_sidx_rebuild_end(), are its surviving slots in order.
+ *  Without CONFIG_BLOB_DB_SLOT_INDEX_CLOCK this is blob_db_sidx_begin(): every
+ *  survivor is re-learnt. With it, entries already present are refreshed, no
+ *  new ones are made, and those whose id did not survive are dropped at the end. */
+void blob_db_sidx_rebuild_begin(uint16_t bid, uint32_t data_off);
+void blob_db_sidx_rebuild_end(uint16_t bid);
+
 /** A full walk of bucket @p bid found the log ending at @p cursor and, if
  *  @p off is non-negative, @p id's newest slot at @p off. */
 void blob_db_sidx_learn(uint16_t bid, uint64_t id, int64_t off,
@@ -81,6 +89,12 @@ static inline void blob_db_sidx_begin(uint16_t bid, uint32_t data_off)
 	(void)bid;
 	(void)data_off;
 }
+static inline void blob_db_sidx_rebuild_begin(uint16_t bid, uint32_t data_off)
+{
+	(void)bid;
+	(void)data_off;
+}
+static inline void blob_db_sidx_rebuild_end(uint16_t bid) { (void)bid; }
 static inline void blob_db_sidx_note(uint16_t bid, uint64_t id, uint32_t off,
 				     uint32_t size, bool tombstone)
 {

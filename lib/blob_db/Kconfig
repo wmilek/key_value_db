@@ -558,11 +558,34 @@ if BLOB_DB_SLOT_INDEX
 config BLOB_DB_SLOT_INDEX_ENTRIES
 	int "Slot index capacity (power of two)"
 	default 2048
-	range 64 1048576
+	range 16 1048576
 	help
 	  Cells in the id table. Up to 7/8 of them are filled, so size it at
 	  about 1.15x the live blobs the store will hold (blob_db_count()).
 	  12 bytes of RAM per cell: 2048 cells is 24 KiB.
+
+	  With BLOB_DB_SLOT_INDEX_CLOCK the table is a cache instead, and it
+	  needs to hold only the ids looked up often, typically a small
+	  fraction of the store: size it by the hot set, not by the store.
+
+config BLOB_DB_SLOT_INDEX_CLOCK
+	bool "Slot index as a cache: learn on lookup, evict with CLOCK"
+	help
+	  Without this, the table fills with the first ids written or found
+	  and never evicts: once full, every id that did not get in is walked
+	  forever, and a compaction re-learns all of a bucket's survivors in
+	  on-flash order, so ids that are only written (logs) can take the
+	  room of ids read on every operation.
+
+	  With this, an entry is created only when a lookup walks to an id;
+	  appends and compactions only refresh entries already present. A
+	  full table evicts by CLOCK: one reference bit per cell, set on each
+	  hit; a sweeping hand clears set bits and evicts the first cell
+	  found clear. Ids looked up more often than the hand comes round
+	  stay; the rest are walked, which is what a miss costs anyway.
+
+	  Costs 2 bits of RAM per cell. Eviction never affects correctness:
+	  the index is a hint and every hit is still checked against flash.
 
 config BLOB_DB_SLOT_INDEX_MAX_BUCKETS
 	int "Largest bucket count the slot index covers"
