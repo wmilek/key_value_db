@@ -1429,24 +1429,34 @@ int persondb_person_roundtrip(const struct persondb_person *p,
 
 /* -- introspection ------------------------------------------------------ */
 
+static void io_fill(struct persondb_stat *out)
+{
+#ifdef CONFIG_BLOB_DB_IOSTATS
+	struct blob_db_iostats io;
+
+	blob_db_iostats_get(&io);
+	out->flash_reads = io.reads;
+	out->flash_writes = io.writes;
+	out->flash_erases = io.erases;
+	out->bytes_read = io.bytes_read;
+	out->bytes_written = io.bytes_written;
+	out->bytes_erased = io.bytes_erased;
+	out->io_measured = true;
+#else
+	ARG_UNUSED(out);
+#endif
+}
+
+void persondb_io_stat(struct persondb_stat *out)
+{
+	memset(out, 0, sizeof(*out));
+	io_fill(out);
+}
+
 int persondb_stat(struct persondb *db, struct persondb_stat *out)
 {
 	*out = db->st;
-
-#ifdef CONFIG_BLOB_DB_IOSTATS
-	{
-		struct blob_db_iostats io;
-
-		blob_db_iostats_get(&io);
-		out->flash_reads = io.reads;
-		out->flash_writes = io.writes;
-		out->flash_erases = io.erases;
-		out->bytes_read = io.bytes_read;
-		out->bytes_written = io.bytes_written;
-		out->bytes_erased = io.bytes_erased;
-		out->io_measured = true;
-	}
-#endif
+	io_fill(out);
 	out->n_persons = db->sb.n_persons;
 	out->populated = db->sb.populated;
 	out->rev = db->sb.rev;
@@ -1469,9 +1479,11 @@ int persondb_stat(struct persondb *db, struct persondb_stat *out)
 
 void persondb_counters_reset(struct persondb *db)
 {
-	db->st.map_gets = 0;
-	db->st.map_sets = 0;
-	db->st.map_dels = 0;
+	if (db) {
+		db->st.map_gets = 0;
+		db->st.map_sets = 0;
+		db->st.map_dels = 0;
+	}
 #ifdef CONFIG_BLOB_DB_IOSTATS
 	blob_db_iostats_reset();
 #endif

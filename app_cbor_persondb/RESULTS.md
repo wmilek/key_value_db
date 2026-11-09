@@ -875,7 +875,9 @@ No phase exercises these, so this file says nothing about them:
   cost is unknown
 - `persondb_person_delete`, `persondb_permission_grant`,
   `persondb_permission_revoke`
-- `persondb_close`, `persondb_erase`, `persondb_stat`,
+- `persondb_destroy` — measured since, on `native_sim` with a DK projection:
+  §11
+- `persondb_close`, `persondb_stat`,
   `persondb_progress_get`/`_set`, `persondb_person_equal`,
   `persondb_person_record_bytes`, `persondb_person_credential_bytes`
 
@@ -2287,3 +2289,104 @@ High-performance mode needs #49's driver patch and
 nRF5340-DK. An nRF52840-DK that arrives with readback protection on must be
 unlocked first (`nrfutil device recover`, which erases its internal flash but
 not the MX25R).
+
+## 11. Destroying a loaded store — `persondb_destroy()`
+
+Every number above this section is about a store that keeps living. This one
+is about taking it away. It was never measured: §5b listed it under *Not
+measured* as `persondb_erase`, and the only teardown figure in this file was
+`FRESH_START`'s 25.8 s, which is a **whole-partition** `blob_db_erase_all()`
+and so not an option for an application. blob_db is shared (DESIGN.md §12.4):
+`persondb_destroy()` may release this store's blobs and nothing else.
+
+That makes it a different operation from an erase. Each map reads every one of
+its buckets in full, because a bucket may name spilled blobs that have to go
+first. Then it deletes each bucket and directory, one `blob_db_delete()` at a
+time, and each of those walks its erase block's slot headers to find the
+slot, then appends a tombstone. The cost follows what the store holds, not
+the partition size.
+
+`CONFIG_APP_CBOR_PERSONDB_BENCH_DESTROY=y` adds two phases after the report:
+`destroy` (one `persondb_destroy()` of the loaded store) and `create` (the
+`persondb_open()` that builds an empty store in its place, the second half of
+`scenario reset`). The shell's `persondb destroy` and `scenario reset` print
+the same counters. It is off by default because it throws away the run's
+store, and the next boot fills from empty.
+
+`native_sim/native/64`, Zephyr `0235217d2893`, default UBI backend, DK
+geometry (the board's `.conf` and `.overlay` passed explicitly, since the
+`/native/64` variant does not pick up `boards/native_sim.*`). One fresh flash
+image per scale. *DK s (proj.)* is
+`app_perf_l0/tools/l0_timing.py predict -m models/mx25r64_nrf5340dk_full.json`
+on the run's own counters: flash cost on `flash_area`, with no CPU and no UBI
+per-access overhead (add ~10 µs per transaction for UBI, `app_perf_blob_db`).
+**Projected, not measured on a board.**
+
+| persons | live | buckets (people + cred) | reads | bytes read | read B / live B | writes | erases | host ms | **DK s (proj.)** |
+|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|
+| 250 | 110 KB | 63 + 157 | 8 949 | 325 094 | 2.95 | 224 | 0 | 1.2 | **0.80** |
+| 1 000 | 433 KB | 250 + 256 | 46 990 | 1 423 452 | 3.29 | 525 | 0 | 5.0 | **3.83** |
+| 2 000 | 866 KB | 256 + 256 | 76 979 | 2 715 810 | 3.13 | 551 | 1 | 11.0 | **7.41** |
+| 4 000 | 1.73 MB | 400 + 256 | 39 962 | 4 009 368 | 2.31 | 699 | 1 | 14.8 | **5.33** |
+| 8 000 | 3.47 MB | 784 + 256 | 54 894 | 7 648 678 | 2.21 | 1 091 | 1 | 27.5 | **7.27** |
+| 12 000 | 5.21 MB | 1 156 + 256 | 76 653 | 11 521 395 | 2.21 | 1 471 | 3 | 44.9 | **13.02** |
+
+At 8 000 persons a second run on the same image measured 54 399 reads,
+7 573 982 B, 1 090 writes and 0 erases (25.8 ms host): within 1 % on reads,
+and the erase is circumstantial. `create` costs 0.03–0.28 s projected at
+every scale except 12 000 (1.41 s, of which one erase is 1.09 s).
+
+### What the numbers say
+
+- **Destroy is a read job, not an erase job.** At 8 000 persons it reads
+  7.6 MB, 91 % of the 8 MiB partition, to release 3.5 MB of content. Reads are
+  79 % of the projected time and the single erase is 15 %. Tombstones are
+  ~20 B each, so a thousand of them seldom fill an erase block, and that is
+  why erases stay at 0–3.
+- **Bytes read scale with live content, about 2.2× it** at the benchmark scale
+  (2.2–3.3× across the sweep). Roughly one copy is kvhash reading each
+  bucket to look for spilled blobs. The rest is blob_db's slot-header walks
+  and directory re-reads. That split is an estimate from the code
+  (`release_bucket()`, `delete_impl()`), not a separate measurement.
+- **Transaction count is not monotonic in scale**: 2 000 persons needs more
+  reads than 4 000. That is the same slot-walk length §10 shows for `check`,
+  which peaks at a few thousand persons. So the DK time is **~4–7 s anywhere
+  from 1 000 to 8 000 persons and ~13 s at 12 000**, not a straight line.
+- **It is still ~3.5× cheaper than the wipe it replaced**: 7.3 s projected
+  at 8 000 persons, against the 25.8 s `FRESH_START` measured erasing the
+  8 MiB partition (§5). The wipe costs that at any fill, and it also takes
+  every other tenant's data with it.
+- **The store is out of service for the whole figure.** It stops answering
+  at the first write (kvhash's `KVHD` commit), and the new store exists only
+  after `create`, so a reset that a user waits on costs the full time above.
+  Being resumable after a power cut (DESIGN.md §12.4) is a correctness
+  property, not a latency one.
+
+### Not yet known
+
+- **A board run.** The projections use the `flash_area` L0 model. They
+  carry the same caveat §5 found for writes, but this phase is ~80 % reads,
+  which is where the model has held to within a few percent.
+- **Leaks at scale.** The unit tests (`tests/app_cbor_persondb`) prove
+  that a destroy releases every blob and touches no other structure, on small
+  stores. This phase does not count blobs before and after at 8 000 persons,
+  because `blob_db_count()` is partition-wide and would need a new
+  persondb diagnostic to stay behind the domain API (F12).
+
+### Reproducing
+
+```
+west build -p -b native_sim/native/64 app_cbor_persondb -- \
+    -DEXTRA_CONF_FILE=boards/native_sim.conf \
+    -DDTC_OVERLAY_FILE=$PWD/app_cbor_persondb/boards/native_sim.overlay \
+    -DCONFIG_APP_CBOR_PERSONDB_BENCH_DESTROY=y
+./build/zephyr/zephyr.exe --flash=destroy.bin
+python3 app_perf_l0/tools/l0_timing.py predict \
+    -m app_perf_l0/models/mx25r64_nrf5340dk_full.json <console log>
+```
+
+On a board, build with `CONFIG_APP_CBOR_PERSONDB_BENCH_DESTROY=y` and **without**
+`FRESH_START` (Kconfig makes them exclusive). The previous run's `destroy`
+already gives the next run a clean start, scoped to this store.
+`tools/perf_sweep.py run --config CONFIG_APP_CBOR_PERSONDB_BENCH_DESTROY=y`
+adds both phases to every point of a sweep. Each run then becomes a fill run.

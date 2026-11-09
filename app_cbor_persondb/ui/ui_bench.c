@@ -9,7 +9,8 @@
  * or a CBOR byte.
  *
  * Sequence: open -> prepare -> fill (resuming, in batches) -> verify ->
- * mutate -> re-verify -> benchmarks -> report.
+ * mutate -> re-verify -> benchmarks -> report [-> destroy -> create, with
+ * CONFIG_APP_CBOR_PERSONDB_BENCH_DESTROY].
  *
  * Rerunning matters. The verify before the mutation round checks content that
  * a *previous boot* wrote, so persistence is proven rather than asserted:
@@ -18,6 +19,11 @@
  *                                                     start over)
  *   hardware   : reset the board; set
  *                CONFIG_APP_CBOR_PERSONDB_FRESH_START=y once to wipe.
+ *
+ * With CONFIG_APP_CBOR_PERSONDB_BENCH_DESTROY the run ends by destroying the
+ * store it measured (RESULTS.md §11), so every run is a first run and none
+ * proves persistence — but the clean start it leaves is scoped to this store,
+ * where FRESH_START wipes the shared partition.
  */
 
 #include <inttypes.h>
@@ -102,6 +108,32 @@ static void print_report(const struct scenario_report *r)
 	printk("  NOTE: physical occupancy (live + uncompacted garbage) is not\n"
 	       "        observable through the API — see FINDINGS.md B3.\n");
 }
+
+#if defined(CONFIG_APP_CBOR_PERSONDB_BENCH_DESTROY)
+/* The teardown, last: it throws away everything the run built. One op each,
+ * so the bench line's us/op is the whole operation. */
+static int bench_teardown(struct scenario *s, const struct scenario_report *rep)
+{
+	struct scenario_destroy_report d;
+	int rc = scenario_reset(s, rep, &d);
+
+	printk("\ndestroy      : %u persons, %u credentials — person map depth "
+	       "%u x %u buckets, credential map depth %u x %u buckets\n",
+	       d.persons, d.credentials, d.people_depth, d.people_buckets,
+	       d.cred_depth, d.cred_buckets);
+	if (d.destroy.ops == 0) {
+		printk("bench destroy failed: %d\n", rc);
+		return rc;
+	}
+	print_bench(&d.destroy);
+	if (d.create.ops == 0) {
+		printk("bench create failed: %d\n", rc);
+		return rc;
+	}
+	print_bench(&d.create);
+	return 0;
+}
+#endif
 
 int ui_main(void)
 {
@@ -233,8 +265,17 @@ int ui_main(void)
 		print_report(&rep);
 	}
 
+#if defined(CONFIG_APP_CBOR_PERSONDB_BENCH_DESTROY)
+	rc = bench_teardown(&s, rc == 0 ? &rep : NULL);
+	if (rc != 0) {
+		goto out;
+	}
+	printk("\npersondb: done — store at rev %u, then destroyed and rebuilt "
+	       "empty; the next run fills from scratch\n", mut.rev_to);
+#else
 	printk("\npersondb: done — store at rev %u; rerun to prove persistence\n",
 	       mut.rev_to);
+#endif
 	rc = 0;
 
 out:

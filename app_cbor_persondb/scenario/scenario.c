@@ -92,21 +92,6 @@ int scenario_close(struct scenario *s)
 	return 0;
 }
 
-int scenario_reset(struct scenario *s)
-{
-	int rc = persondb_destroy(&s->db);
-
-	if (rc != 0) {
-		return rc;
-	}
-	return scenario_open(s);
-}
-
-int scenario_destroy(struct scenario *s)
-{
-	return persondb_destroy(&s->db);
-}
-
 int scenario_prepare(struct scenario *s, int *steps, int64_t *ms)
 {
 	int64_t t = scenario_now_us();
@@ -348,6 +333,32 @@ const char *scenario_bench_name(enum scenario_bench_kind which)
 	return which < SCENARIO_BENCH_KINDS ? bench_names[which] : "?";
 }
 
+/* Fold the counters read at the end of a phase into its result. The counters
+ * were reset at its start, so the reading is the phase's own traffic; out->us,
+ * out->ops and out->payload_bytes are already set. */
+static void bench_close(struct bench_result *out, const struct persondb_stat *st)
+{
+	out->ms = out->us / 1000;
+	out->store_ops = st->map_gets + st->map_sets + st->map_dels;
+	out->flash_ops = st->flash_reads + st->flash_writes + st->flash_erases;
+	out->flash_bytes = st->bytes_read + st->bytes_written + st->bytes_erased;
+	out->reads = st->flash_reads;
+	out->writes = st->flash_writes;
+	out->erases = st->flash_erases;
+	out->bytes_read = st->bytes_read;
+	out->bytes_written = st->bytes_written;
+	out->bytes_erased = st->bytes_erased;
+	out->measured = st->io_measured;
+	/* Microseconds, not milliseconds/ops: `cbor` runs in a few hundred
+	 * microseconds in total, and rounding that to whole milliseconds is
+	 * exactly the comparison this benchmark exists to make. */
+	out->us_per_op = out->ops ? (uint32_t)(out->us / out->ops) : 0;
+	out->amplification = out->payload_bytes
+				     ? (uint32_t)(out->flash_bytes /
+						  out->payload_bytes)
+				     : 0;
+}
+
 int scenario_bench(struct scenario *s, enum scenario_bench_kind which,
 		   uint32_t samples, struct bench_result *out)
 {
@@ -464,27 +475,8 @@ int scenario_bench(struct scenario *s, enum scenario_bench_kind which,
 	}
 
 	out->us = scenario_since_us(t);
-	out->ms = out->us / 1000;
 	persondb_stat(s->db, &st1);
-
-	out->store_ops = st1.map_gets + st1.map_sets + st1.map_dels;
-	out->flash_ops = st1.flash_reads + st1.flash_writes + st1.flash_erases;
-	out->flash_bytes = st1.bytes_read + st1.bytes_written + st1.bytes_erased;
-	out->reads = st1.flash_reads;
-	out->writes = st1.flash_writes;
-	out->erases = st1.flash_erases;
-	out->bytes_read = st1.bytes_read;
-	out->bytes_written = st1.bytes_written;
-	out->bytes_erased = st1.bytes_erased;
-	out->measured = st1.io_measured;
-	/* Microseconds, not milliseconds/ops: `cbor` runs in a few hundred
-	 * microseconds in total, and rounding that to whole milliseconds is
-	 * exactly the comparison this benchmark exists to make. */
-	out->us_per_op = out->ops ? (uint32_t)(out->us / out->ops) : 0;
-	out->amplification = out->payload_bytes
-				     ? (uint32_t)(out->flash_bytes /
-						  out->payload_bytes)
-				     : 0;
+	bench_close(out, &st1);
 	return 0;
 }
 
@@ -573,5 +565,85 @@ int scenario_card_of(struct scenario *s, uint32_t index, uint8_t slot,
 		return -EINVAL;
 	}
 	dataset_card(index, slot, out);
+	return 0;
+}
+
+/* -- teardown ----------------------------------------------------------- */
+
+int scenario_destroy(struct scenario *s, const struct scenario_report *live,
+		     struct scenario_destroy_report *out)
+{
+	struct scenario_destroy_report tmp;
+	struct persondb_stat st;
+	int64_t t;
+	int rc;
+
+	if (out == NULL) {
+		out = &tmp;
+	}
+	memset(out, 0, sizeof(*out));
+	out->destroy.name = "destroy";
+	out->create.name = "create";
+
+	/* Read before anything goes: afterwards there is no store to ask. */
+	if (s->db) {
+		persondb_stat(s->db, &st);
+		out->persons = st.populated;
+		out->people_depth = st.people_depth;
+		out->people_buckets = st.people_buckets;
+		out->cred_depth = st.cred_depth;
+		out->cred_buckets = st.cred_buckets;
+	}
+	if (live) {
+		out->credentials = live->credentials;
+		out->destroy.payload_bytes = live->logical_bytes;
+	}
+
+	/* No handle to reset through, and none needed: the flash counters are
+	 * blob_db's, and nothing else runs on this single-threaded stack. */
+	persondb_counters_reset(NULL);
+	t = scenario_now_us();
+	rc = persondb_destroy(&s->db);
+	out->destroy.us = scenario_since_us(t);
+	if (rc == 0) {
+		out->destroy.ops = 1;
+	}
+	persondb_io_stat(&st);
+	bench_close(&out->destroy, &st);
+	return rc;
+}
+
+int scenario_reset(struct scenario *s, const struct scenario_report *live,
+		   struct scenario_destroy_report *out)
+{
+	struct scenario_destroy_report tmp;
+	struct persondb_stat st;
+	int64_t t;
+	int rc;
+
+	if (out == NULL) {
+		out = &tmp;
+	}
+	rc = scenario_destroy(s, live, out);
+	if (rc != 0) {
+		return rc;
+	}
+
+	/* persondb_open() alone, not scenario_open(): the stat read that
+	 * follows it is bookkeeping, not part of building the store. */
+	persondb_counters_reset(NULL);
+	t = scenario_now_us();
+	rc = persondb_open(&s->db, N_PERSONS);
+	out->create.us = scenario_since_us(t);
+	persondb_io_stat(&st);
+	if (rc != 0) {
+		bench_close(&out->create, &st);
+		return rc;
+	}
+	out->create.ops = 1;
+	bench_close(&out->create, &st);
+
+	persondb_stat(s->db, &st);
+	s->n_persons = st.n_persons;
 	return 0;
 }

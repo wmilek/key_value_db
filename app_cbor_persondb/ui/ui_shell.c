@@ -131,19 +131,35 @@ static int cmd_close(const struct shell *sh, size_t argc, char **argv)
 	return rc;
 }
 
+/* What a teardown phase cost. Printed even when it failed part-way: a
+ * destroy that released half the store has still done that work. */
+static void print_teardown(const struct shell *sh, const struct bench_result *b)
+{
+	shell_print(sh, "  %-7s %8lld us  rd %llu ops/%llu B  wr %llu ops/%llu B"
+			"  er %llu ops/%llu B",
+		    b->name, (long long)b->us, (unsigned long long)b->reads,
+		    (unsigned long long)b->bytes_read,
+		    (unsigned long long)b->writes,
+		    (unsigned long long)b->bytes_written,
+		    (unsigned long long)b->erases,
+		    (unsigned long long)b->bytes_erased);
+}
+
 /* Needs no open store: it is how a store this build refuses — a newer
  * build's, or one a destroy lost power in — gets removed. Only this store
  * goes; the rest of the partition is untouched. The handle is gone either
  * way, since a failed destroy may have released part of the store. */
 static int cmd_destroy(const struct shell *sh, size_t argc, char **argv)
 {
+	struct scenario_destroy_report d;
 	int rc;
 
 	ARG_UNUSED(argc);
 	ARG_UNUSED(argv);
-	rc = scenario_destroy(&g_s);
+	rc = scenario_destroy(&g_s, NULL, &d);
 	g_open = false;
 	shell_print(sh, "destroy: %d", rc);
+	print_teardown(sh, &d.destroy);
 	return rc;
 }
 
@@ -805,9 +821,15 @@ static int cmd_reset(const struct shell *sh, size_t argc, char **argv)
 
 	ARG_UNUSED(argc);
 	ARG_UNUSED(argv);
-	rc = scenario_reset(&g_s);
+	struct scenario_destroy_report d;
+
+	rc = scenario_reset(&g_s, NULL, &d);
 	g_open = (rc == 0);
 	shell_print(sh, "reset: %d", rc);
+	print_teardown(sh, &d.destroy);
+	if (d.destroy.ops) {
+		print_teardown(sh, &d.create);
+	}
 	return rc;
 }
 

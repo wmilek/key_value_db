@@ -52,13 +52,6 @@ int64_t scenario_since_us(int64_t since_us);
 int scenario_open(struct scenario *s);
 int scenario_close(struct scenario *s);
 
-/** Destroy this store and build an empty one (`scenario reset`). */
-int scenario_reset(struct scenario *s);
-
-/** Destroy this store and leave none (`persondb destroy`); s->db is NULL
- *  afterwards, success or not. */
-int scenario_destroy(struct scenario *s);
-
 /* -- population --------------------------------------------------------- */
 
 struct scenario_fill_report {
@@ -214,6 +207,61 @@ struct scenario_report {
  * bytes plus uncompacted garbage — stays unobservable either way (B3).
  */
 int scenario_report_get(struct scenario *s, struct scenario_report *out);
+
+/* -- teardown ----------------------------------------------------------- */
+
+/*
+ * Removing the store, measured.
+ *
+ * persondb_destroy() cannot be a partition wipe: blob_db is shared, and other
+ * structures live in it (DESIGN.md §12.4), so blob_db_erase_all() is not this
+ * store's to call. The store takes itself apart instead — each map releases
+ * its buckets one blob_db_delete() at a time, then its directory, then the
+ * superblock goes and the registry entry with it. Each map reads every bucket
+ * first, for the spilled blobs it may name; each release walks its erase
+ * block's slot headers and appends a tombstone there, and enough tombstones
+ * in one block force a compaction.
+ *
+ * So the cost scales with what the store holds and with where its blobs
+ * landed, not with the partition size. Measured, it is mostly reads: about
+ * twice the live content at 8 000 persons, with 0-3 erases (RESULTS.md §11).
+ * That is why it is measured on a loaded store rather than estimated.
+ */
+struct scenario_destroy_report {
+	/* What was there, read before the first release. Zero when no store
+	 * was open — the shell destroys stores this build refuses to open. */
+	uint32_t persons;        /* dataset persons written */
+	uint32_t credentials;    /* only when @p live was given */
+	uint8_t  people_depth, cred_depth;
+	uint32_t people_buckets, cred_buckets;
+
+	/* persondb_destroy(), one op. payload_bytes is the live content it
+	 * removed, so amplification reads as flash bytes moved per byte of
+	 * data dropped. ops is 0 if it failed. */
+	struct bench_result destroy;
+
+	/* persondb_open() building an empty store in its place: the second
+	 * half of a reset. scenario_reset() only; ops is 0 if not run. */
+	struct bench_result create;
+};
+
+/**
+ * @brief Destroy this store and leave none (`persondb destroy`), measuring it.
+ *
+ * Needs no open store. s->db is NULL afterwards, success or not.
+ *
+ * @param live (optional) scenario_report_get() of the store about to go, for
+ *             the payload and credential figures. Computing it re-encodes
+ *             every person, so a caller that has one passes it rather than
+ *             this function paying for another.
+ * @param out  (optional) what it cost
+ */
+int scenario_destroy(struct scenario *s, const struct scenario_report *live,
+		     struct scenario_destroy_report *out);
+
+/** scenario_destroy(), then build an empty store (`scenario reset`). */
+int scenario_reset(struct scenario *s, const struct scenario_report *live,
+		   struct scenario_destroy_report *out);
 
 /* -- single-record access, for the shell -------------------------------- */
 

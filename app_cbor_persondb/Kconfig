@@ -126,6 +126,27 @@ config APP_CBOR_PERSONDB_BENCH_SAMPLES
 	default 200
 	range 1 65536
 
+config APP_CBOR_PERSONDB_BENCH_DESTROY
+	bool "End the benchmark run by destroying the store (destructive)"
+	depends on !APP_CBOR_PERSONDB_FRESH_START
+	help
+	  After the report, run `persondb_destroy()` on the loaded store and
+	  time it, then rebuild an empty store in its place and time that:
+	  `scenario reset`, measured. Both print as bench lines with their
+	  flash traffic split by class, like every other phase.
+
+	  This is the scoped teardown, not a wipe. blob_db is shared, so the
+	  store releases its own blobs one delete at a time and leaves
+	  everything else alone (DESIGN.md §12.4); its cost follows what the
+	  store holds, and the erases that its tombstones force are the part
+	  that costs seconds on real flash.
+
+	  Off by default because it throws away what the run built: the next
+	  boot fills from empty again, so every run becomes a first run and
+	  no run proves the previous one's writes survived. Excludes
+	  FRESH_START, which would wipe the partition inside the timed
+	  rebuild.
+
 config APP_CBOR_PERSONDB_FRESH_START
 	bool "Wipe the whole blob_db partition at boot (benchmarks)"
 	help

@@ -457,7 +457,24 @@ int persondb_person_roundtrip(const struct persondb_person *p,
 
 int persondb_stat(struct persondb *db, struct persondb_stat *out);
 
-/** Zero the traffic counters, so a phase can be measured in isolation. */
+/**
+ * @brief The flash counters alone, with no store needed.
+ *
+ * persondb_stat() reads a handle, and the one operation whose cost most needs
+ * measuring leaves none: after persondb_destroy() there is no store to ask.
+ * This fills the flash_* and bytes_* fields and io_measured, zeroes the rest,
+ * and touches no flash. The counters are blob_db's, so they count everything
+ * the partition did since the last reset, not only this store's traffic.
+ */
+void persondb_io_stat(struct persondb_stat *out);
+
+/**
+ * @brief Zero the traffic counters, so a phase can be measured in isolation.
+ *
+ * @p db may be NULL, which resets the flash counters only: that is how a
+ * caller measures persondb_open() or persondb_destroy(), which run without a
+ * handle.
+ */
 void persondb_counters_reset(struct persondb *db);
 
 #ifdef __cplusplus
