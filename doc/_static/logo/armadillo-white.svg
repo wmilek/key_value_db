@@ -1,0 +1,28 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="4 60 192 80" width="192" height="80" role="img">
+<title>key_value_db armadillo</title>
+<g fill="#fff">
+<defs>
+<mask id="a-body" maskUnits="userSpaceOnUse" x="0" y="40" width="200" height="120">
+<rect x="0" y="40" width="200" height="120" fill="#fff"/>
+<g fill="#000"><rect x="72" y="60" width="4" height="60"/><rect x="86" y="60" width="4" height="60"/><rect x="100" y="60" width="4" height="60"/><rect x="114" y="60" width="4" height="60"/><rect x="128" y="60" width="4" height="60"/></g>
+<path d="M154 94 L157 74 L166 91 Z" fill="#000" stroke="#000" stroke-width="4" stroke-linejoin="round"/>
+<path d="M148 90 Q176 88 192 118 Q170 124 148 120 Z" fill="#000" stroke="#000" stroke-width="4" stroke-linejoin="round"/>
+</mask>
+<mask id="a-ear" maskUnits="userSpaceOnUse" x="0" y="40" width="200" height="120">
+<rect x="0" y="40" width="200" height="120" fill="#fff"/>
+<path d="M148 90 Q176 88 192 118 Q170 124 148 120 Z" fill="#000" stroke="#000" stroke-width="4" stroke-linejoin="round"/>
+</mask>
+<mask id="a-head" maskUnits="userSpaceOnUse" x="0" y="40" width="200" height="120">
+<rect x="0" y="40" width="200" height="120" fill="#fff"/>
+<g fill="#000"><circle cx="170" cy="103" r="3.5"/></g>
+</mask>
+</defs>
+<g mask="url(#a-body)">
+<path d="M44 102 Q24 112 8 132 L13 135 Q30 124 46 116 Z"/>
+<rect x="52" y="110" width="16" height="26" rx="4"/><rect x="134" y="110" width="16" height="26" rx="4"/>
+<path d="M38 120 A62 56 0 0 1 162 120 Z"/>
+</g>
+<path d="M154 94 L157 74 L166 91 Z" mask="url(#a-ear)"/>
+<path d="M148 90 Q176 88 192 118 Q170 124 148 120 Z" mask="url(#a-head)"/>
+</g>
+</svg>
