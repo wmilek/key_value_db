@@ -61,6 +61,35 @@ config APP_PERF_BLOB_DB_CHURN_LEN
 	  without large payloads). Larger payloads fill a bucket in fewer
 	  updates, so compaction comes sooner.
 
+config APP_PERF_BLOB_DB_IN_N
+	int "Inline objects in the small-window read phase"
+	default 16
+	range 0 256
+	help
+	  The "in get" / "in read" phases write this many objects that fit in
+	  one slot and read them back: whole, then in IN_PART windows the way
+	  `blob_db export` (32 B) and `blob_db dump` (64 B) do. The io lines
+	  show what a window costs in flash reads against reading the object
+	  once. 0 skips the phases.
+
+config APP_PERF_BLOB_DB_IN_LEN
+	int "Size of each inline object, in bytes"
+	default 1024 if BLOB_DB_LARGE_PAYLOADS
+	default 240
+	range 1 65535
+	help
+	  Must not exceed CONFIG_BLOB_DB_MAX_PAYLOAD_LEN, so the object stays
+	  in one slot. The window phase reads IN_LEN / IN_PART times as often
+	  as the whole-object phase, so a larger object shows the cost of a
+	  window more plainly.
+
+config APP_PERF_BLOB_DB_IN_PART
+	int "Window size of the inline read phase, in bytes"
+	default 32
+	range 1 4096
+	help
+	  32 matches `blob_db export`, 64 `blob_db dump`.
+
 if BLOB_DB_LARGE_PAYLOADS
 
 config APP_PERF_BLOB_DB_OBJ_LEN

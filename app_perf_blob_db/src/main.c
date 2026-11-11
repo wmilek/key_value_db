@@ -27,6 +27,15 @@
  *
  *   mount list — remount with the list in place; it must read back the same
  *
+ * Then objects that fit in one slot, read back the way `blob_db export` and
+ * `blob_db dump` read them (IN_N objects of IN_LEN bytes):
+ *   in write — blob_db_update() of each object (not the point; for scale)
+ *   in get   — blob_db_get() of each object, whole: one read per object
+ *   in read  — blob_db_read() over each object in IN_PART windows. Every
+ *              call loads and CRC-checks the whole slot to hand back one
+ *              window, so its io line against "in get" is the price of a
+ *              small window on an inline object
+ *
  * With CONFIG_BLOB_DB_LARGE_PAYLOADS a second group of phases exercises
  * objects too large for one slot — stored as segments plus an index record —
  * and the partial-access API that exists for them:
@@ -431,7 +440,123 @@ static int bench_mount(const char *what)
 	return 0;
 }
 
+/* Throughput line for the phases where bytes matter more than operations. */
+static void bench_bytes(const char *what, int ops, size_t bytes, int64_t ms)
+{
+	uint64_t kb_per_s =
+		(ms > 0) ? (uint64_t)bytes * 1000ULL / 1024ULL / (uint64_t)ms : 0;
+	uint64_t us_per_op =
+		(ops > 0) ? (uint64_t)ms * 1000ULL / (uint64_t)ops : 0;
+
+	printk("bench %-10s: %4d ops in %7" PRId64 " ms  -> "
+	       "%6llu KB/s  (%9llu us/op)\n",
+	       what, ops, ms, (unsigned long long)kb_per_s,
+	       (unsigned long long)us_per_op);
+}
+
+/* --- inline objects read in small windows ---------------------------- */
+
+#define IN_N    CONFIG_APP_PERF_BLOB_DB_IN_N
+#define IN_LEN  CONFIG_APP_PERF_BLOB_DB_IN_LEN
+#define IN_PART CONFIG_APP_PERF_BLOB_DB_IN_PART
+
+#if IN_N > 0
+BUILD_ASSERT(IN_LEN <= CONFIG_BLOB_DB_MAX_PAYLOAD_LEN,
+	     "APP_PERF_BLOB_DB_IN_LEN must fit one slot (MAX_PAYLOAD_LEN)");
+BUILD_ASSERT(IN_PART <= IN_LEN, "APP_PERF_BLOB_DB_IN_PART exceeds IN_LEN");
+
+static uint8_t __aligned(4) g_in_obj[IN_LEN];
+static uint8_t __aligned(4) g_in_win[IN_PART];
+static uint64_t g_in_ids[IN_N];
+
+static void in_fill(int i)
+{
+	for (size_t b = 0; b < IN_LEN; b++) {
+		g_in_obj[b] = (uint8_t)((b * 7u + (unsigned)i * 13u) ^ (b >> 5));
+	}
+}
+
+/* Both read phases fold every byte, in object order, into the same sum, so
+ * the windows must hand back exactly what the whole-object reads did. */
+static int bench_inline(void)
+{
+	const int windows = (IN_LEN + IN_PART - 1) / IN_PART;
+	uint32_t sum_get = 0;
+	uint32_t sum_read = 0;
+	int64_t t;
+	int rc;
+
+	printk("\n-- inline objects (IN_N=%u  IN_LEN=%u  IN_PART=%u, "
+	       "%d windows each) --\n",
+	       (unsigned)IN_N, (unsigned)IN_LEN, (unsigned)IN_PART, windows);
+
+	io_reset();
+	t = k_uptime_get();
+	for (int i = 0; i < IN_N; i++) {
+		g_in_ids[i] = blob_db_alloc_id();
+		if (g_in_ids[i] == 0) {
+			LOG_ERR("in: alloc_id returned 0 at i=%d", i);
+			return -EIO;
+		}
+		in_fill(i);
+		rc = blob_db_update(g_in_ids[i], g_in_obj, IN_LEN);
+		if (rc < 0) {
+			LOG_ERR("in write %d: %d", i, rc);
+			return rc;
+		}
+	}
+	bench_bytes("in write", IN_N, (size_t)IN_N * IN_LEN, k_uptime_delta(&t));
+	io_line("in write", (size_t)IN_N * IN_LEN);
+
+	io_reset();
+	t = k_uptime_get();
+	for (int i = 0; i < IN_N; i++) {
+		size_t got = 0;
+
+		rc = blob_db_get(g_in_ids[i], g_in_obj, IN_LEN, &got);
+		if (rc < 0 || got != IN_LEN) {
+			LOG_ERR("in get %d: %d, %zu B", i, rc, got);
+			return rc < 0 ? rc : -EIO;
+		}
+		for (size_t b = 0; b < got; b++) {
+			sum_get = sum_get * 33u + g_in_obj[b];
+		}
+	}
+	bench_bytes("in get", IN_N, (size_t)IN_N * IN_LEN, k_uptime_delta(&t));
+	io_line("in get", (size_t)IN_N * IN_LEN);
+
+	io_reset();
+	t = k_uptime_get();
+	for (int i = 0; i < IN_N; i++) {
+		for (size_t off = 0; off < IN_LEN; off += IN_PART) {
+			const size_t want = MIN((size_t)IN_PART, IN_LEN - off);
+			size_t got = 0;
+
+			rc = blob_db_read(g_in_ids[i], off, g_in_win, want, &got);
+			if (rc < 0 || got != want) {
+				LOG_ERR("in read %d@%zu: %d, %zu B", i, off, rc, got);
+				return rc < 0 ? rc : -EIO;
+			}
+			for (size_t b = 0; b < got; b++) {
+				sum_read = sum_read * 33u + g_in_win[b];
+			}
+		}
+	}
+	bench_bytes("in read", IN_N * windows, (size_t)IN_N * IN_LEN,
+		    k_uptime_delta(&t));
+	io_line("in read", (size_t)IN_N * IN_LEN);
+
+	if (sum_read != sum_get) {
+		LOG_ERR("in read checksum 0x%08x, in get 0x%08x", sum_read, sum_get);
+		return -EIO;
+	}
+	printk("in checksum: 0x%08x\n", sum_get);
+	return 0;
+}
+#endif /* IN_N > 0 */
+
 /* --- large-object phases ----------------------------------------------- */
+
 #if defined(CONFIG_BLOB_DB_LARGE_PAYLOADS)
 
 #define OBJ_LEN   CONFIG_APP_PERF_BLOB_DB_OBJ_LEN
@@ -447,20 +572,6 @@ BUILD_ASSERT(PART_LEN <= OBJ_LEN, "APP_PERF_BLOB_DB_PART_LEN exceeds OBJ_LEN");
 static uint8_t __aligned(4) g_obj[OBJ_LEN];
 static uint8_t __aligned(4) g_win[PART_LEN];
 static uint64_t g_ids[N_LARGE];
-
-/* Throughput line for the phases where bytes matter more than operations. */
-static void bench_bytes(const char *what, int ops, size_t bytes, int64_t ms)
-{
-	uint64_t kb_per_s =
-		(ms > 0) ? (uint64_t)bytes * 1000ULL / 1024ULL / (uint64_t)ms : 0;
-	uint64_t us_per_op =
-		(ops > 0) ? (uint64_t)ms * 1000ULL / (uint64_t)ops : 0;
-
-	printk("bench %-10s: %4d ops in %7" PRId64 " ms  -> "
-	       "%6llu KB/s  (%9llu us/op)\n",
-	       what, ops, ms, (unsigned long long)kb_per_s,
-	       (unsigned long long)us_per_op);
-}
 
 static void fill_obj(uint8_t seed)
 {
@@ -959,6 +1070,14 @@ int main(void)
 		rc = -EIO;
 		goto out;
 	}
+
+#if IN_N > 0
+	/* ============ inline objects, small windows ==================== */
+	rc = bench_inline();
+	if (rc < 0) {
+		goto out;
+	}
+#endif
 
 #if defined(CONFIG_BLOB_DB_LARGE_PAYLOADS)
 	/* ============ large objects ==================================== */
