@@ -188,7 +188,7 @@ kvdb:~$ diag roots
     struct_root 3      kvhash   v3 spill (2026-10)      72  n=8 depth=1 bound=3
 
 'BFS1'/0x00000000 blobfs
-  8      blobfs   v2 dirs (2026-10)       68  dir_root=9
+  8      blobfs   v2 dirs (2026-10)       66  dir_root=9
     dir_root    9      kvhash   v3 spill (2026-10)      72  n=8 depth=1 bound=2
 kvdb:~$ diag show 6 kvbucket
 6      kvbucket                         20  entries=1 spilled=1 [shape]
@@ -202,7 +202,7 @@ is named and decoded too:
 |---|---|---|
 | `rootreg` | `RREG` | v1 |
 | `kvdb` | `KVDB`, 32 bytes | v1 |
-| `blobfs` | `BFS1` | v1 bare (16 B, 2026-08) · v1 with rename intent (2026-09) · v2 directories (2026-10) |
+| `blobfs` | `BFS1` | v1 bare (16 B, 2026-08) · v1 with rename intent (2026-09) · v2 directories (2026-10); packed since 2026-11, padded to the writer's u64 alignment (4 or 8) before |
 | `persondb` | CBOR map, key 1 = version | v1 people shards (2026-08) · v2 table directory (2026-10) |
 | `kvhash` | `KVHA`, or `KVHD` mid-destroy | v1 one level (2026-07) · v2 depth (2026-08) · v3 spill (2026-10) |
 | `logring` | `CLOG` | ring v1, the whole log inline (2026-07) · chain v1 root (2026-10) |

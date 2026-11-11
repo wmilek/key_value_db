@@ -65,6 +65,7 @@ EXPECTED = {
     56: ('blobfs', 'v1 intent', 'dir_root=55'),
     58: ('blobfs', 'v1 intent', 'rename-in-flight'),
     59: ('blobfs', 'v2', 'rename-in-flight'),
+    60: ('blobfs', 'v2', 'rename-in-flight'),
     57: ('persondb', 'v1', 'people_maps=2 cred=72'),
 }
 
@@ -136,6 +137,7 @@ def test_roots(store: Shell):
                       '"old" -> "new"']),
     ('diag show 59', ['name limit 20', 'from dir 21, to dir 24',
                       '"x" -> "yy"']),
+    ('diag show 60', ['name limit 12', '"dk" -> "moved"']),
     ('diag show 22', ['"a.txt" = dirent file body -> 23',
                       '"sub" = dirent dir root -> 24']),
     ('diag show 12', ['"alpha" = "1"',

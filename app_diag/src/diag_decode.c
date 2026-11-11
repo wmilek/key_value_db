@@ -54,10 +54,11 @@
  *   v2, 9613f7a (2026-10-11, directories): the intent names both directories
  *     ... [u64 dir_root] [u64 rename_body] [u64 from_dir] [u64 to_dir]
  *     [char from[N+1]] [char to[N+1]]
- * N is CONFIG_BLOBFS_MAX_NAME_LEN of the writing build (default 12). The
- * struct is not packed: it is padded to the writer's u64 alignment, 8 on ARM
- * and 4 on native_sim (x86-32), so a v2 meta with N = 12 is 72 bytes on the
- * DK and 68 on native_sim. N is inferred from the length under either.
+ * N is CONFIG_BLOBFS_MAX_NAME_LEN of the writing build (default 12). Until
+ * blobfs packed the struct (2026-11) it was padded to the writer's u64
+ * alignment, 8 on ARM and 4 on native_sim (x86-32), so a v2 meta with
+ * N = 12 is 72 bytes from the DK, 68 from native_sim, and 66 packed from
+ * either since. N is inferred from the length under any of the three.
  * A directory is a Map (kvhash) of name -> 16-byte dirent:
  *     [u8 type 1=file 2=dir] [u8 version=1] [u16 rsvd] [u32 rsvd]
  *     [u64 body_id | dir_root]
@@ -319,19 +320,23 @@ static bool zeros(const uint8_t *p, size_t from, size_t to)
 }
 
 /* blobfs v1-with-intent and v2: infer the writer's name limit from the
- * length, padded to 4 or to 8, preferring the default. blobfs zero-fills
- * both name fields, so with the whole meta at hand a candidate must leave
- * every byte past each name, up to the limit, zero. Returns 0 if none
- * fits. */
+ * length — packed, or padded to 4 or to 8 by a build from before packing —
+ * preferring the default, then a packed fit, since that is what blobfs
+ * writes now. blobfs zero-fills both name fields, so with the whole meta
+ * at hand a candidate must leave every byte past each name, up to the
+ * limit, zero. Returns 0 if none fits. */
 static size_t bfs_name_max(const uint8_t *buf, size_t n, size_t size,
 			   size_t fixed)
 {
 	size_t best = 0;
+	bool best_packed = false;
 
 	for (size_t nm = 1; nm <= 255; nm++) {
 		const size_t raw = fixed + 2 * (nm + 1);
+		const bool packed = (raw == size);
 
-		if (ROUND_UP(raw, 4u) != size && ROUND_UP(raw, 8u) != size) {
+		if (!packed && ROUND_UP(raw, 4u) != size &&
+		    ROUND_UP(raw, 8u) != size) {
 			continue;
 		}
 		if (n == size) {
@@ -345,8 +350,12 @@ static size_t bfs_name_max(const uint8_t *buf, size_t n, size_t size,
 				continue;
 			}
 		}
-		if (nm == BFS_NAME_DEFAULT || best == 0) {
+		if (nm == BFS_NAME_DEFAULT) {
+			return nm;
+		}
+		if (best == 0 || (packed && !best_packed)) {
 			best = nm;
+			best_packed = packed;
 		}
 	}
 	return best;

@@ -81,14 +81,15 @@ def blobfs_v1_bare(dir_root: int) -> bytes:
 
 
 def _pad(b: bytes, align: int) -> bytes:
-    """The blobfs meta is not packed: padded to the writer's u64 alignment,
-    8 on ARM, 4 on native_sim (x86-32)."""
+    """The blobfs meta is packed (align 1) since 2026-11. Before that it was
+    padded to the writer's u64 alignment, 8 on ARM, 4 on native_sim
+    (x86-32)."""
     return b + b'\0' * (-len(b) % align)
 
 
 def blobfs_v1_intent(dir_root: int, body: int = 0, frm: str = '',
                      to: str = '', name_max: int = 12,
-                     align: int = 8) -> bytes:
+                     align: int = 1) -> bytes:
     f, t = frm.encode(), to.encode()
     return _pad(struct.pack('<IBBBBQQ', fourcc('BFS1'), 1, int(body != 0),
                             len(f), len(t), dir_root, body) +
@@ -98,7 +99,7 @@ def blobfs_v1_intent(dir_root: int, body: int = 0, frm: str = '',
 
 def blobfs_v2(dir_root: int, body: int = 0, frm: str = '', to: str = '',
               from_dir: int = 0, to_dir: int = 0, name_max: int = 12,
-              align: int = 8) -> bytes:
+              align: int = 1) -> bytes:
     f, t = frm.encode(), to.encode()
     return _pad(struct.pack('<IBBBBQQQQ', fourcc('BFS1'), 2, int(body != 0),
                             len(f), len(t), dir_root, body, from_dir,
@@ -167,7 +168,7 @@ def objects() -> dict[int, bytes]:
         14: b'\xee' * 40,            # stands for a spilled key
         15: b'\xdd' * 40,            # and a spilled value
 
-        # blobfs v2, a rename caught in flight.
+        # blobfs v2, packed, a rename caught in flight.
         20: blobfs_v2(21, body=23, frm='a.txt', to='b.txt', from_dir=21,
                       to_dir=21),
         21: kvhash_dir(3, 1, [22, 0]),
@@ -197,10 +198,12 @@ def objects() -> dict[int, bytes]:
         52: kvhash_dir(1, 1, [53, 0]),
         53: kv_entry(b'k', b'v'),
         54: blobfs_v1_bare(55),
-        56: blobfs_v1_intent(55),
+        56: blobfs_v1_intent(55, align=8),
         58: blobfs_v1_intent(55, body=23, frm='old', to='new', align=4),
         59: blobfs_v2(21, body=23, frm='x', to='yy', from_dir=21,
                       to_dir=24, name_max=20, align=4),
+        60: blobfs_v2(21, body=23, frm='dk', to='moved', from_dir=21,
+                      to_dir=21, align=8),     # from the DK, before packing
         57: cbor({1: 1, 2: [70, 71], 3: 72, 4: 3, 5: 1, 6: 2}),
 
         # States and oddities.
