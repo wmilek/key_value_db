@@ -139,29 +139,33 @@ static int cmd_info(const struct shell *sh, size_t argc, char **argv)
 
 /* blob_db stats [top] ---------------------------------------------------- */
 
+/* Buckets are ranked by live bytes, not by used ones: a full log is
+ * compacted on the next append, so only what compaction keeps (live) counts
+ * against the room a bucket has left. */
 struct top_entry {
 	uint16_t bid;
+	uint32_t live;
 	uint32_t used;
 };
 
 static void top_insert(struct top_entry *top, size_t *n, size_t cap,
-		       uint16_t bid, uint32_t used)
+		       uint16_t bid, uint32_t live, uint32_t used)
 {
 	size_t i = *n;
 
 	if (i == cap) {
-		if (used <= top[cap - 1].used) {
+		if (live <= top[cap - 1].live) {
 			return;
 		}
 		i = cap - 1;
 	} else {
 		(*n)++;
 	}
-	while (i > 0 && top[i - 1].used < used) {
+	while (i > 0 && top[i - 1].live < live) {
 		top[i] = top[i - 1];
 		i--;
 	}
-	top[i] = (struct top_entry){ .bid = bid, .used = used };
+	top[i] = (struct top_entry){ .bid = bid, .live = live, .used = used };
 }
 
 static int cmd_stats(const struct shell *sh, size_t argc, char **argv)
@@ -219,13 +223,14 @@ static int cmd_stats(const struct shell *sh, size_t argc, char **argv)
 		compactions += bs.gen - 1;
 
 		const uint32_t used = bs.capacity - bs.free_bytes;
-		const uint32_t bin = MIN(permille(used, bs.capacity) /
+		const uint32_t bin = MIN(permille(bs.live_bytes, bs.capacity) /
 					 (1000 / HIST_BINS),
 					 (uint32_t)HIST_BINS - 1);
 
 		hist[bin]++;
 		if (top_n) {
-			top_insert(top, &n_top, top_n, bid, used);
+			top_insert(top, &n_top, top_n, bid, bs.live_bytes,
+				   used);
 		}
 	}
 
@@ -281,7 +286,8 @@ static int cmd_stats(const struct shell *sh, size_t argc, char **argv)
 		}
 
 		shell_print(sh, "");
-		shell_print(sh, "fill of formatted buckets (used / capacity):");
+		shell_print(sh, "fill of formatted buckets (live / capacity, "
+			    "what compaction keeps):");
 		for (int i = 0; i < HIST_BINS; i++) {
 			char bar[HIST_BAR + 1];
 			size_t w = DIV_ROUND_UP((size_t)hist[i] * HIST_BAR, peak);
@@ -296,10 +302,12 @@ static int cmd_stats(const struct shell *sh, size_t argc, char **argv)
 
 	if (n_top) {
 		shell_print(sh, "");
-		shell_print(sh, "fullest buckets:");
+		shell_print(sh, "fullest buckets (by live bytes):");
 		for (size_t i = 0; i < n_top; i++) {
-			shell_print(sh, "  bucket %-5u %6u B used " PM_FMT,
-				    top[i].bid, top[i].used,
+			shell_print(sh, "  bucket %-5u %6u B live " PM_FMT
+				    "   used " PM_FMT, top[i].bid, top[i].live,
+				    PM_ARG(permille(top[i].live,
+						    in.bucket_capacity)),
 				    PM_ARG(permille(top[i].used,
 						    in.bucket_capacity)));
 		}
@@ -332,7 +340,7 @@ static int cmd_buckets(const struct shell *sh, size_t argc, char **argv)
 	const uint64_t last = MIN(first + count, (uint64_t)in.n_buckets);
 
 	shell_print(sh, "bucket   gen  ids  seg stale tomb    live garbage"
-		    "   torn    free   used");
+		    "   torn    free   used  live%");
 
 	uint32_t skipped = 0;
 
@@ -352,11 +360,12 @@ static int cmd_buckets(const struct shell *sh, size_t argc, char **argv)
 		const uint32_t used = bs.capacity - bs.free_bytes;
 
 		shell_print(sh, "%6llu %5u %4u %4u %5u %4u %7u %7u %6u %7u "
-			    PM_FMT, (unsigned long long)bid, bs.gen,
-			    bs.objects, bs.segments, bs.superseded,
+			    PM_FMT " " PM_FMT, (unsigned long long)bid,
+			    bs.gen, bs.objects, bs.segments, bs.superseded,
 			    bs.tombstones, bs.live_bytes, bs.garbage_bytes,
 			    bs.tail_bytes, bs.free_bytes,
-			    PM_ARG(permille(used, bs.capacity)));
+			    PM_ARG(permille(used, bs.capacity)),
+			    PM_ARG(permille(bs.live_bytes, bs.capacity)));
 	}
 	if (skipped) {
 		shell_print(sh, "(%u never-used buckets not shown)", skipped);
