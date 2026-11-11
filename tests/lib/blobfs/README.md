@@ -29,8 +29,10 @@ follow a renamed directory), renaming a directory with its contents, and
 root and in a subdirectory, a rename that fails part way in a running
 session (via kvhash's write-cut test hook) being finished before the next
 unlink or rename, mounting a store whose meta predates directories and its
-upgrade at the first `mkdir`, removing a directory whose Map is already gone,
-a listing stepping past a broken entry, and the single-mount limit.
+upgrade at the first `mkdir`, a meta of either version mounting whether it
+was written packed or padded by a 4- or 8-byte-aligned build, removing a
+directory whose Map is already gone, a listing stepping past a broken entry,
+and the single-mount limit.
 
 ```shell
 west twister -T key_value_db/tests/lib/blobfs -p native_sim -v --inline-logs

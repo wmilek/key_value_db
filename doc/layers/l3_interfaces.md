@@ -196,6 +196,21 @@ that predates directories refuses the store at mount instead of reporting
 each directory as corrupt; a store that never makes a directory stays
 version 1 and can still go back to that firmware.
 
+The meta record is **packed**, so its bytes are the same whatever the
+writing build's ABI, and a store moves between native_sim and a DK (e.g. a
+partition dump opened in the app_diag host build). Packing moves no field —
+everything before the two names is naturally aligned — it only drops the
+trailing padding earlier builds wrote: the record rounded up to the u64
+alignment, 8 bytes on ARM and x86-64, 4 on native_sim (x86-32). With the
+default 12-byte names that is 66 bytes now against 72 / 68 before for
+version 2, and 50 against 56 / 52 for version 1. Mount accepts all three
+lengths for either version and ignores the pad bytes; every meta write is
+packed. The version byte is unchanged, since what the fields mean is: a
+build from before packing that reads a packed meta refuses it at mount
+(`bad blobfs metadata … len 66`) rather than misreading it. A store is only
+rewritten packed by a meta write (mkfs, `rename`, the `mkdir` upgrade
+above), so a store that only gets mounted keeps its old length.
+
 **Listing** is `map_ops.next` (§3) passed straight through:
 `blobfs_opendir` resolves a path to the directory's id, and `blobfs_next_id`
 takes the previous name as its cursor and returns the following entry with

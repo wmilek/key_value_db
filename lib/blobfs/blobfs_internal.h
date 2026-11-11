@@ -15,6 +15,9 @@
 
 #include <stdint.h>
 
+#include <zephyr/sys/util.h>  /* ROUND_UP */
+#include <zephyr/toolchain.h> /* __packed */
+
 #include <app/lib/blobfs.h> /* BLOBFS_NAME_MAX */
 
 #define BLOBFS_MAGIC          0x42465331u /* 'BFS1' */
@@ -37,8 +40,16 @@
  * The intent names the directory each end lives in. Today both are always
  * the same directory (rename across directories reports -EXDEV); the two
  * fields are what will let a cross-directory rename use this format as is.
+ *
+ * Both meta versions are __packed, so the record is the same bytes whatever
+ * the writing build's ABI. Every field before the names is naturally
+ * aligned, so packing moves no offset; it only drops the trailing padding
+ * an unpacked struct got from its u64 alignment. Builds before this wrote
+ * that padding — the record rounded up to 8 bytes on ARM and x86-64, to 4
+ * on native_sim (x86-32) — and mount still accepts all three lengths, see
+ * BLOBFS_META_LEN_OK().
  */
-struct blobfs_meta {
+struct __packed blobfs_meta {
 	uint32_t magic;
 	uint8_t  version;
 	uint8_t  rename_in_flight; /* the fields below hold a live intent */
@@ -58,7 +69,7 @@ struct blobfs_meta {
  */
 #define BLOBFS_META_VERSION_1 1
 
-struct blobfs_meta_v1 {
+struct __packed blobfs_meta_v1 {
 	uint32_t magic;
 	uint8_t  version;
 	uint8_t  rename_in_flight;
@@ -69,6 +80,14 @@ struct blobfs_meta_v1 {
 	char     from[BLOBFS_NAME_MAX + 1];
 	char     to[BLOBFS_NAME_MAX + 1];
 };
+
+/* Whether a meta record of @p got bytes is a struct of @p packed bytes, as
+ * this build writes it or as an earlier build padded it to 4 or 8 bytes.
+ * The padding bytes carry nothing and are not checked.
+ */
+#define BLOBFS_META_LEN_OK(got, packed)                                       \
+	((got) == (packed) || (got) == ROUND_UP((packed), 4) ||               \
+	 (got) == ROUND_UP((packed), 8))
 
 /* Directory entry (the Map's value): name -> body blob, or name -> the
  * Map root of a subdirectory.

@@ -37,6 +37,7 @@
  */
 
 #include <errno.h>
+#include <stddef.h>
 #include <string.h>
 
 #include <zephyr/logging/log.h>
@@ -55,6 +56,15 @@ BUILD_ASSERT(sizeof(struct blobfs_meta) <= CONFIG_BLOB_DB_MAX_PAYLOAD_LEN,
 	     "blobfs_meta (which scales with CONFIG_BLOBFS_MAX_NAME_LEN) must "
 	     "fit one blob payload; raise CONFIG_BLOB_DB_MAX_PAYLOAD_LEN or "
 	     "lower CONFIG_BLOBFS_MAX_NAME_LEN");
+/* The meta's field offsets are the ones builds before packing wrote. */
+BUILD_ASSERT(offsetof(struct blobfs_meta, dir_root) == 8 &&
+	     offsetof(struct blobfs_meta, from) == 40 &&
+	     sizeof(struct blobfs_meta) == 40 + 2 * (BLOBFS_NAME_MAX + 1),
+	     "blobfs_meta layout changed");
+BUILD_ASSERT(offsetof(struct blobfs_meta_v1, dir_root) == 8 &&
+	     offsetof(struct blobfs_meta_v1, from) == 24 &&
+	     sizeof(struct blobfs_meta_v1) == 24 + 2 * (BLOBFS_NAME_MAX + 1),
+	     "blobfs_meta_v1 layout changed");
 BUILD_ASSERT(sizeof(struct blobfs_dirent) == 16,
 	     "blobfs_dirent must be a tight 16 bytes");
 
@@ -332,7 +342,9 @@ static int rename_recover(struct blobfs_meta *meta)
 /* Read the meta blob, in either version, as version 2. A version 1 meta
  * (blobfs before directories) differs only in its intent having no
  * directory fields: there was only the root, so both ends live there.
- * Nothing is written here; the next meta write stores version 2.
+ * Either version may carry the trailing padding of the build that wrote it
+ * (see struct blobfs_meta), so the buffer has room for the longest.
+ * Nothing is written here; the next meta write stores version 2, packed.
  */
 static int meta_read(uint64_t meta_id, struct blobfs_meta *meta,
 		     bool *was_v1)
@@ -340,6 +352,8 @@ static int meta_read(uint64_t meta_id, struct blobfs_meta *meta,
 	union {
 		struct blobfs_meta    v2;
 		struct blobfs_meta_v1 v1;
+		uint8_t               raw[ROUND_UP(sizeof(struct blobfs_meta),
+						   8)];
 	} buf;
 	size_t got = 0;
 	int rc = blob_db_get(meta_id, &buf, sizeof(buf), &got);
@@ -351,13 +365,15 @@ static int meta_read(uint64_t meta_id, struct blobfs_meta *meta,
 		return -ENOENT;
 	}
 
-	if (got == sizeof(buf.v2) && buf.v2.magic == BLOBFS_MAGIC &&
+	if (BLOBFS_META_LEN_OK(got, sizeof(buf.v2)) &&
+	    buf.v2.magic == BLOBFS_MAGIC &&
 	    buf.v2.version == BLOBFS_META_VERSION) {
 		*meta = buf.v2;
 		*was_v1 = false;
 		return 0;
 	}
-	if (got == sizeof(buf.v1) && buf.v1.magic == BLOBFS_MAGIC &&
+	if (BLOBFS_META_LEN_OK(got, sizeof(buf.v1)) &&
+	    buf.v1.magic == BLOBFS_MAGIC &&
 	    buf.v1.version == BLOBFS_META_VERSION_1) {
 		*meta = (struct blobfs_meta){
 			.magic = BLOBFS_MAGIC,

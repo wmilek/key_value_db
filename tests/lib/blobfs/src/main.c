@@ -1162,6 +1162,113 @@ ZTEST(blobfs, test_mkdir_upgrades_v1_meta)
 	zassert_ok(fs_unmount(&blobfs_mnt));
 }
 
+/* The meta is packed, so its bytes do not depend on the writing build's
+ * ABI. Builds before that padded it to the u64 alignment: 8 bytes on ARM
+ * (the DKs) and x86-64, 4 on native_sim (x86-32). A store written at either
+ * padding — or packed — mounts, in either version, with a pending intent
+ * in it, and the meta that recovery writes back is packed.
+ */
+static void forge_padded_meta(uint8_t version, size_t pad, uint64_t body_id,
+			      size_t *len)
+{
+	uint8_t rec[ROUND_UP(sizeof(struct blobfs_meta), 8)] = {0};
+	uint64_t meta_id = 0;
+	struct blobfs_meta meta;
+	size_t got = 0;
+	size_t packed;
+
+	zassert_ok(rootreg_get(ROOTREG_KEY(BLOBFS_MAGIC, 0), &meta_id));
+	zassert_ok(blob_db_get(meta_id, &meta, sizeof(meta), &got));
+	zassert_equal(got, sizeof(meta), "meta not written packed");
+
+	/* Intent committed, directory untouched: mount rolls it back. */
+	if (version == BLOBFS_META_VERSION_1) {
+		struct blobfs_meta_v1 v1 = {
+			.magic = BLOBFS_MAGIC,
+			.version = BLOBFS_META_VERSION_1,
+			.rename_in_flight = 1,
+			.from_len = 3,
+			.to_len = 3,
+			.dir_root = meta.dir_root,
+			.rename_body = body_id,
+		};
+
+		memcpy(v1.from, "old", 3);
+		memcpy(v1.to, "new", 3);
+		packed = sizeof(v1);
+		memcpy(rec, &v1, packed);
+	} else {
+		meta.rename_in_flight = 1;
+		meta.from_len = 3;
+		meta.to_len = 3;
+		meta.rename_body = body_id;
+		meta.from_dir = meta.dir_root;
+		meta.to_dir = meta.dir_root;
+		memcpy(meta.from, "old", 3);
+		memcpy(meta.to, "new", 3);
+		packed = sizeof(meta);
+		memcpy(rec, &meta, packed);
+	}
+
+	*len = pad ? ROUND_UP(packed, pad) : packed;
+	zassert_ok(blob_db_update(meta_id, rec, *len));
+}
+
+ZTEST(blobfs, test_meta_mounts_at_any_padding)
+{
+	static const uint8_t versions[] = {BLOBFS_META_VERSION_1,
+					   BLOBFS_META_VERSION};
+	static const size_t pads[] = {0, 4, 8};
+	struct fs_dirent stat;
+	uint64_t body_id = 0;
+	uint64_t meta_id = 0;
+	size_t size = 0;
+
+	/* The lengths differ between paddings, or a padding goes untested. */
+	BUILD_ASSERT(sizeof(struct blobfs_meta) % 4 != 0 &&
+		     ROUND_UP(sizeof(struct blobfs_meta), 4) % 8 != 0,
+		     "pick a CONFIG_BLOBFS_MAX_NAME_LEN where the three meta "
+		     "lengths differ");
+
+	zassert_ok(fs_mount(&blobfs_mnt));
+	make_file(MNT_POINT "/old", "pad", 3);
+	zassert_ok(blobfs_lookup("old", &body_id));
+	zassert_ok(fs_unmount(&blobfs_mnt));
+	zassert_ok(rootreg_get(ROOTREG_KEY(BLOBFS_MAGIC, 0), &meta_id));
+
+	ARRAY_FOR_EACH(versions, v) {
+		ARRAY_FOR_EACH(pads, p) {
+			size_t len = 0;
+
+			forge_padded_meta(versions[v], pads[p], body_id, &len);
+			zassert_ok(fs_mount(&blobfs_mnt),
+				   "version %u meta of %zu bytes refused",
+				   versions[v], len);
+
+			zassert_ok(fs_stat(MNT_POINT "/old", &stat));
+			zassert_equal(stat.size, 3);
+			zassert_equal(fs_stat(MNT_POINT "/new", &stat),
+				      -ENOENT);
+			zassert_ok(blob_db_size(meta_id, &size));
+			zassert_equal(size, sizeof(struct blobfs_meta),
+				      "recovery wrote %zu bytes", size);
+			check_intent_cleared();
+
+			zassert_ok(fs_unmount(&blobfs_mnt));
+		}
+	}
+
+	/* A length between the paddings is still refused. */
+	size_t len = 0;
+
+	forge_padded_meta(BLOBFS_META_VERSION, 0, body_id, &len);
+	uint8_t rec[ROUND_UP(sizeof(struct blobfs_meta), 8)] = {0};
+
+	zassert_ok(blob_db_get(meta_id, rec, sizeof(rec), &size));
+	zassert_ok(blob_db_update(meta_id, rec, len + 1));
+	zassert_equal(fs_mount(&blobfs_mnt), -EIO);
+}
+
 /* Make a rename from "a" to "b" fail on its last step (dropping "a"), so
  * both names are left bound to one file with the intent on flash.
  */
