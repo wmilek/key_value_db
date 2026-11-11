@@ -173,6 +173,24 @@ The shell runs on the board's console UART. The storage partition is the first
 8 MB of the external MX25R64. A raw dump of that range opens unchanged with
 `--kvdb=` on the host build.
 
+## On the device (nRF54L15-DK)
+
+```bash
+west build -b nrf54l15dk/nrf54l15/cpuapp -d build/diag_n54 key_value_db/app_diag
+```
+
+The shell runs on the board's first VCOM. The storage partition is the whole
+MX25R64 (8 MB, 64 KB erase blocks), which on this board is on SPI00 rather
+than QSPI, so its write block is 1 B: an image from this board does not open
+on the nRF5340-DK build or on `native_sim`'s default geometry, nor the other
+way round. The SoC's internal `storage_partition` is removed so that
+`storage` names the external part only.
+
+`BLOB_DB_MAX_PAYLOAD_LEN` defaults to 256, but firmware storing larger
+records formats with a larger cap; match it, for example
+`-DCONFIG_BLOB_DB_MAX_PAYLOAD_LEN=16384`, before mounting that firmware's
+store.
+
 ## Tests
 
 `sample.yaml` runs these scenarios on `native_sim` under twister:

@@ -1,0 +1,28 @@
+/*
+ * The store on the nRF54L15-DK's MX25R64: the same chip as the nRF5340-DK's,
+ * but on SPI00 (jedec,spi-nor, single line, 8 MHz) rather than QSPI. The whole
+ * chip, 64 KB sectors, as app_cbor_persondb and nrf_ble_scanner_with_db lay it
+ * out on this board.
+ *
+ * The SoC's internal storage_partition (RRAM) is removed so that the label
+ * "storage" names the external part only.
+ *
+ * spi-nor's write block is 1 B (QSPI: 4 B), so an image written here does not
+ * open on the nRF5340-DK build or on native_sim's default, and the other way
+ * round.
+ */
+
+/delete-node/ &storage_partition;
+
+&mx25r64 {
+	partitions {
+		compatible = "fixed-partitions";
+		#address-cells = <1>;
+		#size-cells = <1>;
+
+		storage_partition: partition@0 {
+			label = "storage";
+			reg = <0x00000000 0x00800000>;
+		};
+	};
+};
