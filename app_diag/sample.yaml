@@ -69,3 +69,16 @@ tests:
     harness_config:
       pytest_root:
         - "pytest/test_export.py"
+
+  # `diag`: a store imported from pytest/diag_fixtures.py, one object in every
+  # structure format diag knows, current and past, is scanned, walked from
+  # the registry and decoded object by object. One device for the module:
+  # the store is imported once.
+  app.diag.structs:
+    platform_allow:
+      - native_sim
+    harness: pytest
+    harness_config:
+      pytest_dut_scope: module
+      pytest_root:
+        - "pytest/test_structs.py"

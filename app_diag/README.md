@@ -8,8 +8,8 @@ a partition image. The plan it is the first step of is
 
 ## What it contains
 
-The app registers no commands of its own. It enables the groups the libraries
-and Zephyr provide.
+The groups the libraries and Zephyr provide, plus one of the app's own,
+`diag`, which names and decodes the structures in the store.
 
 | Group | Source | Needs a mount | Writes |
 |---|---|---|---|
@@ -23,6 +23,7 @@ and Zephyr provide.
 | `flash read` · `write` · `erase` · … | Zephyr `CONFIG_FLASH_SHELL` | no | `write`, `erase`, `copy`, `load`, `test` |
 | `kernel …`, `device list` | Zephyr kernel and device shells | no | no |
 | `kernel reboot cold` · `warm` | Zephyr kernel shell (`CONFIG_REBOOT`) | no | no; the store sees a power cut between operations |
+| `diag scan [-a]` · `roots` · `show <id> [type]` · `formats` | `app_diag/src/diag_*.c` (`CONFIG_APP_DIAG_STRUCT`) | yes (`formats`: no) | no |
 
 ## No automatic mount
 
@@ -163,6 +164,74 @@ The host build stages objects of up to 128 KB
 by default. On a device, `import` lines have to be sent one at a time, each
 after the previous reply: the shell has no flow control on its input.
 
+## Structure recognition (`diag`)
+
+blob_db stores ids and bytes; it does not know what an object is. `diag`
+recognises the structures the libraries build on it from the bytes alone, and
+prints them:
+
+| Command | What it does |
+|---|---|
+| `diag scan` | classifies every live object; lists the structure heads, anything suspect, and what the registry points at; then a count and byte total per type and variant |
+| `diag scan -a` | the same, listing every object |
+| `diag roots` | the root registry (id 1), each root, and what each root points at |
+| `diag show <id>` | one object decoded in full, every id it references included |
+| `diag show <id> <type>` | decoded as `<type>`, whatever it looks like: a bucket or a log entry carries no magic |
+| `diag formats` | the types and the variants this build knows |
+
+```
+kvdb:~$ diag roots
+1      rootreg  v1                      56  entries=3
+
+'KVDB'/0x68067b08 kvdb
+  2      kvdb     v1                      32  name="settings" backend=hash map=3
+    struct_root 3      kvhash   v3 spill (2026-10)      72  n=8 depth=1 bound=3
+
+'BFS1'/0x00000000 blobfs
+  8      blobfs   v2 dirs (2026-10)       68  dir_root=9
+    dir_root    9      kvhash   v3 spill (2026-10)      72  n=8 depth=1 bound=2
+kvdb:~$ diag show 6 kvbucket
+6      kvbucket                         20  entries=1 spilled=1 [shape]
+  [0] "wifi.psk" = spilled 100 B -> 5
+```
+
+What it knows, with the variants earlier firmware wrote, so that an old image
+is named and decoded too:
+
+| Type | Recognised by | Variants |
+|---|---|---|
+| `rootreg` | `RREG` | v1 |
+| `kvdb` | `KVDB`, 32 bytes | v1 |
+| `blobfs` | `BFS1` | v1 bare (16 B, 2026-08) · v1 with rename intent (2026-09) · v2 directories (2026-10) |
+| `persondb` | CBOR map, key 1 = version | v1 people shards (2026-08) · v2 table directory (2026-10) |
+| `kvhash` | `KVHA`, or `KVHD` mid-destroy | v1 one level (2026-07) · v2 depth (2026-08) · v3 spill (2026-10) |
+| `logring` | `CLOG` | ring v1, the whole log inline (2026-07) · chain v1 root (2026-10) |
+| `kvbucket` | layout only | kvhash bucket, inline or spilled entries; blobfs dirents and CBOR values shown as such |
+| `logentry` | layout only | logring chain entry |
+| `cbor` | one well-formed CBOR array or map | e.g. a spilled persondb record |
+
+Each verdict is a guess from bytes. A magic whose length checks agree is a
+strong one. A type without a magic is marked `[shape]`, and a magic whose
+other fields disagree is marked `[suspect: ...]`. A file body or a spilled
+value can hold any bytes, another structure's magic included. Spilled keys and
+values and file bodies have no layout to recognise and count as `unknown`.
+
+The formats are copied into `src/diag_decode.c`, with the commit each layout
+comes from. The libraries carry no diagnostic code. When a library changes a
+format, add the new variant there and keep the old one.
+`pytest/diag_fixtures.py` builds an object of each, which
+`app.diag.structs` imports and checks.
+
+The commands only read: `blob_db_size()`, `blob_db_read()` and the inspect
+API. An object is read into one buffer of `CONFIG_APP_DIAG_BUF_SIZE` bytes
+(default: one payload), and a larger one is judged by its first bytes.
+
+`scan` and `roots` report a registered root, or a field of one, that names no
+object, as `unbound`. That is normal for a structure created lazily, or one a
+crash interrupted before its first bind. Telling a leaked object from a live
+one needs the whole reference graph, which is step 4 of the
+[tools plan](../doc/proposals/2026-11-02-kvdb-tools.md).
+
 ## On the device (nRF5340-DK)
 
 ```bash
@@ -209,3 +278,6 @@ store.
   one pass.
 - `app.diag.export.large`: the same with `CONFIG_BLOB_DB_LARGE_PAYLOADS=y`,
   so one object is segmented.
+- `app.diag.structs`: `pytest/test_structs.py` imports an object in each
+  format `diag` knows, current and past (`pytest/diag_fixtures.py`), and
+  checks `scan`, `scan -a`, `roots` and `show`.

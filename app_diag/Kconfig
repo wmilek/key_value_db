@@ -25,3 +25,40 @@ config APP_DIAG_MOUNT_AT_BOOT
 	  touches the storage partition only through the commands typed at it:
 	  "flash" reads raw bytes, "blob_db" answers "not mounted" until
 	  `blob_db mount` or `blob_db format yes` is run.
+
+config APP_DIAG_STRUCT
+	bool "diag: recognise and decode structures"
+	default y
+	depends on SHELL && BLOB_DB_INSPECT
+	help
+	  Add a `diag` shell group that names what each live object is: the
+	  root registry, kvdb and blobfs metas, the persondb superblock,
+	  kvhash directories and buckets, logring roots and entries. `scan`
+	  classifies every object and counts them by type, `roots` walks the
+	  root registry one level down, `show` decodes one object.
+
+	  The formats, the current ones and those earlier builds wrote, are
+	  compiled into app_diag (src/diag_decode.c); the libraries carry none
+	  of this. Read-only: only blob_db_size(), blob_db_read() and the
+	  inspect API are called.
+
+config APP_DIAG_BUF_SIZE
+	int "Bytes of one object diag reads"
+	default BLOB_DB_MAX_PAYLOAD_LEN
+	range 64 65536
+	depends on APP_DIAG_STRUCT
+	help
+	  An object is read into one static buffer of this size to be
+	  classified and decoded. A larger object is judged by its first
+	  bytes only. Every structure head and kvhash bucket fits in one
+	  payload, so the default covers all of them.
+
+config APP_DIAG_HINTS_MAX
+	int "References diag tracks from the root registry"
+	default 32
+	range 4 1024
+	depends on APP_DIAG_STRUCT
+	help
+	  `diag scan` labels the registry's roots, and what each root points
+	  at, with where they are referenced from, and lists those that name
+	  no object. This many fit; 24 bytes each.

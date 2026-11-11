@@ -5,7 +5,8 @@
  * kvdb diagnostics: an application that does nothing but expose the shell.
  *
  * The commands are the ones the libraries and Zephyr register (blob_db,
- * flash, kernel, device); this file adds none. It says what was built, and
+ * flash, kernel, device), plus the app's own `diag` (diag_shell.c), which
+ * recognises the structures in the store. This file says what was built, and
  * mounts the store only when CONFIG_APP_DIAG_MOUNT_AT_BOOT asks for it: by
  * default nothing writes the storage partition until a command typed at the
  * shell does (`blob_db mount`, `blob_db format yes`, `flash write`).
