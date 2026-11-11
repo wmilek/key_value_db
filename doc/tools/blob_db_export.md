@@ -77,7 +77,12 @@ not objects: its content comes as one object, read through its id.
 `blob_db_read()` outside its callback. `blob_db_iterate()` cannot do it: its
 callback must not read, and it hands a large object's segment table as the
 payload. An application writing to the store meanwhile is not stopped: each
-object is consistent, the dump as a whole is not a snapshot.
+object is consistent, the dump as a whole is not a snapshot. Worse for a
+restore: the header's `next_id` is read before the walk, so an object created
+during the export can carry an id at or past it, and import refuses that
+object. A dump meant for restoring is taken from `app_diag`, which has no
+background writers, or with the application's writers stopped.
+`blob_db_export.py` warns about such ids.
 
 `import` writes. It is built with `CONFIG_BLOB_DB_SHELL_ADMIN`.
 

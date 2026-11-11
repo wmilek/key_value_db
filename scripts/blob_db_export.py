@@ -185,6 +185,24 @@ class Dump:
                               f'{n_err} seen')
         return issues, resend
 
+    def warnings(self) -> list[str]:
+        """What is readable but will not restore as it is."""
+        out = []
+        try:
+            next_id = int(self.header['next_id'])
+        except (TypeError, KeyError, ValueError):
+            return out
+        late = sorted(oid for oid in self.complete() if oid >= next_id)
+        if late:
+            # The header is taken before the walk: an id allocated while the
+            # export ran can be in the dump. Import refuses it.
+            out.append(f'{len(late)} objects have ids at or past the '
+                       f"header's next_id {next_id} ({late[0]}..{late[-1]}): "
+                       'the store was written during the export, and import '
+                       'refuses them. Export from app_diag, or with the '
+                       "application's writers stopped.")
+        return out
+
     def complete(self) -> dict[int, bytes]:
         out = {}
         for oid, o in self.objects.items():
@@ -250,6 +268,8 @@ def _report(dump: Dump) -> bool:
               file=sys.stderr)
     for i in issues:
         print(f'problem: {i}', file=sys.stderr)
+    for w in dump.warnings():
+        print(f'warning: {w}', file=sys.stderr)
     if resend:
         print('resend with:', file=sys.stderr)
         for c in dict.fromkeys(resend):
