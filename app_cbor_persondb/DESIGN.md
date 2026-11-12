@@ -1000,6 +1000,15 @@ in-between states need the open path's help:
   superblock at the registered id: it drops the entry and builds at a fresh
   one. An id that was never bound holds nothing, so this leaks nothing.
 
+**What it costs.** Not a partition erase, and not cheap either. Each map
+reads every bucket in full — a bucket may name spilled blobs that must go
+first — and then deletes it, and every `blob_db_delete()` walks its erase
+block's slot headers to find the slot and appends a tombstone there. So the
+cost follows what the store holds: at 8 000 persons it reads about twice the
+live content and writes about a thousand tombstones, with the occasional
+compaction erase. `CONFIG_APP_CBOR_PERSONDB_BENCH_DESTROY` measures it, and
+`RESULTS.md` §11 has the numbers.
+
 **What it cannot do.** It must read the superblock to know what it owns, so a
 store whose superblock is a newer format than this build reads is refused
 (`-ENOTSUP`). Fixing that means freezing the part of the superblock that lists

@@ -427,3 +427,9 @@ rather than asserted:
 native_sim: ./zephyr.exe --flash=db.bin        (--flash_erase to start over)
 hardware:   reset the board; CONFIG_APP_CBOR_PERSONDB_FRESH_START=y wipes once
 ```
+
+The one phase that breaks this on purpose is
+`CONFIG_APP_CBOR_PERSONDB_BENCH_DESTROY=y`. It ends each run by timing
+`persondb_destroy()` on the loaded store, and the next run starts empty. The
+cost of tearing a store down without wiping the shared partition is in
+`RESULTS.md` §11.

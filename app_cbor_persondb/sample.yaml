@@ -56,3 +56,25 @@ tests:
         - "VERIFY PASS"
         - "bucket overflows: 0"
         - "persondb: done"
+
+  # The smoke run, ended by destroying the store and building an empty one
+  # (RESULTS.md §11). Spilling is on so the destroy also has to release
+  # every bucket's spilled blobs, which is the path that can leak.
+  app.cbor_persondb.smoke.destroy:
+    platform_allow: native_sim
+    extra_configs:
+      - CONFIG_APP_CBOR_PERSONDB_N_PERSONS=200
+      - CONFIG_APP_CBOR_PERSONDB_VERIFY_SAMPLES=64
+      - CONFIG_APP_CBOR_PERSONDB_BENCH_SAMPLES=20
+      - CONFIG_BLOB_CONTAINER_KVHASH_VAL_INLINE_MAX=64
+      - CONFIG_APP_CBOR_PERSONDB_BENCH_DESTROY=y
+    harness: console
+    harness_config:
+      type: multi_line
+      ordered: true
+      regex:
+        - "VERIFY PASS"
+        - "bucket overflows: 0"
+        - "bench destroy:\\s+1 ops"
+        - "bench create:\\s+1 ops"
+        - "persondb: done"

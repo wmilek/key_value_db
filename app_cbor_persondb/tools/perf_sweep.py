@@ -53,7 +53,7 @@ SCHEMA = "persondb-perf/1"
 
 APP_DIR = Path(__file__).resolve().parent.parent
 
-BENCHES = ("check", "byid", "miss", "put", "cbor")
+BENCHES = ("check", "byid", "miss", "put", "cbor", "destroy", "create")
 READ_BENCHES = ("check", "byid", "miss")
 
 # The scales the sweep visits by default. 8 000 is the benchmark constant and
@@ -768,7 +768,12 @@ def report(docs, model_name, at):
                  "byid": "`byid` — person id → record",
                  "miss": "`miss` — unknown card",
                  "put": "`put` — replace a record + its index entries",
-                 "cbor": "`cbor` — encode + decode, no flash"}
+                 "cbor": "`cbor` — encode + decode, no flash",
+                 # Only with CONFIG_APP_CBOR_PERSONDB_BENCH_DESTROY=y
+                 # (--config), and one op each: the whole store, then an
+                 # empty one built in its place.
+                 "destroy": "`destroy` — release the whole store (1 op)",
+                 "create": "`create` — build an empty store (1 op)"}
         for b in BENCHES:
             v = ref["bench"].get(b)
             if not v:
