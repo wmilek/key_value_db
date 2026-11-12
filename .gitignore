@@ -19,3 +19,6 @@ __pycache__/
 
 # docs
 /doc/_build*
+
+# out-of-tree measurement harnesses (doc/proposals/*/measure.sh)
+/doc/proposals/*/build/
