@@ -1,0 +1,24 @@
+/*
+ * The DK's MX25R64 QSPI NOR (8 MB, 64 KB layout pages), split into two
+ * 4 MB partitions as on native_sim: blob_db's and littlefs's.
+ */
+
+/delete-node/ &storage_partition;
+
+&mx25r64 {
+	partitions {
+		compatible = "fixed-partitions";
+		#address-cells = <1>;
+		#size-cells = <1>;
+
+		storage_partition: partition@0 {
+			label = "storage";
+			reg = <0x00000000 0x00400000>;
+		};
+
+		lfs_partition: partition@400000 {
+			label = "lfs";
+			reg = <0x00400000 0x00400000>;
+		};
+	};
+};
