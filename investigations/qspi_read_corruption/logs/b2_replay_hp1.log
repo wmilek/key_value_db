@@ -1,0 +1,18 @@
+*** Booting Zephyr OS build 4a405846193f ***
+REPLAY 43300 entries
+REGS before rc=0,0 SR=40 CR1=00 CR2=00 -> ultra-low-power mode
+REGS write 40 00 02 rc=0
+REGS after rc=0,0 SR=40 CR1=00 CR2=02 -> high-performance mode
+REPLAY pass 0 delay 0 us: 0 bad, 2888 ms
+REPLAY pass 0 delay 20 us: 0 bad, 3764 ms
+REPLAY pass 0 delay 100 us: 0 bad, 7203 ms
+REPLAY pass 1 delay 0 us: 0 bad, 2888 ms
+REPLAY pass 1 delay 20 us: 0 bad, 3765 ms
+REPLAY pass 1 delay 100 us: 0 bad, 7203 ms
+REPLAY pass 2 delay 0 us: 0 bad, 2888 ms
+REPLAY pass 2 delay 20 us: 0 bad, 3751 ms
+REPLAY pass 2 delay 100 us: 0 bad, 7182 ms
+REGS before rc=0,0 SR=40 CR1=00 CR2=02 -> high-performance mode
+REGS write 40 00 00 rc=0
+REGS after rc=0,0 SR=40 CR1=00 CR2=00 -> ultra-low-power mode
+REPLAY DONE

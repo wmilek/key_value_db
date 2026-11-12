@@ -1,0 +1,143 @@
+From 7483394e4533c069957e62c3b233bb4d2f3c8572 Mon Sep 17 00:00:00 2001
+From: Wojciech Milek <28384009+wmilek@users.noreply.github.com>
+Date: Sun, 11 Oct 2026 20:06:05 +0200
+Subject: [PATCH] drivers: flash: nrf_qspi_nor: support mxicy,mx25r-power-mode
+
+The nordic,qspi-nor binding includes jedec,spi-nor-common, which defines
+mxicy,mx25r-power-mode, but only the spi_nor driver acted on it. With
+nrf_qspi_nor, an MX25R stays in its power-on default, ultra low power mode.
+
+On the nRF5340 DK (MX25R6435F, read4io, 8 MHz SCK), ultra low power mode
+corrupts reads after certain dense quad-read sequences. One read returns
+the target ORed with the same offset in a 64 KB block that differs in
+address bits A16-A18. The next read is correct. This reproduces on two
+DKs. High performance mode removes it completely: a recorded 43k-read
+trace that always corrupts in ULP passes in HP, and a relocated-trigger
+sweep that hit 79 and 61 blocks drops to 0.
+
+When the property is set, read SR and CR (RDCR) during configure_chip()
+and, if the L/H bit (CR2 bit 1) differs, write SR/CR1/CR2 with WRSR.
+The mode is applied on every init, because the chip keeps it across an
+SoC reset but its state after a flash power cycle is not assumed.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01JoZx4hA4ogQt8JC82PfK5Z
+---
+ drivers/flash/nrf_qspi_nor.c | 94 ++++++++++++++++++++++++++++++++++++
+ 1 file changed, 94 insertions(+)
+
+diff --git a/drivers/flash/nrf_qspi_nor.c b/drivers/flash/nrf_qspi_nor.c
+index 5c24a77e5c3..fce7f814ffc 100644
+--- a/drivers/flash/nrf_qspi_nor.c
++++ b/drivers/flash/nrf_qspi_nor.c
+@@ -651,6 +651,92 @@ static int qspi_erase(const struct device *dev, uint32_t addr, uint32_t size)
+ 	return rc != 0 ? rc : rc2;
+ }
+ 
++#if DT_INST_NODE_HAS_PROP(0, mxicy_mx25r_power_mode)
++/* Macronix MX25R: the L/H switch is bit 1 of configuration register 2. */
++#define MXICY_CR2_HIGH_PERF  BIT(1)
++#define MXICY_MX25R_HIGH_PERF \
++	IS_EQUAL(DT_INST_ENUM_IDX(0, mxicy_mx25r_power_mode), 1)
++
++/*
++ * Select ultra low power or high performance mode on an MX25R device.
++ *
++ * The power-on default is ultra low power. In that mode, a dense sequence of
++ * quad reads can make a read return the target data ORed with the data at the
++ * same offset in another 64 KB block. High performance mode does not show this.
++ */
++static int mxicy_configure(const struct device *dev)
++{
++	const struct qspi_nor_config *dev_config = dev->config;
++	uint8_t cr[2];
++	const struct qspi_buf cr_buf = {
++		.buf = cr,
++		.len = sizeof(cr),
++	};
++	struct qspi_cmd cmd = {
++		.op_code = SPI_NOR_CMD_RDCR,
++		.rx_buf = &cr_buf,
++	};
++	int rc;
++
++	/* Only supported on the Macronix MX25R Ultra Low Power series. */
++	if (dev_config->id[0] != 0xC2 || dev_config->id[1] != 0x28) {
++		LOG_WRN("mxicy,mx25r-power-mode ignored: not an MX25R device");
++		return 0;
++	}
++
++	rc = qspi_rdsr(dev, 1);
++	if (rc < 0) {
++		return rc;
++	}
++	uint8_t sr = (uint8_t)rc;
++
++	rc = qspi_send_cmd(dev, &cmd, false);
++	if (rc < 0) {
++		return rc;
++	}
++
++	if (((cr[1] & MXICY_CR2_HIGH_PERF) != 0) == MXICY_MX25R_HIGH_PERF) {
++		return 0;
++	}
++
++	/* WRSR on MX25R writes SR, CR1 and CR2 in one go. */
++	uint8_t regs[3] = {
++		sr,
++		cr[0],
++		MXICY_MX25R_HIGH_PERF ? (cr[1] | MXICY_CR2_HIGH_PERF)
++				      : (cr[1] & ~MXICY_CR2_HIGH_PERF),
++	};
++	const struct qspi_buf regs_buf = {
++		.buf = regs,
++		.len = sizeof(regs),
++	};
++	struct qspi_cmd wrsr = {
++		.op_code = SPI_NOR_CMD_WRSR,
++		.tx_buf = &regs_buf,
++	};
++
++	rc = qspi_send_cmd(dev, &wrsr, true);
++	if (rc == 0) {
++		rc = qspi_wait_while_writing(dev, K_NO_WAIT);
++	}
++	if (rc < 0) {
++		return rc;
++	}
++
++	rc = qspi_send_cmd(dev, &cmd, false);
++	if (rc < 0) {
++		return rc;
++	}
++	if (((cr[1] & MXICY_CR2_HIGH_PERF) != 0) != MXICY_MX25R_HIGH_PERF) {
++		LOG_ERR("MX25R power mode not applied, CR2 %02x", cr[1]);
++		return -EIO;
++	}
++
++	LOG_DBG("MX25R %s mode", MXICY_MX25R_HIGH_PERF ? "high performance" : "low power");
++	return 0;
++}
++#endif /* DT_INST_NODE_HAS_PROP(0, mxicy_mx25r_power_mode) */
++
+ static int configure_chip(const struct device *dev)
+ {
+ 	int rc = 0;
+@@ -710,6 +796,14 @@ static int configure_chip(const struct device *dev)
+ 		}
+ #endif
+ 
++#if DT_INST_NODE_HAS_PROP(0, mxicy_mx25r_power_mode)
++	rc = mxicy_configure(dev);
++	if (rc < 0) {
++		LOG_ERR("MX25R power mode setup failed: %d", rc);
++		return rc;
++	}
++#endif
++
+ 	if (INST_0_4BA != 0) {
+ 		struct qspi_cmd cmd = {
+ 			.op_code = SPI_NOR_CMD_4BA,
+-- 
+2.39.2
+
