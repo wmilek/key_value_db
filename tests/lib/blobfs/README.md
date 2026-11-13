@@ -28,8 +28,11 @@ follow a renamed directory), renaming a directory with its contents, and
 `-ENOTSUP`, the one-payload file size cap, mid-rename crash recovery in the
 root and in a subdirectory, a rename that fails part way in a running
 session (via kvhash's write-cut test hook) being finished before the next
-unlink or rename, mounting a store whose meta predates directories and its
-upgrade at the first `mkdir`, removing a directory whose Map is already gone,
+unlink or rename, the on-flash format (an older meta, an unknown incompat
+feature and a corrupt meta or intent refused without a byte rewritten; a
+longer meta, unknown compat features and another name limit accepted; the
+meta never rewritten by use; an intent with names beyond this build's limit
+still recovered), removing a directory whose Map is already gone,
 a listing stepping past a broken entry, and the single-mount limit.
 
 ```shell

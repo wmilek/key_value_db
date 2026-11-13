@@ -4,10 +4,14 @@
  *
  * blobfs — persisted on-flash formats.
  *
- * Shared between blobfs.c and the blobfs test suite (which forges a
- * mid-rename crash state to exercise mount recovery). Nothing here is API:
- * the layouts may change freely between releases, and the version bytes
+ * Shared between blobfs.c and the blobfs test suite (which forges crash
+ * states and older formats to exercise mount). Nothing here is API: the
+ * layouts may change between releases, and the magic and version bytes
  * below are what makes an old image detectable rather than misread.
+ *
+ * No persisted layout depends on a build option. In particular
+ * CONFIG_BLOBFS_MAX_NAME_LEN only bounds the names a build creates: a store
+ * mounts under any setting, whichever setting wrote it.
  */
 
 #ifndef LIB_BLOBFS_BLOBFS_INTERNAL_H_
@@ -18,7 +22,7 @@
 #include <app/lib/blobfs.h> /* BLOBFS_NAME_MAX */
 
 #define BLOBFS_MAGIC          0x42465331u /* 'BFS1' */
-#define BLOBFS_META_VERSION   2
+#define BLOBFS_META_VERSION   3
 #define BLOBFS_DIRENT_VERSION 1
 
 /** dirent type tags. A directory's dirent points at the directory's own Map
@@ -27,48 +31,72 @@
 #define BLOBFS_TYPE_FILE 1
 #define BLOBFS_TYPE_DIR  2
 
-/* Filesystem metadata, bound to the blob the root registry points at.
+/* Filesystem metadata: blobfs's superblock, the blob the root registry
+ * points at (ROOTREG_KEY(BLOBFS_MAGIC, 0)).
  *
- * Besides the root directory it carries the *rename intent*: rename is two
- * Map mutations (bind the new name, drop the old), and the intent recorded
- * before the first makes the pair atomic against power loss — mount rolls a
- * half-done rename forward or back before anything else can observe it.
+ * Fixed size, written once when the filesystem is created and never again:
+ * a rename journals in its own intent blob,
+ * so day-to-day use does not rewrite the one record everything hangs off.
  *
- * The intent names the directory each end lives in. Today both are always
- * the same directory (rename across directories reports -EXDEV); the two
- * fields are what will let a cross-directory rename use this format as is.
+ * Feature flags gate later additions: a build refuses a store with an
+ * incompat bit it does not know (-ENOTSUP) and ignores unknown compat bits.
+ * A longer payload than this struct is accepted: a compat addition may
+ * append fields, and since no build rewrites a meta, none is lost.
  */
 struct blobfs_meta {
-	uint32_t magic;
-	uint8_t  version;
-	uint8_t  rename_in_flight; /* the fields below hold a live intent */
-	uint8_t  from_len;
-	uint8_t  to_len;
+	uint32_t magic;            /* BLOBFS_MAGIC */
+	uint8_t  version;          /* BLOBFS_META_VERSION */
+	uint8_t  name_max;         /* CONFIG_BLOBFS_MAX_NAME_LEN at creation;
+				    * informational only
+				    */
+	uint16_t rsvd;
+	uint32_t compat;           /* none defined */
+	uint32_t incompat;         /* none defined */
 	uint64_t dir_root;         /* the root directory's Map root */
-	uint64_t rename_body;      /* body (or directory) id being moved */
+	uint64_t intent_id;        /* the intent blob (struct blobfs_intent) */
+};
+
+#define BLOBFS_COMPAT_KNOWN   0u
+#define BLOBFS_INCOMPAT_KNOWN 0u
+
+/* Intent blob: what a multi-step mutation records before its first step,
+ * so mount can roll a half-done one forward or back. Its own format,
+ * separate from the meta, like a container's intent blob (see
+ * doc/layers/l2_containers.md §2.2).
+ *
+ * An empty payload (or an id never bound) means no intent. Clearing writes
+ * an empty payload rather than deleting the blob: blob_db never lets a
+ * deleted id be bound again.
+ *
+ * Rename is two Map mutations (bind the new name, drop the old). Its
+ * intent names both ends, the directory each lives in, and the body they
+ * move. The names follow the header: from[from_len] then to[to_len], no
+ * NUL, so the payload is exactly sizeof(header) + from_len + to_len.
+ */
+#define BLOBFS_INTENT_MAGIC   0x42465349u /* 'BFSI' */
+#define BLOBFS_INTENT_VERSION 1
+#define BLOBFS_INTENT_RENAME  1
+
+struct blobfs_intent {
+	uint32_t magic;            /* BLOBFS_INTENT_MAGIC */
+	uint8_t  version;          /* BLOBFS_INTENT_VERSION */
+	uint8_t  op;               /* BLOBFS_INTENT_RENAME */
+	uint8_t  from_len;         /* 1..255 */
+	uint8_t  to_len;           /* 1..255 */
 	uint64_t from_dir;         /* directory holding 'from' */
 	uint64_t to_dir;           /* directory holding 'to' */
-	char     from[BLOBFS_NAME_MAX + 1];
-	char     to[BLOBFS_NAME_MAX + 1];
+	uint64_t body;             /* body (or directory) id being moved */
+	/* uint8_t names[from_len + to_len]; */
 };
 
-/* Version 1 of the meta, written by blobfs before directories existed: the
- * intent had no directory fields, because there was only the root. Mount
- * still reads it; every write is version 2.
+/* Longest name any intent can carry: its length field is one byte. */
+#define BLOBFS_INTENT_NAME_MAX 255u
+
+/* Older metas (version 1: before directories; version 2: rename intent
+ * embedded with name fields sized by CONFIG_BLOBFS_MAX_NAME_LEN) are not
+ * read: mount refuses them with -ENOTSUP and writes nothing, so the store
+ * can still go back to the firmware that wrote it.
  */
-#define BLOBFS_META_VERSION_1 1
-
-struct blobfs_meta_v1 {
-	uint32_t magic;
-	uint8_t  version;
-	uint8_t  rename_in_flight;
-	uint8_t  from_len;
-	uint8_t  to_len;
-	uint64_t dir_root;
-	uint64_t rename_body;
-	char     from[BLOBFS_NAME_MAX + 1];
-	char     to[BLOBFS_NAME_MAX + 1];
-};
 
 /* Directory entry (the Map's value): name -> body blob, or name -> the
  * Map root of a subdirectory.
