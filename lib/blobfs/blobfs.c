@@ -12,8 +12,9 @@
  * subdirectory's dirent holds the Map root of that directory instead, so
  * a path resolves with one Map lookup per component.
  *
- *   rootreg[ BLOBFS_KEY ] -> meta blob -> { dir_root, rename intent }
- *                                              |
+ *   rootreg[ BLOBFS_KEY ] -> meta blob -> { dir_root, intent_id }
+ *                                              |           |
+ *                                              |      intent blob (rename)
  *          map_ops(dir_root):  name -> dirent { FILE, body_id } -> bytes
  *                              name -> dirent { DIR,  map root }
  *                                                        |
@@ -24,10 +25,11 @@
  * what lets a handle layer above stay bound to the file across renames.
  *
  * Rename itself is two Map mutations (bind the new name, drop the old), so
- * the meta blob records a *rename intent* before the first one: mount finds
- * a half-done rename and rolls it forward or back before anything else can
- * observe it. No API caller ever sees two names on one body. Rename stays
- * within one directory for now (-EXDEV otherwise).
+ * a *rename intent* goes to the intent blob before the first one: mount
+ * finds a half-done rename and rolls it forward or back before anything
+ * else can observe it. No API caller ever sees two names on one body.
+ * The meta itself is written once, at creation. Rename stays within one
+ * directory for now (-EXDEV otherwise).
  *
  * Listing a directory is the Map's own enumeration (map_ops.next): the
  * name is the cursor, so a listing holds no state here.
@@ -37,6 +39,7 @@
  */
 
 #include <errno.h>
+#include <stddef.h>
 #include <string.h>
 
 #include <zephyr/logging/log.h>
@@ -51,24 +54,50 @@
 
 LOG_MODULE_REGISTER(blobfs, CONFIG_BLOBDB_BLOBFS_LOG_LEVEL);
 
-BUILD_ASSERT(sizeof(struct blobfs_meta) <= CONFIG_BLOB_DB_MAX_PAYLOAD_LEN,
-	     "blobfs_meta (which scales with CONFIG_BLOBFS_MAX_NAME_LEN) must "
-	     "fit one blob payload; raise CONFIG_BLOB_DB_MAX_PAYLOAD_LEN or "
-	     "lower CONFIG_BLOBFS_MAX_NAME_LEN");
+BUILD_ASSERT(sizeof(struct blobfs_meta) == 32,
+	     "blobfs_meta must be a tight 32 bytes");
+BUILD_ASSERT(sizeof(struct blobfs_intent) == 32,
+	     "blobfs_intent's header must be a tight 32 bytes");
 BUILD_ASSERT(sizeof(struct blobfs_dirent) == 16,
 	     "blobfs_dirent must be a tight 16 bytes");
+BUILD_ASSERT(BLOBFS_NAME_MAX <= BLOBFS_INTENT_NAME_MAX,
+	     "an intent's name lengths are one byte");
+BUILD_ASSERT(sizeof(struct blobfs_intent) + 2 * BLOBFS_NAME_MAX <=
+		     CONFIG_BLOB_DB_MAX_PAYLOAD_LEN,
+	     "a rename intent (32 B + two names of CONFIG_BLOBFS_MAX_NAME_LEN) "
+	     "must fit one blob payload; raise CONFIG_BLOB_DB_MAX_PAYLOAD_LEN "
+	     "or lower CONFIG_BLOBFS_MAX_NAME_LEN");
 
 static struct {
 	bool     mounted;
-	/* The meta on flash is still version 1 (see blobfs_mkdir). */
-	bool     meta_v1;
 	/* A rename intent may be on flash: a rename failed part way this
 	 * session, so two names may share one entry (see intent_settle).
 	 */
 	bool     intent_pending;
 	uint64_t meta_id;
 	uint64_t dir_root;
+	uint64_t intent_id;
 } st;
+
+/* An intent as recovery sees it. The names point into intent_buf. */
+struct intent {
+	uint64_t    from_dir;
+	uint64_t    to_dir;
+	uint64_t    body;
+	uint8_t     from_len;
+	uint8_t     to_len;
+	const char *from;
+	const char *to;
+};
+
+/* The intent blob's payload, read or being written. Static: the stack is
+ * single-threaded by contract (the VFS shim serializes every op), and this
+ * keeps up to ~540 B off the mount path's stack. No payload is larger than
+ * CONFIG_BLOB_DB_MAX_PAYLOAD_LEN, so a smaller cap costs nothing.
+ */
+static uint8_t intent_buf[MIN(sizeof(struct blobfs_intent) +
+			      2 * BLOBFS_INTENT_NAME_MAX,
+			      CONFIG_BLOB_DB_MAX_PAYLOAD_LEN)] __aligned(8);
 
 /* kvhash is the only Map provider implemented; a Kconfig choice can select
  * among providers here later, exactly as kvdb does.
@@ -246,27 +275,137 @@ static int resolve(const char *path, struct where *w, struct blobfs_dirent *de)
 	return 0;
 }
 
-/* Commit the meta blob — one atomic blob_db_update. Always version 2. */
-static int meta_write(const struct blobfs_meta *meta)
+/* Read and check the meta. Only the current version mounts: an older or
+ * unknown one, or an incompat feature this build does not know, is refused
+ * with -ENOTSUP and nothing is written, so the store can still go back to
+ * the firmware that wrote it. -ENOENT: never written (a virgin store).
+ */
+static int meta_read(uint64_t meta_id, struct blobfs_meta *meta)
 {
-	int rc = blob_db_update(st.meta_id, meta, sizeof(*meta));
+	size_t size = 0;
+	size_t got = 0;
+	int rc = blob_db_size(meta_id, &size);
 
-	if (rc == 0) {
-		st.meta_v1 = false;
+	if (rc != 0) {
+		return rc;
 	}
-	return rc;
+	if (size == 0) {
+		return -ENOENT;
+	}
+
+	/* pread-style: a compat addition may have made it longer. */
+	rc = blob_db_read(meta_id, 0, meta, sizeof(*meta), &got);
+	if (rc != 0) {
+		return rc;
+	}
+	if (got < offsetof(struct blobfs_meta, compat) ||
+	    meta->magic != BLOBFS_MAGIC) {
+		LOG_ERR("bad blobfs metadata (len %zu)", size);
+		return -EIO;
+	}
+	if (meta->version != BLOBFS_META_VERSION) {
+		LOG_ERR("blobfs metadata version %u, this build reads only %u",
+			meta->version, BLOBFS_META_VERSION);
+		return -ENOTSUP;
+	}
+	if (got != sizeof(*meta) || meta->dir_root == 0 ||
+	    meta->intent_id == 0) {
+		LOG_ERR("bad blobfs metadata (len %zu)", size);
+		return -EIO;
+	}
+	if (meta->incompat & ~BLOBFS_INCOMPAT_KNOWN) {
+		LOG_ERR("blobfs metadata has unknown incompat features 0x%08x",
+			meta->incompat & ~BLOBFS_INCOMPAT_KNOWN);
+		return -ENOTSUP;
+	}
+	if (meta->name_max != BLOBFS_NAME_MAX) {
+		LOG_INF("created with names up to %u B, this build allows %u",
+			meta->name_max, BLOBFS_NAME_MAX);
+	}
+	return 0;
 }
 
-static void intent_clear(struct blobfs_meta *meta)
+/* Read the intent blob into @p it. -ENOENT: no intent (an empty payload,
+ * or an id never bound). -EIO: a payload blobfs did not write.
+ */
+static int intent_read(struct intent *it)
 {
-	meta->rename_in_flight = 0;
-	meta->from_len = 0;
-	meta->to_len = 0;
-	meta->rename_body = 0;
-	meta->from_dir = 0;
-	meta->to_dir = 0;
-	memset(meta->from, 0, sizeof(meta->from));
-	memset(meta->to, 0, sizeof(meta->to));
+	size_t got = 0;
+	int rc = blob_db_get(st.intent_id, intent_buf, sizeof(intent_buf),
+			     &got);
+
+	if (rc == -ENOMEM) {
+		LOG_ERR("corrupt rename intent (larger than %zu B)",
+			sizeof(intent_buf));
+		return -EIO;
+	}
+	if (rc != 0) {
+		return rc;
+	}
+	if (got == 0) {
+		return -ENOENT;
+	}
+
+	struct blobfs_intent hdr = { 0 };
+
+	if (got >= sizeof(hdr)) {
+		memcpy(&hdr, intent_buf, sizeof(hdr));
+	}
+	if (got < sizeof(hdr) ||
+	    hdr.magic != BLOBFS_INTENT_MAGIC ||
+	    hdr.version != BLOBFS_INTENT_VERSION ||
+	    hdr.op != BLOBFS_INTENT_RENAME ||
+	    hdr.from_len == 0 || hdr.to_len == 0 ||
+	    hdr.from_dir == 0 || hdr.to_dir == 0 ||
+	    got != sizeof(hdr) + hdr.from_len + hdr.to_len) {
+		LOG_ERR("corrupt rename intent (len %zu)", got);
+		return -EIO;
+	}
+
+	*it = (struct intent){
+		.from_dir = hdr.from_dir,
+		.to_dir = hdr.to_dir,
+		.body = hdr.body,
+		.from_len = hdr.from_len,
+		.to_len = hdr.to_len,
+		.from = (const char *)&intent_buf[sizeof(hdr)],
+		.to = (const char *)&intent_buf[sizeof(hdr) + hdr.from_len],
+	};
+	return 0;
+}
+
+/* Commit a rename intent — one atomic blob_db_update. */
+static int intent_write(uint64_t from_dir, const char *from, size_t from_len,
+			uint64_t to_dir, const char *to, size_t to_len,
+			uint64_t body)
+{
+	struct blobfs_intent hdr = {
+		.magic = BLOBFS_INTENT_MAGIC,
+		.version = BLOBFS_INTENT_VERSION,
+		.op = BLOBFS_INTENT_RENAME,
+		.from_len = (uint8_t)from_len,
+		.to_len = (uint8_t)to_len,
+		.from_dir = from_dir,
+		.to_dir = to_dir,
+		.body = body,
+	};
+
+	/* Names are walk()-checked against BLOBFS_NAME_MAX, and the build
+	 * asserts two of those fit one payload.
+	 */
+	memcpy(intent_buf, &hdr, sizeof(hdr));
+	memcpy(&intent_buf[sizeof(hdr)], from, from_len);
+	memcpy(&intent_buf[sizeof(hdr) + from_len], to, to_len);
+	return blob_db_update(st.intent_id, intent_buf,
+			      sizeof(hdr) + from_len + to_len);
+}
+
+/* Withdraw the intent: an empty payload, not a delete, since blob_db never
+ * lets a deleted id be bound again.
+ */
+static int intent_clear(void)
+{
+	return blob_db_update(st.intent_id, NULL, 0);
 }
 
 /* Finish or abandon a rename the previous boot left half done. The intent
@@ -282,30 +421,23 @@ static void intent_clear(struct blobfs_meta *meta)
  *                                (rename refuses an occupied destination);
  *                                keep both names, clear the intent, and say
  *                                so.
+ *
+ * The names were valid when the intent was written; they are looked up,
+ * never created, so a build with a lower name limit still resolves them.
  */
-static int rename_recover(struct blobfs_meta *meta)
+static int rename_recover(const struct intent *it)
 {
 	struct blobfs_dirent de;
+	int rc = dirent_get(it->to_dir, it->to, it->to_len, &de);
 
-	if (meta->from_len == 0 || meta->from_len > BLOBFS_NAME_MAX ||
-	    meta->to_len == 0 || meta->to_len > BLOBFS_NAME_MAX ||
-	    meta->from_dir == 0 || meta->to_dir == 0) {
-		LOG_ERR("corrupt rename intent (from_len=%u to_len=%u)",
-			meta->from_len, meta->to_len);
-		return -EIO;
-	}
-
-	int rc = dirent_get(meta->to_dir, meta->to, meta->to_len, &de);
-
-	if (rc == 0 && de.body_id == meta->rename_body) {
+	if (rc == 0 && de.body_id == it->body) {
 		/* Visible: make sure the old name is gone. */
 		struct blobfs_dirent from_de;
 
-		rc = dirent_get(meta->from_dir, meta->from, meta->from_len,
-				&from_de);
-		if (rc == 0 && from_de.body_id == meta->rename_body) {
-			rc = dir_ops()->del(meta->from_dir, meta->from,
-					    meta->from_len);
+		rc = dirent_get(it->from_dir, it->from, it->from_len, &from_de);
+		if (rc == 0 && from_de.body_id == it->body) {
+			rc = dir_ops()->del(it->from_dir, it->from,
+					    it->from_len);
 			if (rc != 0) {
 				return rc;
 			}
@@ -313,91 +445,31 @@ static int rename_recover(struct blobfs_meta *meta)
 			return rc;
 		}
 		LOG_INF("recovered rename '%.*s' -> '%.*s' (rolled forward)",
-			meta->from_len, meta->from, meta->to_len, meta->to);
+			it->from_len, it->from, it->to_len, it->to);
 	} else if (rc == -ENOENT) {
 		LOG_INF("recovered rename '%.*s' -> '%.*s' (rolled back)",
-			meta->from_len, meta->from, meta->to_len, meta->to);
+			it->from_len, it->from, it->to_len, it->to);
 	} else if (rc != 0) {
 		return rc;
 	} else {
 		LOG_ERR("rename intent found '%.*s' bound to another body; "
 			"clearing intent, keeping both names",
-			meta->to_len, meta->to);
+			it->to_len, it->to);
 	}
 
-	intent_clear(meta);
-	return meta_write(meta);
+	return intent_clear();
 }
 
-/* Read the meta blob, in either version, as version 2. A version 1 meta
- * (blobfs before directories) differs only in its intent having no
- * directory fields: there was only the root, so both ends live there.
- * Nothing is written here; the next meta write stores version 2.
- */
-static int meta_read(uint64_t meta_id, struct blobfs_meta *meta,
-		     bool *was_v1)
+/* Resolve whatever intent is on flash: the recovery mount runs. */
+static int intent_resolve(void)
 {
-	union {
-		struct blobfs_meta    v2;
-		struct blobfs_meta_v1 v1;
-	} buf;
-	size_t got = 0;
-	int rc = blob_db_get(meta_id, &buf, sizeof(buf), &got);
+	struct intent it;
+	int rc = intent_read(&it);
 
-	if (rc != 0) {
-		return rc;
-	}
-	if (got == 0) {
-		return -ENOENT;
-	}
-
-	if (got == sizeof(buf.v2) && buf.v2.magic == BLOBFS_MAGIC &&
-	    buf.v2.version == BLOBFS_META_VERSION) {
-		*meta = buf.v2;
-		*was_v1 = false;
+	if (rc == -ENOENT) {
 		return 0;
 	}
-	if (got == sizeof(buf.v1) && buf.v1.magic == BLOBFS_MAGIC &&
-	    buf.v1.version == BLOBFS_META_VERSION_1) {
-		*meta = (struct blobfs_meta){
-			.magic = BLOBFS_MAGIC,
-			.version = BLOBFS_META_VERSION,
-			.rename_in_flight = buf.v1.rename_in_flight,
-			.from_len = buf.v1.from_len,
-			.to_len = buf.v1.to_len,
-			.dir_root = buf.v1.dir_root,
-			.rename_body = buf.v1.rename_body,
-			.from_dir = buf.v1.dir_root,
-			.to_dir = buf.v1.dir_root,
-		};
-		memcpy(meta->from, buf.v1.from, sizeof(meta->from));
-		memcpy(meta->to, buf.v1.to, sizeof(meta->to));
-		*was_v1 = true;
-		return 0;
-	}
-
-	LOG_ERR("bad blobfs metadata (magic %08x version %u len %zu)",
-		buf.v2.magic, buf.v2.version, got);
-	return -EIO;
-}
-
-/* Rewrite a version 1 meta as version 2, before the first directory is
- * made. Firmware older than directories mounts a version 1 meta and would
- * then report every directory as corrupt; a version 2 meta it refuses at
- * mount instead. A store that never makes a directory stays version 1, so
- * it can still go back to that firmware.
- */
-static int meta_upgrade(void)
-{
-	if (!st.meta_v1) {
-		return 0;
-	}
-
-	struct blobfs_meta meta;
-	bool was_v1;
-	int rc = meta_read(st.meta_id, &meta, &was_v1);
-
-	return (rc != 0) ? rc : meta_write(&meta);
+	return (rc != 0) ? rc : rename_recover(&it);
 }
 
 /* Finish a rename that failed part way earlier in this session. A rename
@@ -414,15 +486,49 @@ static int intent_settle(void)
 		return 0;
 	}
 
-	struct blobfs_meta meta;
-	bool was_v1;
-	int rc = meta_read(st.meta_id, &meta, &was_v1);
+	int rc = intent_resolve();
 
-	if (rc == 0 && meta.rename_in_flight) {
-		rc = rename_recover(&meta);
-	}
 	if (rc == 0) {
 		st.intent_pending = false;
+	}
+	return rc;
+}
+
+/* Build an empty filesystem: the root directory, an intent id, and the
+ * meta that names both — committed last, in one write.
+ */
+static int fs_create(uint64_t meta_id, struct blobfs_meta *meta)
+{
+	uint64_t dir_root = blob_db_alloc_id();
+	uint64_t intent_id = blob_db_alloc_id();
+
+	if (dir_root == 0 || intent_id == 0) {
+		return -EIO;
+	}
+
+	int rc = dir_create(dir_root);
+
+	if (rc != 0) {
+		LOG_ERR("directory create: %d", rc);
+		return rc;
+	}
+
+	*meta = (struct blobfs_meta){
+		.magic = BLOBFS_MAGIC,
+		.version = BLOBFS_META_VERSION,
+		.name_max = BLOBFS_NAME_MAX,
+		.dir_root = dir_root,
+		.intent_id = intent_id,
+	};
+
+	/* A crash before this commit leaves dir_root orphaned and the meta
+	 * unbound, so the next mount simply builds a fresh one. The intent id
+	 * stays unbound until the first rename: no intent.
+	 */
+	rc = blob_db_update(meta_id, meta, sizeof(*meta));
+	if (rc == 0) {
+		LOG_DBG("created filesystem, dir_root=%llu",
+			(unsigned long long)dir_root);
 	}
 	return rc;
 }
@@ -441,56 +547,26 @@ int blobfs_mount(void)
 	}
 
 	struct blobfs_meta meta;
-	bool was_v1 = false;
 
-	rc = meta_read(meta_id, &meta, &was_v1);
+	rc = meta_read(meta_id, &meta);
 	if (rc == -ENOENT) {
-		/* Virgin filesystem: build an empty root directory and commit
-		 * it.
-		 */
-		uint64_t dir_root = blob_db_alloc_id();
-
-		if (dir_root == 0) {
-			return -EIO;
-		}
-
-		rc = dir_create(dir_root);
-		if (rc != 0) {
-			LOG_ERR("directory create: %d", rc);
-			return rc;
-		}
-
-		meta = (struct blobfs_meta){
-			.magic = BLOBFS_MAGIC,
-			.version = BLOBFS_META_VERSION,
-			.dir_root = dir_root,
-		};
-
-		/* A crash before this commit leaves dir_root orphaned and the
-		 * meta unbound, so the next mount simply builds a fresh one.
-		 */
-		rc = blob_db_update(meta_id, &meta, sizeof(meta));
-		if (rc != 0) {
-			return rc;
-		}
-		LOG_DBG("created filesystem, dir_root=%llu",
-			(unsigned long long)dir_root);
-	} else if (rc != 0) {
+		rc = fs_create(meta_id, &meta);
+	}
+	if (rc != 0) {
 		return rc;
 	}
 
 	st.meta_id = meta_id;
 	st.dir_root = meta.dir_root;
-	st.meta_v1 = was_v1;
+	st.intent_id = meta.intent_id;
 	st.intent_pending = false;
 
-	if (meta.rename_in_flight) {
-		rc = rename_recover(&meta);
-		if (rc != 0) {
-			st.meta_id = 0;
-			st.dir_root = 0;
-			return rc;
-		}
+	rc = intent_resolve();
+	if (rc != 0) {
+		st.meta_id = 0;
+		st.dir_root = 0;
+		st.intent_id = 0;
+		return rc;
 	}
 
 	st.mounted = true;
@@ -500,10 +576,10 @@ int blobfs_mount(void)
 int blobfs_unmount(void)
 {
 	st.mounted = false;
-	st.meta_v1 = false;
 	st.intent_pending = false;
 	st.meta_id = 0;
 	st.dir_root = 0;
+	st.intent_id = 0;
 	return 0;
 }
 
@@ -573,11 +649,6 @@ int blobfs_mkdir(const char *path)
 	struct where w = { 0 };
 	int rc = walk_to_free_name(path, &w);
 
-	if (rc != 0) {
-		return rc;
-	}
-
-	rc = meta_upgrade();
 	if (rc != 0) {
 		return rc;
 	}
@@ -909,21 +980,8 @@ int blobfs_rename(const char *from, const char *to)
 	 * the rename forward (intent + new name visible) or back (intent
 	 * only), so no caller ever observes two names on one body.
 	 */
-	struct blobfs_meta meta = {
-		.magic = BLOBFS_MAGIC,
-		.version = BLOBFS_META_VERSION,
-		.rename_in_flight = 1,
-		.from_len = (uint8_t)wf.nlen,
-		.to_len = (uint8_t)wt.nlen,
-		.dir_root = st.dir_root,
-		.rename_body = de.body_id,
-		.from_dir = wf.dir,
-		.to_dir = wt.dir,
-	};
-	memcpy(meta.from, wf.name, wf.nlen);
-	memcpy(meta.to, wt.name, wt.nlen);
-
-	rc = meta_write(&meta);
+	rc = intent_write(wf.dir, wf.name, wf.nlen, wt.dir, wt.name, wt.nlen,
+			  de.body_id);
 	if (rc != 0) {
 		return rc; /* atomic: no intent was written */
 	}
@@ -934,8 +992,7 @@ int blobfs_rename(const char *from, const char *to)
 		/* Nothing became visible; withdraw the intent. If even that
 		 * fails, intent_settle (or mount) rolls the intent back.
 		 */
-		intent_clear(&meta);
-		if (meta_write(&meta) == 0) {
+		if (intent_clear() == 0) {
 			st.intent_pending = false;
 		}
 		return rc;
@@ -950,8 +1007,7 @@ int blobfs_rename(const char *from, const char *to)
 		return rc;
 	}
 
-	intent_clear(&meta);
-	rc = meta_write(&meta);
+	rc = intent_clear();
 	if (rc == 0) {
 		st.intent_pending = false;
 	}

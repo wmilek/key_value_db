@@ -31,6 +31,11 @@
 
 #define MNT_POINT "/blob"
 
+/* A name over any limit the suite runs with (see testcase.yaml). */
+#define TOO_LONG "a_name_longer_than_any_limit_this_suite_is_built_with_0123456789"
+BUILD_ASSERT(sizeof(TOO_LONG) - 1 > BLOBFS_NAME_MAX,
+	     "TOO_LONG must exceed CONFIG_BLOBFS_MAX_NAME_LEN");
+
 static struct fs_mount_t blobfs_mnt = {
 	.type = BLOBFS_FS_TYPE,
 	.mnt_point = MNT_POINT,
@@ -217,7 +222,7 @@ ZTEST(blobfs, test_readdir_unlink_while_listing)
 {
 	struct fs_dir_t dir;
 	struct fs_dirent entry;
-	char path[32];
+	char path[sizeof(MNT_POINT "/") + sizeof(entry.name)];
 	int removed = 0;
 
 	zassert_ok(fs_mount(&blobfs_mnt));
@@ -286,7 +291,7 @@ ZTEST(blobfs, test_next_resumes_across_remount)
 		zassert_equal(seen[i], 1, "f%02zu listed %d times", i, seen[i]);
 	}
 
-	zassert_equal(blobfs_next_id(root, "a_name_that_is_far_too_long", name,
+	zassert_equal(blobfs_next_id(root, TOO_LONG, name,
 				     NULL),
 		      -ENAMETOOLONG);
 	zassert_equal(blobfs_next_id(root, NULL, name, NULL), -EINVAL);
@@ -380,7 +385,7 @@ ZTEST(blobfs, test_namespace_and_size_limits)
 		      -EINVAL);
 
 	/* Names are bounded by CONFIG_BLOBFS_MAX_NAME_LEN. */
-	zassert_equal(fs_open(&file, MNT_POINT "/a_name_that_is_far_too_long",
+	zassert_equal(fs_open(&file, MNT_POINT "/" TOO_LONG,
 			      FS_O_CREATE | FS_O_RDWR),
 		      -ENAMETOOLONG);
 
@@ -638,46 +643,54 @@ ZTEST(blobfs, test_mount_at_root)
 	zassert_ok(fs_unmount(&root_mnt));
 }
 
-/* Forge the meta state a crash would leave mid-rename and check that mount
- * resolves it. The intent layout comes from the library's internal header —
- * this is deliberately white-box: it is the only way to reach these states
- * without cutting power.
+/* Forge the intent state a crash would leave mid-rename and check that
+ * mount resolves it. The intent layout comes from the library's internal
+ * header — this is deliberately white-box: it is the only way to reach
+ * these states without cutting power.
  */
+static void read_meta(uint64_t *meta_id, struct blobfs_meta *meta)
+{
+	size_t got = 0;
+
+	zassert_ok(rootreg_get(ROOTREG_KEY(BLOBFS_MAGIC, 0), meta_id));
+	zassert_ok(blob_db_get(*meta_id, meta, sizeof(*meta), &got));
+	zassert_equal(got, sizeof(*meta));
+}
+
+/* Write a rename intent naming @p from and @p to in @p dir, of any length. */
 static void forge_rename_intent_in(uint64_t dir, const char *from,
 				   const char *to, uint64_t body_id)
 {
 	uint64_t meta_id = 0;
 	struct blobfs_meta meta;
-	size_t got = 0;
+	uint8_t buf[sizeof(struct blobfs_intent) + 2 * BLOBFS_INTENT_NAME_MAX];
+	size_t fl = strlen(from), tl = strlen(to);
+	struct blobfs_intent hdr = {
+		.magic = BLOBFS_INTENT_MAGIC,
+		.version = BLOBFS_INTENT_VERSION,
+		.op = BLOBFS_INTENT_RENAME,
+		.from_len = (uint8_t)fl,
+		.to_len = (uint8_t)tl,
+		.from_dir = dir,
+		.to_dir = dir,
+		.body = body_id,
+	};
 
-	zassert_ok(rootreg_get(ROOTREG_KEY(BLOBFS_MAGIC, 0), &meta_id));
-	zassert_ok(blob_db_get(meta_id, &meta, sizeof(meta), &got));
-	zassert_equal(got, sizeof(meta));
-
-	meta.rename_in_flight = 1;
-	meta.from_dir = dir;
-	meta.to_dir = dir;
-	meta.from_len = (uint8_t)strlen(from);
-	meta.to_len = (uint8_t)strlen(to);
-	meta.rename_body = body_id;
-	memset(meta.from, 0, sizeof(meta.from));
-	memset(meta.to, 0, sizeof(meta.to));
-	memcpy(meta.from, from, strlen(from));
-	memcpy(meta.to, to, strlen(to));
-
-	zassert_ok(blob_db_update(meta_id, &meta, sizeof(meta)));
+	read_meta(&meta_id, &meta);
+	memcpy(buf, &hdr, sizeof(hdr));
+	memcpy(&buf[sizeof(hdr)], from, fl);
+	memcpy(&buf[sizeof(hdr) + fl], to, tl);
+	zassert_ok(blob_db_update(meta.intent_id, buf, sizeof(hdr) + fl + tl));
 }
 
-/* The same, in the root directory. Read through blobfs while mounted. */
+/* The same, in the root directory. */
 static void forge_rename_intent(const char *from, const char *to,
 				uint64_t body_id)
 {
 	uint64_t meta_id = 0;
 	struct blobfs_meta meta;
-	size_t got = 0;
 
-	zassert_ok(rootreg_get(ROOTREG_KEY(BLOBFS_MAGIC, 0), &meta_id));
-	zassert_ok(blob_db_get(meta_id, &meta, sizeof(meta), &got));
+	read_meta(&meta_id, &meta);
 	forge_rename_intent_in(meta.dir_root, from, to, body_id);
 }
 
@@ -685,12 +698,13 @@ static void check_intent_cleared(void)
 {
 	uint64_t meta_id = 0;
 	struct blobfs_meta meta;
-	size_t got = 0;
+	size_t size = 0;
 
-	zassert_ok(rootreg_get(ROOTREG_KEY(BLOBFS_MAGIC, 0), &meta_id));
-	zassert_ok(blob_db_get(meta_id, &meta, sizeof(meta), &got));
-	zassert_equal(got, sizeof(meta));
-	zassert_equal(meta.rename_in_flight, 0, "intent not cleared");
+	read_meta(&meta_id, &meta);
+	int rc = blob_db_size(meta.intent_id, &size);
+
+	zassert_true(rc == -ENOENT || (rc == 0 && size == 0),
+		     "intent not cleared (rc %d, %zu B)", rc, size);
 }
 
 ZTEST(blobfs, test_rename_intent_recovery)
@@ -793,7 +807,7 @@ ZTEST(blobfs, test_mkdir_nested)
 
 	/* Every component obeys the name rules. */
 	zassert_equal(fs_mkdir(MNT_POINT "/d/.."), -EINVAL);
-	zassert_equal(fs_mkdir(MNT_POINT "/d/a_name_that_is_far_too_long"),
+	zassert_equal(fs_mkdir(MNT_POINT "/d/" TOO_LONG),
 		      -ENAMETOOLONG);
 
 	zassert_ok(fs_unmount(&blobfs_mnt));
@@ -1056,109 +1070,218 @@ ZTEST(blobfs, test_rename_intent_recovery_in_subdirectory)
 	zassert_ok(fs_unmount(&blobfs_mnt));
 }
 
-/* A store written before directories existed carries a version 1 meta.
- * Mount reads it, a pending intent in it included, and the next meta write
- * stores version 2.
+/* Mount must refuse @p blob as blobfs's meta with @p want, and leave it
+ * byte for byte as it was.
  */
-ZTEST(blobfs, test_meta_v1_still_mounts)
+static void check_meta_refused(const void *blob, size_t len, int want)
 {
-	struct fs_dirent stat;
-	uint64_t body_id = 0;
 	uint64_t meta_id = 0;
-	struct blobfs_meta meta;
+	uint8_t after[96];
 	size_t got = 0;
 
-	zassert_ok(fs_mount(&blobfs_mnt));
-	make_file(MNT_POINT "/old", "v1", 2);
-	zassert_ok(blobfs_lookup("old", &body_id));
-	zassert_ok(fs_unmount(&blobfs_mnt));
-
+	zassert_true(len <= sizeof(after));
 	zassert_ok(rootreg_get(ROOTREG_KEY(BLOBFS_MAGIC, 0), &meta_id));
-	zassert_ok(blob_db_get(meta_id, &meta, sizeof(meta), &got));
+	zassert_ok(blob_db_update(meta_id, blob, len));
 
-	/* Rewrite it as version 1, mid-rename: intent committed, directory
-	 * untouched.
-	 */
-	struct blobfs_meta_v1 v1 = {
-		.magic = BLOBFS_MAGIC,
-		.version = BLOBFS_META_VERSION_1,
-		.rename_in_flight = 1,
-		.from_len = 3,
-		.to_len = 3,
-		.dir_root = meta.dir_root,
-		.rename_body = body_id,
-	};
-	memcpy(v1.from, "old", 3);
-	memcpy(v1.to, "new", 3);
-	zassert_ok(blob_db_update(meta_id, &v1, sizeof(v1)));
+	zassert_equal(fs_mount(&blobfs_mnt), want);
+	zassert_ok(blob_db_get(meta_id, after, sizeof(after), &got));
+	zassert_equal(got, len, "refusal rewrote the meta");
+	zassert_mem_equal(after, blob, len, "refusal rewrote the meta");
+}
+
+/* A store from before this format — a version 2 meta, the rename intent
+ * embedded, here as a 12-byte name limit wrote it (72 B) — is refused, not
+ * misread, and stays untouched for the firmware that wrote it. So is a
+ * version 1 meta from before directories.
+ */
+ZTEST(blobfs, test_older_meta_refused)
+{
+	uint64_t meta_id = 0;
+	struct blobfs_meta meta;
+	uint8_t old[72] = { 0 };
+	uint32_t magic = BLOBFS_MAGIC;
 
 	zassert_ok(fs_mount(&blobfs_mnt));
+	make_file(MNT_POINT "/f", "x", 1);
+	zassert_ok(fs_unmount(&blobfs_mnt));
+	read_meta(&meta_id, &meta);
 
-	/* Rolled back, in the root directory, and stored as version 2. */
-	zassert_ok(fs_stat(MNT_POINT "/old", &stat));
-	zassert_equal(stat.size, 2);
-	zassert_equal(fs_stat(MNT_POINT "/new", &stat), -ENOENT);
-	zassert_ok(blob_db_get(meta_id, &meta, sizeof(meta), &got));
-	zassert_equal(got, sizeof(meta));
+	memcpy(old, &magic, sizeof(magic));
+	memcpy(&old[8], &meta.dir_root, sizeof(meta.dir_root));
+	old[4] = 2;
+	check_meta_refused(old, sizeof(old), -ENOTSUP);
+	old[4] = 1;
+	check_meta_refused(old, 56, -ENOTSUP);
+}
+
+/* An incompat feature this build does not know is refused untouched; an
+ * unknown compat feature, a longer meta (a compat addition), and a store
+ * created with another name limit all mount.
+ */
+ZTEST(blobfs, test_meta_features)
+{
+	uint64_t meta_id = 0;
+	struct blobfs_meta meta;
+	uint8_t longer[sizeof(meta) + 8];
+	struct fs_dirent stat;
+
+	zassert_ok(fs_mount(&blobfs_mnt));
+	make_file(MNT_POINT "/f", "x", 1);
+	zassert_ok(fs_unmount(&blobfs_mnt));
+	read_meta(&meta_id, &meta);
 	zassert_equal(meta.version, BLOBFS_META_VERSION);
-	zassert_equal(meta.rename_in_flight, 0);
+	zassert_equal(meta.name_max, BLOBFS_NAME_MAX);
 
+	struct blobfs_meta m = meta;
+
+	m.incompat = 0x80000000u;
+	check_meta_refused(&m, sizeof(m), -ENOTSUP);
+
+	m = meta;
+	m.compat = 0x80000000u;
+	m.name_max = BLOBFS_NAME_MAX + 20;
+	memcpy(longer, &m, sizeof(m));
+	memset(&longer[sizeof(m)], 0xa5, sizeof(longer) - sizeof(m));
+	zassert_ok(blob_db_update(meta_id, longer, sizeof(longer)));
+	zassert_ok(fs_mount(&blobfs_mnt));
+	zassert_ok(fs_stat(MNT_POINT "/f", &stat));
+	zassert_ok(fs_rename(MNT_POINT "/f", MNT_POINT "/g"));
+	zassert_ok(fs_stat(MNT_POINT "/g", &stat));
 	zassert_ok(fs_unmount(&blobfs_mnt));
+
+	/* Using the store never rewrote the meta: the tail is still there. */
+	uint8_t after[sizeof(longer)];
+	size_t got = 0;
+
+	zassert_ok(blob_db_get(meta_id, after, sizeof(after), &got));
+	zassert_equal(got, sizeof(longer));
+	zassert_mem_equal(after, longer, sizeof(longer));
 }
 
-/* Rewrite the meta as version 1 (no intent), as blobfs before directories
- * left it.
+/* A corrupt meta or intent fails mount with -EIO; it is not taken for an
+ * empty filesystem.
  */
-static uint64_t forge_v1_meta(void)
+ZTEST(blobfs, test_corrupt_meta_or_intent_refused)
 {
 	uint64_t meta_id = 0;
 	struct blobfs_meta meta;
+
+	zassert_ok(fs_mount(&blobfs_mnt));
+	zassert_ok(fs_unmount(&blobfs_mnt));
+	read_meta(&meta_id, &meta);
+
+	struct blobfs_meta m = meta;
+
+	m.magic ^= 1;
+	check_meta_refused(&m, sizeof(m), -EIO);
+	m = meta;
+	m.intent_id = 0;
+	check_meta_refused(&m, sizeof(m), -EIO);
+	check_meta_refused(&meta, sizeof(meta) - 8, -EIO);
+
+	/* Restore the meta; break the intent instead. */
+	zassert_ok(blob_db_update(meta_id, &meta, sizeof(meta)));
+	forge_rename_intent("a", "b", 1);
+
+	uint8_t buf[64];
 	size_t got = 0;
 
-	zassert_ok(rootreg_get(ROOTREG_KEY(BLOBFS_MAGIC, 0), &meta_id));
-	zassert_ok(blob_db_get(meta_id, &meta, sizeof(meta), &got));
+	zassert_ok(blob_db_get(meta.intent_id, buf, sizeof(buf), &got));
+	zassert_ok(blob_db_update(meta.intent_id, buf, got - 1)); /* short */
+	zassert_equal(fs_mount(&blobfs_mnt), -EIO);
+	buf[0] ^= 1; /* bad magic */
+	zassert_ok(blob_db_update(meta.intent_id, buf, got));
+	zassert_equal(fs_mount(&blobfs_mnt), -EIO);
 
-	struct blobfs_meta_v1 v1 = {
-		.magic = BLOBFS_MAGIC,
-		.version = BLOBFS_META_VERSION_1,
-		.dir_root = meta.dir_root,
-	};
-
-	zassert_ok(blob_db_update(meta_id, &v1, sizeof(v1)));
-	return meta_id;
+	/* An empty intent is no intent. */
+	zassert_ok(blob_db_update(meta.intent_id, NULL, 0));
+	zassert_ok(fs_mount(&blobfs_mnt));
+	zassert_ok(fs_unmount(&blobfs_mnt));
 }
 
-/* A version 1 store stays version 1 while it is used flat — so it can
- * still go back to firmware from before directories — and the first mkdir
- * makes it version 2, which that firmware refuses at mount instead of
- * reporting the directory as corrupt.
+/* Day-to-day use — files, directories, renames — never rewrites the meta:
+ * renames journal in the intent blob, which is empty again after each.
  */
-ZTEST(blobfs, test_mkdir_upgrades_v1_meta)
+ZTEST(blobfs, test_meta_written_once)
 {
-	size_t size = 0;
+	uint64_t meta_id = 0;
+	struct blobfs_meta before, after;
 
 	zassert_ok(fs_mount(&blobfs_mnt));
-	zassert_ok(fs_unmount(&blobfs_mnt));
+	read_meta(&meta_id, &before);
 
-	uint64_t meta_id = forge_v1_meta();
-
-	zassert_ok(fs_mount(&blobfs_mnt));
-	make_file(MNT_POINT "/flat", "1", 1);
-	zassert_ok(blob_db_size(meta_id, &size));
-	zassert_equal(size, sizeof(struct blobfs_meta_v1),
-		      "flat use rewrote the version 1 meta");
-
+	make_file(MNT_POINT "/a", "1", 1);
 	zassert_ok(fs_mkdir(MNT_POINT "/d"));
-	zassert_ok(blob_db_size(meta_id, &size));
-	zassert_equal(size, sizeof(struct blobfs_meta),
-		      "mkdir left a version 1 meta");
-
+	make_file(MNT_POINT "/d/b", "2", 1);
+	zassert_ok(fs_rename(MNT_POINT "/a", MNT_POINT "/c"));
+	check_intent_cleared();
+	zassert_ok(fs_rename(MNT_POINT "/d/b", MNT_POINT "/d/e"));
+	check_intent_cleared();
+	zassert_ok(fs_rename(MNT_POINT "/d", MNT_POINT "/f"));
+	check_intent_cleared();
+	zassert_ok(fs_unlink(MNT_POINT "/c"));
 	zassert_ok(fs_unmount(&blobfs_mnt));
 	zassert_ok(fs_mount(&blobfs_mnt));
-	struct fs_dirent stat;
 
-	zassert_ok(fs_stat(MNT_POINT "/d", &stat));
-	zassert_equal(stat.type, FS_DIR_ENTRY_DIR);
+	read_meta(&meta_id, &after);
+	zassert_mem_equal(&after, &before, sizeof(before), "meta rewritten");
+	zassert_ok(fs_unmount(&blobfs_mnt));
+}
+
+/* An intent whose names are longer than this build's limit — left by a
+ * build with a higher one — is still resolved: recovery only looks the
+ * names up.
+ */
+ZTEST(blobfs, test_intent_names_beyond_limit_recovered)
+{
+	char from[BLOBFS_NAME_MAX + 9], to[BLOBFS_NAME_MAX + 9];
+	struct fs_dirent stat;
+	uint64_t body_id = 0, meta_id = 0;
+	struct blobfs_meta meta;
+
+	memset(from, 'f', sizeof(from) - 1);
+	from[sizeof(from) - 1] = '\0';
+	memset(to, 't', sizeof(to) - 1);
+	to[sizeof(to) - 1] = '\0';
+
+	zassert_ok(fs_mount(&blobfs_mnt));
+	make_file(MNT_POINT "/keep", "k", 1);
+	zassert_ok(blobfs_lookup("keep", &body_id));
+	zassert_ok(fs_unmount(&blobfs_mnt));
+	read_meta(&meta_id, &meta);
+
+	/* Roll forward: the long 'to' is bound, as the other build left it,
+	 * and the long 'from' still aliases the body.
+	 */
+	struct blobfs_dirent de = {
+		.type = BLOBFS_TYPE_FILE,
+		.version = BLOBFS_DIRENT_VERSION,
+		.body_id = body_id,
+	};
+
+	zassert_ok(kvhash_map_ops.set(meta.dir_root, from, strlen(from),
+				      &de, sizeof(de)));
+	zassert_ok(kvhash_map_ops.set(meta.dir_root, to, strlen(to),
+				      &de, sizeof(de)));
+	forge_rename_intent(from, to, body_id);
+
+	zassert_ok(fs_mount(&blobfs_mnt));
+	check_intent_cleared();
+	size_t got = 0;
+
+	zassert_equal(kvhash_map_ops.get(meta.dir_root, from, strlen(from),
+					 &de, sizeof(de), &got),
+		      -ENOENT, "long 'from' not dropped");
+	zassert_ok(kvhash_map_ops.get(meta.dir_root, to, strlen(to),
+				      &de, sizeof(de), &got));
+	zassert_ok(fs_stat(MNT_POINT "/keep", &stat));
+	zassert_ok(fs_unmount(&blobfs_mnt));
+
+	/* Roll back: the long 'to' was never bound. */
+	forge_rename_intent("keep", from, body_id);
+	zassert_ok(fs_mount(&blobfs_mnt));
+	check_intent_cleared();
+	zassert_ok(fs_stat(MNT_POINT "/keep", &stat));
 	zassert_ok(fs_unmount(&blobfs_mnt));
 }
 

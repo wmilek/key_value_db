@@ -178,7 +178,7 @@ never touches the id; unlink deletes the body, after which `_id` calls report
 free — handles follow renames and fail cleanly after unlink.
 
 `rename` is two Map mutations (bind `to`, drop `from`), made atomic against
-power loss by a **rename intent** recorded in the filesystem meta blob before
+power loss by a **rename intent** recorded in blobfs's intent blob before
 the first one: mount finds a half-done rename and rolls it forward (intent +
 new name visible) or back (intent only), so no caller ever observes two names
 bound to one body after a power cut. A rename whose last step fails with a
@@ -187,14 +187,27 @@ flash error in a running session leaves the same intent behind; the next
 unlinked from under the other and the intent is never overwritten. An
 occupied destination is refused rather than silently replaced.
 
-The intent names the directory each end lives in (meta version 2); the two
-are always equal today, and are what will let a cross-directory rename reuse
-the same recovery. Mount still reads a version 1 meta, from before
-directories, as an intent in the root. The first `mkdir` on such a store
-rewrites the meta as version 2 before creating the directory, so firmware
-that predates directories refuses the store at mount instead of reporting
-each directory as corrupt; a store that never makes a directory stays
-version 1 and can still go back to that firmware.
+The intent names the directory each end lives in; the two are always equal
+today, and are what will let a cross-directory rename reuse the same
+recovery.
+
+**On flash** blobfs has two records of its own besides the directory Maps
+and file bodies (layouts in `lib/blobfs/blobfs_internal.h`):
+
+| Record | Found via | Written | Holds |
+|---|---|---|---|
+| **meta** (superblock), 32 B | root registry `ROOTREG_KEY('BFS1', 0)` | once, at creation | magic, version 3, name limit at creation, compat / incompat flags, root directory Map, intent blob id |
+| **intent** | `intent_id` in the meta | each rename: set, then cleared (empty payload) | magic `'BFSI'`, version, op, both directories, the body, then the two names (1..255 B each) |
+
+No layout depends on a build option: `CONFIG_BLOBFS_MAX_NAME_LEN` only
+bounds the names a build creates, so a store mounts under any setting
+(names longer than the current limit stay resolvable for recovery; a
+listing reports them `-EIO`). A meta with an unknown incompat flag is
+refused with `-ENOTSUP`; unknown compat flags are ignored. Older metas —
+version 1 (before directories) and version 2 (the rename intent embedded in
+the meta, with name fields sized by `CONFIG_BLOBFS_MAX_NAME_LEN`, so a store
+did not mount after the limit changed) — are refused with `-ENOTSUP` and
+left untouched.
 
 **Listing** is `map_ops.next` (§3) passed straight through:
 `blobfs_opendir` resolves a path to the directory's id, and `blobfs_next_id`

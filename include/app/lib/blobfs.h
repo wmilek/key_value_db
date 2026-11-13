@@ -40,8 +40,8 @@ extern "C" {
  *   file's id report -ENOENT from then on (there is no orphan-until-close
  *   state; blob_db deletes immediately).
  *
- * Rename is atomic against power loss: an intent recorded in the filesystem
- * metadata before the directory is touched lets @ref blobfs_mount roll a
+ * Rename is atomic against power loss: an intent recorded in blobfs's
+ * intent blob before the directory is touched lets @ref blobfs_mount roll a
  * half-done rename forward or back, so no caller ever observes two names
  * bound to one body after a power cut. A rename that fails part way
  * without one (a flash error on its last step) reports the error and may
@@ -114,6 +114,9 @@ struct blobfs_stat {
  *                   configuration mistake — deterministic on every boot)
  * @retval -ENODEV   blob_db not mounted / registry not bootstrapped
  * @retval -ENOSPC   registry full, or the directory could not be created
+ * @retval -ENOTSUP  the metadata is an older version (blobfs before
+ *                   format 3), or has an incompat feature this build does
+ *                   not know; nothing is written
  * @retval -EIO      flash error or corrupt metadata
  */
 int blobfs_mount(void);
