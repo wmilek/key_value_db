@@ -62,6 +62,13 @@ is the commit alone — no stage, no possible residue. Dangling references are
 impossible under this ordering; if one is ever observed, it is treated as
 absent and repaired, never returned as data.
 
+One container departs from that last sentence on purpose: `seq` (§4.1) writes
+an element's id into its slot *before* binding the id, and deletes an element
+*before* clearing its slot, so for `seq` a slot whose id does not resolve is
+the ordinary encoding of "empty", not an anomaly. This is still P7 — a
+reference that does not resolve is absent — and it is what lets every `seq`
+mutation keep one commit with no intent blob.
+
 Every mutation a container defines must be reducible to this pattern; one that
 cannot (e.g. needing two commits) is outside the contract and requires its own
 crash analysis against P7.
@@ -107,8 +114,8 @@ rediscovers an ordinary entry naming an ordinary root, and never retries.
 L3 binds against a *shape*, never a concrete container (P6). Two shapes cover
 the planned interfaces:
 
-**Sequence** — ordered, index-addressed (`seq_ops`):
-`create · open · append · get(index) · set(index) · remove(index) · len · iterate`
+**Sequence** — a sparse array, index-addressed (`seq_ops`):
+`create · destroy · stat · len · get(index) · set(index) · del(index) · append · truncate · next`
 
 **Map** — key-addressed (`map_ops`):
 `create · destroy · open · get(key) · set(key) · del(key) · has(key) · iterate`
@@ -141,23 +148,42 @@ the planned interfaces:
 > undefined". A replacement map therefore goes at a fresh `alloc_id`, never
 > back on the old root.
 
+> Specified, not yet implemented (`include/app/lib/containers/shape_seq.h`):
+> the Sequence shape mirrors the Map shape's conventions — `create(root,
+> seq_config)` with a binding `max_elems`, `stat`, `get` with the same
+> `-ENOMEM` probe, `destroy` under §2.4 — over a **sparse array of slots**
+> instead of keys. A slot is empty or holds one element, an opaque byte string
+> the container owns: callers pass bytes, never blob ids, so no caller ever
+> holds a blob that nothing references yet. Any slot below the capacity may be
+> set; `del` empties one; `len` is one past the highest slot set since the
+> last `truncate` (stored, so O(1) — unlike Map `count`); `append` is `set` at
+> `len`. `next(from)` is the Map `next` with the index as the cursor: the first
+> occupied slot at or after `from`, in ascending order, mutation between calls
+> allowed.
+>
+> What earns the shape a place beside L1's large payloads: an L1 object is
+> **one** value addressed by byte offset (`blob_db_read`/`blob_db_write`); a
+> sequence is **many** values addressed by index, each replaced on its own, at
+> its own size. Use cases are listed in §4.1.
+
 Keys and values are opaque byte strings (`ptr + len`); key semantics (strings,
 paths, hashes) belong to L3. Concrete containers export a `const struct
 map_ops`/`seq_ops` instance; the L3 backend `choice` (P4) decides which instance
 an interface is compiled against — a compile-time binding, no runtime dispatch
 cost beyond one indirection.
 
-Both shapes' `iterate` follow the L1 iterator rules (contract §4, decision D5): Zephyr
-convention (callback returns 0 = continue, non-zero = stop, value propagated
-to the caller), and **mutating the container from inside the callback is
-undefined behavior** — collect-then-mutate is the supported pattern.
-Iteration is a diagnostic/repair facility, not a data path.
+Neither shape has a callback `iterate`: both enumerate with a stateless
+`next` whose cursor is the last key (Map) or index (Sequence) seen, so a walk
+holds no iterator, survives a reboot, and may be interleaved with mutations.
+The L1 callback rules (contract §4, decision D5 — mutating from inside the
+callback is undefined) apply to L1's own `iterate` only. Enumeration is for
+listing, export and repair, not a hot data path.
 
 ## 4. The containers
 
 | Container | Shape | Lookup | Ordered | Kconfig |
 |---|---|---|---|---|
-| §4.1 `seq` — simple list | Sequence | O(n) | insertion | `CONTAINER_SEQ` |
+| §4.1 `seq` — sparse indexed array | Sequence | O(1), ≤ 3 reads | by index | `CONTAINER_SEQ` |
 | §4.2 `kvlist` — simple k→v list | Map | O(n) | insertion | `CONTAINER_KVLIST` |
 | §4.3 `kvhash` — k→v hash | Map | O(1) avg | no | `CONTAINER_KVHASH` |
 | §4.4 `kvtree` — k→v tree | Map | O(log n) | by key | `CONTAINER_KVTREE` |
@@ -168,21 +194,109 @@ discipline, and the §5 invariants. The node layouts sketched below are
 implementation designs — they show feasibility and may be fine-tuned when
 each container gets its own implementation document under `doc/impl/`.
 
-### 4.1 `seq` — simple list
+### 4.1 `seq` — sparse indexed array
 
-Singly-linked chain of chunk nodes; the root holds head/tail ids and a count.
+A fixed-capacity array of slots; each occupied slot names one element blob.
+One or two levels of id arrays, like the `kvhash` directory (§4.3), and like
+it the geometry is derived at create from what the caller declares
+(`seq_config.max_elems`) and fixed thereafter.
 
 ```
-root  { magic 'CSEQ', head_id, tail_id, count }
-chunk { next_id, nelems, elem[]… }          each elem: { len, bytes… }
+root  { magic 'CSEQ', version, depth, flags, capacity, len,
+        trim_from, trim_to, child_id[] }
+  depth 1: child_id[i] is slot i — an element id, or 0
+  depth 2: child_id[i] is a leaf, or 0 (no leaf yet: all its slots empty)
+leaf  { slot_id[] }                                   one i-node, created lazily
+element = the caller's bytes, verbatim                 one i-node per element
 ```
 
-Chunking (several elements per i-node, up to the payload limit) keeps read
-amplification low; a chunk splits when an insert doesn't fit. `append` is O(1)
-(tail id known from the root); `get(index)` is O(n/chunk_factor). Intended use:
-queues, file-data chunk chains — not random access at scale. For *bounded*
-logging with automatic eviction of old records, use `logring` (§4.5) instead
-of an ever-growing `seq`.
+A slot is **occupied** when its id resolves (`blob_db_get` succeeds) and
+**empty** otherwise: id 0, an id reserved but never bound, or a deleted id all
+read as empty (§2.2). Slots at or past `len` read as empty whatever they hold.
+
+**Capacity.** With a ~24 B root header and 8 B per id, one level addresses
+about 29 slots at the 256 B default payload and about 249 at 2016 B (the
+`BLOB_DB_LARGE_PAYLOADS` default); two levels about 29 × 32 ≈ 900 and
+249 × 252 ≈ 62 000. A `max_elems` past two levels is `-EINVAL` at create. An
+element is its own blob, so its size limit is blob_db's — with large payloads
+on, an element can itself be segmented.
+
+**Cost** (depth 2; depth 1 saves the leaf read and write):
+
+| op | reads | writes |
+|---|---|---|
+| `get`, `len`, `stat` | root + leaf + element / root / root | 0 |
+| `set`, slot occupied | root + leaf + element | **1** — the element, updated in place, id kept |
+| `set`, empty slot below `len` | root + leaf + probe | 2 — leaf, element |
+| `set`/`append` at or past `len` | root + leaf + probe | 3 — leaf, element, root |
+| `del` | root + leaf + probe | 2 — element tombstone, leaf |
+| `truncate` | root + leaves in range | root, then one tombstone per element and one write per leaf, then root |
+| `next` | leaves in range + one probe per non-zero slot (+ element if asked) | 0 |
+
+Replacing an element is the common case for slot tables and costs one write
+with no stage: the element blob belongs to the sequence alone, so it is
+rewritten in place (`l1_model_container.md` §3.4) and nothing that names it
+changes.
+
+**Mutation order.** Every mutation has one commit and needs no intent blob,
+because blob_db reserves ids without writing (`alloc_id` → bind) and reads an
+unbound or deleted id as `-ENOENT`:
+
+| op | order | commit | residue of a crash |
+|---|---|---|---|
+| `set`, slot occupied | update the element | that update | none |
+| `set`, empty slot below `len` | `alloc_id`; write the id arrays on the path holding the new id, bottom-up; bind the element | the bind | a slot naming an unbound id — reads empty, nothing on flash |
+| `set`/`append` at or past `len` | as above, then write the root with the new `len` | the root write | a bound element just past `len` — reachable from its id array, reused by the next `set`/`append` there, released by `truncate`/`destroy` |
+| `del` | delete the element; clear the slot | the delete | a slot naming a deleted id — reads empty |
+| `truncate`, shrinking | write the root with the new `len` and `trim_from/trim_to`; delete each element in the range, then clear it from its leaf; delete leaves wholly past `len`; write the root clearing the range and their entries | the first root write | elements in the trim range, still reachable; finished by the next mutation |
+| `truncate`, growing | write the root with the new `len` | that write | none |
+
+Two rules make the table hold:
+
+- **`set` binds only an id it has just reserved, or one that resolves.** A
+  slot whose id answers `-ENOENT` gets a fresh `alloc_id`, because the
+  sequence cannot tell an id reserved but never bound from a deleted one, and
+  binding a deleted id is undefined (L1 D3).
+- **A pending trim is finished before any other mutation.** The trim range is
+  inline in the root, as `logring` keeps its eviction range (§4.5), so an
+  interrupted `truncate` is completed by whichever mutation comes next, and
+  is bounded by the range.
+
+At depth 1 the root is also the id array, so a fill at or past `len` writes it
+twice — once naming the reserved id, once with the new `len`. Folding those
+into one is an implementation question for `doc/impl/` when `seq` is built.
+
+**Destroy** (§2.4) writes the root with a destroying flag — every op answers
+`-ENOENT` from then on — deletes each leaf's elements and then the leaf, and
+deletes the root last; `-ENOENT` from any delete counts as done, so a repeat
+resumes where the last attempt stopped.
+
+**What it is for** — values addressed by a dense integer, each large enough or
+changed often enough to deserve its own blob:
+
+- **numbered slot tables**: users, keys and certificates, biometric templates,
+  presets, schedule and holiday entries — fixed capacity, holes, a slot
+  replaced on its own. In a Map they would pay for stored keys, hashing, and
+  a bucket that rewrites its neighbours; here a lookup is two reads to the
+  element's id, and `next` lists the occupants or finds a free slot;
+- **arrays of container roots** past what one superblock payload holds —
+  per-period logs, per-entity sub-maps — with the root id stored as an
+  8-byte element (the sequence does not destroy what it names);
+- **record streams read back by position that must not drop data** —
+  store-and-forward batches, sample blocks indexed by time — where `logring`
+  would evict and an L1 object would cap the total and be one value.
+
+**What it is not for:** one large value (an L1 payload, with
+`blob_db_read`/`blob_db_write`); an array small enough to live inside its
+owner's record; a bounded log (`logring`, §4.5); lookup by an arbitrary key
+(a Map); an ordered list that needs inserts and removals in the middle.
+
+> **History.** Until 2026-11 this section described a byte-stream `seq` — a
+> chain of chunk nodes behind `len/read/append/truncate` on bytes — meant for
+> file bodies. L1 decision D4 (amended; proposal D10) moved large values into
+> L1 itself, with O(1) seek and pread/pwrite, and blobfs bodies are L1 blobs,
+> so that role is gone. The shape was redefined around what L1 cannot do:
+> many separately replaced values under one root.
 
 ### 4.2 `kvlist` — simple k→v list
 
@@ -267,8 +381,9 @@ B-tree rules, still committed by the single root write.
 
 ### 4.5 `logring` — bounded per-entry log
 
-Where `seq` (§4.1) is an *unbounded, index-addressed* sequence — the right
-shape for file bodies and chunk chains — `logring` is purpose-built for
+Where `seq` (§4.1) is a *fixed-capacity, index-addressed* array that never
+drops an element on its own — the right shape for slot tables and for records
+read back by position — `logring` is purpose-built for
 **logging**: a *bounded* store that keeps the most recent records and drops the
 oldest, scaling from a couple of MB up to near the whole partition. It does not
 implement the generic `seq_ops`; it exports its own append/scan API
@@ -326,7 +441,7 @@ Every implementation must uphold (checklist for reviews and tests):
 ```
 menuconfig BLOB_CONTAINERS         bool "Container layer"      depends on BLOB_DB
 
-config CONTAINER_SEQ               bool "Simple list (sequence)"
+config CONTAINER_SEQ               bool "Sparse indexed array (sequence)"
 config CONTAINER_KVLIST            bool "Simple key→value list"
 config CONTAINER_KVLIST_INLINE_MAX int  "Inline value limit"    default 64
 config CONTAINER_KVHASH            bool "Key→value hash"        select CONTAINER_KVLIST
@@ -369,8 +484,9 @@ tests/lib/containers/
 ## 8. Testing strategy (per container)
 
 Beyond per-container functional cases, a **shared shape-conformance suite** runs
-the same scenarios against every enabled `map_ops` provider (and `seq_ops`
-provider), so backends stay behaviorally interchangeable:
+the same scenarios against every enabled `map_ops` provider, so backends stay
+behaviorally interchangeable (`seq` is the only `seq_ops` provider, so items
+1–7 run in its own suite until a second one exists):
 
 1. create → open by root id → empty behavior
 2. set/get/del round-trips, including binary keys/values and 0-length values
@@ -389,3 +505,13 @@ provider), so backends stay behaviorally interchangeable:
    wrong-type `open` → `-ENOTSUP`. (`logring` uses its own append/scan API,
    not `seq_ops`/`map_ops`, so it is exercised by its own suite rather than
    the shared shape-conformance suite.)
+10. `seq`: sparse fill in any order; empty slot (`-ENOENT`) vs empty element
+    (length 0); `len` raised by `set` past it, kept by `del`, moved both ways
+    by `truncate`; `append` at capacity → `-EFBIG`; index at or past capacity
+    → `-EINVAL`; `next` returns occupied slots once each in ascending order,
+    with and without element buffers, across `set`/`del` between calls; depth
+    1 and depth 2 at their capacity boundaries; crash injection at every step
+    of every row of the §4.1 mutation-order table, verifying old-or-new state,
+    that a slot naming an unbound or deleted id reads empty and is never
+    rebound, that an interrupted `truncate` is finished by the next mutation,
+    and that `destroy` leaves no element, leaf or root behind.

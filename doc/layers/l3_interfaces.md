@@ -116,8 +116,9 @@ Hierarchical `path → file` storage. Composition:
 - **Directory** = a Map container instance: `name → dirent`, where a dirent
   encodes `{ type: dir|file, i-node id }`. Nested directories are just Map roots
   referenced from their parent — nesting gives paths.
-- **File body** = inline value for small files; a `seq` chunk chain
-  (`BLOBFS_FILE_CHUNKED`) for large or streamed content.
+- **File body** = the file's own blob; past one slot it is an L1 segmented
+  payload (`BLOB_DB_LARGE_PAYLOADS`), read and written in place with
+  `blob_db_read()`/`blob_db_write()` (§4.1).
 
 The API is **handle-free**: there is no open/close and no file-position
 state — reads and writes pass an explicit offset (pread/pwrite style):
@@ -151,8 +152,7 @@ restricts `rename` to within one directory (`-EXDEV` otherwise).
 
 ### 4.1 What v1 ships
 
-The shipped module is the above minus cross-directory rename and chunked
-bodies: a tree of directories holding files, with the handle-free calls —
+The shipped module is the above minus cross-directory rename: a tree of directories holding files, with the handle-free calls —
 `create`, `mkdir`, `stat`, `read`, `write`, `truncate`, `unlink`, `rename`,
 the listing pair `opendir`/`next_id`, plus `mount`/`unmount`.
 `name -> dirent { type, id }` is the Map value. A file's id is its **body,
@@ -270,7 +270,6 @@ choice BLOBFS_DIR_BACKEND          prompt "directory container"    depends on BL
   config BLOBFS_DIR_KVHASH         select CONTAINER_KVHASH
   config BLOBFS_DIR_KVTREE         select CONTAINER_KVTREE         # sorted readdir
 endchoice
-config BLOBFS_FILE_CHUNKED         bool "Chunked file bodies"      select CONTAINER_SEQ
 
 config SETTINGS_KVDB               bool "Zephyr settings backend over kvdb"  depends on KVDB && SETTINGS
 ```
@@ -304,7 +303,7 @@ tests/lib/blobfs/ ztest
   rename to replace a file). Local tests cover directories — nesting, path
   walking, removal, listing, renaming one with its contents, `-EXDEV` — and
   the v1 boundaries: `-ENOTSUP` for `statvfs`, the body size cap, rename
-  recovery, single-mount. Chunk-boundary read/write joins with `seq`.
+  recovery, single-mount.
 - **Cross-interface**: enable `kvdb` + `blobfs` together; verify id = 1 root
   directory dispatch (§2) and mutual isolation.
 - **Persistence & crash**: remount and torn-write cases at this level are smoke

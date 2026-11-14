@@ -335,8 +335,9 @@ The commit rule this decision already stated is unchanged and is what preserves
 "atomicity" and "no partial reads" hold with no new primitive — the single slot
 append that makes a small write atomic makes a large one atomic.
 
-L2's `seq` remains the right answer for *streams* (logs, queues, append-mostly
-data), not for large single values.
+L2 keeps what L1 cannot do: `logring` for bounded logs, and `seq` for *many*
+separately replaced values addressed by index (`l2_containers.md` §4.1) —
+neither is a way to store one large value.
 
 Writes are no longer whole-blob only: `blob_db_write` touches just the storage
 a range covers, so a small change to a large object costs O(chunk) rather than

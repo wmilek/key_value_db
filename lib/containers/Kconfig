@@ -48,9 +48,11 @@ source "subsys/logging/Kconfig.template.log_config"
 endif
 
 config BLOB_CONTAINER_SEQ
-	bool "seq — append/index sequence container"
+	bool "seq — sparse indexed array container"
 	help
-	  Sequence shape (seq_ops): file bodies and chunked payloads.
+	  Sequence shape (seq_ops): a fixed-capacity array of slots, each
+	  empty or holding one element blob, addressed by index — slot tables,
+	  arrays of container roots, records read back by position.
 	  NOT YET IMPLEMENTED — skeleton only.
 
 config BLOB_CONTAINER_KVLIST
