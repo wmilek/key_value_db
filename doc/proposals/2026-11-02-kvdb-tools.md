@@ -1,6 +1,6 @@
 # Design change proposal — kvdb tools: one shell, on the device and on images
 
-Status: **proposal**, step 1 and part of step 2 landed (`app_diag/`, `blob_db mount` · `unmount` · `format`, `blob_db export` · `import`) · 2026-11-02
+Status: **proposal**, step 1 and part of steps 2 and 4 landed (`app_diag/`, `blob_db mount` · `unmount` · `format`, `blob_db export` · `import`, `diag` structure recognition) · 2026-11-02
 · Builds on: `lib/blob_db/blob_db_shell.c`, `include/app/lib/blob_db_inspect.h`,
   the store seam `lib/blob_db/blob_db_store.h`
 · Governed by `doc/principles.md`
@@ -54,6 +54,7 @@ blob_db  info · stats · buckets · bucket · id · dump · maintain · iostats
          mount · unmount · format yes                                        exists (SHELL_ADMIN)
          export · import (logical dump, doc/tools/blob_db_export.md)         exists (import: SHELL_ADMIN)
          ls · get · verify                                                   later
+diag     scan · roots · show · formats (structure recognition, app_diag)    exists
 ubi      info · peb · ec-hist (wear)                                         L0
 rootreg  ls · get · set · rm                                                 L1½
 kvdb     stores · ls · get · set · rm · stats                                L3
@@ -146,7 +147,7 @@ Fault injection reuses `tests/support/flash_fault`.
 | **1** (landed) | `app_diag/`: shell only, existing groups (`blob_db`, `blob_db iostats`, `flash`, `kernel`, `device`); no mount unless `CONFIG_APP_DIAG_MOUNT_AT_BOOT=y`; nRF5340-DK build plus a `native_sim` build whose store flash is a partition image (`--kvdb=<file>`); twister runs both variants | none |
 | 2 | `blob_db mount` / `unmount` / `format yes` behind `CONFIG_BLOB_DB_SHELL_ADMIN` (**landed**); `blob_db export` / `import` and `scripts/blob_db_export.py` (**landed**, import on native_sim); read-only groups for `rootreg`, `kvdb`, `blobfs` | yes |
 | 3 | Copy-on-write store under the seam, so a mount on an image writes nothing unless committed; `west kvdb` wrapper (build per profile, run on an image, batch input, machine-readable output) | wrapper only |
-| 4 | fsck L0/L1, then container walkers and reachability | `fsck` |
+| 4 | Structure recognition: name every object from its bytes, current and past formats, compiled into `app_diag` only (**landed**, `diag`, §3.1); fsck L0/L1, then container walkers and reachability | `diag`, `fsck` |
 | 5 | `danger` group behind a Kconfig option and `unlock`; fault injection | `danger` |
 | 6 | mkimage from a manifest | `image mkimage` |
 | 7 | Logical diff, wear analysis, workload replay against an image | `image diff`, `ubi ec-hist` |
@@ -174,6 +175,31 @@ no later step changes what an earlier one does.
   unchanged. Twister's shell harness runs format (refused without `yes`),
   mount, a second mount, unmount and format against a blank image
   (`app.diag.admin`). Both backends were exercised by hand.
+
+### 3.1 Structure recognition (`diag`)
+
+`app_diag/src/diag_*.c` add the app's only command group. `diag scan`
+enumerates the live objects (the inspect API, as export does), reads each with
+`blob_db_read()`, and names it from its bytes: the magic and length checks of
+the root registry, kvdb meta, blobfs meta, kvhash directory and logring root,
+the CBOR shape of the persondb superblock, and, for types without a magic, the
+layout of a kvhash bucket or a logring entry. `diag roots` walks the registry
+one level down; `diag show` decodes one object and lists every id it names.
+
+The formats are a copy, in `diag_decode.c`, kept in the app so that the
+libraries carry no diagnostic code. The copy holds every layout earlier
+firmware wrote as well: a one-level kvhash, the inline logring ring, three
+blobfs metas, the persondb superblock v1. That is what an image from the field
+needs. It is the second implementation of the formats §1.1 left out, limited
+to what naming and printing need. Nothing acts on its verdicts. Reachability
+(§1.5) still needs the per-container walkers, and should not be built on this
+copy: a stale copy would report live objects as leaked.
+
+Built against images written by the libraries themselves (kvdb, blobfs,
+logring and a 200-person `app_cbor_persondb` store), every object came out
+named and none suspect. That check found one fact the copy now encodes. The
+blobfs meta is not packed: its length follows the writer's u64 alignment, 72
+bytes on the DK and 68 on `native_sim`.
 
 ## 4. Open questions
 
