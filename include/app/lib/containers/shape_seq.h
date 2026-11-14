@@ -25,8 +25,9 @@ extern "C" {
  * holds up to @ref seq_info.capacity **slots**, numbered from 0. A slot is
  * either empty or holds one **element**: an opaque byte string, stored and
  * replaced independently of every other element. The container owns its
- * elements — the caller passes bytes, never blob ids, and @ref set,
- * @ref del, @ref truncate and @ref destroy release what they replace.
+ * elements — the caller passes bytes, never blob ids, and @ref seq_ops.set,
+ * @ref seq_ops.del, @ref seq_ops.truncate and @ref seq_ops.destroy release
+ * what they replace.
  *
  * What it is for: values addressed by a dense integer, each large enough or
  * changed often enough to deserve its own blob — numbered slot tables
@@ -76,7 +77,7 @@ struct seq_info {
 	uint8_t depth;
 	/** Number of slots; valid indexes are 0 .. capacity - 1. */
 	uint32_t capacity;
-	/** Largest element, in bytes, @ref set and @ref append accept. */
+	/** Largest element, in bytes, @ref seq_ops.set and @ref seq_ops.append accept. */
 	size_t elem_bytes_limit;
 };
 
@@ -88,12 +89,12 @@ struct seq_info {
  * order; a slot never set, or cleared by @ref del or @ref truncate, is empty
  * and answers -ENOENT. An empty element (length 0) is an element like any
  * other and is not the same as an empty slot. The **length** is one past
- * the highest slot set since the last @ref truncate: @ref set beyond it
+ * the highest slot set since the last @ref truncate. @ref set beyond it
  * raises it, @ref del leaves it alone, @ref truncate moves it. @ref append
  * sets the slot at the length.
  *
  * **Index bounds.** An index at or past the capacity is -EINVAL on
- * @ref get, @ref set and @ref del: the capacity is known from @ref stat, so
+ * @ref get, @ref set and @ref del. The capacity is known from @ref stat, so
  * such an index is a caller bug, not a state.
  *
  * **Atomicity.** Every mutation is crash-atomic with one commit point
@@ -244,7 +245,7 @@ struct seq_ops {
 	 * falls. @ref set, @ref del, @ref append and @ref truncate may be called
 	 * freely between two calls.
 	 *
-	 * **Buffers.** As for @ref get: @p out may be NULL when @p out_sz is 0.
+	 * **Buffers.** As for @ref get, @p out may be NULL when @p out_sz is 0.
 	 * On 0 and on -ENOMEM, *out_index and (when non-NULL) *out_len are set,
 	 * so the caller can retry the same index with a larger buffer or skip
 	 * past it.
