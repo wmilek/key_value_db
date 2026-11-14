@@ -21,6 +21,7 @@ Status: v2 · Top-level document; per-layer detail lives in `doc/layers/`
 | `doc/impl/l1_bucketlog.md` | **Implementation design** (non-normative): the v1 bucket-log allocator — formats, algorithms, costs, open items |
 | `doc/impl/l0_backends.md` | **Implementation design** (non-normative): the two L0 providers — operation mapping, geometry overhead, measured costs |
 | `doc/impl/l2_logring.md` | **Implementation design**: the `logring` per-entry log — format, algorithms, crash model |
+| `doc/impl/l2_seq.md` | **Implementation design** (draft, not implemented): the `seq` sparse indexed array — layout, costs, mutation order, crash analysis |
 | `doc/proposals/` | **Change proposals** (non-normative until accepted): analysis + design for a change that spans a contract and its implementation |
 | `doc/reviews/*.md` | Dated reviews of this document set, with findings and their resolution |
 

@@ -62,13 +62,6 @@ is the commit alone — no stage, no possible residue. Dangling references are
 impossible under this ordering; if one is ever observed, it is treated as
 absent and repaired, never returned as data.
 
-One container departs from that last sentence on purpose: `seq` (§4.1) writes
-an element's id into its slot *before* binding the id, and deletes an element
-*before* clearing its slot, so for `seq` a slot whose id does not resolve is
-the ordinary encoding of "empty", not an anomaly. This is still P7 — a
-reference that does not resolve is absent — and it is what lets every `seq`
-mutation keep one commit with no intent blob.
-
 Every mutation a container defines must be reducible to this pattern; one that
 cannot (e.g. needing two commits) is outside the contract and requires its own
 crash analysis against P7.
@@ -196,80 +189,34 @@ each container gets its own implementation document under `doc/impl/`.
 
 ### 4.1 `seq` — sparse indexed array
 
-A fixed-capacity array of slots; each occupied slot names one element blob.
-One or two levels of id arrays, like the `kvhash` directory (§4.3), and like
-it the geometry is derived at create from what the caller declares
-(`seq_config.max_elems`) and fixed thereafter.
+A fixed-capacity array of slots addressed by index. Each slot is empty or
+holds one element, stored as its own blob. The capacity is the caller's
+`seq_config.max_elems`, fixed at create; `stat` reports what was built.
 
-```
-root  { magic 'CSEQ', version, depth, flags, capacity, len,
-        trim_from, trim_to, child_id[] }
-  depth 1: child_id[i] is slot i — an element id, or 0
-  depth 2: child_id[i] is a leaf, or 0 (no leaf yet: all its slots empty)
-leaf  { slot_id[] }                                   one i-node, created lazily
-element = the caller's bytes, verbatim                 one i-node per element
-```
+**Limits.** About 900 slots at the 256 B default payload and about 62 000 at
+2016 B (the `BLOB_DB_LARGE_PAYLOADS` default); a larger `max_elems` fails the
+create with `-EINVAL`. An element can be as large as one blob_db payload
+(`seq_info.elem_bytes_limit`).
 
-A slot is **occupied** when its id resolves (`blob_db_get` succeeds) and
-**empty** otherwise: id 0, an id reserved but never bound, or a deleted id all
-read as empty (§2.2). Slots at or past `len` read as empty whatever they hold.
-
-**Capacity.** With a ~24 B root header and 8 B per id, one level addresses
-about 29 slots at the 256 B default payload and about 249 at 2016 B (the
-`BLOB_DB_LARGE_PAYLOADS` default); two levels about 29 × 32 ≈ 900 and
-249 × 252 ≈ 62 000. A `max_elems` past two levels is `-EINVAL` at create. An
-element is its own blob, so its size limit is blob_db's — with large payloads
-on, an element can itself be segmented.
-
-**Cost** (depth 2; depth 1 saves the leaf read and write):
+**Cost** (worst case, flash operations):
 
 | op | reads | writes |
 |---|---|---|
-| `get`, `len`, `stat` | root + leaf + element / root / root | 0 |
-| `set`, slot occupied | root + leaf + element | **1** — the element, updated in place, id kept |
-| `set`, empty slot below `len` | root + leaf + probe | 2 — leaf, element |
-| `set`/`append` at or past `len` | root + leaf + probe | 3 — leaf, element, root |
-| `del` | root + leaf + probe | 2 — element tombstone, leaf |
-| `truncate` | root + leaves in range | root, then one tombstone per element and one write per leaf, then root |
-| `next` | leaves in range + one probe per non-zero slot (+ element if asked) | 0 |
+| `get` | 3 | 0 |
+| `len`, `stat` | 1 | 0 |
+| `set` replacing an element | 3 | **1** |
+| `set` filling an empty slot, `append` | 3 | 3 |
+| `del` | 3 | 2 |
+| `truncate` (shrinking) | 1 per id array in range | 2, plus 1 per element released and per id array touched |
+| `next` | 1 per id array scanned, 1 per occupied slot checked, +1 for the element if asked | 0 |
 
-Replacing an element is the common case for slot tables and costs one write
-with no stage: the element blob belongs to the sequence alone, so it is
-rewritten in place (`l1_model_container.md` §3.4) and nothing that names it
-changes.
+Replacing an element — the common operation on a slot table — rewrites that
+element alone.
 
-**Mutation order.** Every mutation has one commit and needs no intent blob,
-because blob_db reserves ids without writing (`alloc_id` → bind) and reads an
-unbound or deleted id as `-ENOENT`:
-
-| op | order | commit | residue of a crash |
-|---|---|---|---|
-| `set`, slot occupied | update the element | that update | none |
-| `set`, empty slot below `len` | `alloc_id`; write the id arrays on the path holding the new id, bottom-up; bind the element | the bind | a slot naming an unbound id — reads empty, nothing on flash |
-| `set`/`append` at or past `len` | as above, then write the root with the new `len` | the root write | a bound element just past `len` — reachable from its id array, reused by the next `set`/`append` there, released by `truncate`/`destroy` |
-| `del` | delete the element; clear the slot | the delete | a slot naming a deleted id — reads empty |
-| `truncate`, shrinking | write the root with the new `len` and `trim_from/trim_to`; delete each element in the range, then clear it from its leaf; delete leaves wholly past `len`; write the root clearing the range and their entries | the first root write | elements in the trim range, still reachable; finished by the next mutation |
-| `truncate`, growing | write the root with the new `len` | that write | none |
-
-Two rules make the table hold:
-
-- **`set` binds only an id it has just reserved, or one that resolves.** A
-  slot whose id answers `-ENOENT` gets a fresh `alloc_id`, because the
-  sequence cannot tell an id reserved but never bound from a deleted one, and
-  binding a deleted id is undefined (L1 D3).
-- **A pending trim is finished before any other mutation.** The trim range is
-  inline in the root, as `logring` keeps its eviction range (§4.5), so an
-  interrupted `truncate` is completed by whichever mutation comes next, and
-  is bounded by the range.
-
-At depth 1 the root is also the id array, so a fill at or past `len` writes it
-twice — once naming the reserved id, once with the new `len`. Folding those
-into one is an implementation question for `doc/impl/` when `seq` is built.
-
-**Destroy** (§2.4) writes the root with a destroying flag — every op answers
-`-ENOENT` from then on — deletes each leaf's elements and then the leaf, and
-deletes the root last; `-ENOENT` from any delete counts as done, so a repeat
-resumes where the last attempt stopped.
+**Guarantees**, beyond the §5 invariants: every mutation is atomic across
+power loss — each slot holds its old or new element, `len` its old or new
+value — and leaves no unreachable blob behind. A `truncate` cut short by a
+power loss is finished by the next mutation. `destroy` follows §2.4.
 
 **What it is for** — values addressed by a dense integer, each large enough or
 changed often enough to deserve its own blob:
@@ -277,8 +224,8 @@ changed often enough to deserve its own blob:
 - **numbered slot tables**: users, keys and certificates, biometric templates,
   presets, schedule and holiday entries — fixed capacity, holes, a slot
   replaced on its own. In a Map they would pay for stored keys, hashing, and
-  a bucket that rewrites its neighbours; here a lookup is two reads to the
-  element's id, and `next` lists the occupants or finds a free slot;
+  a bucket that rewrites its neighbours; here `next` lists the occupants or
+  finds a free slot;
 - **arrays of container roots** past what one superblock payload holds —
   per-period logs, per-entity sub-maps — with the root id stored as an
   8-byte element (the sequence does not destroy what it names);
@@ -291,12 +238,7 @@ changed often enough to deserve its own blob:
 owner's record; a bounded log (`logring`, §4.5); lookup by an arbitrary key
 (a Map); an ordered list that needs inserts and removals in the middle.
 
-> **History.** Until 2026-11 this section described a byte-stream `seq` — a
-> chain of chunk nodes behind `len/read/append/truncate` on bytes — meant for
-> file bodies. L1 decision D4 (amended; proposal D10) moved large values into
-> L1 itself, with O(1) seek and pread/pwrite, and blobfs bodies are L1 blobs,
-> so that role is gone. The shape was redefined around what L1 cannot do:
-> many separately replaced values under one root.
+Layout, mutation order and crash analysis: `doc/impl/l2_seq.md`.
 
 ### 4.2 `kvlist` — simple k→v list
 
@@ -510,8 +452,7 @@ behaviorally interchangeable (`seq` is the only `seq_ops` provider, so items
     by `truncate`; `append` at capacity → `-EFBIG`; index at or past capacity
     → `-EINVAL`; `next` returns occupied slots once each in ascending order,
     with and without element buffers, across `set`/`del` between calls; depth
-    1 and depth 2 at their capacity boundaries; crash injection at every step
-    of every row of the §4.1 mutation-order table, verifying old-or-new state,
-    that a slot naming an unbound or deleted id reads empty and is never
-    rebound, that an interrupted `truncate` is finished by the next mutation,
-    and that `destroy` leaves no element, leaf or root behind.
+    1 and depth 2 at their capacity boundaries; crash injection at every write
+    of every mutation, verifying old-or-new state, that an interrupted
+    `truncate` is finished by the next mutation, and that `destroy` leaves no
+    blob behind.

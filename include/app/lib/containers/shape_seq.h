@@ -249,10 +249,9 @@ struct seq_ops {
 	 * so the caller can retry the same index with a larger buffer or skip
 	 * past it.
 	 *
-	 * **Cost.** An empty part of the id array is skipped without reading
-	 * elements; each candidate slot costs one check that its element exists
-	 * (l2_containers.md §4.1), and the element is read only when @p out_sz
-	 * is non-zero. A walk with @p out_sz 0 lists the occupied indexes
+	 * **Cost.** Empty ranges are skipped without reading elements; each
+	 * occupied slot costs one existence check, and the element is read
+	 * only when @p out_sz is non-zero (l2_containers.md §4.1). A walk with @p out_sz 0 lists the occupied indexes
 	 * cheaply — the way to enumerate a slot table or find a free slot.
 	 *
 	 * @param root       the sequence

@@ -43,6 +43,7 @@ instructions live in the repository ``README.md``.
    impl/l0_backends
    impl/l2_kvhash
    impl/l2_logring
+   impl/l2_seq
 
 .. toctree::
    :maxdepth: 1
