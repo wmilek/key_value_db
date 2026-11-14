@@ -21,6 +21,7 @@ Status: v2 · Top-level document; per-layer detail lives in `doc/layers/`
 | `doc/impl/l1_bucketlog.md` | **Implementation design** (non-normative): the v1 bucket-log allocator — formats, algorithms, costs, open items |
 | `doc/impl/l0_backends.md` | **Implementation design** (non-normative): the two L0 providers — operation mapping, geometry overhead, measured costs |
 | `doc/impl/l2_logring.md` | **Implementation design**: the `logring` per-entry log — format, algorithms, crash model |
+| `doc/impl/l2_seq.md` | **Implementation design** (draft, not implemented): the `seq` sparse indexed array — layout, costs, mutation order, crash analysis |
 | `doc/proposals/` | **Change proposals** (non-normative until accepted): analysis + design for a change that spans a contract and its implementation |
 | `doc/reviews/*.md` | Dated reviews of this document set, with findings and their resolution |
 
@@ -130,12 +131,12 @@ instead. → `layers/l1_root_registry.md`
 **L2 — Containers.** Data structures whose nodes are i-nodes and whose edges
 are ids stored in payloads. Four providers behind two abstract shapes — **Map**
 (`kvlist` O(n) · `kvhash` O(1) · `kvtree` O(log n), ordered) and **Sequence**
-(`seq`). Mutations are copy-on-write with a single root `update` as the atomic
+(`seq`, a sparse array addressed by index). Mutations are copy-on-write with a single root `update` as the atomic
 commit point. Each container independently enable-able. → `layers/l2_containers.md`
 
 **L3 — Access interfaces.** Ergonomic APIs for the rest of the system: `kvdb`
 (string key → value over any Map), `blobfs` (paths/files: Map directories +
-Sequence file bodies), optional Zephyr `settings` backend. Interfaces bind to a
+L1 blobs as file bodies), optional Zephyr `settings` backend. Interfaces bind to a
 shape; Kconfig binds the shape to a container. → `layers/l3_interfaces.md`
 
 ## 5. Composition via Kconfig
@@ -155,7 +156,7 @@ combinations are unrepresentable.
 | Tiny settings store, <20 keys | `KVDB` + backend `KVLIST` | blob_db + kvlist + kvdb |
 | Fast device DB, 10k keys | `KVDB` + backend `KVHASH` | + kvhash |
 | Ordered / range queries | `KVDB` + backend `KVTREE` | kvtree instead of kvhash |
-| File-like storage | `BLOBFS` + dir `KVHASH` + `FILE_CHUNKED` | + kvhash, seq, blobfs |
+| File-like storage | `BLOBFS` (+ `BLOB_DB_LARGE_PAYLOADS` for files past one slot) | + kvhash, blobfs |
 | Test image | everything | all containers + all interfaces |
 
 ## 6. End-to-end walk

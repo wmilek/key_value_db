@@ -107,8 +107,8 @@ rediscovers an ordinary entry naming an ordinary root, and never retries.
 L3 binds against a *shape*, never a concrete container (P6). Two shapes cover
 the planned interfaces:
 
-**Sequence** — ordered, index-addressed (`seq_ops`):
-`create · open · append · get(index) · set(index) · remove(index) · len · iterate`
+**Sequence** — a sparse array, index-addressed (`seq_ops`):
+`create · destroy · stat · len · get(index) · set(index) · del(index) · append · truncate · next`
 
 **Map** — key-addressed (`map_ops`):
 `create · destroy · open · get(key) · set(key) · del(key) · has(key) · iterate`
@@ -141,23 +141,42 @@ the planned interfaces:
 > undefined". A replacement map therefore goes at a fresh `alloc_id`, never
 > back on the old root.
 
+> Specified, not yet implemented (`include/app/lib/containers/shape_seq.h`):
+> the Sequence shape mirrors the Map shape's conventions — `create(root,
+> seq_config)` with a binding `max_elems`, `stat`, `get` with the same
+> `-ENOMEM` probe, `destroy` under §2.4 — over a **sparse array of slots**
+> instead of keys. A slot is empty or holds one element, an opaque byte string
+> the container owns: callers pass bytes, never blob ids, so no caller ever
+> holds a blob that nothing references yet. Any slot below the capacity may be
+> set; `del` empties one; `len` is one past the highest slot set since the
+> last `truncate` (stored, so O(1) — unlike Map `count`); `append` is `set` at
+> `len`. `next(from)` is the Map `next` with the index as the cursor: the first
+> occupied slot at or after `from`, in ascending order, mutation between calls
+> allowed.
+>
+> What earns the shape a place beside L1's large payloads: an L1 object is
+> **one** value addressed by byte offset (`blob_db_read`/`blob_db_write`); a
+> sequence is **many** values addressed by index, each replaced on its own, at
+> its own size. Use cases are listed in §4.1.
+
 Keys and values are opaque byte strings (`ptr + len`); key semantics (strings,
 paths, hashes) belong to L3. Concrete containers export a `const struct
 map_ops`/`seq_ops` instance; the L3 backend `choice` (P4) decides which instance
 an interface is compiled against — a compile-time binding, no runtime dispatch
 cost beyond one indirection.
 
-Both shapes' `iterate` follow the L1 iterator rules (contract §4, decision D5): Zephyr
-convention (callback returns 0 = continue, non-zero = stop, value propagated
-to the caller), and **mutating the container from inside the callback is
-undefined behavior** — collect-then-mutate is the supported pattern.
-Iteration is a diagnostic/repair facility, not a data path.
+Neither shape has a callback `iterate`: both enumerate with a stateless
+`next` whose cursor is the last key (Map) or index (Sequence) seen, so a walk
+holds no iterator, survives a reboot, and may be interleaved with mutations.
+The L1 callback rules (contract §4, decision D5 — mutating from inside the
+callback is undefined) apply to L1's own `iterate` only. Enumeration is for
+listing, export and repair, not a hot data path.
 
 ## 4. The containers
 
 | Container | Shape | Lookup | Ordered | Kconfig |
 |---|---|---|---|---|
-| §4.1 `seq` — simple list | Sequence | O(n) | insertion | `CONTAINER_SEQ` |
+| §4.1 `seq` — sparse indexed array | Sequence | O(1), ≤ 3 reads | by index | `CONTAINER_SEQ` |
 | §4.2 `kvlist` — simple k→v list | Map | O(n) | insertion | `CONTAINER_KVLIST` |
 | §4.3 `kvhash` — k→v hash | Map | O(1) avg | no | `CONTAINER_KVHASH` |
 | §4.4 `kvtree` — k→v tree | Map | O(log n) | by key | `CONTAINER_KVTREE` |
@@ -168,21 +187,58 @@ discipline, and the §5 invariants. The node layouts sketched below are
 implementation designs — they show feasibility and may be fine-tuned when
 each container gets its own implementation document under `doc/impl/`.
 
-### 4.1 `seq` — simple list
+### 4.1 `seq` — sparse indexed array
 
-Singly-linked chain of chunk nodes; the root holds head/tail ids and a count.
+A fixed-capacity array of slots addressed by index. Each slot is empty or
+holds one element, stored as its own blob. The capacity is the caller's
+`seq_config.max_elems`, fixed at create; `stat` reports what was built.
 
-```
-root  { magic 'CSEQ', head_id, tail_id, count }
-chunk { next_id, nelems, elem[]… }          each elem: { len, bytes… }
-```
+**Limits.** About 900 slots at the 256 B default payload and about 62 000 at
+2016 B (the `BLOB_DB_LARGE_PAYLOADS` default); a larger `max_elems` fails the
+create with `-EINVAL`. An element can be as large as one blob_db payload
+(`seq_info.elem_bytes_limit`).
 
-Chunking (several elements per i-node, up to the payload limit) keeps read
-amplification low; a chunk splits when an insert doesn't fit. `append` is O(1)
-(tail id known from the root); `get(index)` is O(n/chunk_factor). Intended use:
-queues, file-data chunk chains — not random access at scale. For *bounded*
-logging with automatic eviction of old records, use `logring` (§4.5) instead
-of an ever-growing `seq`.
+**Cost** (worst case, flash operations):
+
+| op | reads | writes |
+|---|---|---|
+| `get` | 3 | 0 |
+| `len`, `stat` | 1 | 0 |
+| `set` replacing an element | 3 | **1** |
+| `set` filling an empty slot, `append` | 3 | 3 |
+| `del` | 3 | 2 |
+| `truncate` (shrinking) | 1 per id array in range | 2, plus 1 per element released and per id array touched |
+| `next` | 1 per id array scanned, 1 per occupied slot checked, +1 for the element if asked | 0 |
+
+Replacing an element — the common operation on a slot table — rewrites that
+element alone.
+
+**Guarantees**, beyond the §5 invariants: every mutation is atomic across
+power loss — each slot holds its old or new element, `len` its old or new
+value — and leaves no unreachable blob behind. A `truncate` cut short by a
+power loss is finished by the next mutation. `destroy` follows §2.4.
+
+**What it is for** — values addressed by a dense integer, each large enough or
+changed often enough to deserve its own blob:
+
+- **numbered slot tables**: users, keys and certificates, biometric templates,
+  presets, schedule and holiday entries — fixed capacity, holes, a slot
+  replaced on its own. In a Map they would pay for stored keys, hashing, and
+  a bucket that rewrites its neighbours; here `next` lists the occupants or
+  finds a free slot;
+- **arrays of container roots** past what one superblock payload holds —
+  per-period logs, per-entity sub-maps — with the root id stored as an
+  8-byte element (the sequence does not destroy what it names);
+- **record streams read back by position that must not drop data** —
+  store-and-forward batches, sample blocks indexed by time — where `logring`
+  would evict and an L1 object would cap the total and be one value.
+
+**What it is not for:** one large value (an L1 payload, with
+`blob_db_read`/`blob_db_write`); an array small enough to live inside its
+owner's record; a bounded log (`logring`, §4.5); lookup by an arbitrary key
+(a Map); an ordered list that needs inserts and removals in the middle.
+
+Layout, mutation order and crash analysis: `doc/impl/l2_seq.md`.
 
 ### 4.2 `kvlist` — simple k→v list
 
@@ -267,8 +323,9 @@ B-tree rules, still committed by the single root write.
 
 ### 4.5 `logring` — bounded per-entry log
 
-Where `seq` (§4.1) is an *unbounded, index-addressed* sequence — the right
-shape for file bodies and chunk chains — `logring` is purpose-built for
+Where `seq` (§4.1) is a *fixed-capacity, index-addressed* array that never
+drops an element on its own — the right shape for slot tables and for records
+read back by position — `logring` is purpose-built for
 **logging**: a *bounded* store that keeps the most recent records and drops the
 oldest, scaling from a couple of MB up to near the whole partition. It does not
 implement the generic `seq_ops`; it exports its own append/scan API
@@ -326,7 +383,7 @@ Every implementation must uphold (checklist for reviews and tests):
 ```
 menuconfig BLOB_CONTAINERS         bool "Container layer"      depends on BLOB_DB
 
-config CONTAINER_SEQ               bool "Simple list (sequence)"
+config CONTAINER_SEQ               bool "Sparse indexed array (sequence)"
 config CONTAINER_KVLIST            bool "Simple key→value list"
 config CONTAINER_KVLIST_INLINE_MAX int  "Inline value limit"    default 64
 config CONTAINER_KVHASH            bool "Key→value hash"        select CONTAINER_KVLIST
@@ -369,8 +426,9 @@ tests/lib/containers/
 ## 8. Testing strategy (per container)
 
 Beyond per-container functional cases, a **shared shape-conformance suite** runs
-the same scenarios against every enabled `map_ops` provider (and `seq_ops`
-provider), so backends stay behaviorally interchangeable:
+the same scenarios against every enabled `map_ops` provider, so backends stay
+behaviorally interchangeable (`seq` is the only `seq_ops` provider, so items
+1–7 run in its own suite until a second one exists):
 
 1. create → open by root id → empty behavior
 2. set/get/del round-trips, including binary keys/values and 0-length values
@@ -389,3 +447,12 @@ provider), so backends stay behaviorally interchangeable:
    wrong-type `open` → `-ENOTSUP`. (`logring` uses its own append/scan API,
    not `seq_ops`/`map_ops`, so it is exercised by its own suite rather than
    the shared shape-conformance suite.)
+10. `seq`: sparse fill in any order; empty slot (`-ENOENT`) vs empty element
+    (length 0); `len` raised by `set` past it, kept by `del`, moved both ways
+    by `truncate`; `append` at capacity → `-EFBIG`; index at or past capacity
+    → `-EINVAL`; `next` returns occupied slots once each in ascending order,
+    with and without element buffers, across `set`/`del` between calls; depth
+    1 and depth 2 at their capacity boundaries; crash injection at every write
+    of every mutation, verifying old-or-new state, that an interrupted
+    `truncate` is finished by the next mutation, and that `destroy` leaves no
+    blob behind.
